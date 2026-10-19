@@ -1,0 +1,344 @@
+desc:GFX CHECK [mix check]
+//tags: monitor controller mix check mono phone car translation reference utility
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-input, gfx-output, gfx-ui, gfx-panel and gfx-dyn (.jsfx-inc) in the same folder.
+//
+// CHECK. A mix-translation monitor controller: the last plug-in on the master while you mix, to hear the mix the way
+// other people will. LISTENING ONLY - remove it (or set everything back to STEREO / FLAT / FULL) before you render: its
+// banner flashes whenever a check is engaged. No drift (a monitor: nothing should wander).
+//
+//   LISTEN   STEREO, MONO (the sum), SIDES (the difference), LEFT, RIGHT (each on both speakers); SWAP exchanges left
+//            and right.
+//   SYSTEM   playback-system curves, level-matched to FLAT on pink noise (within about 1 dB):
+//            PHONE    a phone speaker: mono, nothing below ~700 Hz, a 2.5 kHz honk, the top gone past 8 kHz
+//            LAPTOP   laptop speakers: thin below 250 Hz, a 1.5 kHz lift, a narrow stereo image
+//            EARBUDS  everyday earbuds: a lifted low end and upper mids, a softened top
+//            RADIO    a kitchen radio: mono, a narrow 180 Hz - 5 kHz band with a 1 kHz bump
+//            CAR      a car: a big cabin low end, a 250 Hz boom dip, a softened top
+//            CLUB     a club rig: mono, a heavy sub and low end, a rolled-off top
+//   BAND     solo a band: LOW (below 200 Hz), MID (200 Hz - 3 kHz), HIGH (above 3 kHz), FULL = everything.
+//   DIM      -20 dB. REF switches to the calibrated REF LEVEL (your reference listening level), so every check
+//            is heard at the same loudness; LEVEL sets the monitor level otherwise (-30 .. +6 dB).
+//   Every switch is click-free: LISTEN and SWAP crossfade, SYSTEM and BAND dip for 8 ms each way (like a relay).
+//   OUTPUT   the house output stage passes straight through (a utility: no clip).
+//   PRESETS  Init and nine checks (Mono, Phone, Laptop, Earbuds, Kitchen Radio, Car, Club, Bass Check, Sides Only)
+//            plus Reset all to defaults. A preset sets LISTEN, SWAP, SYSTEM and BAND; the levels are left alone.
+
+slider1:0<0,4,1{Stereo,Mono,Sides,Left,Right}>-Listen
+slider2:0<0,1,1{Off,On}>-Swap
+slider3:0<0,6,1{Flat,Phone,Laptop,Earbuds,Radio,Car,Club}>-System
+slider4:0<0,3,1{Full,Low,Mid,High}>-Band
+slider5:0<0,1,1{Off,On}>-Dim
+slider6:0<0,1,1{Off,On}>-Ref
+slider7:0<-30,6,0.1>-Level (dB)
+slider8:-10<-30,0,0.1>-Ref level (dB)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+
+@init
+#ui_man = "gfx-check";                                // the ? pop-up links to this manual
+ext_noinit = 1;
+
+function ck_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+// RBJ biquad: t 0 LP, 1 HP, 2 peak, 3 low shelf, 4 high shelf, 5 pass-through
+function bq_set(t, f, q, gdb) instance(b0, b1, b2, a1, a2) local(w, cw, sw, al, A, n, sq) (
+  w = 2 * $pi * min(f, 0.45 * srate) / srate; cw = cos(w); sw = sin(w); al = sw / (2 * q); A = 10 ^ (gdb / 40);
+  t == 0 ? ( n = 1 + al; b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n; ) :
+  t == 1 ? ( n = 1 + al; b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n; ) :
+  t == 2 ? ( n = 1 + al / A; b0 = (1 + al * A) / n; b1 = -2 * cw / n; b2 = (1 - al * A) / n; a1 = -2 * cw / n; a2 = (1 - al / A) / n; ) :
+  t == 3 ? ( sq = 2 * sqrt(A) * al; n = (A + 1) + (A - 1) * cw + sq;
+             b0 = A * ((A + 1) - (A - 1) * cw + sq) / n; b1 = 2 * A * ((A - 1) - (A + 1) * cw) / n; b2 = A * ((A + 1) - (A - 1) * cw - sq) / n;
+             a1 = -2 * ((A - 1) + (A + 1) * cw) / n; a2 = ((A + 1) + (A - 1) * cw - sq) / n; ) :
+  t == 4 ? ( sq = 2 * sqrt(A) * al; n = (A + 1) - (A - 1) * cw + sq;
+             b0 = A * ((A + 1) + (A - 1) * cw + sq) / n; b1 = -2 * A * ((A - 1) + (A + 1) * cw) / n; b2 = A * ((A + 1) + (A - 1) * cw - sq) / n;
+             a1 = 2 * ((A - 1) - (A + 1) * cw) / n; a2 = ((A + 1) - (A - 1) * cw - sq) / n; ) :
+           ( b0 = 1; b1 = b2 = a1 = a2 = 0; );
+);
+function bq_run(x) instance(b0, b1, b2, a1, a2, s1, s2) local(y) ( y = b0 * x + s1; s1 = b1 * x - a1 * y + s2; s2 = b2 * x - a2 * y; y; );
+function bq_clr() instance(s1, s2) ( s1 = s2 = 0; );
+function bq_tidy() instance(s1, s2) ( s1 = ck_tn(s1); s2 = ck_tn(s2); );
+
+// ---------- one channel's SYSTEM curve: four biquad slots ----------
+function sy_run(x) ( this.q4.bq_run(this.q3.bq_run(this.q2.bq_run(this.q1.bq_run(x)))); );
+function sy_clr() ( this.q1.bq_clr(); this.q2.bq_clr(); this.q3.bq_clr(); this.q4.bq_clr(); );
+function sy_tidy() ( this.q1.bq_tidy(); this.q2.bq_tidy(); this.q3.bq_tidy(); this.q4.bq_tidy(); );
+function sy_set(s) (
+  s == 1 ? ( this.q1.bq_set(1, 700, 0.9, 0); this.q2.bq_set(2, 2500, 1.2, 4); this.q3.bq_set(0, 8000, 0.7, 0); this.q4.bq_set(1, 500, 0.7, 0); ) :     // PHONE
+  s == 2 ? ( this.q1.bq_set(1, 250, 0.8, 0); this.q2.bq_set(2, 1500, 1, 3); this.q3.bq_set(2, 4000, 2, -2); this.q4.bq_set(0, 14000, 0.7, 0); ) :   // LAPTOP
+  s == 3 ? ( this.q1.bq_set(3, 100, 0.7, 4); this.q2.bq_set(2, 3000, 1, 3); this.q3.bq_set(4, 10000, 0.7, -2); this.q4.bq_set(5, 1, 1, 0); ) :     // EARBUDS
+  s == 4 ? ( this.q1.bq_set(1, 180, 0.8, 0); this.q2.bq_set(2, 1000, 0.7, 5); this.q3.bq_set(0, 5000, 0.8, 0); this.q4.bq_set(1, 150, 0.7, 0); ) :   // RADIO
+  s == 5 ? ( this.q1.bq_set(3, 70, 0.7, 6); this.q2.bq_set(2, 250, 1.2, -3); this.q3.bq_set(2, 3000, 1, 2); this.q4.bq_set(4, 8000, 0.7, -3); ) :   // CAR
+  s == 6 ? ( this.q1.bq_set(1, 35, 0.7, 0); this.q2.bq_set(3, 60, 0.7, 7); this.q3.bq_set(4, 8000, 0.7, -4); this.q4.bq_set(5, 1, 1, 0); ) :       // CLUB
+           ( this.q1.bq_set(5, 1, 1, 0); this.q2.bq_set(5, 1, 1, 0); this.q3.bq_set(5, 1, 1, 0); this.q4.bq_set(5, 1, 1, 0); );                      // FLAT
+  this.sy_clr();
+);
+// per system: mono (1) or width, and the level trim that matches it to FLAT on pink noise
+function ck_sysinfo(s) (
+  ck_smono = s == 1 || s == 4 || s == 6;
+  ck_swid = s == 2 ? 0.5 : 1;
+  ck_strim = 10 ^ ((s == 1 ? CK_T1 : s == 2 ? CK_T2 : s == 3 ? CK_T3 : s == 4 ? CK_T4 : s == 5 ? CK_T5 : s == 6 ? CK_T6 : 0) / 20);
+);
+CK_T1 = 4.77; CK_T2 = 3.65; CK_T3 = -2.49; CK_T4 = 2.75; CK_T5 = -3.5; CK_T6 = 1.95;   // (dB: matched to FLAT on pink noise)
+
+// ---------- one channel's BAND solo: LR4 at 200 Hz and 3 kHz ----------
+function bs_run(x, b) local(lo, r) (
+  b == 1 ? this.b2.bq_run(this.b1.bq_run(x)) :                                    // LOW
+  b == 2 ? this.b6.bq_run(this.b5.bq_run(this.b4.bq_run(this.b3.bq_run(x)))) :    // MID: HP 200 into LP 3k
+           this.b8.bq_run(this.b7.bq_run(x));                                     // HIGH
+);
+function bs_init() (
+  this.b1.bq_set(0, 200, 0.70710678, 0); this.b2.bq_set(0, 200, 0.70710678, 0);
+  this.b3.bq_set(1, 200, 0.70710678, 0); this.b4.bq_set(1, 200, 0.70710678, 0);
+  this.b5.bq_set(0, 3000, 0.70710678, 0); this.b6.bq_set(0, 3000, 0.70710678, 0);
+  this.b7.bq_set(1, 3000, 0.70710678, 0); this.b8.bq_set(1, 3000, 0.70710678, 0);
+);
+function bs_clr() (
+  this.b1.bq_clr(); this.b2.bq_clr(); this.b3.bq_clr(); this.b4.bq_clr(); this.b5.bq_clr(); this.b6.bq_clr(); this.b7.bq_clr(); this.b8.bq_clr();
+);
+
+// ---------- presets ----------
+#ck_pm = "Init|Mono Check|Phone|Laptop|Earbuds|Kitchen Radio|Car|Club|Bass Check|Sides Only";
+function ck_p(l, w, s, b) ( slider1 = l; slider2 = w; slider3 = s; slider4 = b; );
+function load_preset(p) (
+  p == 1  ? ck_p(0, 0, 0, 0) : p == 2 ? ck_p(1, 0, 0, 0) : p == 3 ? ck_p(0, 0, 1, 0) : p == 4 ? ck_p(0, 0, 2, 0) :
+  p == 5  ? ck_p(0, 0, 3, 0) : p == 6 ? ck_p(0, 0, 4, 0) : p == 7 ? ck_p(0, 0, 5, 0) : p == 8 ? ck_p(0, 0, 6, 0) :
+  p == 9  ? ck_p(1, 0, 0, 1) : p == 10 ? ck_p(2, 0, 0, 0) :
+  p == 11 ? ( ck_p(0, 0, 0, 0); slider5 = 0; slider6 = 0; slider7 = 0; slider8 = -10; );
+  slider_automate(255);
+  pr_cur = p == 11 ? 1 : p;
+);
+
+// ---------- state ----------
+function ck_srinit() (
+  ck_sr = srate;
+  ck_gs = 1 - exp(-1 / (0.015 * srate));              // listen matrix / levels: 15 ms
+  ck_dst = 1 / (0.008 * srate);                       // the relay dip: 8 ms each way
+  bsL.bs_init(); bsR.bs_init(); syL.sy_set(ck_sys); syR.sy_set(ck_sys);
+  ost_init(0);
+);
+ck_sys = 0; ck_band = 0;
+ck_srinit();
+in_init();
+ck_sysinfo(0);
+ck_dip = 1; ck_dipdir = 0;                            // the relay: 1 = open; -1 falling, +1 rising
+ck_snap = 1;
+
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
+ui_dflt = 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@block
+srate != ck_sr ? ck_srinit();
+in_setup(0, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through (a utility)
+// LISTEN: the matrix (out L = aL * L + bL * R, out R = aR * L + bR * R), then SWAP
+ck_l = floor(min(max(slider1, 0), 4) + 0.5);
+ck_l == 0 ? ( ck_taL = 1; ck_tbL = 0; ck_taR = 0; ck_tbR = 1; ) :
+ck_l == 1 ? ( ck_taL = 0.5; ck_tbL = 0.5; ck_taR = 0.5; ck_tbR = 0.5; ) :
+ck_l == 2 ? ( ck_taL = 0.5; ck_tbL = -0.5; ck_taR = 0.5; ck_tbR = -0.5; ) :
+ck_l == 3 ? ( ck_taL = 1; ck_tbL = 0; ck_taR = 1; ck_tbR = 0; ) :
+            ( ck_taL = 0; ck_tbL = 1; ck_taR = 0; ck_tbR = 1; );
+slider2 >= 0.5 ? ( ck_t = ck_taL; ck_taL = ck_taR; ck_taR = ck_t; ck_t = ck_tbL; ck_tbL = ck_tbR; ck_tbR = ck_t; );
+// SYSTEM / BAND: a change opens the relay dip; the new setting is switched in at the bottom of the dip
+ck_st = floor(min(max(slider3, 0), 6) + 0.5); ck_bt = floor(min(max(slider4, 0), 3) + 0.5);
+(ck_st != ck_sys || ck_bt != ck_band) ? (
+  ck_snap ? ( ck_sys = ck_st; ck_band = ck_bt; syL.sy_set(ck_sys); syR.sy_set(ck_sys); ck_sysinfo(ck_sys); ) : ck_dipdir = -1;
+);
+// levels: LEVEL or the calibrated REF LEVEL, DIM
+ck_lvt = 10 ^ ((slider6 >= 0.5 ? min(max(slider8, -30), 0) : min(max(slider7, -30), 6)) / 20) * (slider5 >= 0.5 ? 0.1 : 1);
+ck_snap ? (
+  ck_aL = ck_taL; ck_bL = ck_tbL; ck_aR = ck_taR; ck_bR = ck_tbR; ck_lvs = ck_lvt; ck_mns = ck_smono; ck_wds = ck_swid; ck_trs = ck_strim;
+  ck_snap = 0;
+);
+// is any check engaged? (the banner)
+ck_active = ck_l != 0 || slider2 >= 0.5 || ck_st != 0 || ck_bt != 0 || slider5 >= 0.5;
+syL.sy_tidy(); syR.sy_tidy();
+cka_pi = max(cka_pi, ck_pi); ck_pi = 0; cka_po = max(cka_po, ck_po); ck_po = 0;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+in_process(spl0, spl1);
+ck_xl = in_l; ck_xr = in_r;
+ck_pi = max(ck_pi, max(abs(ck_xl), abs(ck_xr)));
+// the relay dip: down, switch, up
+ck_dipdir < 0 ? (
+  ck_dip -= ck_dst;
+  ck_dip <= 0 ? (
+    ck_dip = 0; ck_dipdir = 1;
+    ck_st != ck_sys ? ( ck_sys = ck_st; syL.sy_set(ck_sys); syR.sy_set(ck_sys); ck_sysinfo(ck_sys); ck_mns = ck_smono; ck_wds = ck_swid; ck_trs = ck_strim; );
+    ck_bt != ck_band ? ( ck_band = ck_bt; bsL.bs_clr(); bsR.bs_clr(); );
+  );
+) : ck_dipdir > 0 ? ( ck_dip += ck_dst; ck_dip >= 1 ? ( ck_dip = 1; ck_dipdir = 0; ); );
+// LISTEN / SWAP (glided)
+ck_aL += (ck_taL - ck_aL) * ck_gs; ck_bL += (ck_tbL - ck_bL) * ck_gs; ck_aR += (ck_taR - ck_aR) * ck_gs; ck_bR += (ck_tbR - ck_bR) * ck_gs;
+ck_yl = ck_aL * ck_xl + ck_bL * ck_xr; ck_yr = ck_aR * ck_xl + ck_bR * ck_xr;
+// SYSTEM: its curve, mono or width, its level match
+ck_sys > 0 ? (
+  ck_mns > 0 ? ( ck_m = 0.5 * (ck_yl + ck_yr); ck_yl = ck_m; ck_yr = ck_m; ) :
+  ck_wds < 1 ? ( ck_m = 0.5 * (ck_yl + ck_yr); ck_s = 0.5 * (ck_yl - ck_yr) * ck_wds; ck_yl = ck_m + ck_s; ck_yr = ck_m - ck_s; );
+  ck_yl = syL.sy_run(ck_yl) * ck_trs; ck_yr = ck_mns > 0 ? ck_yl : syR.sy_run(ck_yr) * ck_trs;
+);
+// BAND solo
+ck_band > 0 ? ( ck_yl = bsL.bs_run(ck_yl, ck_band); ck_yr = bsR.bs_run(ck_yr, ck_band); );
+// levels (glided), the relay
+ck_lvs += (ck_lvt - ck_lvs) * ck_gs;
+ck_e = ck_dip * ck_dip * (3 - 2 * ck_dip);
+ck_yl *= ck_lvs * ck_e; ck_yr *= ck_lvs * ck_e;
+ost_out(ck_yl, ck_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+ck_po = max(ck_po, max(abs(spl0), abs(spl1)));
+
+@gfx 960 388
+ui_begin(960, 388);
+// =====================================================================
+// GUI - mint white panel, pea green lit keys, dark ink (design space 960 x 388; S / M / L).
+// LISTEN | SYSTEM | BAND | LEVEL; the banner and meter strip below.
+// =====================================================================
+sc != cg_lsc ? (
+  cg_lsc = sc;
+  gfx_setfont(11, "Trebuchet MS", 18 * sc, 'b');     // section titles
+  gfx_setfont(12, "Trebuchet MS", 14 * sc, 'b');     // knob labels / values
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print
+  gfx_setfont(14, "Trebuchet MS", 13 * sc, 'b');     // keys
+  gfx_setfont(15, "Trebuchet MS", 27 * sc, 'b');     // the unit's name
+);
+CG_FACE = 0xEEF6EE; CG_PLATE = 0xF7FCF7; CG_EDGE = 0xB9CDB9; CG_INK = 0x1F2B1F; CG_DIM = 0x6E806E; CG_PEA = 0x8DB41A;
+CG_KEYC = 0xDCE7DC; CG_TRAY = 0x223022; CG_WARN = 0xE8622C;
+
+function cg_rr(x, y, w, h, r) local(x1, y1, x2, y2, rr) (
+  x1 = floor(x * sc + 0.5); y1 = floor(y * sc + 0.5); x2 = floor((x + w) * sc + 0.5); y2 = floor((y + h) * sc + 0.5);
+  rr = min(floor(r * sc + 0.5), floor((min(x2 - x1, y2 - y1)) * 0.5));
+  gfx_a < 1 ? ui_rrs(x1, y1, x2 - x1, y2 - y1, rr) : (
+    gfx_rect(x1 + rr, y1, x2 - x1 - 2 * rr, y2 - y1);
+    gfx_rect(x1, y1 + rr, rr + 1, y2 - y1 - 2 * rr); gfx_rect(x2 - rr - 1, y1 + rr, rr + 1, y2 - y1 - 2 * rr);
+    gfx_circle(x1 + rr, y1 + rr, rr, 1, 1); gfx_circle(x2 - rr - 1, y1 + rr, rr, 1, 1);
+    gfx_circle(x1 + rr, y2 - rr - 1, rr, 1, 1); gfx_circle(x2 - rr - 1, y2 - rr - 1, rr, 1, 1);
+  );
+);
+function cg_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function cg_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function cg_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function cg_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function cg_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+// a lit key on the light panel: pea green when on
+function cg_key(x, y, w, h, on, col, s) local(hov, hit) (
+  hov = cg_in(x, y, w, h); hit = pressed && hov && drag_id == 0; hit ? drag_id = -1;
+  ui_cola(0x000000, 0.14); cg_rr(x + 1, y + 2, w, h, 4);
+  on ? ( ui_cola(col, 0.25); cg_rr(x - 3, y - 3, w + 6, h + 6, 6); );
+  ui_col(on ? col : CG_KEYC); cg_rr(x, y, w, h, 4);
+  !on ? ( ui_col(ui_mix(col, CG_KEYC, 0.6)); cg_rr(x, y, w, max(2, 2 / sc), 1); );
+  hov ? ( ui_cola(0x000000, 0.06); cg_rr(x, y, w, h, 4); );
+  gfx_setfont(14); ui_col(on ? 0x101810 : CG_INK);
+  ui_keytext((x + w * 0.5) * sc, (y + h * 0.5) * sc, s);
+  hit;
+);
+function cg_sec(x0, w, title) (
+  ui_cola(0x000000, 0.08); cg_rr(x0 + 1, 74, w, 226, 8);
+  ui_col(CG_EDGE); cg_rr(x0, 72, w, 226, 8);
+  ui_col(CG_PLATE); cg_rr(x0 + 1.5, 73.5, w - 3, 223, 7);
+  ui_col(CG_PEA); cg_r(x0 + 18, 84, 4, 22);
+  gfx_setfont(11); ui_col(CG_INK); cg_tl(x0 + 30, 85, title);
+  dy_bg = CG_PLATE; dy_ink = CG_INK;
+);
+function cg_set(idx, v) ( slider(idx) = v; ui_auto(idx); );
+function cg_knob(cx, cy, r, idx, lo, hi, def, lbl) (
+  sprintf(#cgv, "%+.1f dB", slider(idx));
+  dy_kst = 36; dy_knob(cx, cy, r, idx, lo, hi, def, 0, CG_PEA, "", "");
+  gfx_setfont(12); ui_col(dy_act ? 0x557010 : CG_INK); cg_tc(cx, cy + r + 22, dy_act ? #cgv : lbl);
+);
+
+// =====================================================================
+// Draw
+// =====================================================================
+ui_col(CG_FACE); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0x000000, 0.08); cg_r(0, 58, 960, 1);
+ui_col(CG_PEA); cg_r(0, 59, 960, 2);
+
+// ---------- header ----------
+ui_col(CG_INK); gfx_circle(48 * sc, 30 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(CG_FACE); ui_keytext(48 * sc, 30 * sc, "GFX");
+gfx_setfont(15); ui_col(CG_INK); cg_tl(76, 13, "CHECK"); gfx_measurestr("CHECK", cg_tw, cg_th);
+cg_x = 88 + cg_tw / sc;
+ui_col(CG_PEA); cg_r(cg_x, 20, 8, 8); ui_col(0xFFFFFF); cg_r(cg_x + 11, 20, 8, 8); ui_col(CG_EDGE); cg_r(cg_x + 11, 20, 8, 1);
+gfx_setfont(13); ui_col(CG_DIM); cg_tl(cg_x, 33, "MIX TRANSLATION  ·  LISTENING ONLY");
+pk_pextra = "Reset all to defaults";
+cg_k = pk_preset(452 * sc, 14 * sc, 390 * sc, 30 * sc, pr_cur, #ck_pm);
+cg_k > 0 ? load_preset(cg_k);
+ui_size_picker(864 * sc, 20 * sc);
+
+// ---------- LISTEN ----------
+cg_sec(24, 176, "LISTEN");
+cg_l = floor(slider1 + 0.5);
+cg_key(42, 118, 140, 26, cg_l == 0, CG_PEA, "STEREO") ? cg_set(1, 0);
+cg_key(42, 150, 140, 26, cg_l == 1, CG_PEA, "MONO") ? cg_set(1, 1);
+cg_key(42, 182, 140, 26, cg_l == 2, CG_PEA, "SIDES") ? cg_set(1, 2);
+cg_key(42, 214, 67, 26, cg_l == 3, CG_PEA, "LEFT") ? cg_set(1, 3);
+cg_key(115, 214, 67, 26, cg_l == 4, CG_PEA, "RIGHT") ? cg_set(1, 4);
+cg_key(42, 254, 140, 28, slider2 >= 0.5, CG_PEA, "SWAP L / R") ? cg_set(2, slider2 >= 0.5 ? 0 : 1);
+
+// ---------- SYSTEM ----------
+cg_sec(212, 312, "SYSTEM");
+cg_s = floor(slider3 + 0.5);
+cg_key(230, 118, 136, 34, cg_s == 0, CG_PEA, "FLAT") ? cg_set(3, 0);
+cg_key(372, 118, 136, 34, cg_s == 1, CG_PEA, "PHONE") ? cg_set(3, 1);
+cg_key(230, 160, 136, 34, cg_s == 2, CG_PEA, "LAPTOP") ? cg_set(3, 2);
+cg_key(372, 160, 136, 34, cg_s == 3, CG_PEA, "EARBUDS") ? cg_set(3, 3);
+cg_key(230, 202, 136, 34, cg_s == 4, CG_PEA, "RADIO") ? cg_set(3, 4);
+cg_key(372, 202, 136, 34, cg_s == 5, CG_PEA, "CAR") ? cg_set(3, 5);
+cg_key(230, 244, 136, 34, cg_s == 6, CG_PEA, "CLUB") ? cg_set(3, 6);
+gfx_setfont(13); ui_col(CG_DIM);
+cg_tl(380, 246, cg_s == 1 || cg_s == 4 || cg_s == 6 ? "MONO SPEAKER" : cg_s == 2 ? "NARROW STEREO" : cg_s > 0 ? "STEREO" : "");
+cg_tl(380, 262, cg_s > 0 ? "LEVEL-MATCHED" : "");
+
+// ---------- BAND ----------
+cg_sec(536, 144, "BAND");
+cg_b = floor(slider4 + 0.5);
+cg_key(554, 118, 108, 30, cg_b == 0, CG_PEA, "FULL") ? cg_set(4, 0);
+cg_key(554, 156, 108, 30, cg_b == 1, CG_PEA, "LOW") ? cg_set(4, 1);
+cg_key(554, 194, 108, 30, cg_b == 2, CG_PEA, "MID") ? cg_set(4, 2);
+cg_key(554, 232, 108, 30, cg_b == 3, CG_PEA, "HIGH") ? cg_set(4, 3);
+gfx_setfont(13); ui_col(CG_DIM); cg_tc(608, 274, cg_b == 1 ? "BELOW 200 Hz" : cg_b == 2 ? "200 Hz - 3 kHz" : cg_b == 3 ? "ABOVE 3 kHz" : "");
+
+// ---------- LEVEL ----------
+cg_sec(692, 244, "LEVEL");
+cg_key(710, 118, 100, 30, slider5 >= 0.5, CG_WARN, "DIM -20") ? cg_set(5, slider5 >= 0.5 ? 0 : 1);
+cg_key(818, 118, 100, 30, slider6 >= 0.5, CG_PEA, "REF") ? cg_set(6, slider6 >= 0.5 ? 0 : 1);
+cg_knob(760, 208, 30, 7, -30, 6, 0, "LEVEL");
+cg_knob(868, 208, 30, 8, -30, 0, -10, "REF LEVEL");
+slider6 >= 0.5 ? ( ui_cola(CG_PLATE, 0.55); gfx_circle(760 * sc, 208 * sc, 37 * sc, 1, 1); ) :
+                 ( ui_cola(CG_PLATE, 0.55); gfx_circle(868 * sc, 208 * sc, 37 * sc, 1, 1); );   // the level not in use sits back
+
+// ---------- banner and meters ----------
+pk_inset(24 * sc, 310 * sc, 912 * sc, 66 * sc, CG_TRAY);
+cg_fl = ck_active && (time_precise() * 2) % 2 < 1.3;
+ck_active ? (
+  ui_col(cg_fl ? CG_WARN : 0x7A3A1E); cg_rr(36, 320, 236, 46, 5);
+  gfx_setfont(14); ui_col(0xFFFFFF); ui_keytext(154 * sc, 336 * sc, "CHECK ENGAGED");
+  gfx_setfont(13); ui_keytext(154 * sc, 352 * sc, "LISTENING ONLY - DON'T RENDER");
+) : (
+  ui_col(0x2E3E2E); cg_rr(36, 320, 236, 46, 5);
+  gfx_setfont(14); ui_col(CG_PEA); ui_keytext(154 * sc, 336 * sc, "STRAIGHT THROUGH");
+  gfx_setfont(13); ui_col(0x9AB09A); ui_keytext(154 * sc, 352 * sc, slider6 >= 0.5 ? "AT REF LEVEL" : "AT MONITOR LEVEL");
+);
+cg_pi = cka_pi; cka_pi = 0; cg_po = cka_po; cka_po = 0;
+cgmI.ui_ledm(320 * sc, 326 * sc, 600 * sc, 9 * sc, cg_pi);
+cgmO.ui_ledm(320 * sc, 348 * sc, 600 * sc, 9 * sc, cg_po);
+gfx_setfont(13); ui_col(0x9AB09A); cg_tr(306, 324, "IN"); cg_tr(306, 346, "OUT");
+
+pk_end();
+ui_end();

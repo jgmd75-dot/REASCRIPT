@@ -1,0 +1,74 @@
+// gfx-bdelay: the shared engine of the GFX broadcast delays (E-Delay, J-Delay). Import after gfx-bverb
+// (which supplies the converters, the transformer, seven-segment text and the parameter table).
+//   bd_alloc(base)        two 3-second delay lines (left / right) and two pitch-shifter rings
+//   bd_put(l, r)          write one sample into each line
+//   bd_rd(b, d)           read line b, d samples back: 4-point Hermite, or nearest-neighbour when bd_near (vintage)
+//   xh_run(b, target)     a crossfading read head: a new delay time fades in over ~30 ms (no pitch bend)
+//   sl_run(b, target)     a slewing read head: the delay time glides (the pitch bends, as on the old racks)
+//   ps_run(x, ratio)      a two-grain pitch shifter on its own ring (ratio = 2 ^ (semitones / 12))
+//   cmp_in / cmp_out      a 2:1 compander around the line (the breathing of the compact units)
+@init
+
+function bd_alloc(base) (
+  DL_N = ceil(3.05 * srate) + 16;
+  BD_L = base; BD_R = BD_L + DL_N;
+  PS_N = 16384; BD_PS = BD_R + DL_N;          // two pitch rings
+  BD_END = BD_PS + 2 * PS_N;
+  memset(base, 0, BD_END - base);
+  bd_w = 0;
+);
+function bd_put(l, r) ( BD_L[bd_w] = l; BD_R[bd_w] = r; bd_w += 1; bd_w >= DL_N ? bd_w = 0; );
+bd_near = 0;
+function bd_rd(b, d) local(p, i, f, y0, y1, y2, y3, c1, c2, c3) (
+  d = min(max(d, 1), DL_N - 4);
+  p = bd_w - 1 - d; p < 0 ? p += DL_N;
+  bd_near ? b[floor(p + 0.5) % DL_N] : (
+    i = floor(p); f = p - i;
+    y0 = b[i == 0 ? DL_N - 1 : i - 1]; y1 = b[i]; y2 = b[(i + 1) % DL_N]; y3 = b[(i + 2) % DL_N];
+    c1 = 0.5 * (y2 - y0); c2 = y0 - 2.5 * y1 + 2 * y2 - 0.5 * y3; c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+    ((c3 * f + c2) * f + c1) * f + y1;
+  );
+);
+// crossfading head: cur / nxt delays, xf 0 - 1
+xh_rate = 1;
+function xh_run(b, target) instance(cur, nxt, xf, init) (
+  !init ? ( cur = target; init = 1; );
+  xf == 0 && abs(target - cur) > 0.5 ? ( nxt = target; xf = 0.000001; );
+  xf > 0 ? (
+    xf += xh_rate; xf >= 1 ? ( cur = nxt; xf = 0; bd_rd(b, cur); ) : (
+      bd_rd(b, cur) * cos(xf * 0.5 * $pi) + bd_rd(b, nxt) * sin(xf * 0.5 * $pi); );
+  ) : bd_rd(b, cur);
+);
+// slewing head: the delay glides to the target (sl_c per sample)
+sl_c = 0.001;
+function sl_run(b, target) instance(pos, init) (
+  !init ? ( pos = target; init = 1; );
+  pos += (target - pos) * sl_c;
+  bd_rd(b, pos);
+);
+
+// ---------- pitch shifter: two grains crossfaded (window ps_win samples) ----------
+ps_win = 2400;
+function ps_run(x, ratio, k) instance(w, ph) local(b, d1, d2, g1, g2, p, i, f, y) (
+  b = BD_PS + k * PS_N;
+  b[w] = x;
+  ph += (1 - ratio) / ps_win; ph >= 1 ? ph -= 1; ph < 0 ? ph += 1;
+  d1 = ph * ps_win + 2; d2 = (ph >= 0.5 ? ph - 0.5 : ph + 0.5) * ps_win + 2;
+  g1 = sin(ph * $pi); g2 = sin((ph >= 0.5 ? ph - 0.5 : ph + 0.5) * $pi);
+  p = w - d1; p < 0 ? p += PS_N; i = floor(p); f = p - i; y = (b[i] * (1 - f) + b[(i + 1) % PS_N] * f) * g1 * g1;
+  p = w - d2; p < 0 ? p += PS_N; i = floor(p); f = p - i; y += (b[i] * (1 - f) + b[(i + 1) % PS_N] * f) * g2 * g2;
+  w += 1; w >= PS_N ? w = 0;
+  y;
+);
+
+// ---------- compander: 2:1 into the line, 1:2 out of it (RMS detectors, ~20 ms) ----------
+cmp_c = 0.001;
+// in: divide by the square root of the level (rms r -> sqrt r); out: multiply by the level (sqrt r -> r)
+function cmp_in(x) instance(e) ( e += (x * x - e) * cmp_c; x / sqrt(max(sqrt(e), 0.0003)); );
+function cmp_out(x) instance(e) ( e += (x * x - e) * cmp_c; x * min(sqrt(e), 4); );
+
+// ---------- tempo divisions: 1/1 1/2 1/2D 1/2T 1/4 1/4D 1/4T 1/8 1/8D 1/8T 1/16 1/16D 1/16T 1/32 ----------
+function bd_beats(k) ( k == 0 ? 4 : k == 1 ? 2 : k == 2 ? 3 : k == 3 ? 4 / 3 : k == 4 ? 1 : k == 5 ? 1.5 : k == 6 ? 2 / 3 : k == 7 ? 0.5 :
+  k == 8 ? 0.75 : k == 9 ? 1 / 3 : k == 10 ? 0.25 : k == 11 ? 0.375 : k == 12 ? 1 / 6 : 0.125; );
+function bd_divname(k) ( k == 0 ? "1/1" : k == 1 ? "1/2" : k == 2 ? "1/2D" : k == 3 ? "1/2T" : k == 4 ? "1/4" : k == 5 ? "1/4D" : k == 6 ? "1/4T" :
+  k == 7 ? "1/8" : k == 8 ? "1/8D" : k == 9 ? "1/8T" : k == 10 ? "1/16" : k == 11 ? "1/16D" : k == 12 ? "1/16T" : "1/32"; );

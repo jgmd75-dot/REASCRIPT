@@ -1,0 +1,275 @@
+desc:GFX Headsmoother [tape sat + opto]
+//tags: saturation tape compressor optical opto channel strip
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-headsmooth (.jsfx-inc)
+// in the same folder.
+//
+// GFX Head (tape saturator) and GFX Smooth (optical compressor) in one plug-in, as two stacked units.
+//   ORDER - one key: SMOOTH > HEAD (compress, then saturate) or HEAD > SMOOTH. The units swap places on screen,
+//           so the top unit is always the first one the signal meets.
+//   ON    - each unit can be switched out on its own.
+//   HEAD   - DRIVE, VOICE (NORMAL / MEDIUM / BRIGHT), TRIM: as GFX Head.
+//            As DRIVE goes up, more of the low end skips the tape curve and rejoins clean ("tight" drive).
+//   SMOOTH - COMPRESS, ATTACK, RELEASE, LIMIT, BLEND, OUTPUT: as GFX Smooth. COLOUR switches its
+//            valve-style colour stage (off: clean compression).
+// One shared strip below holds DRIFT (one dial: 50% = the drift settings) and IN / OUT (TRIM + GUARD, SAT).
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-headsmooth.jsfx-inc
+
+slider1:3<0,10,0.01>-Head drive
+slider2:0<-24,6,0.1>-Head trim (dB)
+slider3:0<0,2,1{Normal,Medium,Bright}>-Head voice
+slider4:3<0,10,0.01>-Smooth compress
+slider5:0<-12,24,0.1>-Smooth output (dB)
+slider6:1<0,2,1{Slow,Medium,Fast}>-Smooth attack
+slider7:1<0,2,1{Slow,Medium,Fast}>-Smooth release
+slider8:0<0,1,1{Off,On}>-Smooth limit
+slider9:100<0,100,1>-Smooth blend (%)
+slider10:1<0,1,1{Off,On}>-Head on
+slider11:1<0,1,1{Off,On}>-Smooth on
+slider12:0<0,1,1{Smooth then Head,Head then Smooth}>-Order
+slider13:1<0,1,1{Off,On}>-Smooth colour
+slider14:0<-24,12,0.1>-Input trim (dB)
+slider15:1<0,1,1{Off,On}>-Input guard
+slider16:25<0,100,1>-Drift amount (%)
+slider17:0.25<0.02,2,0.01>-Drift speed (Hz)
+slider18:0<0,100,1>-Band sat (%)
+slider19:0<0,100,1>-Head boost (%)
+slider20:120<40,400,1>-Sat low band (Hz)
+slider21:6000<2000,16000,10>-Sat high band (Hz)
+slider22:-0.3<-24,0,0.1>-Ceiling (dB)
+slider23:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider24:50<0,100,1>-Drift (%)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+#ui_man = "gfx-headsmoother";                                  // the ? pop-up links to this manual
+
+// ---------- biquads (RBJ); fs = the rate the filter runs at ----------
+function bq_set(type, f, q, gdb, fs) instance(b0, b1, b2, a1, a2) local(w0, cw, sw, al, amp, sa, n) (
+  w0 = 2 * $pi * min(f, fs * 0.45) / fs; cw = cos(w0); sw = sin(w0); al = sw / (2 * q);
+  amp = 10 ^ (gdb / 40);
+  type == 0 ? (                                    // low-pass
+    n = 1 + al; b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 1 ? (                                // high-pass
+    n = 1 + al; b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 2 ? (                                // peak
+    n = 1 + al / amp; b0 = (1 + al * amp) / n; b1 = -2 * cw / n; b2 = (1 - al * amp) / n; a1 = b1; a2 = (1 - al / amp) / n;
+  ) : (                                            // high shelf
+    sa = 2 * sqrt(amp) * al;
+    n = (amp + 1) - (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) + (amp - 1) * cw + sa) / n; b1 = -2 * amp * ((amp - 1) + (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) + (amp - 1) * cw - sa) / n; a1 = 2 * ((amp - 1) - (amp + 1) * cw) / n;
+    a2 = ((amp + 1) - (amp - 1) * cw - sa) / n;
+  );
+);
+function bq_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+function tc(ms) ( 1 - exp(-1 / (max(ms, 0.05) * 0.001 * srate)); );
+
+// ================= HEAD: tape stage (as GFX Head) =================
+function hd_aa() instance(u1, u2, u3, u4, d1, d2, d3, d4) local(fc, fs2) (
+  fs2 = 2 * srate; fc = min(0.42 * srate, 20000);
+  u1.bq_set(0, fc, 0.5098, 0, fs2); u2.bq_set(0, fc, 0.6013, 0, fs2);
+  u3.bq_set(0, fc, 0.9000, 0, fs2); u4.bq_set(0, fc, 2.5629, 0, fs2);
+  d1.bq_set(0, fc, 0.5098, 0, fs2); d2.bq_set(0, fc, 0.6013, 0, fs2);
+  d3.bq_set(0, fc, 0.9000, 0, fs2); d4.bq_set(0, fc, 2.5629, 0, fs2);
+);
+// voicing + tape EQ (the gap loss follows this side's drift)
+function hd_eq(gapmul) instance(emp, dem, vpre, vpost, bump, gap, dcb, lop) (
+  emp.bq_set(3, 3000, 0.7, 4, srate);  dem.bq_set(3, 3000, 0.7, -4, srate);
+  voice == 1 ? ( vpre.bq_set(2, 1400, 0.6, 3.5, srate); vpost.bq_set(2, 1400, 0.6, -1.5, srate); ) :
+  voice == 2 ? ( vpre.bq_set(3, 6000, 0.7, 5, srate);   vpost.bq_set(3, 6000, 0.7, -2, srate); ) :
+               ( vpre.bq_set(2, 1000, 0.7, 0, srate);   vpost.bq_set(2, 1000, 0.7, 0, srate); );
+  bump.bq_set(2, 70, 0.9, hd_bump, srate);
+  gap.bq_set(0, (voice == 2 ? 21000 : voice == 1 ? 18000 : 16000) * gapmul, 0.55, 0, srate);
+  dcb.bq_set(1, 10, 0.7, 0, srate);
+  lop.bq_set(0, 250, 0.6, 0, srate);               // the low band that bypasses the curve
+);
+// the curve: tanh with a small fixed bias ("tight bias"): mostly odd harmonics with a little even-order
+// warmth that no longer grows with the drive. The gain is set so a signal peaking around -12 dBFS comes
+// out at the same level whatever the drive: DRIVE changes the character, not the loudness.
+function hd_sat(x, b) local(tb, c) (
+  tb = ost_tanh(b);
+  c = 0.25 / ((ost_tanh(hd_g * 0.125 + b) - tb) - (ost_tanh(-hd_g * 0.125 + b) - tb));
+  (ost_tanh(hd_g * x + b) - tb) * c;
+);
+// The lows are split off with a complementary filter (low + rest = the input exactly); as DRIVE goes up,
+// more of the low band skips the curve and rejoins untouched afterwards, so the bass stops pushing the
+// mids and highs in and out of saturation (no "clumping").
+function hd_run(x, b) instance(emp, dem, vpre, vpost, bump, gap, dcb, lop, u1, u2, u3, u4, d1, d2, d3, d4) local(y, z, lo) (
+  lo = lop.bq_run(x) * hd_lb;                      // the part of the lows that bypasses the curve
+  y = vpre.bq_run(emp.bq_run(x - lo)) * 0.5;       // into the curve with 6 dB of headroom
+  // 2x: zero-stuffed upsample, filter, curve, filter, keep every second sample
+  z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(y * 2))));
+  d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b)))));
+  z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(0))));
+  y = d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b))))) * 2;
+  dcb.bq_run(gap.bq_run(bump.bq_run(vpost.bq_run(dem.bq_run(y)) + lo * hd_lg)));
+);
+// the whole unit, stereo: result in hl / hr
+function head_proc(l, r) (
+  hon_s += (slider10 - hon_s) * sm;                // ON fades over ~30 ms (no click)
+  hl = hL.hd_run(l, bL) * trim_s; hr = hR.hd_run(r, bR) * trim_s;
+  hl = l + (hl - l) * hon_s; hr = r + (hr - r) * hon_s;
+  hpk = max(hpk, max(abs(hl), abs(hr)));
+);
+
+// ================= SMOOTH: optical compressor (as GFX Smooth) =================
+function gr_curve(lv) local(o) (
+  o = lv - thr;
+  o <= -kn * 0.5 ? 0 :
+  o >= kn * 0.5 ? o * (1 - 1 / ratio) :
+  (1 - 1 / ratio) * (o + kn * 0.5) ^ 2 / (2 * kn);
+);
+function colour(x, k, b) local(tb) (
+  tb = ost_tanh(b);
+  (ost_tanh(k * x + b) - tb) / (k * (1 - tb * tb));
+);
+// result in cl / cr
+function smooth_proc(l, r) local(dl, dr, lv, tgt, g, yl, yr) (
+  son_s += (slider11 - son_s) * sm;
+  dl = scL.bq_run(l); dr = scR.bq_run(r);
+  env += (0.5 * (dl * dl + dr * dr) - env) * crms;
+  lv = 10 * log10(max(env, 0.000000000001)) + 3;
+  tgt = gr_curve(lv);
+  hold += (gr - hold) * chold;
+  tgt > gr ? ( gr += (tgt - gr) * catt; grpk = gr; )
+           : gr += (tgt - gr) * tc(gr > grpk * 0.6 ? rel_ms * 0.3 : rel_ms * (1 + 2 * min(hold / 6, 1)));
+  g = 10 ^ (-gr / 20);
+  grdisp = max(grdisp, gr * son_s);
+  slider13 ? ( yl = colour(l * g * 0.5, kL, cbL) * 2; yr = colour(r * g * 0.5, kR, cbR) * 2; )
+           : ( yl = l * g; yr = r * g; );
+  cl = (l + (yl - l) * blend_s) * mk_s; cr = (r + (yr - r) * blend_s) * mk_s;
+  cl = l + (cl - l) * son_s; cr = r + (cr - r) * son_s;
+  spk = max(spk, max(abs(cl), abs(cr)));
+);
+
+function update() (
+  hd_g = 10 ^ (slider1 * 2.2 / 20);
+  slider18 = slider19 * slider10;                  // Link saturation amount to BOOST, but only while Head is On -
+                                                    // the output stage runs unconditionally, so otherwise BOOST
+                                                    // kept leaking saturation into the signal even with Head off.
+  hd_b0 = (slider19 / 100) * 0.2;                  // Scale tape asymmetry from BOOST (0 to 0.20)
+  hd_lb = (slider1 / 10) ^ 1.2;                    // how much of the low band bypasses the curve
+  // the bypassed lows rejoin at the curve's gain around 0 VU (-18 dBFS): between its quiet-signal gain
+  // and its unity gain at -12 dBFS, so the low end keeps its place as the drive goes up
+  hd_c = 0.25 / ((ost_tanh(hd_g * 0.125 + hd_b0) - ost_tanh(hd_b0)) - (ost_tanh(-hd_g * 0.125 + hd_b0) - ost_tanh(hd_b0)));
+  hd_lg = sqrt(hd_g * hd_c * (1 - ost_tanh(hd_b0) ^ 2));
+  hd_bump = 1.5 * (1 - 0.5 * slider1 / 10);        // a gentler head bump as the drive goes up
+  voice = slider3;
+  trim_t = 10 ^ (slider2 / 20);
+  thr = -slider4 * 3;
+  mk_t = 10 ^ (slider5 / 20);
+  ratio = slider8 ? 20 : 3; kn = slider8 ? 2 : 12;
+  att_ms = (slider6 == 0 ? 25 : slider6 == 1 ? 8 : 1.5) * (slider8 ? 0.5 : 1);
+  rel_ms = slider7 == 0 ? 900 : slider7 == 1 ? 350 : 90;
+  catt = tc(att_ms);
+  blend_t = slider9 / 100;
+  drift_macro(slider24);                 // DRIFT dial: 50% = the drift settings, 100% = twice, 0 = none
+  drift = slider16 / 100 * dm_a; dspd = slider17 * dm_s;
+  in_setup(slider14, slider15);
+  ins_output_setup(18);   // output stage: CLIP, always on
+);
+
+sm = tc(30);
+hL.hd_aa(); hR.hd_aa();
+scL.bq_set(1, 80, 0.70710678, 0, srate); scR.bq_set(1, 80, 0.70710678, 0, srate);
+crms = tc(5); chold = tc(1500);
+dBL.drift_init(0.8 + rand(0.5)); dBR.drift_init(0.8 + rand(0.5));      // head: bias
+dGL.drift_init(0.8 + rand(0.5)); dGR.drift_init(0.8 + rand(0.5));      // head: gap loss
+dKL.drift_init(0.8 + rand(0.5)); dKR.drift_init(0.8 + rand(0.5));      // smooth: colour drive
+dCL.drift_init(0.8 + rand(0.5)); dCR.drift_init(0.8 + rand(0.5));      // smooth: colour asymmetry
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+env = 0; gr = 0; grpk = 0; hold = 0; grdisp = 0; hpk = 0; spk = 0;
+!ui_dflt ? ui_hw = 1; !ui_dflt ? ui_kstyle = 0;
+update();
+trim_s = trim_t; mk_s = mk_t; blend_s = blend_t; hon_s = slider10; son_s = slider11;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update();
+
+@block
+update();
+dinc = dspd * samplesblock / srate;
+vbL = dBL.drift_tick(dinc); vbR = dBR.drift_tick(dinc);
+vgL = dGL.drift_tick(dinc); vgR = dGR.drift_tick(dinc);
+bL = hd_b0 + vbL * drift * 0.06; bR = hd_b0 + vbR * drift * 0.06;
+hL.hd_eq(2 ^ (vgL * drift * 0.25)); hR.hd_eq(2 ^ (vgR * drift * 0.25));
+vkL = dKL.drift_tick(dinc); vkR = dKR.drift_tick(dinc);
+vcL = dCL.drift_tick(dinc); vcR = dCR.drift_tick(dinc);
+kL = 1.2 * (1 + 0.6 * drift * vkL); kR = 1.2 * (1 + 0.6 * drift * vkR);
+cbL = 0.05 + 0.08 * drift * vcL;    cbR = 0.05 + 0.08 * drift * vcR;
+
+@serialize
+file_var(0, ui_sz);
+
+@sample
+// ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+trim_s += (trim_t - trim_s) * sm; mk_s += (mk_t - mk_s) * sm; blend_s += (blend_t - blend_s) * sm;
+slider12 ? (
+  head_proc(spl0, spl1); smooth_proc(hl, hr); oL = cl; oR = cr;
+) : (
+  smooth_proc(spl0, spl1); head_proc(cl, cr); oL = hl; oR = hr;
+);
+oL = ostL.ost_band(oL); oR = ostR.ost_band(oR);
+ost_out(oL, oR);
+spl0 = ost_l;
+spl1 = ost_r;
+
+@gfx 780 480
+ui_begin(780, 480);
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+
+// ---------- top bar: name, ORDER, size, OUTPUT ----------
+ui_theme(12);
+ui_col(HS_CRM); gfx_circle(30 * sc, 24 * sc, 13 * sc, 1, 1);
+gfx_setfont(4); ui_col(HS_GRN); ui_text(30 * sc, 19 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 16 * sc, 'b'); ui_col(HS_CRM); gfx_x = 52 * sc; gfx_y = 15 * sc; gfx_drawstr("HEADSMOOTHER");
+// ORDER: one warm-brown key, centred; each press swaps the units and its legend shows the order.
+// Its amber LED lights only while the key is held down.
+ox = 325 * sc; oy0 = 12 * sc; ow = 130 * sc; oh = 24 * sc;
+gfx_setfont(4); ui_cola(HS_CRM, 0.6); gfx_x = ox - 42 * sc; gfx_y = 20 * sc; gfx_drawstr("ORDER");
+o_hov = mouse_x >= ox && mouse_x < ox + ow && mouse_y >= oy0 && mouse_y < oy0 + oh;
+o_hov && pressed && drag_id == 0 ? ( drag_id = -1; o_held = 1; slider12 = 1 - slider12; slider_automate(2 ^ 11); );
+!mdown ? o_held = 0;
+ui_bbckey(ox, oy0, ow, oh, slider12 ? "HEAD > SMOOTH" : "SMOOTH > HEAD", o_held, 1, 1, 1, o_hov, o_held, 2);
+ui_size_picker(560 * sc, 15 * sc);
+
+// the unit the signal meets first is drawn on top
+GAP = 8;
+slider12 ? ( hy = 50; sy = 50 + HS_HH + GAP; ) : ( sy = 50; hy = 50 + HS_SH + GAP; );
+
+hs_head_face(hy, 1, 2, 3, hpk, slider10); hpk = 0;
+ui_keycap(686 * sc, (hy + 8) * sc, 64 * sc, 24 * sc, "ON", slider10, 1) ? ( slider10 = 1 - slider10; slider_automate(2 ^ 9); );
+
+hs_smooth_face(sy, 4, 5, 6, 7, 8, 9, grdisp, spk, slider11); grdisp = 0; spk = 0;
+ui_keycap(600 * sc, (sy + 8) * sc, 80 * sc, 24 * sc, "COLOUR", slider13, 1) ? ( slider13 = 1 - slider13; slider_automate(2 ^ 12); );
+ui_keycap(686 * sc, (sy + 8) * sc, 64 * sc, 24 * sc, "ON", slider11, 1) ? ( slider11 = 1 - slider11; slider_automate(2 ^ 10); );
+
+// Bottom DRIFT and IN/OUT strip removed
+
+pk_end();
+ui_end();

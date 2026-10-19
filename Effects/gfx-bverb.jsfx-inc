@@ -1,0 +1,294 @@
+// gfx-bverb: the shared engine of the GFX broadcast reverbs (E-Verb, J-Verb).
+// Building blocks, all stereo, all sample-rate independent:
+//   bv_alloc(base)       memory for every line (call in @init, after srate is known)
+//   bv_pre(l, r)         input pre-delay ring (the tail and the reflections tap it at their own delays)
+//   er_run(m)            the early-reflection grid: up to 48 taps from a mono ring (er_n, er_tl/er_tr, er_gl/er_gr)
+//   dif_run(l, r)        input diffusion: 4 allpasses per side
+//   fdn_run(l, r)        8-line feedback network (Hadamard), three-band decay, optional in-loop allpass + drift on reads
+//   cmb_run(l, r)        6 damped parallel combs (+ 2 allpasses per side)
+//   tank_run(l, r)       an allpass "figure-8" tank, no modulation (dense, recovers quickly)
+//   nl_run(l, r)         a long tapped line with a shaped envelope (room / gate / reverse)
+//   xfm_run(x)           input transformer: E = iron (lows saturate first), J = clean preamp
+//   lofi_in / lofi_out   the vintage clock (sample-and-hold at the hardware rate, filtered) and the converter bits
+// Decay: bv_t60 seconds at mid frequencies, bv_rtlo / bv_rthi = multipliers below ~250 Hz / above ~3.5 kHz.
+@init
+
+// ---------- memory ----------
+function bv_alloc(base) local(sr) (
+  sr = srate;
+  PRE_N = ceil(0.36 * sr) + 8;   BV_PRE = base;               // stereo pre-delay (two rings)
+  ERB_N  = ceil(1.30 * sr) + 8;   BV_ER  = BV_PRE + 2 * PRE_N; // two rings: reflections (mono) / the non-linear line
+  AP_N  = 8192;                  BV_AP  = BV_ER + 2 * ERB_N;   // 16 allpass rings
+  LN_N  = ceil(0.40 * sr) + 8;   BV_LN  = BV_AP + 16 * AP_N;  // 8 network / comb / tank lines
+  BV_END = BV_LN + 8 * LN_N;
+  memset(base, 0, BV_END - base);
+  pre_w = 0; er_w = 0; nl_w = 0;
+  memset(BV_T, 0, 400);
+);
+bv_dn = 10 ^ -20;   // keeps the loops out of denormals
+BV_T = 2000;                       // tables live at 2000 - 2399 and 2400 - 3200
+ln_w  = 2000; ln_len = 2010; ln_z1 = 2020; ln_z2 = 2030; ln_z3 = 2040; ln_mod = 2050; ln_rd = 2060;
+ap_w  = 2100;                      // 16 allpass write positions
+er_tl = 2400; er_tr = 2460; er_gl = 2520; er_gr = 2580;    // 48 taps max
+cb_len = 2700; cb_z = 2710;
+fdn_v = 2720; fdn_o = 2730;
+ln_apl = 2740;                     // in-loop allpass lengths (samples)
+nl_t = 2800; nl_g = 2850;          // 40 taps of the non-linear line
+
+function bv_tanh(x) local(e) ( x = min(max(x, -20), 20); e = exp(2 * x); (e - 1) / (e + 1) );
+
+// a generic allpass on ring k (0 - 15); d in samples (< AP_N)
+function apr(k, x, d, g) local(b, w, r, v, y) (
+  b = BV_AP + k * AP_N; w = ap_w[k];
+  r = w - floor(d); r < 0 ? r += AP_N;
+  v = b[r]; y = v - g * x; b[w] = x + g * y;
+  w += 1; w >= AP_N ? w = 0; ap_w[k] = w;
+  y;
+);
+
+// ---------- pre-delay ring: write, then read at any delay (samples) ----------
+function bv_pre(l, r) ( BV_PRE[pre_w] = l; BV_PRE[PRE_N + pre_w] = r; pre_w += 1; pre_w >= PRE_N ? pre_w = 0; );
+function pre_l(d) local(i) ( i = pre_w - 1 - floor(d); i < 0 ? i += PRE_N; BV_PRE[i] );
+function pre_r(d) local(i) ( i = pre_w - 1 - floor(d); i < 0 ? i += PRE_N; BV_PRE[PRE_N + i] );
+
+// ---------- early reflections: mono in, each tap its own delay and level per side ----------
+er_n = 0;
+function er_run(m) local(k, i, b) (
+  b = BV_ER; b[er_w] = m;
+  er_ol = er_or = 0; k = 0;
+  loop(er_n,
+    i = er_w - er_tl[k]; i < 0 ? i += ERB_N; er_ol += er_gl[k] * b[i];
+    i = er_w - er_tr[k]; i < 0 ? i += ERB_N; er_or += er_gr[k] * b[i];
+    k += 1; );
+  er_w += 1; er_w >= ERB_N ? er_w = 0;
+);
+// a pseudo-random sequence that is the same every time (so a saved reflection pattern stays put)
+function bv_seed(s) ( bv_rs = s; );
+function bv_rnd() local(v) ( bv_rs += 1; v = sin(bv_rs * 12.9898 + 78.233) * 43758.5453; v - floor(v); );
+
+// ---------- input diffusion: 4 allpasses per side (rings 0 - 7), amount 0 - 1, scaled by sc_ ----------
+function dif_run(l, r, amt, sc_) local(g, f) (
+  g = 0.45 + 0.3 * amt; f = srate / 48000 * (0.5 + 0.5 * sc_);
+  amt > 0.01 ? (
+    l = apr(0, l, 142 * f, g); l = apr(1, l, 107 * f, g); l = apr(2, l, 379 * f, g * 0.9); l = apr(3, l, 277 * f, g * 0.9);
+    r = apr(4, r, 151 * f, g); r = apr(5, r, 113 * f, g); r = apr(6, r, 397 * f, g * 0.9); r = apr(7, r, 263 * f, g * 0.9);
+  );
+  dif_l = l; dif_r = r;
+);
+
+// ---------- three-band loss coefficients for a line of L samples ----------
+// mid gain gm; low (below lo_x) gl; high (above hi_x) gh. Stored per line: ln_g (3 values at 2200 + 3k)
+LN_G = 2200;
+bv_lox = 250; bv_hix = 3500;
+function bv_loss(k, L) local(t) (
+  t = max(bv_t60, 0.05);
+  LN_G[3 * k]     = 10 ^ (-3 * L / (t * srate));
+  LN_G[3 * k + 1] = 10 ^ (-3 * L / (t * bv_rtlo * srate));
+  LN_G[3 * k + 2] = 10 ^ (-3 * L / (t * bv_rthi * srate));
+);
+function bv_xover() ( bv_clo = 1 - exp(-2 * $pi * bv_lox / srate); bv_chi = 1 - exp(-2 * $pi * min(bv_hix * bv_hdrift, srate * 0.4) / srate); );
+bv_hdrift = 1;
+// apply the loss to v (state in ln_z1 / ln_z2 for line k)
+function bv_band(k, v) local(lo, hp) (
+  ln_z1[k] += (v - ln_z1[k]) * bv_clo; lo = ln_z1[k];
+  ln_z2[k] += (v - ln_z2[k]) * bv_chi; hp = v - ln_z2[k];
+  LN_G[3 * k] * (v - lo - hp) + LN_G[3 * k + 1] * lo + LN_G[3 * k + 2] * hp;
+);
+
+// ---------- 8-line feedback network ----------
+// set ln_len[k] (samples), bv_loss(k, len) for each line, fdn_apg (0 = no in-loop allpass), ln_apl[k], ln_mod[k] (samples of drift)
+fdn_apg = 0;
+function fdn_run(l, r) local(k, b, rp, ri, rf, v, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7, c0, c1, c2, c3, c4, c5, c6, c7, hs) (
+  k = 0;
+  loop(8,
+    b = BV_LN + k * LN_N;
+    rp = ln_w[k] - ln_len[k] - ln_mod[k]; rp < 0 ? rp += LN_N;
+    ri = floor(rp); rf = rp - ri;
+    v = b[ri] * (1 - rf) + b[ri + 1 >= LN_N ? 0 : ri + 1] * rf;
+    fdn_apg > 0 ? v = apr(8 + k, v, ln_apl[k], fdn_apg);
+    fdn_v[k] = bv_band(k, v);
+    k += 1; );
+  a0 = fdn_v[0]; a1 = fdn_v[1]; a2 = fdn_v[2]; a3 = fdn_v[3]; a4 = fdn_v[4]; a5 = fdn_v[5]; a6 = fdn_v[6]; a7 = fdn_v[7];
+  b0 = a0 + a1; b1 = a0 - a1; b2 = a2 + a3; b3 = a2 - a3; b4 = a4 + a5; b5 = a4 - a5; b6 = a6 + a7; b7 = a6 - a7;
+  c0 = b0 + b2; c1 = b1 + b3; c2 = b0 - b2; c3 = b1 - b3; c4 = b4 + b6; c5 = b5 + b7; c6 = b4 - b6; c7 = b5 - b7;
+  hs = 0.35355339;
+  fdn_o[0] = (c0 + c4) * hs; fdn_o[1] = (c1 + c5) * hs; fdn_o[2] = (c2 + c6) * hs; fdn_o[3] = (c3 + c7) * hs;
+  fdn_o[4] = (c0 - c4) * hs; fdn_o[5] = (c1 - c5) * hs; fdn_o[6] = (c2 - c6) * hs; fdn_o[7] = (c3 - c7) * hs;
+  k = 0;
+  loop(8,
+    b = BV_LN + k * LN_N;
+    b[ln_w[k]] = fdn_o[k] + (k < 4 ? l : r) * (k & 1 ? -0.5 : 0.5) + bv_dn;
+    ln_w[k] += 1; ln_w[k] >= LN_N ? ln_w[k] = 0;
+    k += 1; );
+  // two decorrelated outputs, each a full mix of the lines (mono-safe: no line is in both with opposite signs only)
+  fdn_l = 0.5 * (a0 - a2 + a4 + a6 - 0.6 * a1 + 0.6 * a7);
+  fdn_r = 0.5 * (a1 + a3 - a5 + a7 + 0.6 * a0 - 0.6 * a6);
+);
+
+// ---------- 6 damped combs (lines 0 - 5), then 2 allpasses per side (rings 8 - 11) ----------
+// cb_len[k] samples; cmb_fb[k] from bv_loss on the comb length (uses LN_G); cmb_ap = allpass gain
+function cmb_run(l, r) local(k, b, i, v, sl, sr) (
+  sl = sr = 0; k = 0;
+  loop(6,
+    b = BV_LN + k * LN_N;
+    i = ln_w[k] - floor(cb_len[k]); i < 0 ? i += LN_N;
+    v = bv_band(k, b[i]);
+    b[ln_w[k]] = (k & 1 ? r : l) + v + bv_dn;
+    ln_w[k] += 1; ln_w[k] >= LN_N ? ln_w[k] = 0;
+    k & 1 ? sr += v : sl += v;
+    k += 1; );
+  sl *= 0.4; sr *= 0.4;
+  sl = apr(8, sl, 0.0050 * srate, 0.7); sl = apr(9, sl, 0.0017 * srate, 0.7);
+  sr = apr(10, sr, 0.0053 * srate, 0.7); sr = apr(11, sr, 0.0019 * srate, 0.7);
+  cmb_l = sl + 0.25 * sr; cmb_r = sr + 0.25 * sl;
+);
+
+// ---------- figure-8 allpass tank (lines 0 - 3, rings 12 - 15), no modulation ----------
+// tk_d[0..3] delay lengths, tk_a[0..1] allpass lengths, tank decay via LN_G of line 0 / 2 (bv_loss on the half-loop)
+tk_d = 2900; tk_a = 2910; tk_x = 0;
+function tank_run(l, r) local(b0, b1, b2, b3, i, x, y, ol, or_, k) (
+  b0 = BV_LN; b1 = BV_LN + LN_N; b2 = BV_LN + 2 * LN_N; b3 = BV_LN + 3 * LN_N;
+  // branch A
+  x = l + tk_x2;
+  x = apr(12, x, tk_a[0], -0.6);
+  b0[ln_w[0]] = x + bv_dn;
+  i = ln_w[0] - floor(tk_d[0]); i < 0 ? i += LN_N; y = bv_band(0, b0[i]);
+  y = apr(13, y, tk_a[1], 0.5);
+  b1[ln_w[1]] = y;
+  i = ln_w[1] - floor(tk_d[1]); i < 0 ? i += LN_N; tk_x1 = b1[i] * LN_G[3];
+  // branch B
+  x = r + tk_x1;
+  x = apr(14, x, tk_a[2], -0.6);
+  b2[ln_w[2]] = x + bv_dn;
+  i = ln_w[2] - floor(tk_d[2]); i < 0 ? i += LN_N; y = bv_band(2, b2[i]);
+  y = apr(15, y, tk_a[3], 0.5);
+  b3[ln_w[3]] = y;
+  i = ln_w[3] - floor(tk_d[3]); i < 0 ? i += LN_N; tk_x2 = b3[i] * LN_G[9];
+  // output taps from all four lines
+  i = ln_w[0] - floor(tk_d[0] * 0.27); i < 0 ? i += LN_N; ol = b0[i];
+  i = ln_w[1] - floor(tk_d[1] * 0.63); i < 0 ? i += LN_N; ol += b1[i];
+  i = ln_w[2] - floor(tk_d[2] * 0.41); i < 0 ? i += LN_N; ol -= 0.6 * b2[i];
+  i = ln_w[2] - floor(tk_d[2] * 0.33); i < 0 ? i += LN_N; or_ = b2[i];
+  i = ln_w[3] - floor(tk_d[3] * 0.71); i < 0 ? i += LN_N; or_ += b3[i];
+  i = ln_w[0] - floor(tk_d[0] * 0.52); i < 0 ? i += LN_N; or_ -= 0.6 * b0[i];
+  k = 0; loop(4, ln_w[k] += 1; ln_w[k] >= LN_N ? ln_w[k] = 0; k += 1; );
+  tank_l = ol * 0.6; tank_r = or_ * 0.6;
+);
+
+// ---------- the non-linear line: 40 taps over nl_len samples, envelope shape set in nl_g ----------
+// stereo: even taps read the left input, odd taps the right; taps alternate sides on the way out
+nl_n = 40;
+function nl_run(l, r) local(b, k, i, ol, or_) (
+  b = BV_ER + ERB_N;
+  b[nl_w] = 0.5 * (l + r);
+  ol = or_ = 0; k = 0;
+  loop(nl_n,
+    i = nl_w - nl_t[k]; i < 0 ? i += ERB_N;
+    k & 1 ? or_ += nl_g[k] * b[i] : ol += nl_g[k] * b[i];
+    k += 1; );
+  nl_w += 1; nl_w >= ERB_N ? nl_w = 0;
+  nl_l = ol; nl_r = or_;
+);
+
+// ---------- input transformer ----------
+// E: iron - the lows (below ~300 Hz) saturate first, a touch of 3rd harmonic; J: clean preamp, a soft clip only when pushed
+function xfm_run(x, amt, euro) instance(lp, hp) local(lo, d) (
+  euro ? (
+    lp += (x - lp) * 0.04;
+    lo = lp; d = 1 + 6 * amt;
+    x - lo + bv_tanh(lo * d) / d * (1 + 0.6 * amt) + 0.02 * amt * bv_tanh(x * d) ;
+  ) : (
+    d = 1 + 3 * amt * amt;
+    amt > 0.01 ? bv_tanh(x * d) / bv_tanh(d) * min(1, d) : x;
+  );
+);
+
+// ---------- the vintage clock: band-limit, hold at the hardware rate, quantise, smooth ----------
+// lf_on, lf_inc (clock / srate), lf_q (2^(bits - 1)), lf_c (filter coefficient at ~0.45 x clock)
+function lofi_in(x) instance(a, b, ph, h) (
+  lf_on ? (
+    a += (x - a) * lf_c; b += (a - b) * lf_c;
+    ph += lf_inc; ph >= 1 ? ( ph -= 1; h = floor(b * lf_q + 0.5) / lf_q; );
+    h;
+  ) : x;
+);
+function lofi_out(x) instance(a, b) (
+  lf_on ? ( x = floor(x * lf_q + 0.5) / lf_q; a += (x - a) * lf_c; b += (a - b) * lf_c; b; ) : x;
+);
+function lofi_set(on, clock, bits) (
+  lf_on = on; lf_inc = min(clock / srate, 1); lf_q = 2 ^ (bits - 1);
+  lf_c = 1 - exp(-2 * $pi * min(0.45 * clock, 0.45 * srate) / srate);
+);
+
+// ---------- seven-segment text ----------
+// seg_char(c) -> bit mask a..g (bit 0 = a, top; clockwise; g = middle). Digits, - and the letters a reverb needs.
+function seg_mask(c) (
+  c == '0' || c == 'O' ? 63 : c == '1' || c == 'I' ? 6 : c == '2' ? 91 : c == '3' ? 79 : c == '4' ? 102 : c == '5' || c == 'S' ? 109 :
+  c == '6' ? 125 : c == '7' ? 7 : c == '8' ? 127 : c == '9' ? 111 : c == '-' ? 64 : c == 'A' ? 119 : c == 'B' || c == 'b' ? 124 :
+  c == 'C' ? 57 : c == 'c' ? 88 : c == 'D' || c == 'd' ? 94 : c == 'E' ? 121 : c == 'F' ? 113 : c == 'G' ? 61 : c == 'H' ? 118 :
+  c == 'h' ? 116 : c == 'J' ? 30 : c == 'L' ? 56 : c == 'N' || c == 'n' ? 84 : c == 'o' ? 92 : c == 'P' ? 115 : c == 'r' || c == 'R' ? 80 :
+  c == 't' || c == 'T' ? 120 : c == 'U' ? 62 : c == 'u' ? 28 : c == 'Y' ? 110 : c == '_' ? 8 : 0
+);
+// one digit: x, y = top left (scaled px), w, h; on colour, off (ghost) colour
+function seg_digit(x, y, w, h, m, con, coff, dot) local(t, hh, g) (
+  t = max(1.5, floor(w * 0.19 + 0.5)); hh = floor(h * 0.5); g = max(0.6, t * 0.2);   // thickness, half height, gap
+  ui_col(m & 1 ? con : coff);  gfx_rect(x + t + g, y, w - 2 * t - 2 * g, t);
+  ui_col(m & 2 ? con : coff);  gfx_rect(x + w - t, y + t + g, t, hh - t - 1.5 * g);
+  ui_col(m & 4 ? con : coff);  gfx_rect(x + w - t, y + hh + 0.5 * g, t, hh - t - 1.5 * g);
+  ui_col(m & 8 ? con : coff);  gfx_rect(x + t + g, y + h - t, w - 2 * t - 2 * g, t);
+  ui_col(m & 16 ? con : coff); gfx_rect(x, y + hh + 0.5 * g, t, hh - t - 1.5 * g);
+  ui_col(m & 32 ? con : coff); gfx_rect(x, y + t + g, t, hh - t - 1.5 * g);
+  ui_col(m & 64 ? con : coff); gfx_rect(x + t + g, y + hh - t * 0.5, w - 2 * t - 2 * g, t);
+  ui_col(dot ? con : coff); gfx_rect(x + w + t * 0.6, y + h - t, t, t);
+);
+// a right-aligned string of n digit cells; '.' joins the previous cell
+// seg_clean = 1: plain, easy-to-read figures (bold sans, right-aligned in the same box) instead of segments
+seg_clean = 0;
+function seg_str(x, y, w, h, n, s, con, coff) local(len, i, c, cells, k, m, dt, gap, tw, th) (
+  len = strlen(s); gap = w * 0.34;
+  seg_clean ? (
+    gfx_setfont(9, "Arial", h * 1.18, 'b'); gfx_measurestr(s, tw, th);
+    ui_col(con); gfx_x = x + n * (w + gap) - gap - tw; gfx_y = y + h * 0.5 - th * 0.5; gfx_drawstr(s);
+  ) : (
+
+  // count cells
+  cells = 0; i = 0; loop(len, str_getchar(s, i) != '.' ? cells += 1; i += 1; );
+  k = n - cells; i = 0;
+  loop(n - cells, k > 0 ? seg_digit(x + (n - cells - k) * (w + gap), y, w, h, 0, con, coff, 0); k -= 1; );
+  k = n - cells;
+  loop(len,
+    c = str_getchar(s, i);
+    c != '.' ? (
+      dt = i + 1 < len ? str_getchar(s, i + 1) == '.' : 0;
+      seg_digit(x + k * (w + gap), y, w, h, seg_mask(c), con, coff, dt);
+      k += 1;
+    );
+    i += 1; );
+  );
+);
+
+// ---------- the parameter table (for displays with - / + keys, a data wheel, a keypad) ----------
+// pv_def(k, slider, min, max, step, default, log, decimals)
+PV = 3000;   // 8 values per parameter, 32 parameters
+function pv_def(k, idx, lo, hi, st, df, lg, dp) local(p) (
+  p = PV + 8 * k; p[0] = idx; p[1] = lo; p[2] = hi; p[3] = st; p[4] = df; p[5] = lg; p[6] = dp;
+);
+function pv_get(k) ( slider(PV[8 * k]) );
+function pv_set(k, v) local(p) (
+  p = PV + 8 * k; v = min(max(v, p[1]), p[2]);
+  p[3] > 0 ? v = p[1] + floor((v - p[1]) / p[3] + 0.5) * p[3];
+  slider(p[0]) != v ? ( slider(p[0]) = v; ui_auto(p[0]); );
+);
+// one step up or down (log parameters step by a ratio)
+function pv_step(k, dir) local(p, v) (
+  p = PV + 8 * k; v = slider(p[0]);
+  p[5] ? pv_set(k, v * (dir > 0 ? 1.06 : 1 / 1.06) + (dir > 0 ? p[3] : -p[3])) : pv_set(k, v + dir * p[3]);
+);
+// move by a normalised amount (drag / wheel): n in 0 - 1 of the whole range
+function pv_nudge(k, n) local(p, v, t) (
+  p = PV + 8 * k; v = slider(p[0]);
+  p[5] ? ( t = log(max(v, p[1]) / p[1]) / log(p[2] / p[1]) + n; v = p[1] * (p[2] / p[1]) ^ min(max(t, 0), 1); )
+       : ( v += n * (p[2] - p[1]); );
+  pv_set(k, v);
+);
+function pv_reset(k) ( pv_set(k, PV[8 * k + 4]); );

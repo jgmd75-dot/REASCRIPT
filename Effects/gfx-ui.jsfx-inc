@@ -1,0 +1,1719 @@
+desc:GFX UI library (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// Themes, S/M/L sizing and shared widgets for all GFX plugins.
+//
+// Usage in a plugin:
+//   import gfx-ui.jsfx-inc
+//   @serialize   file_var(0, ui_thm); file_var(0, ui_sz); file_var(0, ui_hw);
+//   @gfx         ui_begin(base_w, base_h); ui_header("NAME"); ... ui_end();
+//   Multiply all layout coordinates by sc.
+//
+// Font: Trebuchet MS (pre-installed on Windows and macOS).
+// Globals: sc (scale), pressed, mdown, drag_id, knob_step,
+//          knob_lblbtn (set to 1 before ui_knob: the label becomes a button; a click sets knob_lblclick = idx),
+//          knob_push (set to a slider index before ui_knob: the GUARD LED button (ui_guard_tag)
+//                     toggles that slider - used for TRIM / GUARD),
+//          ui_thm (0 Amber, 1 Ice, 2 Studio, 3 Vintage, 4 Neon, 5 Graphite, 6 Bordeaux, 7 Saffron, 8 Petrol,
+//                  9 Walnut, 10 Tolex, 11 Velvet, 12 Olive, 13 Frost, 14 Slate, 15 Ember, 16 Honey, 17 Mint, 18 Blossom),
+//          ui_sz  (0 = M, 1 = S, 2 = L; new instances default to M),
+//          ui_hw  (0 = flat look, 1 = hardware look).
+// Hardware look: ui_group (coloured section panels), ui_screen (inset display window),
+//                ui_vu (needle meter), ui_ledm (LED ladder with floating peak), ui_hw_toggle.
+//                Knobs by section: main and MASTER = machined ring (light value ring and pointer),
+//                DRIFT / INPUT / OUTPUT STAGE = small cap with halo (6a).
+// Flat look: flat versions of the same (machined ring for main and MASTER, 6a).
+
+@init
+
+// ---------- host automation (bitmask covers sliders 1-63; higher sliders, up to 256, are passed by name) ----------
+// ---------- supersampled shapes (knob pointers and other thin, angled shapes) ----------
+// gfx_triangle is not anti-aliased and stacked 1 px lines change weight with the angle, so pointers looked uneven.
+// These draw the shape 2x larger into an offscreen image (118) and blit it back at half size with filtering: an
+// evenly smoothed shape at every angle (the way pre-rendered knob filmstrips are made). The image only grows, so a
+// shape costs a clear, the drawing and one blit. Current colour and gfx_a; pixel coordinates.
+// For a custom shape: ui_ss_begin(box), draw with ui_ssx() / ui_ssy() / ui_ssk() (2x), then ui_ss_end().
+function ui_ss_begin(x0, y0, x1, y1) local(w2, h2) (
+  ui_ss_d = gfx_dest; ui_ss_r = gfx_r; ui_ss_g = gfx_g; ui_ss_b = gfx_b; ui_ss_a = gfx_a; ui_ss_m = gfx_mode;
+  ui_ss_x = floor(min(x0, x1)) - 1; ui_ss_y = floor(min(y0, y1)) - 1;
+  ui_ss_w = min(ceil(max(x0, x1)) + 1 - ui_ss_x, 1000); ui_ss_h = min(ceil(max(y0, y1)) + 1 - ui_ss_y, 1000);
+  w2 = ui_ss_w * 2; h2 = ui_ss_h * 2;
+  (w2 > ui_ss_iw || h2 > ui_ss_ih) ? (
+    ui_ss_iw = max(ui_ss_iw, max(w2, 256)); ui_ss_ih = max(ui_ss_ih, max(h2, 256)); gfx_setimgdim(118, ui_ss_iw, ui_ss_ih);
+  );
+  gfx_dest = 118; gfx_mode = 0;
+  gfx_a = 1; gfx_a2 = 0; gfx_rect(0, 0, w2, h2);
+  gfx_r = ui_ss_r; gfx_g = ui_ss_g; gfx_b = ui_ss_b; gfx_a = 1; gfx_a2 = 1;
+);
+function ui_ssx(x) ( (x - ui_ss_x) * 2; );
+function ui_ssy(y) ( (y - ui_ss_y) * 2; );
+function ui_ssk(k) ( k * 2; );
+function ui_ss_end() (
+  gfx_dest = ui_ss_d; gfx_mode = ui_ss_m; gfx_a = ui_ss_a;
+  gfx_blit(118, 1, 0, 0, 0, ui_ss_w * 2, ui_ss_h * 2, ui_ss_x, ui_ss_y, ui_ss_w, ui_ss_h);
+  gfx_r = ui_ss_r; gfx_g = ui_ss_g; gfx_b = ui_ss_b; gfx_a = ui_ss_a;
+);
+// a line of width w (pixels) from (x1, y1) to (x2, y2); rnd = 1: round ends
+function ui_ssline(x1, y1, x2, y2, w, rnd) local(k, a, b, c, d, dx, dy, l, nx, ny) (
+  k = max(w, 0.6) * 0.5;
+  // square-ended and exactly horizontal / vertical: no stepping to smooth, draw it directly
+  !rnd && (abs(x1 - x2) < 0.001 || abs(y1 - y2) < 0.001) ? (
+    abs(y1 - y2) < 0.001 ? gfx_rect(min(x1, x2), y1 - k, abs(x2 - x1), 2 * k) : gfx_rect(x1 - k, min(y1, y2), 2 * k, abs(y2 - y1));
+  ) : (
+  k = k;
+  ui_ss_begin(min(x1, x2) - k, min(y1, y2) - k, max(x1, x2) + k, max(y1, y2) + k);
+  a = ui_ssx(x1); b = ui_ssy(y1); c = ui_ssx(x2); d = ui_ssy(y2); k = ui_ssk(k);
+  dx = c - a; dy = d - b; l = max(sqrt(dx * dx + dy * dy), 0.001); nx = -dy / l * k; ny = dx / l * k;
+  gfx_triangle(a + nx, b + ny, c + nx, d + ny, c - nx, d - ny, a - nx, b - ny);
+  rnd ? ( gfx_circle(a, b, k, 1, 0); gfx_circle(c, d, k, 1, 0); );
+  ui_ss_end();
+  );
+);
+// a ring segment (knob value rings, meter scale arcs): radius r to the middle of the band, width w (pixels),
+// angles as gfx_arc (0 = up, clockwise). Built from fine quads at 2x and filtered down: an even band at every angle.
+function ui_ssarc(cx, cy, r, a1, a2, w) local(t, n, i, d, ta, tb, ri, ro, x0, y0, x1, y1) (
+  a1 > a2 ? ( t = a1; a1 = a2; a2 = t; );
+  a2 - a1 > 0.0005 && w > 0 ? (
+    ri = r - w * 0.5; ro = r + w * 0.5;
+    // the box: the arc's ends plus any of the four extremes it passes
+    x0 = min(cx + sin(a1) * ro, cx + sin(a2) * ro); x1 = max(cx + sin(a1) * ro, cx + sin(a2) * ro);
+    y0 = min(cy - cos(a1) * ro, cy - cos(a2) * ro); y1 = max(cy - cos(a1) * ro, cy - cos(a2) * ro);
+    x0 = min(x0, min(cx + sin(a1) * ri, cx + sin(a2) * ri)); x1 = max(x1, max(cx + sin(a1) * ri, cx + sin(a2) * ri));
+    y0 = min(y0, min(cy - cos(a1) * ri, cy - cos(a2) * ri)); y1 = max(y1, max(cy - cos(a1) * ri, cy - cos(a2) * ri));
+    i = -2; loop(5, t = i * 0.5 * $pi;
+      t >= a1 && t <= a2 ? ( x0 = min(x0, cx + sin(t) * ro); x1 = max(x1, cx + sin(t) * ro); y0 = min(y0, cy - cos(t) * ro); y1 = max(y1, cy - cos(t) * ro); );
+      i += 1; );
+    ui_ss_begin(x0, y0, x1, y1);
+    // segments ~6 px long (within 0.15 px of the true circle); sin / cos stepped by rotation, the 2x coordinates
+    // worked out once per corner
+    n = max(3, ceil((a2 - a1) * ro / 6)); d = (a2 - a1) / n;
+    ta = sin(a1); tb = cos(a1); t = sin(d); x1 = cos(d);
+    cx = ui_ssx(cx); cy = ui_ssy(cy); ri *= 2; ro *= 2;
+    x0 = cx + ta * ri; y0 = cy - tb * ri; i = cx + ta * ro; y1 = cy - tb * ro;
+    loop(n,
+      d = ta * x1 + tb * t; tb = tb * x1 - ta * t; ta = d;
+      d = cx + ta * ro; w = cy - tb * ro;
+      gfx_triangle(x0, y0, i, y1, d, w, cx + ta * ri, cy - tb * ri);
+      x0 = cx + ta * ri; y0 = cy - tb * ri; i = d; y1 = w;
+    );
+    ui_ss_end();
+  );
+);
+// a filled convex quad / triangle (pixel coordinates)
+function ui_ssquad(x1, y1, x2, y2, x3, y3, x4, y4) (
+  ui_ss_begin(min(min(x1, x2), min(x3, x4)), min(min(y1, y2), min(y3, y4)), max(max(x1, x2), max(x3, x4)), max(max(y1, y2), max(y3, y4)));
+  gfx_triangle(ui_ssx(x1), ui_ssy(y1), ui_ssx(x2), ui_ssy(y2), ui_ssx(x3), ui_ssy(y3), ui_ssx(x4), ui_ssy(y4));
+  ui_ss_end();
+);
+function ui_sstri(x1, y1, x2, y2, x3, y3) (
+  ui_ss_begin(min(min(x1, x2), x3), min(min(y1, y2), y3), max(max(x1, x2), x3), max(max(y1, y2), y3));
+  gfx_triangle(ui_ssx(x1), ui_ssy(y1), ui_ssx(x2), ui_ssy(y2), ui_ssx(x3), ui_ssy(y3));
+  ui_ss_end();
+);
+
+function ui_auto(idx) (
+  idx <= 63 ? slider_automate(2 ^ (idx - 1)) :
+  idx == 64 ? slider_automate(slider64) : idx == 65 ? slider_automate(slider65) :
+  idx == 66 ? slider_automate(slider66) : idx == 67 ? slider_automate(slider67) :
+  idx == 68 ? slider_automate(slider68) : idx == 69 ? slider_automate(slider69) :
+  idx == 70 ? slider_automate(slider70) : idx == 71 ? slider_automate(slider71) :
+  idx == 72 ? slider_automate(slider72) : idx == 73 ? slider_automate(slider73) :
+  idx == 74 ? slider_automate(slider74) : idx == 75 ? slider_automate(slider75) :
+  idx == 76 ? slider_automate(slider76) : idx == 77 ? slider_automate(slider77) :
+  idx == 78 ? slider_automate(slider78) : idx == 79 ? slider_automate(slider79) :
+  idx == 80 ? slider_automate(slider80) : idx == 81 ? slider_automate(slider81) :
+  idx == 82 ? slider_automate(slider82) : idx == 83 ? slider_automate(slider83) :
+  idx == 84 ? slider_automate(slider84) : idx == 85 ? slider_automate(slider85) :
+  idx == 86 ? slider_automate(slider86) : idx == 87 ? slider_automate(slider87) :
+  idx == 88 ? slider_automate(slider88) : idx == 89 ? slider_automate(slider89) :
+  idx == 90 ? slider_automate(slider90) : idx == 91 ? slider_automate(slider91) :
+  idx == 92 ? slider_automate(slider92) : idx == 93 ? slider_automate(slider93) :
+  idx == 94 ? slider_automate(slider94) : idx == 95 ? slider_automate(slider95) :
+  idx == 96 ? slider_automate(slider96) : idx == 97 ? slider_automate(slider97) :
+  idx == 98 ? slider_automate(slider98) : idx == 99 ? slider_automate(slider99) :
+  idx == 100 ? slider_automate(slider100) : idx == 101 ? slider_automate(slider101) :
+  idx == 102 ? slider_automate(slider102) : idx == 103 ? slider_automate(slider103) :
+  idx == 104 ? slider_automate(slider104) : idx == 105 ? slider_automate(slider105) :
+  idx == 106 ? slider_automate(slider106) : idx == 107 ? slider_automate(slider107) :
+  idx == 108 ? slider_automate(slider108) : idx == 109 ? slider_automate(slider109) :
+  idx == 110 ? slider_automate(slider110) : idx == 111 ? slider_automate(slider111) :
+  idx == 112 ? slider_automate(slider112) : idx == 113 ? slider_automate(slider113) :
+  idx == 114 ? slider_automate(slider114) : idx == 115 ? slider_automate(slider115) :
+  idx == 116 ? slider_automate(slider116) : idx == 117 ? slider_automate(slider117) :
+  idx == 118 ? slider_automate(slider118) : idx == 119 ? slider_automate(slider119) :
+  idx == 120 ? slider_automate(slider120) : idx == 121 ? slider_automate(slider121) :
+  idx == 122 ? slider_automate(slider122) : idx == 123 ? slider_automate(slider123) :
+  idx == 124 ? slider_automate(slider124) : idx == 125 ? slider_automate(slider125) :
+  idx == 126 ? slider_automate(slider126) : idx == 127 ? slider_automate(slider127) :
+  idx == 128 ? slider_automate(slider128) : idx == 129 ? slider_automate(slider129) :
+  idx == 130 ? slider_automate(slider130) : idx == 131 ? slider_automate(slider131) :
+  idx == 132 ? slider_automate(slider132) : idx == 133 ? slider_automate(slider133) :
+  idx == 134 ? slider_automate(slider134) : idx == 135 ? slider_automate(slider135) :
+  idx == 136 ? slider_automate(slider136) : idx == 137 ? slider_automate(slider137) :
+  idx == 138 ? slider_automate(slider138) : idx == 139 ? slider_automate(slider139) :
+  idx == 140 ? slider_automate(slider140) : idx == 141 ? slider_automate(slider141) :
+  idx == 142 ? slider_automate(slider142) : idx == 143 ? slider_automate(slider143) :
+  idx == 144 ? slider_automate(slider144) : idx == 145 ? slider_automate(slider145) :
+  idx == 146 ? slider_automate(slider146) : idx == 147 ? slider_automate(slider147) :
+  idx == 148 ? slider_automate(slider148) : idx == 149 ? slider_automate(slider149) :
+  idx == 150 ? slider_automate(slider150) : idx == 151 ? slider_automate(slider151) :
+  idx == 152 ? slider_automate(slider152) : idx == 153 ? slider_automate(slider153) :
+  idx == 154 ? slider_automate(slider154) : idx == 155 ? slider_automate(slider155) :
+  idx == 156 ? slider_automate(slider156) : idx == 157 ? slider_automate(slider157) :
+  idx == 158 ? slider_automate(slider158) : idx == 159 ? slider_automate(slider159) :
+  idx == 160 ? slider_automate(slider160) : idx == 161 ? slider_automate(slider161) :
+  idx == 162 ? slider_automate(slider162) : idx == 163 ? slider_automate(slider163) :
+  idx == 164 ? slider_automate(slider164) : idx == 165 ? slider_automate(slider165) :
+  idx == 166 ? slider_automate(slider166) : idx == 167 ? slider_automate(slider167) :
+  idx == 168 ? slider_automate(slider168) : idx == 169 ? slider_automate(slider169) :
+  idx == 170 ? slider_automate(slider170) : idx == 171 ? slider_automate(slider171) :
+  idx == 172 ? slider_automate(slider172) : idx == 173 ? slider_automate(slider173) :
+  idx == 174 ? slider_automate(slider174) : idx == 175 ? slider_automate(slider175) :
+  idx == 176 ? slider_automate(slider176) : idx == 177 ? slider_automate(slider177) :
+  idx == 178 ? slider_automate(slider178) : idx == 179 ? slider_automate(slider179) :
+  idx == 180 ? slider_automate(slider180) : idx == 181 ? slider_automate(slider181) :
+  idx == 182 ? slider_automate(slider182) : idx == 183 ? slider_automate(slider183) :
+  idx == 184 ? slider_automate(slider184) : idx == 185 ? slider_automate(slider185) :
+  idx == 186 ? slider_automate(slider186) : idx == 187 ? slider_automate(slider187) :
+  idx == 188 ? slider_automate(slider188) : idx == 189 ? slider_automate(slider189) :
+  idx == 190 ? slider_automate(slider190) : idx == 191 ? slider_automate(slider191) :
+  idx == 192 ? slider_automate(slider192) : idx == 193 ? slider_automate(slider193) :
+  idx == 194 ? slider_automate(slider194) : idx == 195 ? slider_automate(slider195) :
+  idx == 196 ? slider_automate(slider196) : idx == 197 ? slider_automate(slider197) :
+  idx == 198 ? slider_automate(slider198) : idx == 199 ? slider_automate(slider199) :
+  idx == 200 ? slider_automate(slider200) : idx == 201 ? slider_automate(slider201) :
+  idx == 202 ? slider_automate(slider202) : idx == 203 ? slider_automate(slider203) :
+  idx == 204 ? slider_automate(slider204) : idx == 205 ? slider_automate(slider205) :
+  idx == 206 ? slider_automate(slider206) : idx == 207 ? slider_automate(slider207) :
+  idx == 208 ? slider_automate(slider208) : idx == 209 ? slider_automate(slider209) :
+  idx == 210 ? slider_automate(slider210) : idx == 211 ? slider_automate(slider211) :
+  idx == 212 ? slider_automate(slider212) : idx == 213 ? slider_automate(slider213) :
+  idx == 214 ? slider_automate(slider214) : idx == 215 ? slider_automate(slider215) :
+  idx == 216 ? slider_automate(slider216) : idx == 217 ? slider_automate(slider217) :
+  idx == 218 ? slider_automate(slider218) : idx == 219 ? slider_automate(slider219) :
+  idx == 220 ? slider_automate(slider220) : idx == 221 ? slider_automate(slider221) :
+  idx == 222 ? slider_automate(slider222) : idx == 223 ? slider_automate(slider223) :
+  idx == 224 ? slider_automate(slider224) : idx == 225 ? slider_automate(slider225) :
+  idx == 226 ? slider_automate(slider226) : idx == 227 ? slider_automate(slider227) :
+  idx == 228 ? slider_automate(slider228) : idx == 229 ? slider_automate(slider229) :
+  idx == 230 ? slider_automate(slider230) : idx == 231 ? slider_automate(slider231) :
+  idx == 232 ? slider_automate(slider232) : idx == 233 ? slider_automate(slider233) :
+  idx == 234 ? slider_automate(slider234) : idx == 235 ? slider_automate(slider235) :
+  idx == 236 ? slider_automate(slider236) : idx == 237 ? slider_automate(slider237) :
+  idx == 238 ? slider_automate(slider238) : idx == 239 ? slider_automate(slider239) :
+  idx == 240 ? slider_automate(slider240) : idx == 241 ? slider_automate(slider241) :
+  idx == 242 ? slider_automate(slider242) : idx == 243 ? slider_automate(slider243) :
+  idx == 244 ? slider_automate(slider244) : idx == 245 ? slider_automate(slider245) :
+  idx == 246 ? slider_automate(slider246) : idx == 247 ? slider_automate(slider247) :
+  idx == 248 ? slider_automate(slider248) : idx == 249 ? slider_automate(slider249) :
+  idx == 250 ? slider_automate(slider250) : idx == 251 ? slider_automate(slider251) :
+  idx == 252 ? slider_automate(slider252) : idx == 253 ? slider_automate(slider253) :
+  idx == 254 ? slider_automate(slider254) : idx == 255 ? slider_automate(slider255) :
+  idx == 256 ? slider_automate(slider256);
+);
+
+// house style: knob values show only on hover / drag (a plugin may set ui_hovval = 0 to show them always)
+ui_hovval = 1;
+
+// ---------- colour ----------
+function ui_col(c) (
+  gfx_r = ((c >> 16) & 255) / 255; gfx_g = ((c >> 8) & 255) / 255; gfx_b = (c & 255) / 255; gfx_a = 1;
+);
+function ui_cola(c, a) ( ui_col(c); gfx_a = a; );
+
+// ---------- house palette (named colours for any GFX panel) ----------
+// whites
+GFX_CHIFFON   = 0xEEEFEA;   // warm chiffon white (alt 0xF0F2EF)
+GFX_CHIFFON2  = 0xF0F2EF;
+GFX_ELEPHANT  = 0xC7BEB3;   // elephant's breath
+GFX_COOLWHITE = 0xF4FDFF;   // cool white
+GFX_CREAM     = 0xFFFDD0;   // cream white
+GFX_LIMEWHITE = 0xE8E0CB;   // lime white
+// greys (warm, light to dark)
+GFX_GREY1 = 0xE3D8D8; GFX_GREY2 = 0xC1B5B5; GFX_GREY3 = 0xB2A4A4; GFX_GREY4 = 0xA99999; GFX_GREY5 = 0x9A8A8A;
+
+// opposite hue of c at a fixed mid brightness; -1 if c is too grey to have a hue
+function ui_hsvcomp(c) local(r, g, b, mx, mn, d, h, s, v, i, f, p, q, t) (
+  r = ((c >> 16) & 255) / 255; g = ((c >> 8) & 255) / 255; b = (c & 255) / 255;
+  mx = max(r, max(g, b)); mn = min(r, min(g, b)); d = mx - mn;
+  s = mx > 0 ? d / mx : 0;
+  s > 0.15 ? (
+    h = mx == r ? (g - b) / d : mx == g ? 2 + (b - r) / d : 4 + (r - g) / d;
+    h = h / 6 + 0.5; h -= floor(h);
+    s = min(max(s, 0.45), 0.65); v = 0.55;
+    i = floor(h * 6); f = h * 6 - i; p = v * (1 - s); q = v * (1 - f * s); t = v * (1 - (1 - f) * s);
+    i == 0 ? ( r = v; g = t; b = p; ) : i == 1 ? ( r = q; g = v; b = p; ) : i == 2 ? ( r = p; g = v; b = t; ) :
+    i == 3 ? ( r = p; g = q; b = v; ) : i == 4 ? ( r = t; g = p; b = v; ) : ( r = v; g = p; b = q; );
+    floor(r * 255 + 0.5) * 65536 + floor(g * 255 + 0.5) * 256 + floor(b * 255 + 0.5);
+  ) : -1;
+);
+
+// ---------- themes ----------
+function ui_mix(c1, c2, t) (
+  ((((c1 >> 16) & 255) * (1 - t) + ((c2 >> 16) & 255) * t) | 0) * 65536 +
+  ((((c1 >> 8) & 255) * (1 - t) + ((c2 >> 8) & 255) * t) | 0) * 256 +
+  (((c1 & 255) * (1 - t) + (c2 & 255) * t) | 0);
+);
+function ui_theme(t) (
+  C_S6 = -1;
+  t == 9 ? (        // Walnut: organ-cabinet wood, mahogany, brass
+    C_BG = 0x1A120D; C_HDR = 0x120C08; C_TITLE = 0xF0E2C8; C_ACC = 0xC9A043; C_ACCH = 0xE2BD62;
+    C_LABEL = 0xC8B293; C_VALUE = 0xF2E6D0; C_DIM = 0x3E2C20; C_STXT = 0x8F7A62;
+    C_KNOB = 0x2A1D15; C_KEDGE = 0x4A3526; C_PTR = 0xF4E8D2;
+    C_BTN = 0x33241A; C_BTNT = 0xD9C4A5; C_ACTT = 0x1A120C;
+    C_VA = 0xE2BD62; C_VB = 0xB07A3A; C_DRY = 0xD8C6A8; C_MET = 0xC9A043; C_CLIP = 0xE5544B;
+    C_S0 = 0x6E301F; C_S1 = 0x8C4C27; C_S2 = 0x8A6A30; C_S3 = 0x5C3B26; C_S4 = 0x4C2519;
+    F_BG = 0x2B1B11; F_KIND = 2; F_INK = 0xF0E2C8;
+  ) : t == 10 ? (   // Tolex: black stage-piano tolex, charcoal, red, silver
+    C_BG = 0x141416; C_HDR = 0x0D0D0F; C_TITLE = 0xF0F0F2; C_ACC = 0xD3322F; C_ACCH = 0xEE5A55;
+    C_LABEL = 0xB0B2B8; C_VALUE = 0xF0F0F2; C_DIM = 0x34353A; C_STXT = 0x7D7F86;
+    C_KNOB = 0x232428; C_KEDGE = 0x3E4046; C_PTR = 0xF2F2F4;
+    C_BTN = 0x2C2D31; C_BTNT = 0xC9CBD0; C_ACTT = 0x101012;
+    C_VA = 0xF06A64; C_VB = 0xC22A28; C_DRY = 0xC4C6CC; C_MET = 0xD3322F; C_CLIP = 0xFF5A4E;
+    C_S0 = 0x44464C; C_S1 = 0x55575E; C_S2 = 0x9A9DA4; C_S3 = 0x393A3F; C_S4 = 0x7A1F1F;
+    F_BG = 0x19191B; F_KIND = 3; F_INK = 0xEDEDEF;
+  ) : t == 11 ? (   // Velvet: aubergine, plum, lilac, silver
+    C_BG = 0x1A1222; C_HDR = 0x120C18; C_TITLE = 0xEEE4F6; C_ACC = 0xB58AD8; C_ACCH = 0xD0AEEC;
+    C_LABEL = 0xB7A6C6; C_VALUE = 0xF0E8F8; C_DIM = 0x3A2C48; C_STXT = 0x86749A;
+    C_KNOB = 0x2A1E36; C_KEDGE = 0x46345A; C_PTR = 0xF2ECF8;
+    C_BTN = 0x31243F; C_BTNT = 0xD3C4E2; C_ACTT = 0x150E1C;
+    C_VA = 0xD0AEEC; C_VB = 0x9A62C8; C_DRY = 0xCFC4DA; C_MET = 0xB58AD8; C_CLIP = 0xFF5A6E;
+    C_S0 = 0x5E2D73; C_S1 = 0x7A4592; C_S2 = 0x8C7AA0; C_S3 = 0x4A2660; C_S4 = 0x3A1C4E;
+    F_BG = 0x1E1428; F_KIND = 0; F_INK = 0xEEE4F6;
+  ) : t == 12 ? (   // Olive: olive, moss, sage, amber
+    C_BG = 0x161A12; C_HDR = 0x0F120C; C_TITLE = 0xE9EDDC; C_ACC = 0xE0A030; C_ACCH = 0xF2BE5A;
+    C_LABEL = 0xAEB89A; C_VALUE = 0xEEF2E2; C_DIM = 0x323A28; C_STXT = 0x7C8868;
+    C_KNOB = 0x232A1C; C_KEDGE = 0x3C4630; C_PTR = 0xF0F2E6;
+    C_BTN = 0x2A3222; C_BTNT = 0xCBD3BA; C_ACTT = 0x12160E;
+    C_VA = 0xF2BE5A; C_VB = 0x9DB25A; C_DRY = 0xC8D0B4; C_MET = 0xE0A030; C_CLIP = 0xF0553E;
+    C_S0 = 0x55602E; C_S1 = 0x6E7A3A; C_S2 = 0x7E8A64; C_S3 = 0x46502A; C_S4 = 0x3A4224;
+    F_BG = 0x1C2116; F_KIND = 0; F_INK = 0xE9EDDC;
+  ) : t == 13 ? (   // Frost: cool white, pale grey, blue
+    C_BG = 0xE6ECF2; C_HDR = 0xD3DCE6; C_TITLE = 0x1C2836; C_ACC = 0x3E7CC4; C_ACCH = 0x5C98DA; C_LABEL = 0x4E5E70; C_VALUE = 0x1C2836; C_DIM = 0xB6C2CF; C_STXT = 0x66768A; C_KNOB = 0xF6F9FC; C_KEDGE = 0x9EAEC0; C_PTR = 0x22303E; C_BTN = 0xBCC8D6; C_BTNT = 0x26343F; C_ACTT = 0xFFFFFF; C_VA = 0x6FA6E6; C_VB = 0x3E7CC4; C_DRY = 0x66768A; C_MET = 0x3E7CC4; C_CLIP = 0xD9433A; C_S0 = 0x4F86C6; C_S1 = 0x7FA6CF; C_S2 = 0x3A4A5E; C_S3 = 0x9DB6D2; C_S4 = 0x2F5E96; F_BG = 0xDCE3EA; F_KIND = 0; F_INK = 0x1E2A36; 
+  ) : t == 14 ? (   // Slate: cool blue-grey
+    C_BG = 0x1E2329; C_HDR = 0x161A1F; C_TITLE = 0xE4EAF0; C_ACC = 0x8FB4D8; C_ACCH = 0xB4CFEA; C_LABEL = 0xA4B0BC; C_VALUE = 0xE4EAF0; C_DIM = 0x38414B; C_STXT = 0x76828E; C_KNOB = 0x2A3139; C_KEDGE = 0x46505C; C_PTR = 0xEEF3F8; C_BTN = 0x313943; C_BTNT = 0xC6D0DA; C_ACTT = 0x12161A; C_VA = 0xB4CFEA; C_VB = 0x7A9CC2; C_DRY = 0xB8C2CC; C_MET = 0x8FB4D8; C_CLIP = 0xE5594F; C_S0 = 0x6E8CAE; C_S1 = 0x8CA2B8; C_S2 = 0xC4D0DC; C_S3 = 0x56708E; C_S4 = 0x3C5470; F_BG = 0x252B32; F_KIND = 0; F_INK = 0xE4EAF0; 
+  ) : t == 15 ? (   // Ember: warm brown, burnt orange
+    C_BG = 0x221812; C_HDR = 0x180F0B; C_TITLE = 0xF6E6D4; C_ACC = 0xE8782E; C_ACCH = 0xF59A52; C_LABEL = 0xC9A88C; C_VALUE = 0xF6E6D4; C_DIM = 0x47301F; C_STXT = 0x93745C; C_KNOB = 0x33241A; C_KEDGE = 0x573B28; C_PTR = 0xF8EADC; C_BTN = 0x3D2B1E; C_BTNT = 0xE0C6AE; C_ACTT = 0x1A0F08; C_VA = 0xF59A52; C_VB = 0xC85A22; C_DRY = 0xDCC2A8; C_MET = 0xE8782E; C_CLIP = 0xFF5A40; C_S0 = 0xC8622A; C_S1 = 0xA8502A; C_S2 = 0xE6B07A; C_S3 = 0x8A4A26; C_S4 = 0x6A3418; F_BG = 0x2A1D15; F_KIND = 0; F_INK = 0xF6E6D4; 
+  ) : t == 16 ? (   // Honey: warm cream, amber, brown
+    C_BG = 0xF1E6CC; C_HDR = 0xE2D2AE; C_TITLE = 0x3A2A14; C_ACC = 0xC8862A; C_ACCH = 0xDDA044; C_LABEL = 0x6E5634; C_VALUE = 0x3A2A14; C_DIM = 0xCDB990; C_STXT = 0x8A7350; C_KNOB = 0xFBF4E2; C_KEDGE = 0xB89C6C; C_PTR = 0x3A2A14; C_BTN = 0xD9C69C; C_BTNT = 0x3E2E18; C_ACTT = 0xFFFFFF; C_VA = 0xE0A848; C_VB = 0xB87420; C_DRY = 0x8A7350; C_MET = 0xC8862A; C_CLIP = 0xC8402E; C_S0 = 0xC8862A; C_S1 = 0xA87A3A; C_S2 = 0x5A4224; C_S3 = 0xD8B060; C_S4 = 0x8A5A1E; F_BG = 0xEADCBC; F_KIND = 0; F_INK = 0x3A2A14; 
+  ) : t == 17 ? (   // Mint: pastel green
+    C_BG = 0xE4F2EC; C_HDR = 0xD0E8DE; C_TITLE = 0x1E3A30; C_ACC = 0x4FAF8E; C_ACCH = 0x6CC6A6; C_LABEL = 0x4C6E62; C_VALUE = 0x1E3A30; C_DIM = 0xB4D4C8; C_STXT = 0x6A8A7E; C_KNOB = 0xF6FCF9; C_KEDGE = 0x9CC4B6; C_PTR = 0x1E3A30; C_BTN = 0xBEDCD0; C_BTNT = 0x22403A; C_ACTT = 0xFFFFFF; C_VA = 0x7FD0B2; C_VB = 0x4FAF8E; C_DRY = 0x6A8A7E; C_MET = 0x4FAF8E; C_CLIP = 0xE0645A; C_S0 = 0x6CC0A2; C_S1 = 0x9AD0BE; C_S2 = 0x2E5A4C; C_S3 = 0xA8DCCA; C_S4 = 0x3E8E72; F_BG = 0xDCEDE6; F_KIND = 0; F_INK = 0x1E3A30; 
+  ) : t == 18 ? (   // Blossom: pastel lilac and pink
+    C_BG = 0xF3E8F0; C_HDR = 0xE8D6E4; C_TITLE = 0x3E2440; C_ACC = 0xC77DB8; C_ACCH = 0xD99ACC; C_LABEL = 0x705A72; C_VALUE = 0x3E2440; C_DIM = 0xD6C2D4; C_STXT = 0x8C7290; C_KNOB = 0xFCF6FA; C_KEDGE = 0xC4A8C2; C_PTR = 0x3E2440; C_BTN = 0xDCC8DA; C_BTNT = 0x40284A; C_ACTT = 0xFFFFFF; C_VA = 0xE0A6D4; C_VB = 0xB070B8; C_DRY = 0x8C7290; C_MET = 0xC77DB8; C_CLIP = 0xD84A5A; C_S0 = 0xC98CC0; C_S1 = 0xA8A0D8; C_S2 = 0x5A3A5E; C_S3 = 0xE6B4CE; C_S4 = 0x8E62A8; F_BG = 0xEEE0EA; F_KIND = 0; F_INK = 0x3E2440; 
+  ) : t == 5 ? (        // Graphite
+    C_BG = 0x1E1F22; C_HDR = 0x161719; C_TITLE = 0xEDEDEF; C_ACC = 0xC8CCD2; C_ACCH = 0xE6E9ED;
+    C_LABEL = 0xA8ACB2; C_VALUE = 0xEDEDEF; C_DIM = 0x3A3C40; C_STXT = 0x7E8288;
+    C_KNOB = 0x2C2E32; C_KEDGE = 0x45484D; C_PTR = 0xF0F0F2;
+    C_BTN = 0x34363A; C_BTNT = 0xC8CCD2; C_ACTT = 0x16171A;
+    C_VA = 0xDADDE2; C_VB = 0x9AA0A8; C_DRY = 0xB8BCC2; C_MET = 0xC8CCD2; C_CLIP = 0xE5544B;
+    C_S0 = 0x9CA3AD; C_S1 = 0x7A8089; C_S2 = 0xC9CDD2; C_S3 = 0x8C929A; C_S4 = 0x646B74;
+    F_BG = 0x2A2B2E; F_KIND = 0; F_INK = 0xE8E8EA;
+  ) : t == 6 ? (    // Bordeaux
+    C_BG = 0x1F1416; C_HDR = 0x170F11; C_TITLE = 0xF3E6E4; C_ACC = 0xB8394A; C_ACCH = 0xD66474;
+    C_LABEL = 0xC4A5A8; C_VALUE = 0xF3E6E4; C_DIM = 0x452A2E; C_STXT = 0x8E6F72;
+    C_KNOB = 0x2E1D20; C_KEDGE = 0x4D3236; C_PTR = 0xF6EAEA;
+    C_BTN = 0x38242A; C_BTNT = 0xDCC2C5; C_ACTT = 0x1A0E10;
+    C_VA = 0xE88A96; C_VB = 0xC23A50; C_DRY = 0xD9C0C3; C_MET = 0xD9707E; C_CLIP = 0xFF5A4E;
+    C_S0 = 0x9E2B3C; C_S1 = 0xC4606E; C_S2 = 0xE3B9BE; C_S3 = 0x7A2635; C_S4 = 0x5A1A28;
+    F_BG = 0x241619; F_KIND = 0; F_INK = 0xF1E4E2;
+  ) : t == 7 ? (    // Saffron
+    C_BG = 0x1B1A16; C_HDR = 0x13120F; C_TITLE = 0xF4EDD8; C_ACC = 0xE8C230; C_ACCH = 0xF5D963;
+    C_LABEL = 0xC2B88E; C_VALUE = 0xF4EDD8; C_DIM = 0x3E3A2A; C_STXT = 0x8A8262;
+    C_KNOB = 0x2A2820; C_KEDGE = 0x48442F; C_PTR = 0xF5F0DE;
+    C_BTN = 0x34311F; C_BTNT = 0xD9D0A8; C_ACTT = 0x17150D;
+    C_VA = 0xF5D963; C_VB = 0xE0A82E; C_DRY = 0xD6CCA6; C_MET = 0xE8C230; C_CLIP = 0xF0553E;
+    C_S0 = 0xE3BC2A; C_S1 = 0xC99A2E; C_S2 = 0xEFE2A8; C_S3 = 0xD4A93A; C_S4 = 0x9C7A1E;
+    F_BG = 0x1C1B18; F_KIND = 0; F_INK = 0xF2EBD6;
+  ) : t == 8 ? (    // Petrol
+    C_BG = 0x132020; C_HDR = 0x0D1716; C_TITLE = 0xE0F0ED; C_ACC = 0x2FA39A; C_ACCH = 0x5FC8BF;
+    C_LABEL = 0x93B5B0; C_VALUE = 0xE0F0ED; C_DIM = 0x26403D; C_STXT = 0x6A8E89;
+    C_KNOB = 0x1C2E2C; C_KEDGE = 0x30504C; C_PTR = 0xE6F5F2;
+    C_BTN = 0x223835; C_BTNT = 0xB8D6D1; C_ACTT = 0x0B1514;
+    C_VA = 0x7FDDD3; C_VB = 0x2FA39A; C_DRY = 0xA8CCC7; C_MET = 0x5FC8BF; C_CLIP = 0xF0605A;
+    C_S0 = 0x2A8C85; C_S1 = 0x4FB3A8; C_S2 = 0xA9D9D2; C_S3 = 0x1F6E69; C_S4 = 0x174F4C;
+    C_S6 = 0x346C68;                                    // second main tone (the EQ low bands): a muted teal
+    F_BG = 0x14211F; F_KIND = 0; F_INK = 0xDDEDEA;
+  ) : t == 1 ? (        // Ice
+    C_BG = 0x161C24; C_HDR = 0x0F141A; C_TITLE = 0xDCE6EE; C_ACC = 0x4A86C8; C_ACCH = 0x86B2E6;
+    C_LABEL = 0x9AAAB8; C_VALUE = 0xDCE6EE; C_DIM = 0x2C3844; C_STXT = 0x6E7F8E;
+    C_KNOB = 0x202833; C_KEDGE = 0x34404D; C_PTR = 0xE8F4FA;
+    C_BTN = 0x26303C; C_BTNT = 0xB8C8D4; C_ACTT = 0x0C1218;
+    C_VA = 0x9CC4F0; C_VB = 0x5A9AE0; C_DRY = 0xC8D4DE; C_MET = 0x8FC1F0; C_CLIP = 0xF06A6A;
+    C_S0 = 0x4A86C8; C_S1 = 0x7FA7D6; C_S2 = 0xB9C9DC; C_S3 = 0x5C77A8; C_S4 = 0x2F4F7F;
+    F_BG = 0xBEC3C9; F_KIND = 1; F_INK = 0x1C2228;
+  ) : t == 2 ? (    // Studio (light)
+    C_BG = 0xE4E5E8; C_HDR = 0xD6D8DC; C_TITLE = 0x1E2025; C_ACC = 0x4E7F55; C_ACCH = 0x6E9F72;
+    C_LABEL = 0x5A5F69; C_VALUE = 0x1E2025; C_DIM = 0xB8BBC2; C_STXT = 0x6A6F78;
+    C_KNOB = 0xF4F5F7; C_KEDGE = 0xA8ACB4; C_PTR = 0x24272D;
+    C_BTN = 0xB9BDC5; C_BTNT = 0x33363D; C_ACTT = 0xFFFFFF;
+    C_VA = 0x6BAF6E; C_VB = 0x3E8E50; C_DRY = 0x6A6F78; C_MET = 0x4E9A5A; C_CLIP = 0xD93A30;
+    C_S0 = 0x5E8C61; C_S1 = 0x8DAA7A; C_S2 = 0x4A5A4C; C_S3 = 0xA9B98E; C_S4 = 0x3E6B48;
+    F_BG = 0xD5D8D6; F_KIND = 0; F_INK = 0x23282A;
+  ) : t == 3 ? (    // Vintage
+    C_BG = 0xE8DCC2; C_HDR = 0x5A3E2B; C_TITLE = 0xF2E6CC; C_ACC = 0xB5532A; C_ACCH = 0xC9703F;
+    C_LABEL = 0xDCC49C; C_VALUE = 0x3A281C; C_DIM = 0x9C8466; C_STXT = 0xCDB894;
+    C_KNOB = 0x3A2A20; C_KEDGE = 0x7A5C44; C_PTR = 0xF2E6CC;
+    C_BTN = 0xD4C4A4; C_BTNT = 0x4A3628; C_ACTT = 0xF8F0E0;
+    C_VA = 0xE0A060; C_VB = 0xD86A3A; C_DRY = 0xE8DCC2; C_MET = 0xB0883A; C_CLIP = 0xC0392B;
+    C_S0 = 0xB5532A; C_S1 = 0xC98A3D; C_S2 = 0x6B4A33; C_S3 = 0xA97850; C_S4 = 0x8A3A22;
+    F_BG = 0xE6D9BD; F_KIND = 0; F_INK = 0x3A2A1E;
+  ) : t == 4 ? (    // Neon
+    C_BG = 0x0E0C14; C_HDR = 0x07060B; C_TITLE = 0xE8E4FF; C_ACC = 0xD63A9D; C_ACCH = 0xF06BBE;
+    C_LABEL = 0x9A94B8; C_VALUE = 0xE8E4FF; C_DIM = 0x2A2540; C_STXT = 0x6A6A85;
+    C_KNOB = 0x1A1626; C_KEDGE = 0x3A3358; C_PTR = 0xF0EAFF;
+    C_BTN = 0x221D33; C_BTNT = 0xB8B0D8; C_ACTT = 0x0E0C14;
+    C_VA = 0xFF7AD0; C_VB = 0xB06BFF; C_DRY = 0xB8B0D8; C_MET = 0xC77DFF; C_CLIP = 0xFF4D4D;
+    C_S0 = 0xD63A9D; C_S1 = 0x9B4DDB; C_S2 = 0xD9A6E8; C_S3 = 0xF06BAE; C_S4 = 0x6B2FB0;
+    F_BG = 0x15121B; F_KIND = 0; F_INK = 0xE8E4FF;
+  ) : (             // Amber (default)
+    C_BG = 0x1C1D21; C_HDR = 0x14161A; C_TITLE = 0xE6E6EB; C_ACC = 0xD99A3E; C_ACCH = 0xF0BE6E;
+    C_LABEL = 0xB3B8C2; C_VALUE = 0xE6E6EB; C_DIM = 0x3D4047; C_STXT = 0x80858F;
+    C_KNOB = 0x2B2E33; C_KEDGE = 0x42454D; C_PTR = 0xEBEBF0;
+    C_BTN = 0x333640; C_BTNT = 0xC7CCD6; C_ACTT = 0x1A1A1F;
+    C_VA = 0xE8B86A; C_VB = 0xD9772F; C_DRY = 0xBFC2CC; C_MET = 0xC9A050; C_CLIP = 0xF2594D;
+    C_S0 = 0xD99A3E; C_S1 = 0xB8642E; C_S2 = 0xD9C7A3; C_S3 = 0xA68A5B; C_S4 = 0x8A4A2B;
+    F_BG = 0x1F2023; F_KIND = 0; F_INK = 0xEEE7D7;
+  );
+  // main-knob highlight: complementary to the main panel colour, else to the accent, else silver
+  C_KC = ui_hsvcomp(C_S0);
+  C_KC < 0 ? C_KC = ui_hsvcomp(C_ACC);
+  C_KC < 0 ? C_KC = 0x8A8E96;;
+  C_S6 < 0 ? C_S6 = ui_mix(C_S0, C_S3, 0.5);      // a second main tone for themes that don't set one
+);
+
+// ---------- section colours ----------
+// 0 main, 1 drift, 2 master, 3 input, 4 output stage. Knob arcs and active buttons use it.
+function ui_section(n) (
+  ui_sec = n;
+  C_KA = n == 1 ? C_S1 : n == 2 ? C_S2 : n == 3 ? C_S3 : n == 4 ? C_S4 : C_S0;
+  C_KAH = ui_mix(C_KA, C_PTR, 0.3);
+);
+
+// ---------- hardware look: basic helpers ----------
+// rounded rect on whole pixels (x, y, w, h, r already integers), drawn as one non-overlapping shape: the
+// straight body, then the corner rows (one span across the full width per row) and their anti-aliased edge
+// pixels. Every pixel is painted once, so translucent fills and shadows never double up at the corners.
+function ui_rrpx(x, y, w, h, r) local(x2, y2, a0, i, j, f, dy, d) (
+  x2 = x + w; y2 = y + h;
+  r = min(r, floor(min(w, h) * 0.5));
+  w > 0 && h > 0 ? (
+    r < 1 ? gfx_rect(x, y, w, h) : (
+      a0 = gfx_a;
+      h > 2 * r ? gfx_rect(x, y + r, w, h - 2 * r);
+      j = 0;
+      loop(r,
+        dy = r - j; f = ceil(r - sqrt(max(r * r - dy * dy, 0)) - 0.000001);
+        gfx_a = a0; w > 2 * f ? ( gfx_rect(x + f, y + j, w - 2 * f, 1); gfx_rect(x + f, y2 - 1 - j, w - 2 * f, 1); );
+        i = max(floor(r - sqrt((r + 1) * (r + 1) - dy * dy)), 0);
+        loop(f - i,
+          d = r + 1 - sqrt((r - i) * (r - i) + dy * dy);
+          d > 0 ? (
+            gfx_a = a0 * min(d, 1);
+            gfx_rect(x + i, y + j, 1, 1); gfx_rect(x2 - 1 - i, y + j, 1, 1);
+            gfx_rect(x + i, y2 - 1 - j, 1, 1); gfx_rect(x2 - 1 - i, y2 - 1 - j, 1, 1);
+          );
+          i += 1;
+        );
+        j += 1;
+      );
+      gfx_a = a0;
+    );
+  );
+);
+// rounded rect: each edge snapped down to a whole pixel (the extent the old four-strip drawing covered),
+// corner radius rounded to whole pixels
+function ui_rrect(x, y, w, h, r) (
+  ui_rrpx(floor(x), floor(y), floor(x + w) - floor(x), floor(y + h) - floor(y), floor(r + 0.5));
+);
+
+// dark or light print colour, whichever reads on background c
+function ui_ink(c) local(lum) (
+  lum = 0.299 * ((c >> 16) & 255) + 0.587 * ((c >> 8) & 255) + 0.114 * (c & 255);
+  lum > 150 ? 0x1A1A1C : 0xF4F0E6;
+);
+
+ui_ovt = -1;   // set ui_ovt (theme), ui_ovbg, ui_ovink in a plugin's @init to give that theme its own faceplate
+function ui_hash(n) ( n = sin(n * 12.9898) * 43758.5453; n - floor(n); );
+
+// enclosure finish, rendered once into image 127 and re-blitted each frame
+function ui_hw_bg() local(i, n, xx, yy, k) (
+  (gfx_w != ui_bgw || gfx_h != ui_bgh || ui_thm != ui_bgt || ui_bgok == 0) ? (
+    ui_bgw = gfx_w; ui_bgh = gfx_h; ui_bgt = ui_thm; ui_bgok = 1;
+    gfx_setimgdim(127, gfx_w, gfx_h);
+    gfx_dest = 127;
+    ui_col(F_BG); gfx_rect(0, 0, gfx_w, gfx_h);
+    F_KIND == 2 ? (
+      i = 0;                                   // wood grain: wavy bands of darker / lighter fibre
+      loop(gfx_h,
+        k = 0.5 + 0.5 * sin(i * 0.11 + 2.5 * sin(i * 0.017) + 1.3 * sin(i * 0.0041));
+        ui_cola(k > 0.5 ? 0xFFFFFF : 0x000000, 0.015 + 0.09 * abs(k - 0.5) + 0.03 * ui_hash(i * 2.3));
+        gfx_line(0, i, gfx_w, i);
+        i += 1;
+      );
+      n = floor(gfx_w * gfx_h / 400);          // fine pores
+      i = 0;
+      loop(n,
+        xx = ui_hash(i * 3.17 + 0.1) * gfx_w; yy = ui_hash(i * 7.91 + 1.3) * gfx_h;
+        ui_cola(0x000000, 0.12); gfx_line(xx, yy, xx + 3 + 6 * ui_hash(i * 1.9), yy);
+        i += 1;
+      );
+    ) : F_KIND == 3 ? (
+      n = floor(gfx_w * gfx_h / 14);           // tolex: dense pebble grain
+      i = 0;
+      loop(n,
+        xx = ui_hash(i * 3.17 + 0.1) * gfx_w; yy = ui_hash(i * 7.91 + 1.3) * gfx_h;
+        k = ui_hash(i * 1.61 + 4.2);
+        ui_cola(k > 0.55 ? 0xFFFFFF : 0x000000, k > 0.55 ? 0.05 : 0.22);
+        gfx_rect(xx, yy, 1 + (k > 0.9), 1 + (k > 0.9));
+        i += 1;
+      );
+    ) : F_KIND == 1 ? (
+      i = 0;                                   // brushed metal
+      loop(gfx_h,
+        k = ui_hash(i * 1.37 + 0.5);
+        ui_cola(k > 0.5 ? 0xFFFFFF : 0x000000, 0.02 + 0.06 * abs(k - 0.5));
+        gfx_line(0, i, gfx_w, i);
+        i += 1;
+      );
+    ) : (
+      n = floor(gfx_w * gfx_h / 80);           // powder-coat speckle
+      i = 0;
+      loop(n,
+        xx = ui_hash(i * 3.17 + 0.1) * gfx_w; yy = ui_hash(i * 7.91 + 1.3) * gfx_h;
+        k = ui_hash(i * 1.61 + 4.2);
+        ui_cola(k > 0.5 ? 0xFFFFFF : 0x000000, 0.05 + 0.07 * k);
+        gfx_rect(xx, yy, 1, 1);
+        i += 1;
+      );
+    );
+    gfx_gradrect(0, 0, gfx_w, gfx_h * 0.4, 1, 1, 1, 0.06, 0, 0, 0, 0, 0, 0, 0, -0.06 / (gfx_h * 0.4));
+    gfx_dest = -1;
+  );
+  gfx_x = 0; gfx_y = 0; gfx_a = 1; gfx_mode = 0;
+  gfx_blit(127, 1, 0);
+);
+
+function ui_screw(x, y) local(rr) (
+  rr = 4.5 * sc;
+  ui_cola(0x000000, 0.35); gfx_circle(x + 1, y + 1.5, rr, 1, 1);
+  ui_col(0x9A9DA3); gfx_circle(x, y, rr, 1, 1);
+  ui_col(0xCDD0D5); gfx_circle(x - rr * 0.25, y - rr * 0.25, rr * 0.55, 1, 1);
+  ui_col(0x55585E); gfx_line(x - rr * 0.7, y + rr * 0.3, x + rr * 0.7, y - rr * 0.3, 1);
+);
+
+// size a font so "THRESHOLD" measures 5.28 x the design size (as in the reference design);
+// re-measured after the system's rounding, and stepped down if it would come out wider
+function ui_fitfont(idx, size) local(fs, w, h, target) (
+  target = 5.28 * size;
+  fs = size;
+  loop(3,
+    gfx_setfont(idx, "Trebuchet MS", fs, 'b');
+    gfx_measurestr("THRESHOLD", w, h);
+    fs = min(max(fs * target / max(w, 1), size * 0.75), size * 1.8);
+  );
+  gfx_setfont(idx, "Trebuchet MS", fs, 'b'); gfx_measurestr("THRESHOLD", w, h);
+  loop(3,
+    w > target * 1.01 ? (
+      fs -= 0.5;
+      gfx_setfont(idx, "Trebuchet MS", fs, 'b'); gfx_measurestr("THRESHOLD", w, h);
+    );
+  );
+  fs;
+);
+
+// ---------- frame start / end ----------
+function ui_begin(bw, bh) local(ret, want, fit) (
+  ui_bw = bw;
+  ret  = gfx_ext_retina > 1 ? gfx_ext_retina : 1;
+  want = ui_sz == 1 ? 0.85 : ui_sz == 2 ? 1.3 : 1;
+  fit  = min(gfx_w / (bw * ret), gfx_h / (bh * ret));
+  sc   = ret * max(min(want, fit), 0.5);
+
+  ui_theme(ui_thm);
+  ui_thm == ui_ovt ? ( F_BG = ui_ovbg; F_INK = ui_ovink; );   // a plugin's own faceplate for its home theme
+  ui_section(0);
+  mdown = mouse_cap & 1;
+  pressed = mdown && !prev_down;
+  // the ? pop-up is modal: while it is open the panel underneath sees no mouse
+  ui_mx = mouse_x; ui_my = mouse_y;
+  ui_help_open ? ( mouse_x = -10000; mouse_y = -10000; mouse_wheel = 0; );
+  released_id = (!mdown && prev_down) ? drag_id : 0;
+  !mdown ? drag_id = 0;
+
+  // text calibration: fonts render at different sizes on different systems (Windows measures the
+  // full line height and rounds to whole pixels; fonts differ in width). Each font is sized so a
+  // reference word fills the same width as in the design, re-measured after rounding, and never wider.
+  sc != ui_calsc ? (
+    ui_calsc = sc;
+    ui_fs1 = ui_fitfont(1, 17 * sc);
+    ui_fs2 = ui_fitfont(2, 12.5 * sc);
+    ui_fs4 = ui_fitfont(4, 9.5 * sc);
+    ui_fs5 = ui_fitfont(5, 11 * sc);
+  );
+  gfx_setfont(1, "Trebuchet MS", ui_fs1, 'b');
+  gfx_setfont(2, "Trebuchet MS", ui_fs2, 'b');
+  gfx_setfont(3, "Trebuchet MS", ui_fs2, 'b');
+  gfx_setfont(4, "Trebuchet MS", ui_fs4, 'b');
+  gfx_setfont(5, "Trebuchet MS", ui_fs5, 'b');
+
+  ui_hw ? (
+    ui_hw_bg();
+    ui_screw(9 * sc, 9 * sc);          ui_screw(gfx_w - 9 * sc, 9 * sc);
+    ui_screw(9 * sc, gfx_h - 9 * sc);  ui_screw(gfx_w - 9 * sc, gfx_h - 9 * sc);
+    C_INK = F_INK;
+  ) : (
+    ui_col(C_BG); gfx_rect(0, 0, gfx_w, gfx_h);
+    C_INK = C_LABEL;
+  );
+);
+
+// ---------- the ? button and its pop-up (design credit, website, this plug-in's manual) ----------
+// Every plug-in sets #ui_man (its file name, e.g. "gfx-tandem") in @init. The ? key lives in the size picker.
+#ui_site = "https://www.gardenfx.uk/";
+function ui_help() local(w, h, cw, ch, cx, cy, tw, th) (
+  ui_help_open && pressed && !ui_help_new ? ui_help_open = 0;           // any click closes it
+  ui_help_new = 0;
+  ui_help_open ? (
+    ui_cola(0x000000, 0.62); gfx_rect(0, 0, gfx_w, gfx_h);
+    strcpy(#ui_hl1, "Design by JGWizrad.  "); strcat(#ui_hl1, "© John Garden 2026");
+    strcpy(#ui_hl3, "Manual - "); strcat(#ui_hl3, #ui_site); strcat(#ui_hl3, "manual/"); strcat(#ui_hl3, #ui_man); strcat(#ui_hl3, ".pdf");
+    gfx_setfont(4); gfx_measurestr(#ui_hl3, tw, th);
+    cw = max(tw + 40 * sc, 360 * sc); ch = 126 * sc;
+    cx = (gfx_w - cw) * 0.5; cy = (gfx_h - ch) * 0.5;
+    ui_cola(0x000000, 0.5); ui_rrect(cx + 3 * sc, cy + 5 * sc, cw, ch, 8 * sc);
+    ui_col(0x1C1D20); ui_rrect(cx, cy, cw, ch, 8 * sc);
+    ui_col(0x3A3C42); ui_rrect(cx, cy, cw, 4 * sc, 2 * sc);
+    ui_col(0xE0603A); gfx_rect(cx + 20 * sc, cy + 34 * sc, cw - 40 * sc, 1 * sc);
+    gfx_setfont(5); ui_col(0xF2F2EE); gfx_x = cx + 20 * sc; gfx_y = cy + 14 * sc; gfx_drawstr(#ui_hl1);
+    gfx_setfont(4); ui_col(0xE8B23A); gfx_x = cx + 20 * sc; gfx_y = cy + 48 * sc; gfx_drawstr(#ui_site);
+    ui_col(0xD8D6D0); gfx_x = cx + 20 * sc; gfx_y = cy + 70 * sc; gfx_drawstr(#ui_hl3);
+    ui_col(0x85837E); gfx_x = cx + 20 * sc; gfx_y = cy + 100 * sc; gfx_drawstr("Click anywhere to close.");
+  );
+);
+// ---------- editable names (summing-mixer channel strips) ----------
+// The names live in numbered strings UI_NM + i, saved by the plug-in's @serialize (file_string). Click a name box to
+// type; Enter or a click elsewhere keeps it, Escape cancels, an empty name falls back to the printed default.
+UI_NM = 900; ui_nm_ed = -1;
+function ui_namebox(cx, y, w, i, def, ink) local(x, h, inb, s, fs, tw, th) (
+  h = 14; x = cx - w * 0.5;
+  inb = mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  pressed && inb && drag_id == 0 ? (
+    ui_nm_ed >= 0 && ui_nm_ed != i ? strcpy(UI_NM + ui_nm_ed, #ui_nmed);   // switching boxes keeps the last one
+    ui_nm_ed != i ? ( ui_nm_ed = i; strcpy(#ui_nmed, UI_NM + i); );
+    drag_id = -1;
+  );
+  ui_nm_ed == i ? (
+    inb ? ui_nm_hit = 1;
+    ui_cola(ink, 0.14); gfx_rect(x * sc, y * sc, w * sc, h * sc);
+    ui_cola(ink, 0.8); gfx_rect(x * sc, y * sc, w * sc, h * sc, 0);
+    s = #ui_nmed;
+  ) : (
+    inb ? ( ui_cola(ink, 0.08); gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+    s = strlen(UI_NM + i) ? UI_NM + i : def;
+  );
+  fs = 11; gfx_setfont(7, "Arial", fs * sc, 'b'); gfx_measurestr(s, tw, th);
+  tw > (w - 4) * sc ? ( fs = max(7, fs * (w - 4) * sc / tw); gfx_setfont(7, "Arial", fs * sc, 'b'); gfx_measurestr(s, tw, th); );
+  ui_col(ink); gfx_x = cx * sc - tw * 0.5; gfx_y = (y + h * 0.5) * sc - th * 0.5; gfx_drawstr(s);
+  ui_nm_ed == i && floor(time_precise() * 2) % 2 ? ( gfx_rect(cx * sc + tw * 0.5 + 1, (y + 2) * sc, max(1, sc), (h - 4) * sc); );
+);
+// typing into the open name box (called from ui_end)
+function ui_name_keys() local(c, n) (
+  ui_nm_ed >= 0 ? (
+    loop(32,
+      c = gfx_getchar();
+      c > 0 && ui_nm_ed >= 0 ? (
+        c == 13 ? ( strcpy(UI_NM + ui_nm_ed, #ui_nmed); ui_nm_ed = -1; ) :
+        c == 27 ? ui_nm_ed = -1 :
+        c == 8 ? ( n = strlen(#ui_nmed); n > 0 ? strcpy_substr(#ui_nmed, #ui_nmed, 0, n - 1); ) :
+        c >= 32 && c < 127 && strlen(#ui_nmed) < 16 ? ( sprintf(#ui_nmc, "%c", c); strcat(#ui_nmed, #ui_nmc); );
+      );
+    );
+    pressed && !ui_nm_hit && ui_nm_ed >= 0 ? ( strcpy(UI_NM + ui_nm_ed, #ui_nmed); ui_nm_ed = -1; );
+  );
+  ui_nm_hit = 0;
+);
+
+function ui_end() ( ui_name_keys(); ui_help(); prev_down = mdown; mouse_wheel = 0; );
+
+// ---------- text ----------
+function ui_text(x, y, s) local(w, h) (
+  gfx_measurestr(s, w, h); gfx_x = x - w * 0.5; gfx_y = y; gfx_drawstr(s);
+);
+
+// title font: 16 px bold, shrunk to fit the space before the PRESETS button
+function ui_title_font(name, room) local(tw, th) (
+  gfx_setfont(1); gfx_measurestr(name, tw, th);
+  tw > room ? ( gfx_setfont(6, "Trebuchet MS", ui_fs1 * room / tw, 'b'); gfx_measurestr(name, tw, th); );
+  ui_tth = th;
+);
+
+// ---------- header with GFX brand ----------
+function ui_header(name) (
+  ui_hw ? (
+    ui_cola(0x000000, 0.3); gfx_circle(31 * sc, 23.5 * sc, 15 * sc, 1, 1);
+    ui_col(C_S0);           gfx_circle(30 * sc, 22 * sc, 15 * sc, 1, 1);
+    gfx_setfont(2); ui_col(ui_ink(C_S0)); ui_text(30 * sc, 16.5 * sc, "GFX");
+    ui_title_font(name, 80 * sc); ui_col(F_INK); gfx_x = 52 * sc; gfx_y = 22 * sc - ui_tth * 0.5; gfx_drawstr(name);
+    ui_cola(F_INK, 0.25); gfx_line(16 * sc, 44 * sc, gfx_w - 16 * sc, 44 * sc);
+  ) : (
+    ui_col(C_HDR); gfx_rect(0, 0, gfx_w, 44 * sc);
+    gfx_setfont(1);
+    ui_col(C_ACC);   gfx_x = 16 * sc; gfx_y = 13 * sc; gfx_drawstr("GFX");
+    gfx_x += 8 * sc; ui_tx = gfx_x;
+    ui_title_font(name, 128 * sc - ui_tx); ui_col(C_TITLE); gfx_x = ui_tx; gfx_y = 22 * sc - ui_tth * 0.5; gfx_drawstr(name);
+  );
+);
+
+// rounded rect drawn row by row (symmetric corners, straight edges; one pass, so safe with alpha)
+function ui_rrs(x, y, w, h, r) local(i, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  i = 0;
+  loop(r,
+    d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);
+    gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);
+    i += 1;
+  );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+
+// drop shadow for a raised button, light from the top left. Each layer is the key's outline
+// pushed one more pixel down and right: a row along the bottom joined at the corner to a column
+// up the right side. Layers fade out and never overlap (no dark spots, no gaps at the corner).
+function ui_keyshadow(x, y, w, h, r) local(n, i, al, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  n = max(floor(3 * sc), 2);
+  ui_cola(0x000000, 0.42);                                          // fill the key's rounded bottom-right
+  i = 0;                                                            // corner (same rows as ui_rrs trims)
+  loop(r,
+    d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    ins > 0 ? gfx_rect(x + w - ins, y + h - 1 - i, ins, 1);
+    i += 1;
+  );
+  i = 1;
+  loop(n,
+    al = 0.42 * (1 - (i - 1) / n);
+    ui_cola(0x000000, al);
+    gfx_rect(x + i + r, y + h + i - 1, w - r, 1);                    // bottom row, ends at the corner
+    gfx_rect(x + w + i - 1, y + i + r, 1, h - r - 1);                // right column, stops just above it
+    i += 1;
+  );
+);
+
+// ---------- 80s micro style keycap ----------
+// Sculpted key: dark side walls, smaller dished top face, cream legend. red = 1 for the warm
+// olive-brown function-key colour. led = 1 puts a caps-lock style amber LED in the top face (lit while active);
+// without an LED an active key sits pressed down with its legend in the section colour.
+// hov / dn: hovered / held. font: the gfx font slot for the legend.
+function ui_bbckey(x, y, w, h, label, active, led, red, enabled, hov, dn, font)
+  local(tw, th, k, top, side, edge, ink, tx, ty, fh, lx, ly) (
+  gfx_setfont(font); gfx_measurestr(label, tw, th);
+  k = dn ? 2 * sc : active && !led ? 1.5 * sc : 0;               // travel
+  red ? ( top = hov ? 0x77704A : 0x69633F; side = 0x47422A; edge = 0x1C1A10; ink = 0xF2ECD8; )   // warm olive-brown (micro edit keys)
+      : ( top = hov ? 0x47443F : 0x3B3935; side = 0x24221F; edge = 0x0E0D0C; ink = 0xEDE6D6; );
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  ui_keyshadow(x, y, w, h, 3 * sc);
+  ui_col(edge); ui_rrs(x, y, w, h, 3 * sc);                                         // outline
+  ui_col(ui_mix(side, 0x000000, 0.3)); ui_rrs(x + 1, y + 1, w - 2, h - 2, 3 * sc);  // front wall (darker), full width
+  ui_col(side); ui_rrs(x + 1, y + 1, w - 2, h - 3.5 * sc, 3 * sc);                   // side walls
+  fh = h - 5 * sc + k * 0.6;
+  ui_col(top); ui_rrs(x + 2.5 * sc, y + 1 * sc + k, w - 5 * sc, fh, 2.5 * sc);       // top face
+  gfx_gradrect(x + 3.5 * sc, y + 1.5 * sc + k, w - 7 * sc, fh * 0.5, 1, 1, 1, 0.09, 0, 0, 0, 0, 0, 0, 0, -0.09 / (fh * 0.5));   // dish: light at the back
+  gfx_gradrect(x + 3.5 * sc, y + 1 * sc + k + fh * 0.5, w - 7 * sc, fh * 0.5 - 1 * sc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.10 / (fh * 0.5));  // dish: shade at the front
+  ui_cola(0xFFFFFF, dn ? 0.06 : 0.16); gfx_line(x + 4 * sc, y + 1 * sc + k, x + w - 5 * sc, y + 1 * sc + k);
+  tx = x + (w - tw) * 0.5; ty = y + 1 * sc + k + (fh - th) * 0.5;
+  led ? (
+    lx = x + 8 * sc; ly = y + 1 * sc + k + fh * 0.5; tx = lx + 4 * sc + (x + w - 3 * sc - lx - 4 * sc - tw) * 0.5;   // centred right of the LED
+    ui_col(0x0A0908); gfx_circle(lx, ly, 2.8 * sc, 1, 1);
+    active && enabled ? ( ui_cola(0xFFB030, 0.3); gfx_circle(lx, ly, 5 * sc, 1, 1);
+                          ui_col(0xFFB838); gfx_circle(lx, ly, 2.1 * sc, 1, 1);
+                          ui_cola(0xFFFFFF, 0.7); gfx_circle(lx - 0.6 * sc, ly - 0.6 * sc, 0.8 * sc, 1, 1); )
+                      : ( ui_col(0x3A2A10); gfx_circle(lx, ly, 2.1 * sc, 1, 1); );
+  );
+  !led && active ? ui_cola(red ? 0xFFFFFF : ui_mix(C_KA, 0xFFFFFF, 0.35), enabled ? 1 : 0.4)
+                 : ui_cola(ink, enabled ? (led && !active ? 0.75 : 1) : 0.4);
+  gfx_x = tx; gfx_y = ty; gfx_drawstr(label);
+);
+
+// ---------- button: returns 1 when clicked ----------
+// In hardware mode, wide buttons get a jewel LED (set ui_noled = 1 before a plain push button).
+function ui_button(x, y, w, h, label, active, enabled) local(tw, th, hit, led, hov) (
+  hit = enabled && pressed && drag_id == 0 &&
+        mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+  hit ? drag_id = -1;
+  gfx_setfont(2);
+  gfx_measurestr(label, tw, th);
+  ui_hw ? (
+    // hardware look: 80s micro keycaps. Header selector keys (top strip, with an LED) are warm brown.
+    led = w >= 34 * sc && !ui_noled;
+    hov = enabled && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+    ui_bbckey(x, y, w, h, label, active, led, led && y < 44 * sc, enabled, hov, hov && mdown && drag_id == -1, 2);
+  ) : (
+    active ? ui_cola(C_KA, enabled ? 1 : 0.35) : ui_col(C_BTN);
+    gfx_rect(x, y, w, h);
+    active ? ui_col(ui_ink(C_KA)) : ui_cola(C_BTNT, enabled ? 1 : 0.35);
+    gfx_x = x + (w - tw) * 0.5; gfx_y = y + (h - th) * 0.5;
+    gfx_drawstr(label);
+  );
+  ui_noled = 0;
+  hit;
+);
+
+// ---------- clickable knob label (button look; click sets knob_lblclick) ----------
+function ui_lblbtn(cx, y, idx, s) local(tw, th, bx, by, bw, bh, hov) (
+  gfx_setfont(2); gfx_measurestr(s, tw, th);
+  bw = tw + 14 * sc; bh = th + 3 * sc; bx = cx - bw * 0.5; by = y - 1.5 * sc;
+  hov = mouse_x >= bx && mouse_x < bx + bw && mouse_y >= by && mouse_y < by + bh;
+  pressed && drag_id == 0 && hov ? ( knob_lblclick = idx; drag_id = -1; );
+  ui_hw ? ( ui_keyshadow(bx, by, bw, bh, 3 * sc);
+            hov ? ui_col(0x3A3B40) : ui_col(0x2B2C30); ui_rrs(bx, by, bw, bh, 3 * sc);
+            ui_col(0xE6E6E6); )
+        : ( hov ? ui_col(ui_mix(C_BTN, C_KA, 0.25)) : ui_col(C_BTN); ui_rrect(bx, by, bw, bh, 3 * sc);
+            ui_col(C_BTNT); );
+  gfx_x = bx + 5 * sc; gfx_y = y; gfx_drawstr(s);
+  // small switch arrows to show it can be clicked
+  gfx_triangle(bx + bw - 7 * sc, y + th * 0.5 - 3 * sc, bx + bw - 3 * sc, y + th * 0.5 - 3 * sc, bx + bw - 5 * sc, y + th * 0.5 - 0.5 * sc);
+  gfx_triangle(bx + bw - 7 * sc, y + th * 0.5 + 0.5 * sc, bx + bw - 3 * sc, y + th * 0.5 + 0.5 * sc, bx + bw - 5 * sc, y + th * 0.5 + 3 * sc);
+);
+
+// ---------- knob bound to a slider ----------
+// lg = 1 for log scaling. Set knob_step before the call for detents (Shift = free).
+// Drag vertically (Shift = fine), mouse wheel, double-click = default.
+// ---------- instrument knob styles (hardware look; set ui_kstyle in an instrument's @init) ----------
+// 1 = pointer knob (flared skirt, fin, silver cap)   2 = dial skirt (numbers turn under a fixed marker)
+// 3 = modern synth (glossy two-tone, tick ring, value arc).  Returns the radius the label sits below.
+function ui_kscale(cx, cy, rr) local(i, t, tw, th) (
+  ui_col(C_INK);
+  i = 0;
+  loop(11,
+    t = -0.75 * $pi + i / 10 * 1.5 * $pi;
+    gfx_line(cx + sin(t) * (rr + 1), cy - cos(t) * (rr + 1), cx + sin(t) * (rr + 3 * sc), cy - cos(t) * (rr + 3 * sc), 1);
+    i % 5 == 0 && !ui_kmini && !ui_knonum ? (           // ui_knonum = 1: ticks only, 2: min / max ticks only
+      gfx_setfont(4); sprintf(#ks, "%d", i); gfx_measurestr(#ks, tw, th);
+      gfx_x = cx + sin(t) * (rr + 10 * sc) - tw * 0.5; gfx_y = cy - cos(t) * (rr + 10 * sc) - th * 0.5; gfx_drawstr(#ks);
+    );
+    i += 1;
+  );
+);
+function ui_knob_inst(cx, cy, r, a1, n, act) local(rr, bc, pc, i, t, t2, k, rs, tw, th, x1, y1, x2, y2, c, sk) (
+  ui_kstyle == 1 ? (
+    // ----- pointer knob -----
+    rr = r * 0.92; sk = rr * 1.36;
+    ui_kscale(cx, cy, sk);
+    bc = ui_sec == 0 ? 0x18181A : ui_mix(C_ACC, 0x000000, 0.3);     // secondary knobs: coloured caps from the theme
+    pc = ui_ink(bc) == 0x1A1A1C ? 0x1A1A1A : 0xF4F4F4;
+    ui_cola(0x000000, 0.35); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, rr * 1.04, 1, 1);
+    gfx_triangle(cx + sin(a1) * rr * 1.32 + 1.5 * sc, cy - cos(a1) * rr * 1.32 + 2.5 * sc,
+                 cx + sin(a1 - 0.5) * rr * 0.78 + 1.5 * sc, cy - cos(a1 - 0.5) * rr * 0.78 + 2.5 * sc,
+                 cx + sin(a1 + 0.5) * rr * 0.78 + 1.5 * sc, cy - cos(a1 + 0.5) * rr * 0.78 + 2.5 * sc);
+    ui_col(ui_mix(bc, 0x000000, 0.25)); gfx_circle(cx, cy, rr, 1, 1);
+    ui_col(bc); gfx_circle(cx - 0.5 * sc, cy - 0.8 * sc, rr * 0.94, 1, 1);
+    // the fin
+    ui_col(bc);
+    gfx_triangle(cx + sin(a1) * rr * 1.32, cy - cos(a1) * rr * 1.32,
+                 cx + sin(a1 - 0.5) * rr * 0.78, cy - cos(a1 - 0.5) * rr * 0.78,
+                 cx + sin(a1 + 0.5) * rr * 0.78, cy - cos(a1 + 0.5) * rr * 0.78);
+    // raised body
+    ui_col(ui_mix(bc, 0xFFFFFF, 0.1)); gfx_circle(cx, cy, rr * 0.72, 1, 1);
+    ui_cola(0xFFFFFF, 0.12); gfx_arc(cx, cy, rr * 0.72, -1.9, -0.2, 1);
+    // spun-aluminium cap
+    ui_col(0x8E9298); gfx_circle(cx, cy, rr * 0.48, 1, 1);
+    ui_col(0xC9CCD1); gfx_circle(cx, cy, rr * 0.44, 1, 1);
+    i = 1; loop(4, ui_cola(i & 1 ? 0xFFFFFF : 0x000000, 0.12); gfx_circle(cx, cy, rr * 0.1 * i, 0, 1); i += 1; );
+    ui_cola(0xFFFFFF, 0.55); gfx_circle(cx - rr * 0.14, cy - rr * 0.16, rr * 0.1, 1, 1);
+    // pointer line down the fin
+    act ? ui_col(C_ACC) : ui_col(pc);
+    gfx_line(cx + sin(a1) * rr * 0.52, cy - cos(a1) * rr * 0.52, cx + sin(a1) * rr * 1.24, cy - cos(a1) * rr * 1.24, 1);
+    gfx_line(cx + sin(a1) * rr * 0.52 + cos(a1), cy - cos(a1) * rr * 0.52 + sin(a1),
+             cx + sin(a1) * rr * 1.24 + cos(a1), cy - cos(a1) * rr * 1.24 + sin(a1), 1);
+    sk;
+  ) : ui_kstyle == 2 ? (
+    // ----- dial skirt: the numbers turn with the knob, read under the fixed marker -----
+    rs = r * 1.32;
+    ui_cola(0x000000, 0.35); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, rs, 1, 1);
+    ui_col(0x7E8288); gfx_circle(cx, cy, rs, 1, 1);
+    ui_col(0xCFD2D6); gfx_circle(cx - 0.4 * sc, cy - 0.6 * sc, rs * 0.96, 1, 1);
+    ui_cola(0xFFFFFF, 0.25); gfx_arc(cx, cy, rs * 0.9, -2.2, -0.4, 1);
+    i = 0;
+    loop(21,
+      t = -0.75 * $pi + i / 20 * 1.5 * $pi - a1;          // absolute angle of this graduation
+      ui_col(0x2A2A2C);
+      gfx_line(cx + sin(t) * rs * (i % 2 ? 0.86 : 0.8), cy - cos(t) * rs * (i % 2 ? 0.86 : 0.8),
+               cx + sin(t) * rs * 0.94, cy - cos(t) * rs * 0.94, 1);
+      (r > 18 * sc ? i % 4 == 0 : i % 10 == 0) ? (
+        gfx_setfont(4); sprintf(#ks, "%d", i / 2); gfx_measurestr(#ks, tw, th);
+        gfx_x = cx + sin(t) * rs * 0.66 - tw * 0.5; gfx_y = cy - cos(t) * rs * 0.66 - th * 0.5; gfx_drawstr(#ks);
+      );
+      i += 1;
+    );
+    // knurled black cap with a spun top
+    ui_cola(0x000000, 0.4); gfx_circle(cx + 1 * sc, cy + 1.5 * sc, r * 0.62, 1, 1);
+    ui_col(0x141416); gfx_circle(cx, cy, r * 0.6, 1, 1);
+    i = 0; loop(28, t = i / 28 * 2 * $pi; ui_col(i & 1 ? 0x2C2C30 : 0x0A0A0B);
+      gfx_line(cx + sin(t) * r * 0.5, cy - cos(t) * r * 0.5, cx + sin(t) * r * 0.6, cy - cos(t) * r * 0.6, 1); i += 1; );
+    ui_col(0x9A9EA4); gfx_circle(cx, cy, r * 0.46, 1, 1);
+    ui_col(0xD6D9DD); gfx_circle(cx, cy, r * 0.42, 1, 1);
+    i = 1; loop(4, ui_cola(i & 1 ? 0xFFFFFF : 0x000000, 0.1); gfx_circle(cx, cy, r * 0.1 * i, 0, 1); i += 1; );
+    // fixed marker on the panel
+    act ? ui_col(C_ACC) : ui_col(C_INK);
+    gfx_triangle(cx, cy - rs - 1 * sc, cx - 3.5 * sc, cy - rs - 6 * sc, cx + 3.5 * sc, cy - rs - 6 * sc);
+    rs;
+  ) : (
+    // ----- modern synth: tick ring, value arc, glossy two-tone cap -----
+    rs = r * 1.34;
+    ui_cola(0x000000, 0.3); i = 0; ui_ssarc(cx, cy, rs + (0 + (floor(3 * sc) - 1) * 0.5), -0.75 * $pi, 0.75 * $pi, ((floor(3 * sc) - 1) * 1 + 1));
+    c = ui_mix(C_ACC, 0xFFFFFF, 0.4);
+    n > 0.001 ? (
+      ui_cola(c, 0.25); i = -1; ui_ssarc(cx, cy, rs + (-1 + (floor(5 * sc) - 1) * 0.5), -0.75 * $pi, a1, ((floor(5 * sc) - 1) * 1 + 1));
+      ui_col(c); i = 0; ui_ssarc(cx, cy, rs + (0 + (floor(3 * sc) - 1) * 0.5), -0.75 * $pi, a1, ((floor(3 * sc) - 1) * 1 + 1));
+    );
+    ui_cola(C_INK, 0.6);
+    i = 0;
+    loop(31,
+      t = -0.75 * $pi + i / 30 * 1.5 * $pi;
+      gfx_line(cx + sin(t) * r * 1.08, cy - cos(t) * r * 1.08, cx + sin(t) * r * (i % 5 ? 1.15 : 1.2), cy - cos(t) * r * (i % 5 ? 1.15 : 1.2), 1);
+      i += 1;
+    );
+    ui_cola(0x000000, 0.4); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+    ui_col(0x3A3B3F); gfx_circle(cx, cy, r, 1, 1);
+    // darker lower-right half
+    ui_col(0x141416);
+    i = 0;
+    loop(16,
+      t = -0.25 * $pi + i / 16 * $pi; t2 = -0.25 * $pi + (i + 1) / 16 * $pi;
+      gfx_triangle(cx, cy, cx + cos(t) * (r - 1), cy + sin(t) * (r - 1), cx + cos(t2) * (r - 1), cy + sin(t2) * (r - 1));
+      i += 1;
+    );
+    ui_col(0x232428); gfx_circle(cx, cy, r * 0.8, 1, 1);
+    ui_cola(0xFFFFFF, 0.08); gfx_circle(cx - r * 0.2, cy - r * 0.2, r * 0.5, 1, 1);
+    act ? ui_col(c) : ui_col(0xF2F2F2);
+    ui_ssline(cx + sin(a1) * r * 0.3, cy - cos(a1) * r * 0.3, cx + sin(a1) * r * 0.75, cy - cos(a1) * r * 0.75, 3, 1);
+    rs + 1 * sc;
+  );
+);
+
+// ---------- section knobs (hardware look, standard plugins) ----------
+// Shading is stacked circles / scanlines, lit from the top-left. u = r / 16 (spec units).
+function ui_kfill_v(cx, cy, rr, c1, c2, c3) local(i, n, y, h, t) (
+  // vertical gradient disc: c1 top, c2 middle, c3 bottom
+  ui_col(c2); gfx_circle(cx, cy, rr, 1, 1);
+  n = floor(2 * rr); i = 0;
+  loop(n,
+    y = -rr + i + 0.5; h = sqrt(max(rr * rr - y * y, 0)) - 0.6; t = (y + rr) / (2 * rr);
+    ui_col(t < 0.5 ? ui_mix(c1, c2, t * 2) : ui_mix(c2, c3, (t - 0.5) * 2));
+    h > 0 ? gfx_line(cx - h, floor(cy + y), cx + h, floor(cy + y), 1);
+    i += 1;
+  );
+);
+function ui_kfill_r(cx, cy, rr, chi, cmid, cedge) local(j, t) (
+  // radial gradient disc, highlight up and left of centre
+  j = 0;
+  loop(12,
+    t = j / 11;
+    ui_col(t < 0.6 ? ui_mix(cedge, cmid, t / 0.6) : ui_mix(cmid, chi, (t - 0.6) / 0.4));
+    gfx_circle(cx - rr * 0.24 * t, cy - rr * 0.4 * t, rr * (1 - t * 0.82), 1, 1);
+    j += 1;
+  );
+);
+function ui_kshadow(cx, cy, rr, u) local(i) (
+  i = 0;
+  loop(6, ui_cola(0x000000, 0.18 / (i + 1.5));
+    gfx_circle(cx + (1.2 + i * 0.3) * u, cy + (2 + i * 0.5) * u, rr + i * 0.6 * u, 1, 1); i += 1; );
+);
+function ui_kptr(cx, cy, a, r1, r2, w, c) local(k, nl, o, sx, sy) (
+  // pointer line of width w (px at sc = 1), with a soft shadow down-right
+  nl = max(1, w * sc);
+  sx = 0.5 * sc; sy = 0.8 * sc;
+  ui_cola(0x000000, 0.5);
+  ui_ssline(cx + sin(a) * r1 + sx, cy - cos(a) * r1 + sy, cx + sin(a) * r2 + sx, cy - cos(a) * r2 + sy, nl + 1, 0);
+  ui_col(c);
+  ui_ssline(cx + sin(a) * r1, cy - cos(a) * r1, cx + sin(a) * r2, cy - cos(a) * r2, nl, 0);
+);
+// 3a: line pointer, subtle 3D (not currently assigned to a section). ns = number of tick gaps (10, or the detent count).
+function ui_knob_3a(cx, cy, r, a1, act, ns) local(u, i, t, base, edge) (
+  u = r / 16;
+  base = C_KNOB; edge = C_KEDGE;
+  ui_cola(C_INK, 0.6);
+  i = 0;
+  loop(ns + 1,
+    t = -0.75 * $pi + i / ns * 1.5 * $pi;
+    gfx_line(cx + sin(t) * 21 * u, cy - cos(t) * 21 * u, cx + sin(t) * 24 * u, cy - cos(t) * 24 * u, 1);
+    i += 1;
+  );
+  ui_kshadow(cx, cy, 16 * u, u);
+  ui_kfill_v(cx, cy, 16.5 * u, ui_mix(edge, 0xFFFFFF, 0.3), edge, ui_mix(base, 0x000000, 0.55));
+  ui_kfill_r(cx, cy, 15 * u, ui_mix(edge, 0xFFFFFF, 0.08), base, ui_mix(base, 0x000000, 0.4));
+  ui_kptr(cx, cy, a1, 5 * u, 14 * u, 1.5, act ? C_KAH : C_PTR);
+);
+// 6a: small cap with halo, subtle 3D (DRIFT, INPUT, OUTPUT STAGE)
+function ui_knob_6a(cx, cy, r, a1, n, act) local(u, i, nw, base, edge) (
+  u = r / 16;
+  base = C_KNOB; edge = C_KEDGE;
+  // recessed well
+  nw = max(1, floor(3.5 * u)); i = 0;
+  loop(nw, ui_cola(0x000000, 0.45 * (i + 1) / nw); gfx_circle(cx, cy, 19 * u + i, 0, 1); i += 1; );
+  // halo track and value
+  nw = max(1, floor(3 * sc + 0.5));
+  ui_cola(0x000000, 0.35); i = 0;
+  ui_ssarc(cx, cy, 21 * u + (0 + (floor(nw) - 1) * 0.5) - nw * 0.5, -0.75 * $pi, 0.75 * $pi, ((floor(nw) - 1) * 1 + 1));
+  n > 0.001 ? (
+    ui_cola(C_INK, act ? 0.9 : 0.6); i = 0;      // print colour: the panel face is already the section colour
+    ui_ssarc(cx, cy, 21 * u + (0 + (floor(nw) - 1) * 0.5) - nw * 0.5, -0.75 * $pi, a1, ((floor(nw) - 1) * 1 + 1));
+  );
+  ui_kshadow(cx, cy, 14 * u, u);
+  ui_kfill_v(cx, cy, 14.5 * u, ui_mix(edge, 0xFFFFFF, 0.3), edge, ui_mix(base, 0x000000, 0.55));
+  ui_kfill_v(cx, cy, 13.2 * u, ui_mix(base, edge, 0.6), base, ui_mix(base, 0x000000, 0.12));
+  ui_kptr(cx, cy, a1, 7 * u, 12.5 * u, 2, act ? C_KAH : C_KA);
+);
+// ---------- section knobs (flat look): same shapes as 3a / 6a, no shading ----------
+function ui_kline(cx, cy, a, r1, r2, w, c) local(k, nl, o) (
+  nl = max(1, floor(w * sc + 0.5));
+  ui_col(c); k = 0;
+  loop(nl, o = k - (nl - 1) * 0.5;
+    gfx_line(cx + sin(a) * r1 + o * cos(a), cy - cos(a) * r1 + o * sin(a),
+             cx + sin(a) * r2 + o * cos(a), cy - cos(a) * r2 + o * sin(a), 1); k += 1; );
+);
+function ui_knob_3a_flat(cx, cy, r, a1, act, ns) local(u, i, t) (
+  u = r / 16;
+  ui_col(C_DIM);
+  i = 0;
+  loop(ns + 1,
+    t = -0.75 * $pi + i / ns * 1.5 * $pi;
+    gfx_line(cx + sin(t) * 21 * u, cy - cos(t) * 21 * u, cx + sin(t) * 24 * u, cy - cos(t) * 24 * u, 1);
+    i += 1;
+  );
+  ui_col(C_KNOB); gfx_circle(cx, cy, 16.5 * u, 1, 1);
+  ui_col(C_KEDGE); gfx_circle(cx, cy, 16.5 * u, 0, 1);
+  ui_kline(cx, cy, a1, 5 * u, 14 * u, 1.5, act ? C_KAH : C_PTR);
+);
+function ui_knob_6a_flat(cx, cy, r, a1, n, act) local(u, i, nw) (
+  u = r / 16;
+  nw = max(1, floor(3 * sc + 0.5));
+  ui_col(C_DIM); i = 0;
+  ui_ssarc(cx, cy, 21 * u + (0 + (floor(nw) - 1) * 0.5) - nw * 0.5, -0.75 * $pi, 0.75 * $pi, ((floor(nw) - 1) * 1 + 1));
+  n > 0.001 ? (
+    act ? ui_col(C_KAH) : ui_col(C_KA); i = 0;
+    ui_ssarc(cx, cy, 21 * u + (0 + (floor(nw) - 1) * 0.5) - nw * 0.5, -0.75 * $pi, a1, ((floor(nw) - 1) * 1 + 1));
+  );
+  ui_col(C_KNOB); gfx_circle(cx, cy, 14.5 * u, 1, 1);
+  ui_col(C_KEDGE); gfx_circle(cx, cy, 14.5 * u, 0, 1);
+  ui_kline(cx, cy, a1, 7 * u, 12.5 * u, 2, act ? C_KAH : C_KA);
+);
+
+// ---------- main knob: machined ring (hardware look) ----------
+// Dark turned cap with a stepped inner disc. rc = value-ring colour, pc = pointer colour
+// ns = detent count (0 = plain tick scale with a centre "5").
+function ui_knob_main(cx, cy, r, a1, n, act, ns, rc, pc) local(u, i, t, tw, th, nw, k) (
+  u = r / 21;
+  ui_col(C_INK);
+  k = ns > 0 ? ns : 10; i = 0;
+  loop(k + 1,
+    t = -0.75 * $pi + i / k * 1.5 * $pi;
+    ui_knonum < 2 || i == 0 || i == k ?                // ui_knonum = 2: only the min and max ticks
+      gfx_line(cx + sin(t) * 26.5 * u, cy - cos(t) * 26.5 * u, cx + sin(t) * 29 * u, cy - cos(t) * 29 * u, 1);
+    ns == 0 && i == 5 && !ui_knonum ? (
+      gfx_setfont(4); sprintf(#ks, "%d", i); gfx_measurestr(#ks, tw, th);
+      gfx_x = cx + sin(t) * 34 * u - tw * 0.5; gfx_y = cy - cos(t) * 34 * u - th * 0.5; gfx_drawstr(#ks);
+    );
+    i += 1;
+  );
+  // value ring
+  nw = max(1, floor(3 * sc + 0.5));
+  ui_cola(0x000000, 0.35); i = 0;
+  ui_ssarc(cx, cy, 24 * u + (0 + (floor(nw) - 1) * 0.5) - nw * 0.5, -0.75 * $pi, 0.75 * $pi, ((floor(nw) - 1) * 1 + 1));
+  n > 0.001 ? (
+    ui_cola(rc, act ? 0.9 : 0.6); i = 0;
+    ui_ssarc(cx, cy, 24 * u + (0 + (floor(nw) - 1) * 0.5) - nw * 0.5, -0.75 * $pi, a1, ((floor(nw) - 1) * 1 + 1));
+  );
+  // cap: outer ring, recessed step, inner disc
+  ui_kshadow(cx, cy, 20 * u, u);
+  ui_kfill_v(cx, cy, 21.5 * u, 0x5A5E66, 0x2A2C31, 0x0E0F11);
+  ui_kfill_r(cx, cy, 20 * u, 0x3C3F45, 0x25272B, 0x16171A);
+  ui_kfill_v(cx, cy, 14 * u, 0x0C0D0F, 0x3A3D43, 0x6A6E76);
+  ui_kfill_v(cx, cy, 13 * u, 0x43474E, 0x31343A, 0x1F2125);
+  ui_cola(0xFFFFFF, 0.06); gfx_circle(cx - 3 * u, cy - 5 * u, 5 * u, 1, 1);
+  ui_kptr(cx, cy, a1, 8 * u, 18.5 * u, 2, pc);
+);
+// ---------- main knob: machined ring (flat look) ----------
+function ui_knob_main_flat(cx, cy, r, a1, n, act, ns, rc, pc) local(i, t, nw) (
+  ns > 0 ? (
+    ui_col(C_DIM); i = 0;
+    loop(ns + 1,
+      t = -0.75 * $pi + i / ns * 1.5 * $pi;
+      gfx_line(cx + sin(t) * (r + 9 * sc), cy - cos(t) * (r + 9 * sc), cx + sin(t) * (r + 11 * sc), cy - cos(t) * (r + 11 * sc), 1);
+      i += 1;
+    );
+  );
+  nw = max(1, floor(3 * sc + 0.5));
+  ui_col(C_DIM); i = 0;
+  ui_ssarc(cx, cy, r + 4 * sc + (0 + (floor(nw) - 1) * 0.5), -0.75 * $pi, 0.75 * $pi, ((floor(nw) - 1) * 1 + 1));
+  n > 0.001 ? (
+    ui_col(rc); i = 0;
+    ui_ssarc(cx, cy, r + 4 * sc + (0 + (floor(nw) - 1) * 0.5), -0.75 * $pi, a1, ((floor(nw) - 1) * 1 + 1));
+  );
+  ui_col(C_KNOB); gfx_circle(cx, cy, r, 1, 1);
+  ui_col(C_KEDGE); gfx_circle(cx, cy, r, 0, 1);
+  ui_col(ui_mix(C_KNOB, C_KEDGE, 0.5)); gfx_circle(cx, cy, r * 0.62, 1, 1);
+  ui_col(C_KEDGE); gfx_circle(cx, cy, r * 0.62, 0, 1);
+  ui_kline(cx, cy, a1, r * 0.38, r * 0.88, 2, pc);
+);
+
+
+// a keycap button in a given box (80s micro style, as ui_button in hardware mode).
+// toggle = 1 adds a caps-lock style LED at the left that lights while active. Returns 1 when clicked.
+// In the flat look (ui_hw = 0) it draws as a flat button instead.
+function ui_keycap(x, y, w, h, label, active, toggle) local(hov, hit, tw, th) (
+  hov = mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+  hit = pressed && drag_id == 0 && hov; hit ? drag_id = -1;
+  ui_hw ? (
+    ui_bbckey(x, y, w, h, label, toggle ? active : 0, toggle, 0, 1, hov, hov && mdown && drag_id == -1, 4);
+  ) : (
+    toggle && active ? ui_col(C_KA) : ui_col(C_BTN);
+    gfx_rect(x, y, w, h);
+    gfx_setfont(4); gfx_measurestr(label, tw, th);
+    toggle && active ? ui_col(ui_ink(C_KA)) : ui_col(C_BTNT);
+    gfx_x = x + (w - tw) * 0.5; gfx_y = y + (h - th) * 0.5; gfx_drawstr(label);
+  );
+  hit;
+);
+
+// a keycap label button (used under the filter knobs; 80s micro style in hardware mode); sets knob_lblclick
+function ui_lblbtn3d(cx, y, idx, s) local(tw, th, bx, by, bw, bh, hov) (
+  !ui_hw ? ui_lblbtn(cx, y, idx, s) : (                    // flat look: the plain label button
+  gfx_setfont(4); gfx_measurestr(s, tw, th);
+  bw = tw + 16 * sc; bh = th + 9 * sc; bx = cx - bw * 0.5; by = y - 3 * sc;
+  hov = mouse_x >= bx && mouse_x < bx + bw && mouse_y >= by && mouse_y < by + bh;
+  pressed && drag_id == 0 && hov ? ( knob_lblclick = idx; drag_id = -1; );
+  ui_bbckey(bx, by, bw, bh, s, 0, 0, 0, 1, hov, hov && mdown && drag_id == -1, 4);
+  );
+);
+
+// ---------- coloured-cap knob (set ui_kcap = cap colour before ui_knob; 0 = off) ----------
+// small console knob: a ring of dot ticks, a silver skirt, a coloured cap with a light from the top left,
+// white pointer. Returns the radius the label sits below.
+function ui_knob_cap(cx, cy, r, a1, act, cap) local(i, t, rc, ca, sa) (
+  ui_cola(C_INK, 0.75); i = 0;
+  loop(11, t = -0.75 * $pi + i / 10 * 1.5 * $pi;
+    gfx_circle(cx + sin(t) * (r + 6 * sc), cy - cos(t) * (r + 6 * sc), (i == 0 || i == 5 || i == 10 ? 1.4 : 1) * sc, 1, 1); i += 1; );
+  ui_cola(0x000000, 0.45); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);           // shadow
+  ui_col(0x8E9298); gfx_circle(cx, cy, r, 1, 1);                                           // silver skirt
+  ui_col(0xD2D5DA); gfx_circle(cx - 0.6 * sc, cy - 0.6 * sc, r - 1 * sc, 1, 1);
+  ui_col(0xA9ADB3); gfx_circle(cx, cy, r - 2.2 * sc, 1, 1);
+  rc = r * 0.74;                                                                          // the cap
+  ui_col(ui_mix(cap, 0x000000, 0.35)); gfx_circle(cx, cy, rc, 1, 1);
+  ui_col(cap); gfx_circle(cx - 0.5 * sc, cy - 0.5 * sc, rc - 0.8 * sc, 1, 1);
+  ui_cola(0xFFFFFF, act ? 0.32 : 0.22); gfx_circle(cx - rc * 0.3, cy - rc * 0.32, rc * 0.42, 1, 1);
+  ca = sin(a1); sa = -cos(a1);
+  ui_col(0xF6F6F4); i = -1;
+  ui_ssline(cx + ca * rc * 0.1, cy + sa * rc * 0.1, cx + ca * r * 0.98, cy + sa * r * 0.98, 2.4 * sc, 1);
+  r + 4 * sc;
+);
+
+// ---------- filter knob: small knurled HPF / LPF knob (set ui_kfilter = 1 HPF / 2 LPF before ui_knob) ----------
+// knurled black skirt; HPF: yellow cap, black pointer (house style: HPF caps are always yellow); LPF: black cap, yellow pointer.
+// Optional printed range at the two ends of the travel: put the texts in #kf_lo / #kf_hi.
+function ui_knob_filter(cx, cy, r, a1, act, kind) local(i, t, cap, ptr, rr) (
+  cap = kind == 1 ? 0xF2C21B : 0x141416; ptr = kind == 1 ? 0x141416 : 0xF2C21B;
+  ui_cola(0x000000, 0.4); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+  ui_col(0x0E0E10); gfx_circle(cx, cy, r, 1, 1);                       // knurled skirt
+  i = 0; loop(28, t = i / 28 * 2 * $pi; ui_cola(0xFFFFFF, i % 2 ? 0.05 : 0.16);
+    gfx_line(cx + sin(t) * r * 0.82, cy - cos(t) * r * 0.82, cx + sin(t) * r, cy - cos(t) * r, 1); i += 1; );
+  rr = r * 0.74;
+  ui_col(ui_mix(cap, 0x000000, 0.35)); gfx_circle(cx, cy, rr + 1 * sc, 1, 1);
+  ui_col(cap); gfx_circle(cx, cy, rr, 1, 1);                               // cap
+  ui_cola(0xFFFFFF, kind == 1 ? 0.28 : 0.10); gfx_circle(cx - rr * 0.3, cy - rr * 0.35, rr * 0.45, 1, 1);
+  ui_col(cap); gfx_circle(cx + rr * 0.05, cy + rr * 0.1, rr * 0.62, 1, 1);
+  ui_kline(cx, cy, a1, rr * 0.15, r * 0.98, 2.2, ptr);                     // pointer
+  act ? ( ui_cola(0xFFFFFF, 0.12); gfx_circle(cx, cy, r + 2 * sc, 0, 1); );
+  // the printed range
+  gfx_setfont(4); ui_cola(C_INK, 0.75);
+  strlen(#kf_lo) ? ( gfx_measurestr(#kf_lo, t, i); gfx_x = cx - r * 0.86 - t; gfx_y = cy + r * 0.85; gfx_drawstr(#kf_lo); );
+  strlen(#kf_hi) ? ( gfx_x = cx + r * 0.86; gfx_y = cy + r * 0.85; gfx_drawstr(#kf_hi); );
+  r * 1.05;
+);
+
+ui_flatk = 0.8;   // flat-look knob size relative to the hardware knob
+function ui_knob(cx, cy, idx, vmin, vmax, vdef, lg, label, fmt)
+  local(r, rf, v, n, a1, dx, dy, hover, i, act, t, ns, skr, tw, th) (
+  r = ui_kmini ? 11 * sc : (ui_hw && ui_sec != 0 ? (ui_sec == 2 ? 18 : 16) : 21) * sc;
+  ui_kfilter ? r = 14 * sc;
+  ui_kcap ? r = 13 * sc;
+  v = slider(idx);
+  dx = mouse_x - cx; dy = mouse_y - cy;
+  hover = dx * dx + dy * dy <= (r + 6 * sc) * (r + 6 * sc);
+
+  pressed && hover ? (
+    time_precise() - lastclick_t < 0.35 && lastclick_id == idx ? (
+      slider(idx) = vdef; ui_auto(idx);
+      push_t = 0;
+      drag_id = -1; lastclick_t = 0;
+    ) : (
+      drag_id = idx; drag_y = mouse_y; drag_y0 = mouse_y; drag_moved = 0;
+      drag_n = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+      lastclick_t = time_precise(); lastclick_id = idx;
+    );
+  );
+
+  // a press only starts changing the value once the mouse has moved a few pixels
+  drag_id == idx && !drag_moved && abs(mouse_y - drag_y0) > 3 * sc ? ( drag_moved = 1; drag_y = mouse_y; );
+  // a push knob's switch is toggled by the GUARD LED button, not by clicking the knob
+  knob_push > 0 ? ui_guard_idx = knob_push;
+
+  drag_id == idx && drag_moved ? (
+    drag_n += (drag_y - mouse_y) / (((mouse_cap & 8) ? 1000 : 200) * sc);
+    drag_n = min(max(drag_n, 0), 1);
+    drag_y = mouse_y;
+    v = lg ? vmin * (vmax / vmin) ^ drag_n : vmin + drag_n * (vmax - vmin);
+    knob_step > 0 && !(mouse_cap & 8) ? v = vmin + floor((v - vmin) / knob_step + 0.5) * knob_step;
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+
+  hover && mouse_wheel != 0 && drag_id == 0 ? (
+    knob_step > 0 && !(mouse_cap & 8) ? (
+      v = vmin + (floor((v - vmin) / knob_step + 0.5) + sign(mouse_wheel)) * knob_step;
+      v = min(max(v, vmin), vmax);
+    ) : (
+      n = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+      n = min(max(n + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.03), 0), 1);
+      v = lg ? vmin * (vmax / vmin) ^ n : vmin + n * (vmax - vmin);
+    );
+    slider(idx) = v; ui_auto(idx);
+    mouse_wheel = 0;
+  );
+
+  v = slider(idx);
+  n = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  a1 = -0.75 * $pi + n * 1.5 * $pi;
+  act = hover || drag_id == idx;
+
+  ui_hw ? (
+  // ---------- hardware knob ----------
+  ui_kcap ? ( skr = ui_knob_cap(cx, cy, r, a1, act, ui_kcap); ) :
+  ui_kfilter > 0 ? ( skr = ui_knob_filter(cx, cy, r, a1, act, ui_kfilter); ) :
+  ui_kstyle > 0 ? ( skr = ui_knob_inst(cx, cy, r, a1, n, act); ) : (
+  skr = r * 1.15;
+  ui_sec == 0 ? (
+    ui_knob_main(cx, cy, r, a1, n, act, knob_step > 0 ? floor((vmax - vmin) / knob_step + 0.5) : 0,
+                 C_INK, act ? 0xFFFFFF : 0xE4E4E6);
+  ) : ui_sec == 2 ? (
+    ui_knob_main(cx, cy, r, a1, n, act, knob_step > 0 ? floor((vmax - vmin) / knob_step + 0.5) : 0,
+                 C_INK, act ? 0xFFFFFF : 0xE4E4E6);
+  ) : (
+    ui_knob_6a(cx, cy, r, a1, n, act);
+  );
+  );
+  // label below (shows the value while touched)
+  ui_kmini ? (
+    act ? ( gfx_setfont(4); ui_col(C_INK); sprintf(#kv, fmt, v); ui_text(cx, cy + skr + 1 * sc, #kv); );
+  ) : (
+  gfx_setfont(2); ui_col(C_INK);
+  act ? sprintf(#kv, fmt, v) : strcpy(#kv, label);
+  knob_lblbtn ? ( ui_kfilter ? ui_lblbtn3d(cx, cy + skr + 14 * sc, idx, #kv) : ui_lblbtn(cx, cy + skr + 6 * sc, idx, #kv); ) : ui_text(cx, cy + skr + 6 * sc, #kv);
+  );
+  ) : (
+  // ---------- flat knob (drawn a size smaller than its footprint; label and value keep their places) ----------
+  rf = ui_kmini || ui_kcap || ui_kfilter ? r : r * ui_flatk;
+  ui_kfilter > 0 ? ( ui_knob_filter(cx, cy, rf, a1, act, ui_kfilter); ) :   // filter knobs keep their caps in the flat look too
+  ui_sec == 2 ? (
+    ui_knob_main_flat(cx, cy, rf, a1, n, act, knob_step > 0 ? floor((vmax - vmin) / knob_step + 0.5) : 0,
+                      act ? C_KAH : C_KA, act ? C_KAH : C_PTR);
+  ) : ui_sec > 0 ? (
+    ui_knob_6a_flat(cx, cy, rf, a1, n, act);
+  ) : (
+    ui_knob_main_flat(cx, cy, rf, a1, n, act, knob_step > 0 ? floor((vmax - vmin) / knob_step + 0.5) : 0,
+                      act ? C_KAH : C_KA, act ? C_KAH : C_PTR);
+  );
+
+  ui_kmini ? (
+    act ? ( gfx_setfont(4); ui_col(C_VALUE); sprintf(#kv, fmt, v); ui_text(cx, cy + r + 6 * sc, #kv); );
+  ) : (
+  gfx_setfont(2); ui_col(C_LABEL);
+  knob_lblbtn ? ui_lblbtn(cx, cy - rf - 23 * sc, idx, label) : ui_text(cx, cy - rf - 23 * sc, label);
+  (!ui_hovval || act) ? ( gfx_setfont(3); ui_col(C_VALUE); sprintf(#kv, fmt, v); ui_text(cx, cy + rf + 10 * sc, #kv); );   // ui_hovval = 1: value on hover only
+  );
+  );
+  knob_step = 0; knob_push = 0; knob_lblbtn = 0; ui_kfilter = 0; ui_kcap = 0; strcpy(#kf_lo, ""); strcpy(#kf_hi, "");
+);
+
+// ---------- peak meter (vertical) ----------
+function ui_meter(x, y, w, h, pk) local(lvdb, f) (
+  ui_col(C_HDR); gfx_rect(x, y, w, h);
+  lvdb = pk > 0.000001 ? 20 * log10(pk) : -120;
+  f = min(max((lvdb + 60) / 66, 0), 1);
+  pk > 1 ? ui_col(C_CLIP) : ui_col(C_MET);
+  gfx_rect(x, y + h * (1 - f), w, h * f);
+);
+
+// ---------- theme swatches (9 across, 12 px pitch = 108 px wide) ----------
+// theme: a swatch of the current theme; click it for a drop-down menu (current theme ticked)
+function ui_theme_picker(x, y) local(i, sel, by) (
+  by = 10 * sc;
+  ui_col(ui_hw ? F_INK : C_TITLE); gfx_rect(x, by + 3 * sc, 18 * sc, 18 * sc);
+  ui_col(C_BG);  gfx_rect(x + 1.5 * sc, by + 4.5 * sc, 15 * sc, 15 * sc);
+  ui_col(C_ACC); gfx_rect(x + 6 * sc, by + 9 * sc, 6 * sc, 6 * sc);
+  sel = 0;
+  pressed && drag_id == 0 && mouse_x >= x - 2 * sc && mouse_x < x + 20 * sc &&
+    mouse_y >= by && mouse_y < by + 24 * sc ? ( sel = 1; drag_id = -1; );
+  sel ? (
+    #tm = "";
+    i = 0;
+    loop(19,
+      i > 0 ? strcat(#tm, "|");
+      ui_thm == i ? strcat(#tm, "!");
+      strcat(#tm, i == 0 ? "Amber" : i == 1 ? "Ice" : i == 2 ? "Studio" : i == 3 ? "Vintage" : i == 4 ? "Neon" :
+                  i == 5 ? "Graphite" : i == 6 ? "Bordeaux" : i == 7 ? "Saffron" : i == 8 ? "Petrol" :
+                  i == 9 ? "Walnut" : i == 10 ? "Tolex" : i == 11 ? "Velvet" : i == 12 ? "Olive" :
+                  i == 13 ? "Frost" : i == 14 ? "Slate" : i == 15 ? "Ember" : i == 16 ? "Honey" : i == 17 ? "Mint" : "Blossom");
+      i += 1;
+    );
+    gfx_x = x + ui_mdx; gfx_y = by + 24 * sc + ui_mdy;   // (ui_mdx / ui_mdy: a combo's offset for the unit)
+    i = gfx_showmenu(#tm);
+    i > 0 ? ui_thm = i - 1;
+  );
+  ui_theme(ui_thm);
+);
+// S / M / L panel size, and a ? key that opens the pop-up (design credit, website, manual) - same footprint as before
+function ui_size_picker(x, y) (
+  ui_button(x,           y, 13 * sc, 18 * sc, "S", ui_sz == 1, 1) ? ui_sz = 1;
+  ui_button(x + 14 * sc, y, 13 * sc, 18 * sc, "M", ui_sz == 0, 1) ? ui_sz = 0;
+  ui_button(x + 28 * sc, y, 13 * sc, 18 * sc, "L", ui_sz == 2, 1) ? ui_sz = 2;
+  ui_button(x + 42 * sc, y, 13 * sc, 18 * sc, "?", ui_help_open, 1) ? ( ui_help_open = 1; ui_help_new = 1; );
+);
+
+// ---------- section group panel (Mutation-style), stacked title on the left ----------
+function ui_group(x, y, w, h, sec, title) local(n, i, cy0, lw, lh, ch, rad) (
+  ui_section(sec);
+  ui_hw ? (
+    rad = 5 * sc;
+    // soft drop shadow, down and to the right
+    ui_cola(0x000000, 0.16); ui_rrect(x + 2 * sc, y + 3 * sc, w + 1 * sc, h + 1 * sc, rad);
+    ui_cola(0x000000, 0.25); ui_rrect(x + 1 * sc, y + 2 * sc, w, h, rad);
+    // edges: dark rim bottom / right, light rim top / left, then the face
+    ui_col(ui_mix(C_KA, 0x000000, 0.45)); ui_rrect(x, y, w, h, rad);
+    ui_col(ui_mix(C_KA, 0xFFFFFF, 0.35)); ui_rrect(x, y, w - 2 * sc, h - 2 * sc, rad);
+    ui_col(C_KA);                          ui_rrect(x + 1.5 * sc, y + 1.5 * sc, w - 3.5 * sc, h - 3.5 * sc, rad);
+    // light from the top left + soft vignette towards the edges
+    gfx_gradrect(x + 2 * sc, y + 2 * sc, w - 4 * sc, h * 0.45, 1, 1, 1, 0.1, 0, 0, 0, 0, 0, 0, 0, -0.1 / (h * 0.45));
+    gfx_gradrect(x + 2 * sc, y + h * 0.5, w - 4 * sc, h * 0.5 - 2 * sc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.16 / (h * 0.5));
+    gfx_gradrect(x + w * 0.75, y + 2 * sc, w * 0.25 - 2 * sc, h - 4 * sc, 0, 0, 0, 0, 0, 0, 0, 0.12 / (w * 0.25), 0, 0, 0, 0);
+    gfx_gradrect(x + 2 * sc, y + 2 * sc, 14 * sc, h - 4 * sc, 0, 0, 0, 0.07, 0, 0, 0, -0.07 / (14 * sc), 0, 0, 0, 0);
+    C_INK = ui_ink(C_KA);
+    strlen(title) ? ( ui_cola(C_INK, 0.2); gfx_line(x + 21 * sc, y + 8 * sc, x + 21 * sc, y + h - 8 * sc); );   // "" = no title strip
+    ui_cola(C_INK, 0.85);
+  ) : (
+    ui_col(C_HDR); ui_rrect(x, y, w, h, 5 * sc);
+    ui_col(C_KA);  gfx_rect(x, y + 8 * sc, 3 * sc, h - 16 * sc);
+    C_INK = C_LABEL;
+    strlen(title) ? ( ui_col(C_DIM); gfx_line(x + 21 * sc, y + 8 * sc, x + 21 * sc, y + h - 8 * sc); );
+    ui_col(C_KA);
+  );
+  gfx_setfont(5);
+  n = strlen(title);
+  cy0 = y + (h - n * 11 * sc) * 0.5;
+  i = 0;
+  loop(n,
+    ch = str_getchar(title, i);
+    gfx_measurechar(ch, lw, lh);
+    gfx_x = x + 11 * sc - lw * 0.5; gfx_y = cy0 + i * 11 * sc;
+    gfx_drawchar(ch);
+    i += 1;
+  );
+);
+
+// ---------- inset display window; sets C_SG (grid) and C_ST (text) for its contents ----------
+function ui_screen(x, y, w, h) (
+  ui_hw ? (
+    ui_cola(0x000000, 0.4); ui_rrect(x + 1, y + 2, w, h, 6 * sc);
+    ui_col(0x0E0E10);       ui_rrect(x, y, w, h, 6 * sc);
+    ui_col(0x080B09);       gfx_rect(x + 5 * sc, y + 5 * sc, w - 10 * sc, h - 10 * sc);
+    gfx_gradrect(x + 5 * sc, y + 5 * sc, w - 10 * sc, (h - 10 * sc) * 0.5,
+                 1, 1, 1, 0.05, 0, 0, 0, 0, 0, 0, 0, -0.05 / ((h - 10 * sc) * 0.5));
+    C_SG = 0x24302A; C_ST = 0x7E8F86;
+  ) : (
+    ui_col(C_HDR); gfx_rect(x, y, w, h);
+    C_SG = C_DIM; C_ST = C_STXT;
+  );
+);
+
+// ---------- analogue VU needle meter (0 VU = vdb 0) ----------
+function ui_vu_ang(vudb) local(v) (
+  v = 10 ^ (vudb / 20);
+  -0.8 + 1.6 * (v - 0.1) / (1.4125 - 0.1);
+);
+function ui_vu(x, y, w, h, vdb, title) instance(pos, vel, lt)
+  local(dt, tgt, fx, fy, fw, fh, cx, py, rr, i, lvl_db, ang, ink) (
+  dt = min(max(time_precise() - lt, 0.001), 0.05); lt = time_precise();
+  tgt = min(max(ui_vu_ang(min(max(vdb, -40), 6)), -0.9), 0.9);
+  vel += (160 * (tgt - pos) - 18 * vel) * dt;
+  pos += vel * dt;
+  pos = min(max(pos, -0.95), 0.95);
+
+  fx = x + 6 * sc; fy = y + 6 * sc; fw = w - 12 * sc; fh = h - 12 * sc;
+  ui_hw ? (
+    ui_cola(0x000000, 0.4); ui_rrect(x + 1, y + 2, w, h, 6 * sc);
+    ui_col(0x0E0E10);       ui_rrect(x, y, w, h, 6 * sc);
+    ui_col(0xEFE6C4);       gfx_rect(fx, fy, fw, fh);
+    gfx_gradrect(fx, fy + fh * 0.5, fw, fh * 0.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.12 / (fh * 0.5));
+    ink = 0x2A2620;
+  ) : (
+    ui_col(C_HDR); gfx_rect(x, y, w, h);
+    ink = C_STXT;
+  );
+  cx = fx + fw * 0.5; py = fy + fh * 1.25; rr = fh;
+
+  // scale arc and red zone
+  ui_col(ink);
+  gfx_arc(cx, py, rr * 0.86, ui_vu_ang(-20), ui_vu_ang(0), 1);
+  ui_hw ? ui_col(0xC0392B) : ui_col(C_CLIP);
+  i = 0;
+  ui_ssarc(cx, py, rr * 0.86 + (0 + (floor(3 * sc) - 1) * 0.5), ui_vu_ang(0), ui_vu_ang(3), ((floor(3 * sc) - 1) * 1 + 1));
+  gfx_setfont(4);
+  i = 0;
+  loop(11,
+    lvl_db = i == 0 ? -20 : i == 1 ? -10 : i == 2 ? -7 : i == 3 ? -5 : i == 4 ? -3 : i == 5 ? -2 :
+         i == 6 ? -1 : i == 7 ? 0 : i == 8 ? 1 : i == 9 ? 2 : 3;
+    ang = ui_vu_ang(lvl_db);
+    lvl_db > 0 ? ( ui_hw ? ui_col(0xC0392B) : ui_col(C_CLIP); ) : ui_col(ink);
+    gfx_line(cx + sin(ang) * rr * 0.86, py - cos(ang) * rr * 0.86,
+             cx + sin(ang) * rr * 0.93, py - cos(ang) * rr * 0.93, 1);
+    (i == 0 || i == 1 || i == 2 || i == 3 || i == 4 || i == 7 || i == 10) ? (
+      sprintf(#vs, "%d", abs(lvl_db));
+      ui_text(cx + sin(ang) * rr * 1.03, py - cos(ang) * rr * 1.03 - 4 * sc, #vs);
+    );
+    i += 1;
+  );
+  ui_col(ink);
+  gfx_setfont(2); ui_text(cx, fy + fh * 0.5, "VU");
+  gfx_setfont(4); gfx_x = fx + 4 * sc; gfx_y = fy + fh - 11 * sc; gfx_drawstr(title);
+
+  // needle
+  ui_hw ? ui_cola(0x000000, 0.18) : ui_cola(0x000000, 0);
+  gfx_line(cx + 2 * sc + sin(pos) * rr * 0.3, py - cos(pos) * rr * 0.3 + 2 * sc,
+           cx + 2 * sc + sin(pos) * rr * 0.98, py - cos(pos) * rr * 0.98 + 2 * sc, 1);
+  ui_hw ? ui_col(0x151515) : ui_col(C_VB);
+  gfx_line(cx + sin(pos) * rr * 0.3, py - cos(pos) * rr * 0.3,
+           cx + sin(pos) * rr * 0.98, py - cos(pos) * rr * 0.98, 1);
+  gfx_line(cx + sin(pos) * rr * 0.3 + 0.8, py - cos(pos) * rr * 0.3,
+           cx + sin(pos) * rr * 0.98 + 0.8, py - cos(pos) * rr * 0.98, 1);
+  ui_hw ? ui_col(0x1A1A1C) : ui_col(C_DIM);
+  gfx_circle(cx, fy + fh, fh * 0.16, 1, 1);
+  ui_hw ? (
+    ui_cola(0xFFFFFF, 0.12); gfx_rect(fx, fy, fw, fh * 0.3);
+  );
+);
+
+// ---------- LED ladder meter with floating peak (-42..+3 dBFS, 3 dB steps) ----------
+// click any LED meter to clear the floating peak on all of them
+function ui_ledm(x, y, w, h, pk) instance(hold, ht) local(n, i, sh, lvl_db, lit, hi, sdb, c) (
+  pressed && drag_id == 0 && mouse_x >= x - 3 * sc && mouse_x < x + w + 3 * sc &&
+    mouse_y >= y && mouse_y < y + h ? ( ui_led_clr = time_precise(); drag_id = -1; );
+  ht == 0 && hold == 0 ? hold = -100;                // never set yet: start below the scale, not at 0 dB
+  ht < ui_led_clr ? ( hold = -100; ht = ui_led_clr; );
+  lvl_db = pk > 0.00001 ? 20 * log10(pk) : -100;
+  lvl_db > hold ? ( hold = lvl_db; ht = time_precise(); )
+            : ( time_precise() - ht > 1.2 ? hold = max(hold - 0.6, lvl_db); );
+  n = 15; sh = (w > h ? w : h) / n;                   // a wide slot draws left to right, a tall one bottom to top
+  ui_hw ? ( ui_col(0x0A0A0B); gfx_rect(x - 2 * sc, y - 2 * sc, w + 4 * sc, h + 4 * sc); )
+        : ( ui_col(C_HDR); gfx_rect(x, y, w, h); );
+  i = 0;
+  loop(n,
+    sdb = -42 + i * 3;
+    ui_hw ? ( c = sdb >= 0 ? 0xFF3B30 : sdb >= -9 ? 0xFFC233 : 0x3BD16F; )
+          : ( c = sdb >= 0 ? C_CLIP : C_MET; );
+    lit = lvl_db >= sdb;
+    hi = hold >= sdb && hold < sdb + 3 && hold > -42;
+    (lit || hi || ui_hw) ? (
+      (lit || hi) ? ( ui_hw ? ( ui_cola(c, 0.3);
+                              w > h ? gfx_rect(x + i * sh - 1, y - 1, sh + 1, h + 2) : gfx_rect(x - 1, y + h - (i + 1) * sh - 1, w + 2, sh + 1); );
+                     ui_col(c); ) : ui_cola(c, 0.13);
+      w > h ? gfx_rect(x + i * sh + 1, y, sh - 1, h) : gfx_rect(x, y + h - (i + 1) * sh + 1, w, sh - 1);
+    );
+    i += 1;
+  );
+);
+
+// ---------- GUARD warning badge: pops up beside the TRIM knob while guard is on ----------
+// GUARD indicator: a small LED push-button cap, no text.
+// LED off = GUARD off, steady red = standing by, brighter with a glow = guarding (glow grows with grd).
+// Click it to toggle GUARD (the slider given to knob_push for the TRIM knob). Returns 1 when clicked.
+function ui_guard_tag(x, y, on, grd) local(w, h, bx, by, kt, hit, g) (
+  w = 22 * sc; h = 30 * sc;
+  hit = pressed && drag_id == 0 && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+  hit ? (
+    ui_guard_idx > 0 ? ( slider(ui_guard_idx) = 1 - slider(ui_guard_idx); slider_automate(2 ^ (ui_guard_idx - 1)); );
+    drag_id = -1;
+  );
+  bx = x + w * 0.5; by = y + h * 0.24; kt = y + h * 0.46;
+  ui_hw ? (
+    ui_keyshadow(x, y, w, h, 2 * sc);
+    ui_col(0x0E0E10); ui_rrs(x, y, w, h, 2 * sc);                            // body
+    ui_col(0x202023); gfx_rect(x + 1 * sc, y + 1 * sc, w - 2 * sc, kt - y - 1 * sc);   // LED housing
+    ui_cola(0xFFFFFF, 0.1); gfx_line(x + 2 * sc, y + 1 * sc, x + w - 3 * sc, y + 1 * sc);
+    ui_col(0x2E2E32); gfx_rect(x + 1 * sc, kt, w - 2 * sc, 1 * sc);          // chamfer edge, lit
+    ui_col(0x18181B); gfx_rect(x + 3.5 * sc, kt + 3 * sc, w - 7 * sc, y + h - kt - 6 * sc);   // key face
+    ui_cola(0xFFFFFF, 0.07); gfx_line(x + 3.5 * sc, kt + 3 * sc, x + w - 4.5 * sc, kt + 3 * sc);
+    ui_cola(0x000000, 0.5);  gfx_line(x + 3.5 * sc, y + h - 3 * sc, x + w - 4.5 * sc, y + h - 3 * sc);
+    ui_col(0x060607); gfx_circle(bx, by, 5.2 * sc, 1, 1);                    // LED bezel
+  ) : (
+    ui_col(C_BTN); ui_rrect(x, y, w, h, 3 * sc);
+    ui_col(ui_mix(C_BTN, 0x000000, 0.25)); gfx_rect(x + 3.5 * sc, kt + 3 * sc, w - 7 * sc, y + h - kt - 6 * sc);
+    ui_col(ui_mix(C_BTN, 0x000000, 0.45)); gfx_circle(bx, by, 5.2 * sc, 1, 1);
+  );
+  // the LED
+  on ? (
+    g = min(grd / 6, 1);
+    grd > 0.05 ? (
+      ui_cola(0xFF3B2E, 0.12 + 0.2 * g); gfx_circle(bx, by, (7 + 4 * g) * sc, 1, 1);
+      ui_col(0xFF3B2E);
+    ) : ui_col(0xC8231B);
+    gfx_circle(bx, by, 4.2 * sc, 1, 1);
+    ui_cola(0xFFFFFF, grd > 0.05 ? 0.8 : 0.55); gfx_circle(bx - 1.2 * sc, by - 1.3 * sc, 1.3 * sc, 1, 1);
+  ) : (
+    ui_col(0x4A1612); gfx_circle(bx, by, 4.2 * sc, 1, 1);
+    ui_cola(0xFFFFFF, 0.2); gfx_circle(bx - 1.2 * sc, by - 1.3 * sc, 1.1 * sc, 1, 1);
+  );
+  hit;
+);
+
+// ---------- swapping two stacked units on screen (the combo plug-ins' ORDER) ----------
+// The panel is drawn as designed into an off-screen image; each unit's controls see the mouse where that unit
+// will be shown. ui_swb(): start (after ui_begin). ui_swu(d): the next controls belong to a unit shown d units
+// lower than designed (0 = in place). ui_swe(x0, x1, t0, t1, b0, b1, swap): put it on screen; with swap, the
+// bottom unit (b0..b1) goes to the top (from t0) and the top unit (t0..t1) below it, the same gap between.
+function ui_swb() (
+  (ui_sww != gfx_w || ui_swh != gfx_h) ? ( ui_sww = gfx_w; ui_swh = gfx_h; gfx_setimgdim(125, gfx_w, gfx_h); );
+  ui_swmy = mouse_y; gfx_dest = 125;
+);
+function ui_swu(d) ( mouse_y = ui_swmy - d * sc; ui_mdy = d * sc; );   // (ui_mdy: pop-up menus open where the unit is shown)
+function ui_swe(x0, x1, t0, t1, b0, b1, swap) local(X, W, T0, T1, B0, B1) (
+  mouse_y = ui_swmy; ui_mdy = 0;
+  gfx_muladdrect(0, 0, gfx_w, gfx_h, 1, 1, 1, 0, 0, 0, 0, 1);   // make the image opaque (alpha 1) so it blits solid
+  gfx_dest = -1; gfx_a = 1; gfx_mode = 0;
+  gfx_blit(125, 1, 0, 0, 0, gfx_w, gfx_h, 0, 0, gfx_w, gfx_h);
+  swap ? (
+    // whole pixels, so the bands meet without a seam
+    X = floor(x0 * sc); W = floor(x1 * sc) - X;
+    T0 = floor(t0 * sc + 0.5); T1 = floor(t1 * sc + 0.5); B0 = floor(b0 * sc + 0.5); B1 = floor(b1 * sc + 0.5);
+    gfx_blit(125, 1, 0, X, B0, W, B1 - B0, X, T0, W, B1 - B0);
+    gfx_blit(125, 1, 0, X, T1, W, B0 - T1, X, T0 + B1 - B0, W, B0 - T1);
+    gfx_blit(125, 1, 0, X, T0, W, T1 - T0, X, T0 + B1 - T1, W, T1 - T0);
+  );
+);
+// ---------- a row shown at the top, under the header (the house preset display) ----------
+// Drawn off-screen like the ORDER swap: ui_swb(), then (panels on the stock background) ui_swbg(x0, x1, t0, r0, r1).
+// The row is designed below everything, r0..r1; ui_swrow() shows it from t0 and moves t0..r0 down by r1 - r0.
+// Controls: ui_swu(t0 - r0) before the row's, ui_swu(r1 - r0) before the moved panel's, ui_swu(0) for the rest.
+// A combo with ORDER passes its pair as in ui_swe (s = 1: st0..st1 and sb0..sb1 change places).
+function ui_swbl(X, W, a, b, d) local(A, B) (
+  A = floor(a * sc + 0.5); B = floor(b * sc + 0.5);
+  B > A ? gfx_blit(125, 1, 0, X, A, W, B - A, X, A + floor((d - a) * sc + 0.5), W, B - A);
+);
+function ui_swbg(x0, x1, t0, r0, r1) local(X, W, D, A, B, C) (
+  ui_hw ? (
+    ui_hw_bg(); gfx_dest = 125; gfx_x = 0; gfx_y = 0; gfx_a = 1; gfx_mode = 0; gfx_blit(127, 1, 0);
+    // the background under the moved bands is taken from where they will be shown, so the grain runs on
+    X = floor(x0 * sc); W = floor(x1 * sc) - X; D = floor((r1 - r0) * sc + 0.5);
+    A = floor(t0 * sc + 0.5); B = floor(r0 * sc + 0.5); C = floor(r1 * sc + 0.5);
+    gfx_blit(127, 1, 0, X, A + D, W, B - A, X, A, W, B - A);
+    gfx_blit(127, 1, 0, X, A, W, C - B, X, B, W, C - B);
+    ui_screw(9 * sc, 9 * sc);          ui_screw(gfx_w - 9 * sc, 9 * sc);
+    ui_screw(9 * sc, gfx_h - 9 * sc);  ui_screw(gfx_w - 9 * sc, gfx_h - 9 * sc);
+  ) : (
+    ui_col(C_BG); gfx_rect(0, 0, gfx_w, gfx_h);
+  );
+);
+function ui_swrow(x0, x1, t0, r0, r1, s, st0, st1, sb0, sb1) local(X, W, D) (
+  mouse_y = ui_swmy; ui_mdy = 0;
+  gfx_muladdrect(0, 0, gfx_w, gfx_h, 1, 1, 1, 0, 0, 0, 0, 1);   // make the image opaque (alpha 1) so it blits solid
+  gfx_dest = -1; gfx_a = 1; gfx_mode = 0;
+  gfx_blit(125, 1, 0, 0, 0, gfx_w, gfx_h, 0, 0, gfx_w, gfx_h);
+  X = floor(x0 * sc); W = floor(x1 * sc) - X; D = r1 - r0;
+  ui_swbl(X, W, r0, r1, t0);
+  s ? (
+    ui_swbl(X, W, t0, st0, t0 + D);
+    ui_swbl(X, W, sb0, sb1, st0 + D);
+    ui_swbl(X, W, st1, sb0, st0 + D + sb1 - sb0);
+    ui_swbl(X, W, st0, st1, st0 + D + sb1 - st1);
+    ui_swbl(X, W, sb1, r0, sb1 + D);
+  ) : ui_swbl(X, W, t0, r0, t0 + D);
+);
+// the ORDER key: a momentary key whose amber LED lights while it is held; each press flips slider idx
+function ui_orderkey(x, y, w, h, idx, s0, s1, font) local(hov) (
+  hov = mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+  hov && pressed && drag_id == 0 ? ( drag_id = -1; ui_okheld = 1; slider(idx) = 1 - slider(idx); ui_auto(idx); );
+  !mdown ? ui_okheld = 0;
+  ui_bbckey(x, y, w, h, slider(idx) ? s1 : s0, ui_okheld, 1, 1, 1, hov, ui_okheld, font);
+);
+
+// ---------- GUARD on the TRIM knob: a single click on the knob switches the input guard ----------
+// Call right after drawing the knob. kid = the knob's drag id (ui_knob: its slider; dy_knob: 1600 + slider).
+// A click (press and release without moving) toggles slider iG once no second click follows (a double-click
+// still resets the knob). The LED (dark when off, red when on, bright while catching peaks) sits on the knob's
+// 45-degree diagonal, upper right: (cx, cy) = the knob's centre, ro = the outer edge of its scale markings (all
+// unscaled); the clear gap between the markings and the LED is the LED's radius times the golden ratio.
+function ui_guardclick(kid, iG, cx, cy, ro) local(on, g, d, lx, ly) (
+  d = (ro + 2.6 + 2.6 * 1.618) * 0.7071; lx = cx + d; ly = cy - d;
+  pressed ? ( ui_gcpend = 0; drag_id == kid ? ( ui_gckid = kid; ui_gcx = mouse_x; ui_gcy = mouse_y; ui_gcmv = 0; ); );
+  drag_id == kid && (abs(mouse_x - ui_gcx) > 3 * sc || abs(mouse_y - ui_gcy) > 3 * sc) ? ui_gcmv = 1;
+  released_id == kid && ui_gckid == kid && !ui_gcmv ? ( ui_gcpend = kid; ui_gct = time_precise(); ui_gckid = 0; );
+  ui_gcpend == kid && time_precise() - ui_gct > 0.33 ? ( slider(iG) = 1 - slider(iG); ui_auto(iG); ui_gcpend = 0; );
+  on = slider(iG); g = on && in_grd > 0.05; ui_gcglow = g ? 1 : ui_gcglow * 0.85; in_grd = 0;
+  ui_col(0x080808); gfx_circle(lx * sc, ly * sc, 3.6 * sc, 1, 1);
+  on ? (
+    ui_gcglow > 0.1 ? ( ui_cola(0xFF3B2E, 0.25 * ui_gcglow + 0.1); gfx_circle(lx * sc, ly * sc, 6.5 * sc, 1, 1); );
+    ui_col(ui_gcglow > 0.1 ? 0xFF5A40 : 0xD8261C);
+  ) : ui_col(0x4A1612);
+  gfx_circle(lx * sc, ly * sc, 2.6 * sc, 1, 1);
+  on ? ( ui_cola(0xFFFFFF, 0.55); gfx_circle((lx - 0.8) * sc, (ly - 0.9) * sc, 0.9 * sc, 1, 1); );
+);
+
+// ---------- house keys (formerly the OUT stage keys): small off-white keys; the selected one glows in its colour ----------
+// x, y, w, h unscaled. ui_okfs: caption size relative to font 4.
+// (The output stage itself has no keys any more: each unit's mode is fixed - see gfx-output.jsfx-inc.)
+ui_okfs = 0.85;
+function ui_okey(x, y, w, h, on, col) local(hov, hit) (
+  hov = mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = pressed && hov && drag_id == 0; hit ? drag_id = -1;
+  ui_cola(0x000000, 0.45); gfx_rect((x + 0.5) * sc, (y + 1.5) * sc, w * sc, h * sc);
+  ui_col(0x2A2824); gfx_rect(x * sc, y * sc, w * sc, h * sc);
+  on ? (
+    ui_cola(col, 0.3); gfx_rect((x - 2) * sc, (y - 2) * sc, (w + 4) * sc, (h + 4) * sc);
+    ui_col(col);
+  ) : ui_col(0xE6E1D3);
+  gfx_rect((x + 1) * sc, (y + 1) * sc, (w - 2) * sc, (h - 2) * sc);
+  ui_cola(0xFFFFFF, on ? 0.45 : 0.6); gfx_rect((x + 1) * sc, (y + 1) * sc, (w - 2) * sc, max(1, sc));
+  ui_cola(0x000000, on ? 0.18 : 0.12); gfx_rect((x + 1) * sc, (y + h - 2) * sc, (w - 2) * sc, max(1, sc));
+  hov ? ( ui_cola(0xFFFFFF, 0.12); gfx_rect((x + 1) * sc, (y + 1) * sc, (w - 2) * sc, (h - 2) * sc); );
+  hit;
+);
+function ui_keytext(cx, cy, s) local(w, h) (
+  // the line box holds descender room below the capitals, so lift by a little to centre the capitals themselves
+  gfx_measurestr(s, w, h); gfx_x = floor(cx - w * 0.5 + 0.5); gfx_y = floor(cy - h * 0.58 + 0.5); gfx_drawstr(s);
+);
+// the output stage no longer has keys: kept so older panels still compile; it draws nothing
+function ui_outkeys(x, y, w, h, gap, iM) ( gfx_setfont(8, "Trebuchet MS", ui_fs4 * ui_okfs, 'b'); ost_clipped = 0; );
+
+// ---------- FLAT / HARDWARE switch ----------
+function ui_hw_toggle(x, y) (
+  ui_button(x, y, 30 * sc, 18 * sc, "HW", ui_hw, 1) ? ( ui_hw = 1 - ui_hw; ui_bgok = 0; );
+);
+
+// ---------- state ----------
+gfx_ext_retina = 1;
+drag_id = 0; prev_down = 0; ui_mdx = 0; ui_mdy = 0; lastclick_t = 0; lastclick_id = 0; knob_step = 0;
+ui_noled = 0; ui_bgok = 0; ui_sec = 0; knob_push = 0; push_t = 0; released_id = 0;
+drag_moved = 0; drag_y0 = 0; ui_led_clr = 0; knob_lblbtn = 0; knob_lblclick = 0; ui_guard_idx = 0;
+// new instances open in Medium (saved projects restore their own size via @serialize)
+!ui_szinit ? ( ui_sz = 0; ui_szinit = 1; );
+ui_calsc = -1; ui_fs1 = 17; ui_fs2 = 12.5; ui_fs4 = 9.5; ui_fs5 = 11;
+
+// ---------- LAMP KEY (house style, Oct 2026) ----------
+// A console-style illuminated lens key, for the hardware-look faces (Benthick, BOB34, Ferrum family).
+// Flat designs keep their own flat keys.
+//   Off: a milky, darker lens with a soft vignette (darker towards the edges); dark ink legend.
+//   On : the full colour, brightening in soft steps towards the centre (the bulb behind the lens),
+//        a faint spill of light onto the panel round the well; dark ink legend.
+//   Small keys get a little extra glow (their bright centre is smaller).
+// House rules: on light (cream) faces use LK_BLU_LT instead of LK_BLU and LK_AMB instead of LK_WHT.
+//   lk_key(x, y, w, h, on, col, s) : (x, y, w, h) is the cap; the well and spill sit outside it.
+//   lk_fit(x, y, w, h, on, col, s) : (x, y, w, h) is the whole key, well included (to replace an
+//                                    older key without moving anything).
+//   both return 1 when clicked. Options, set before the call:
+//   lk_well  : the collar's colour (default 0x141518; a warm dark on cream faces)
+//   lk_oncol : a brighter lit colour for this key only (cleared after the call; LK_GRN does this itself)
+//   lk_inert : 1 = drawn but not clickable (cleared after the call)
+//   lk_font / lk_font2 : the plugin's font slots for legends on keys 26 px tall or more / smaller keys
+//                        (0 = use whatever font is current; lk_font2 0 = use lk_font)
+LK_RED = 0xD8332E; LK_YEL = 0xF2C230; LK_GRN = 0x3FA45B; LK_GRN_ON = 0x52C873; LK_BLU = 0x3D7FD6;
+LK_BLU_LT = 0x5C9AEC; LK_WHT = 0xE9E2CC; LK_AMB = 0xF2A41E; LK_ORA = 0xF08A24;
+lk_well = 0x141518; lk_font = 0; lk_font2 = 0;
+function lk_mul(c, k) (
+  min(floor(((c >> 16) & 255) * k), 255) * 65536 + min(floor(((c >> 8) & 255) * k), 255) * 256 + min(floor((c & 255) * k), 255);
+);
+function lk_rr(x, y, w, h, r) ( ui_rrs(x * sc, y * sc, w * sc, h * sc, r * sc); );
+function lk_key(x, y, w, h, on, col, s) local(hov, hit, k, lens, dn, i, t, dx, dy, ink) (
+  hov = mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = !lk_inert && pressed && hov && drag_id == 0; hit ? drag_id = -1;
+  dn = !lk_inert && hov && mdown ? 1 : 0;                  // the cap sinks a pixel while held
+  k = min(w / 54, h / 40);                                  // inset steps scale with the key's size
+  lens = lk_mul(ui_mix(col, 0xCFC9BC, 0.5), 0.76);
+  col == LK_GRN && !lk_oncol ? lk_oncol = LK_GRN_ON;
+  on && lk_oncol ? col = lk_oncol;
+  on ? lens = col;
+  // light spill onto the panel (lit only)
+  on ? (
+    ui_cola(col, 0.10); lk_rr(x - 9 * k, y - 9 * k, w + 18 * k, h + 18 * k, 10 * k);
+    ui_cola(col, 0.18); lk_rr(x - 6 * k, y - 6 * k, w + 12 * k, h + 12 * k, 8 * k);
+  );
+  // the well, then the cap's side wall
+  ui_col(lk_well); lk_rr(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k, 5 * k);
+  ui_col(lk_mul(lens, 0.55)); lk_rr(x, y + 1, w, h, 4 * k);
+  y += dn - 1;
+  on ? (
+    ui_col(lens); lk_rr(x, y, w, h - 1, 4 * k);
+    i = 1;
+    loop(4,
+      t = 0.07 * i * (1 + 0.6 * max(1 - k, 0));
+      dx = (i == 1 ? 3 : i == 2 ? 6 : i == 3 ? 10 : 14) * k; dy = (i == 1 ? 2 : i == 2 ? 4 : i == 3 ? 7 : 9) * k;
+      ui_col(ui_mix(col, 0xFFFFFF, t)); lk_rr(x + dx, y + dy, w - 2 * dx, h - 1 - 2 * dy, 4 * k);
+      i += 1;
+    );
+  ) : (
+    ui_col(lk_mul(lens, 0.62)); lk_rr(x, y, w, h - 1, 4 * k);
+    ui_col(lk_mul(lens, 0.78)); lk_rr(x + 2 * k, y + 2 * k, w - 4 * k, h - 5 * k, 4 * k);
+    ui_col(lk_mul(lens, 0.92)); lk_rr(x + 5 * k, y + 4 * k, w - 10 * k, h - 10 * k, 4 * k);
+    ui_col(lens);               lk_rr(x + 9 * k, y + 7 * k, w - 18 * k, h - 17 * k, 4 * k);
+  );
+  ui_cola(0xFFFFFF, on ? 0.45 : 0.22); gfx_rect((x + 4 * k) * sc, y * sc, (w - 8 * k) * sc, max(1, 1.5 * sc));
+  hov && !dn && !lk_inert ? ( ui_cola(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1, 4 * k); );
+  // the legend: dark ink printed on the cap
+  strlen(s) ? (
+    h < 26 && lk_font2 ? gfx_setfont(lk_font2) : lk_font ? gfx_setfont(lk_font);
+    ink = lk_mul(col, on ? 0.30 : 0.17);
+    ui_col(ink); ui_keytext((x + w * 0.5) * sc, (y + h * 0.5) * sc, s);
+  );
+  lk_oncol = 0; lk_inert = 0;
+  hit;
+);
+function lk_fit(x, y, w, h, on, col, s) local(k) (
+  k = min(w / 62, h / 48);
+  lk_key(x + 4 * k, y + 4 * k, w - 8 * k, h - 8 * k, on, col, s);
+);
+
+// ---------- CREAM SELECTOR KEY (house style, Oct 2026; first drawn on Quad22) ----------
+// A square-cornered cream console key for selectors (models, frequencies, sources, LFO shapes...).
+//   Selected (on): raised cream with a small lit amber LED in its top-left corner.
+//   Not selected : a greyed cream, sitting slightly depressed, its LED dark.
+//   ck_key(x, y, w, h, on, s) : (x, y, w, h) = the key, design units; returns 1 when clicked.
+//   ck_font : the plugin's font slot for the legend (0 = current font); dark ink in both states.
+//   ck_inert: 1 = drawn but not clickable (cleared after the call).
+ck_font = 0;
+function ck_key(x, y, w, h, on, s) local(hov, hit, k, dn, b, tw, th) (
+  hov = !ck_inert && mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  k = min(h / 21, w / 40); b = 1.1 * k; dn = on ? 0 : 1.1 * k;
+  on ? ( ui_cola(0x000000, 0.4); gfx_rect((x + 0.75 * k) * sc, (y + 1.5 * k) * sc, w * sc, h * sc); );
+  ui_col(0x16140F); gfx_rect(x * sc, y * sc, w * sc, h * sc);
+  ui_col(on ? 0xEDE5CF : 0xBDB6A6); gfx_rect((x + b) * sc, (y + b + dn) * sc, (w - 2 * b) * sc, (h - 2 * b - dn) * sc);
+  on ? (
+    ui_cola(0xFFFFFF, 0.55); gfx_rect((x + b) * sc, (y + b) * sc, (w - 2 * b) * sc, max(1, 0.75 * k * sc));
+    ui_cola(0x000000, 0.18); gfx_rect((x + b) * sc, (y + h - b - 1.5 * k) * sc, (w - 2 * b) * sc, 1.5 * k * sc);
+  ) : (
+    ui_cola(0x000000, 0.3); gfx_rect((x + b) * sc, (y + b + dn) * sc, (w - 2 * b) * sc, max(1, 1.1 * k * sc));
+  );
+  hov ? ( ui_cola(0xFFFFFF, 0.1); gfx_rect((x + b) * sc, (y + b + dn) * sc, (w - 2 * b) * sc, (h - 2 * b - dn) * sc); );
+  on ? (
+    ui_cola(0xFFB030, 0.35); gfx_circle((x + 5.25 * k) * sc, (y + 4.5 * k) * sc, 3.75 * k * sc, 1, 1);
+    ui_col(0xFFB030); gfx_circle((x + 5.25 * k) * sc, (y + 4.5 * k) * sc, 1.95 * k * sc, 1, 1);
+    ui_cola(0xFFFFFF, 0.6); gfx_circle((x + 4.7 * k) * sc, (y + 4 * k) * sc, 0.7 * k * sc, 1, 1);
+  ) : ( ui_col(0x6B5A3C); gfx_circle((x + 5.25 * k) * sc, (y + 4.5 * k + dn) * sc, 1.95 * k * sc, 1, 1); );
+  strlen(s) ? (
+    ck_font ? gfx_setfont(ck_font);
+    gfx_measurestr(s, tw, th); ui_col(on ? 0x2A2620 : 0x57524A);
+    gfx_x = (x + w * 0.5) * sc - tw * 0.5; gfx_y = (y + h * 0.5 + dn * 0.5 + 0.75 * k) * sc - th * 0.5; gfx_drawstr(s);
+  );
+  ck_inert = 0;
+  hit;
+);

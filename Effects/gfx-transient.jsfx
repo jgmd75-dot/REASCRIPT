@@ -1,0 +1,226 @@
+desc:GFX Transient [transient shaper]
+// gfx-transient - transient shaper: more or less attack, more or less sustain, level-independent
+//tags: dynamics transient shaper attack sustain envelope
+//author: JGWizrad / Garden FX (GFX)
+//
+// No threshold: the shaper compares two envelopes of the signal, so it works the same on quiet and loud hits.
+// ATTACK      + sharpens the front of every hit, - softens it (pushes drums back, tames picking).
+// SUSTAIN     + brings up the ring and room after each hit, - dries it up and tightens the tail.
+// SPEED       how long the attack window is: short for clicks and sticks, long for a fatter front.
+// LENGTH      how long the sustain stage holds on after each hit.
+// FOCUS       a high-pass on what the shaper listens to, so kick or bass rumble does not trigger it.
+// MIX         blends in the dry signal.
+// Stereo: one detector for both channels, so the image never shifts.
+//
+// GUI: drag knobs (Shift = fine), double-click / Ctrl-click = reset. Click the LCD for the preset list.
+// S / M / L / ? = size and help.
+//
+// Requires gfx-output, gfx-ui, gfx-panel, gfx-dyn and gfx-faceplate (.jsfx-inc) in the same folder.
+
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:0<0,7,1{Init,Snappy Snare,Punchy Kick,Room Killer,Big Room,Soft Pick,Tight Bass,Drum Bus Snap}>-Preset
+slider2:0<-100,100,1>-Attack (%)
+slider3:0<-100,100,1>-Sustain (%)
+slider4:20<5,60,0.1>-Speed (ms)
+slider5:250<50,1000,1>-Length (ms)
+slider6:20<20,500,1>-Focus (Hz, 20 = off)
+slider7:0<-12,12,0.1>-Output (dB)
+slider8:100<0,100,1>-Mix (%)
+slider9:1<0,1,1{Off,Clip}>-(unused, was output stage)
+
+@init
+gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+#ui_man = "gfx-transient";
+nextmem = 0;
+function alloc(n) local(p) ( p = nextmem; nextmem += n; memset(p, 0, n); p; );
+function db2g(d) ( exp(d*0.11512925465); );
+function g2db(g) ( 8.68588963807*log(max(g, 0.0000000001)); );
+function tc(s) ( 1 - exp(-1/(max(s, 0.000001)*srate)); );
+ost_init(alloc(4096));
+
+// second-order high-pass for the detector (bypassed at 20 Hz)
+function hp_set(f) instance(b0, b1, b2, a1, a2) local(w0, cw, al, n) (
+  w0 = 2*$pi*min(f, srate*0.45)/srate; cw = cos(w0); al = sin(w0)/(2*0.7071); n = 1 + al;
+  b0 = (1 + cw)*0.5/n; b1 = -(1 + cw)/n; b2 = b0; a1 = -2*cw/n; a2 = (1 - al)/n;
+);
+function hp_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2; x2 = x1; x1 = x; y2 = y1; y1 = y; y;
+);
+
+function setup() (
+  atk = slider2/100; sus = slider3/100;
+  cFa = tc(0.0003); cFr = tc(0.03);                // fast envelope: follows every hit
+  cSa = tc(slider4*0.001);                         // slow envelope: lags the front by SPEED
+  cHr = tc(slider5*0.001);                         // hold envelope: lets go over LENGTH
+  foc = slider6 > 20.5; foc ? ( hL.hp_set(slider6); hR.hp_set(slider6); );
+  outg = db2g(slider7); mix = slider8/100;
+  ost_setup(0, 0, 120, 6000, -0.3, 0);   // output stage: straight through
+);
+eF = eS = eH = 0; gDb = 0; mA = mS = 0; mOut = 0;
+
+// ---------- presets: attack, sustain, speed, length, focus, mix ----------
+function pr(a, s, sp, ln, fo, m) ( slider2 = a; slider3 = s; slider4 = sp; slider5 = ln; slider6 = fo; slider8 = m; );
+function apply_preset(n) (
+  n == 0 ? pr(0, 0, 20, 250, 20, 100) :          // Init
+  n == 1 ? pr(60, -10, 12, 200, 120, 100) :      // Snappy Snare
+  n == 2 ? pr(45, -25, 25, 180, 20, 100) :       // Punchy Kick
+  n == 3 ? pr(10, -70, 20, 300, 60, 100) :       // Room Killer
+  n == 4 ? pr(-10, 70, 20, 600, 60, 100) :       // Big Room
+  n == 5 ? pr(-50, 10, 10, 250, 150, 100) :      // Soft Pick
+  n == 6 ? pr(30, -40, 30, 150, 20, 100) :       // Tight Bass
+           pr(35, -15, 18, 250, 80, 60);         // Drum Bus Snap
+);
+!ui_dflt ? ( ui_sz = 2; lastPreset = slider1; );
+ui_dflt = 1;
+setup();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, lastPreset);
+
+@slider
+slider1 != lastPreset ? ( apply_preset(slider1); lastPreset = slider1; );
+setup();
+
+@block
+setup();
+
+@sample
+// ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+inL = spl0; inR = spl1;
+foc ? ( dL = hL.hp_run(inL); dR = hR.hp_run(inR); ) : ( dL = inL; dR = inR; );
+d_ = max(abs(dL), abs(dR));
+eF += (d_ - eF)*(d_ > eF ? cFa : cFr);
+eS += (d_ - eS)*(d_ > eS ? cSa : cFr);
+eH += (d_ - eH)*(d_ > eH ? cFa : cHr);
+fD = g2db(eF);
+aDb = max(0, fD - g2db(eS));                       // how far the front is ahead of the slow envelope
+sDb = max(0, g2db(eH) - fD);                       // how far the tail hangs above the fast envelope
+w_ = min(max((g2db(eH) + 66)/12, 0), 1);           // fade the sustain stage out below -54 dBFS (no noise pumping)
+aC = atk*min(aDb, 24)*0.5; susC = sus*min(sDb, 24)*0.6*w_;   // up to about +/-12 dB attack, +/-14 dB sustain
+tg = min(max(aC + susC, -24), 15);
+gDb += (tg - gDb)*0.35;
+g_ = db2g(gDb);
+yL = inL + (inL*g_ - inL)*mix; yR = inR + (inR*g_ - inR)*mix;
+ost_out(yL*outg, yR*outg);
+spl0 = ost_l; spl1 = ost_r;
+// meters: the attack and sustain stages' own contributions (dB)
+abs(aC) > abs(mA) ? mA = aC; abs(susC) > abs(mS) ? mS = susC;
+a_ = max(abs(spl0), abs(spl1)); mOut = a_ > mOut ? a_ : mOut*0.9997;
+
+@gfx 720 300
+// =====================================================================
+// GUI - a top strip over one half-rack unit in warm grey, dark print; green ATTACK and red SUSTAIN caps.
+// Design space 960 x 400 at qs = 0.75 * sc (720 x 300 at size M).
+// =====================================================================
+ui_begin(720, 300);
+qs = sc*0.75;
+
+gfx_setfont(8, "Trebuchet MS", 13.5*qs, 'b');
+gfx_setfont(9, "Courier New", 24*qs, 'b');
+gfx_setfont(10, "Courier New", 15*qs, 'b');
+gfx_setfont(12, "Trebuchet MS", 34*qs, 'b');
+gfx_setfont(13, "Trebuchet MS", 20*qs, 'b');
+GRN = 0x46D86A; AMB = 0xFFB030; RED = 0xFF3A2A;
+CAP_A = 0x33A052; CAP_S = 0xD02E28;
+PNL = 0xB2A4A4; INK = 0x241E1E; INK2 = 0x4E4444;
+
+function R(x, y, w, h) ( gfx_rect(x*qs, y*qs, max(1, w*qs), max(1, h*qs)); );
+function CIRC(x, y, rr, f) ( gfx_circle(x*qs, y*qs, rr*qs, f, 1); );
+function TX(x, y, t) ( gfx_x = x*qs; gfx_y = y*qs; gfx_drawstr(t); );
+function TC(cx, y, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = cx*qs - w*0.5; gfx_y = y*qs; gfx_drawstr(t); );
+function inbox(x, y, w, h) ( mouse_x >= x*qs && mouse_x < (x + w)*qs && mouse_y >= y*qs && mouse_y < (y + h)*qs; );
+function hitbox(x, y, w, h) local(h_) ( h_ = pressed && drag_id == 0 && inbox(x, y, w, h); h_ ? drag_id = -1; h_; );
+function setmsg(n, v) ( strcpy(#lcdn, n); strcpy(#lcdv, v); lcd_t = time_precise(); );
+function touch(idx, name, val) ( drag_id == 1600 + idx ? setmsg(name, val); );
+function knob(idx, cx, cy, r, lo, hi, def, lg, cap, label, val) (
+  dy_kst = 7; dy_ink = INK; dy_ntick = 11;
+  dy_knob(cx*0.75, cy*0.75, r*0.75, idx, lo, hi, def, lg, cap, label, val);   // value shows on hover / drag only
+  touch(idx, label, val);
+);
+function rscrew(x, y) ( rd_screw(x*0.75, y*0.75); );
+// bipolar bar: +/- 12 dB about the centre line
+function bibar(x, y, h, v, c, label) local(f, m) (
+  ui_col(0x0A0A0B); R(x - 3, y - 3, 24, h + 6);
+  ui_col(0x1C1A1A); R(x, y, 18, h);
+  m = y + h*0.5; f = min(max(v/12, -1), 1)*h*0.5;
+  ui_col(c); f > 0 ? R(x, m - f, 18, max(f, 1)) : f < 0 ? R(x, m, 18, max(-f, 1));
+  ui_cola(0xFFFFFF, 0.5); R(x - 2, m, 22, 1);
+  gfx_setfont(8); ui_col(INK); TC(x + 9, y + h + 8, label);
+);
+function pname(n) (
+  n == 0 ? "INIT" : n == 1 ? "SNAPPY SNARE" : n == 2 ? "PUNCHY KICK" : n == 3 ? "ROOM KILLER" :
+  n == 4 ? "BIG ROOM" : n == 5 ? "SOFT PICK" : n == 6 ? "TIGHT BASS" : "DRUM BUS SNAP";
+);
+function go_preset(n) ( slider1 = n; apply_preset(n); lastPreset = n; lcd_t = 0; slider_automate(511); );
+function fpm(v) ( sprintf(#vt, v > 0 ? "+%d%%" : "%d%%", floor(v + (v < 0 ? -0.5 : 0.5))); #vt; );
+
+// ---------------------------------------------------------------------
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+
+// ---- top strip: name, presets, size ----
+ui_col(0x1E2023); R(0, 0, 960, 76);
+gfx_gradrect(0, 0, 960*qs, 30*qs, 1, 1, 1, 0.05, 0, 0, 0, 0, 0, 0, 0, -0.05/(30*qs));
+ui_col(CAP_A); CIRC(40, 38, 22, 1);
+gfx_setfont(2); ui_col(0xF2EEE4); ui_text(40*qs, 31*qs, "GFX");
+gfx_setfont(12); ui_col(0xEDEBE4); TX(74, 14, "TRANSIENT");
+gfx_setfont(8); ui_col(0xA8ABB0); TX(76, 52, "ATTACK  +  SUSTAIN SHAPER");
+
+ui_col(0x050505); R(290, 10, 270, 56);
+ui_col(0x0A1408); R(294, 14, 262, 48);
+ui_col(0x8FE07A);
+time_precise() - lcd_t < 1.5 ? ( gfx_setfont(10); TX(306, 18, #lcdn); gfx_setfont(9); TX(306, 34, #lcdv); )
+  : ( pk_lcdfont(9, 34*qs); gfx_measurestr(pname(slider1), pn_w, pn_h); pk_fitstr(pname(slider1), 306*qs, 38*qs - pn_h*0.5, 34*qs, 244*qs); );
+hitbox(290, 10, 270, 56) ? (
+  #pm = ""; k = 0; loop(8, slider1 == k ? strcat(#pm, "!"); strcat(#pm, pname(k)); k < 7 ? strcat(#pm, "|"); k += 1; );
+  gfx_x = mouse_x; gfx_y = mouse_y; k = gfx_showmenu(#pm); k > 0 ? go_preset(k - 1);
+);
+ui_button(570*qs, 14*qs, 38*qs, 48*qs, "<", 0, 1) ? go_preset((slider1 + 7) % 8);
+ui_button(612*qs, 14*qs, 38*qs, 48*qs, ">", 0, 1) ? go_preset((slider1 + 1) % 8);
+ui_okfs = 0.8; ui_outkeys(744*0.75, 8*0.75, 52*0.75, 12, 2, 9);
+gfx_setfont(8, "Trebuchet MS", 13.5*qs, 'b');
+ui_size_picker(824*qs, 26*qs);
+
+// ---- the unit: warm grey ----
+ui_col(PNL); R(10, 86, 940, 304);
+gfx_gradrect(10*qs, 86*qs, 940*qs, 140*qs, 1, 1, 1, 0.10, 0, 0, 0, 0, 0, 0, 0, -0.10/(140*qs));
+ui_cola(0x000000, 0.3); R(10, 388, 940, 2); ui_cola(0xFFFFFF, 0.4); R(10, 86, 940, 1);
+ui_col(CAP_A); R(10, 86, 470, 5); ui_col(CAP_S); R(480, 86, 470, 5);
+rscrew(24, 104); rscrew(24, 372); rscrew(936, 104); rscrew(936, 372);
+gfx_setfont(8); ui_col(INK2); TX(44, 104, "LEVEL-INDEPENDENT TRANSIENT DESIGNER");
+
+// the two big ones
+knob(2, 150, 222, 50, -100, 100, 0, 0, CAP_A, "ATTACK", fpm(slider2));
+knob(3, 326, 222, 50, -100, 100, 0, 0, CAP_S, "SUSTAIN", fpm(slider3));
+ui_cola(INK, 0.25); R(424, 130, 1, 220);
+// timing and focus
+sprintf(#v4, "%.1f ms", slider4); knob(4, 488, 196, 26, 5, 60, 20, 1, 0x9DA2A8, "SPEED", #v4);
+sprintf(#v5, "%d ms", floor(slider5 + 0.5)); knob(5, 584, 196, 26, 50, 1000, 250, 1, 0x9DA2A8, "LENGTH", #v5);
+slider6 <= 20.5 ? strcpy(#v6, "OFF") : sprintf(#v6, "%d Hz", floor(slider6 + 0.5));
+dy_kf = 1; knob(6, 488, 306, 22, 20, 500, 20, 1, 0, "FOCUS", #v6);        // HPF on the detector: house yellow cap
+sprintf(#v8, "%d%%", floor(slider8 + 0.5)); knob(8, 584, 306, 22, 0, 100, 100, 0, 0x9DA2A8, "MIX", #v8);
+sprintf(#v7, "%+.1f dB", slider7); knob(7, 680, 250, 30, -12, 12, 0, 0, 0x9DA2A8, "OUTPUT", #v7);
+ui_cola(INK, 0.25); R(740, 130, 1, 220);
+
+// meters: what the attack and sustain stages are doing, and the output
+vA = abs(mA) > abs(vA*0.85) ? mA : vA*0.85; mA = 0;
+vS = abs(mS) > abs(vS*0.9) ? mS : vS*0.9; mS = 0;
+bibar(776, 132, 216, vA, GRN, "ATK");
+bibar(820, 132, 216, vS, RED, "SUS");
+vOut = max(mOut, vOut*0.9);
+k = 0; od_ = g2db(vOut);
+ui_col(0x0A0A0B); R(869, 129, 22, 222);
+loop(16, lit_ = od_ >= -30 + (16 - k)*30/16 - 30/16; c_ = k < 2 ? RED : k < 5 ? AMB : GRN;
+  ui_col(lit_ ? c_ : ui_mix(c_, 0x000000, 0.82)); R(872, 132 + k*13.5 + 1, 16, 11.5); k += 1; );
+gfx_setfont(8); ui_col(INK); TC(880, 356, "OUT");
+
+pk_end();
+ui_end();

@@ -1,0 +1,336 @@
+desc:GFX TRDI [transformer DI]
+//tags: DI direct box transformer iron nickel saturation bass utility
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-input, gfx-output, gfx-ui, gfx-panel and gfx-dyn (.jsfx-inc) in the same folder.
+//
+// TRDI. A passive transformer DI in the spirit of the classic British bass-amp maker's DI box: a 1:1 nickel-iron
+// (high-permeability Ni-Fe) transformer, very wide bandwidth, and soft magnetic saturation that only shows when the
+// core is pushed (hot 5-strings, drop tunings, kick drums, low synths). Linked stereo: two identical paths.
+// No drift (a passive box: nothing to wander).
+//
+// CHAIN  IN -> polarity -> input LOAD -> DRIVE -> RF filter -> the core (flux saturation + hysteresis)
+//        -> transformer bandwidth (and LIFT) -> insertion LOSS -> DRIVE compensation -> OUTPUT -> house output stage
+//
+//   LOAD     the input impedance the pickup sees: 1M (none), 220k (a slight top softening), 47k (a vintage, darker
+//            load). Only matters on a direct instrument.
+//   DRIVE    -12 .. +18 dB into the core, level-compensated: it sets how hard the iron is worked, not the level.
+//            The core's flux follows the integral of the voltage, so the saturation lands on the lows first (and on
+//            the loudest notes): at 0 dB a full-scale 40 Hz note just reaches the knee, the mids and highs stay clean.
+//   THE CORE soft nickel-iron saturation of the flux (mostly 3rd harmonic, a trace of 2nd from the hysteresis), with a
+//            small hysteresis lag. The CORE lamp and the FLUX bar show how hard it is worked (the mark = the knee).
+//   BANDWIDTH flat 20 Hz - 20 kHz within 0.5 dB: a 2nd-order low end (-3 dB at 14 Hz, with its phase shift through
+//            the low bass) and a gentle top past 80 kHz.
+//   LIFT     ground lift: adds a DC-blocking pole (10 Hz) - the low end tightens a touch.
+//   RF       the RF-rejection filter: a 2-pole low-pass at 30 kHz (a whisper off the very top at 44.1 / 48 kHz).
+//   Ø        polarity (0 / 180 degrees), faded through zero: no click.
+//   LOSS     the transformer's nominal 1.0 dB insertion loss (on = as the box; off = unity).
+//   OUTPUT   -12 .. +12 dB. The house output stage passes straight through (a utility: no clip).
+//   PRESETS  10 (Init + 9) plus Reset all to defaults. A preset sets DRIVE, LOAD, LIFT, RF and LOSS; OUTPUT and
+//            POLARITY are left alone (Reset all restores them too).
+
+slider1:0<-12,18,0.1>-Drive (dB)
+slider2:0<0,2,1{1M,220k,47k}>-Load
+slider3:0<0,1,1{Off,On}>-Ground lift
+slider4:0<0,1,1{Off,On}>-RF filter
+slider5:0<0,1,1{Normal,Inverted}>-Polarity
+slider6:1<0,1,1{Off,On}>-Insertion loss
+slider7:0<-12,12,0.1>-Output (dB)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+
+@init
+#ui_man = "gfx-trdi";                                 // the ? pop-up links to this manual
+ext_noinit = 1;
+
+// ---------- helpers ----------
+function td_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );                          // denormal housekeeping
+function td_op(f) ( 1 - exp(-2 * $pi * min(f, 0.49 * srate) / srate); );        // one-pole coefficient
+// RBJ biquad coefficients into an instance (hp: type 0, lp: type 1)
+function bq_set(t, f, q) instance(b0, b1, b2, a1, a2) local(w, cw, al, n) (
+  w = 2 * $pi * min(f, 0.45 * srate) / srate; cw = cos(w); al = sin(w) / (2 * q); n = 1 + al;
+  t == 0 ? ( b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; ) : ( b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; );
+  b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+);
+// the RF filter, bilinear with prewarping above Nyquist: its 30 kHz corner folds onto the top of the band as a gentle slope
+function bq_rf(f) instance(b0, b1, b2, a1, a2) local(k, n, q) (
+  q = 0.7071; k = tan($pi * min(f / srate, 0.4999));
+  f > 0.45 * srate ? k = tan($pi * 0.45) * (f / (0.45 * srate));             // past the band: keep the shape, slide it up
+  n = 1 + k / q + k * k;
+  b0 = k * k / n; b1 = 2 * b0; b2 = b0; a1 = 2 * (k * k - 1) / n; a2 = (1 - k / q + k * k) / n;
+);
+function bq_run(x) instance(b0, b1, b2, a1, a2, s1, s2) local(y) (
+  y = b0 * x + s1; s1 = b1 * x - a1 * y + s2; s2 = b2 * x - a2 * y;      // transposed direct form II
+  y;
+);
+function bq_tidy() instance(s1, s2) ( s1 = td_tn(s1); s2 = td_tn(s2); );
+
+// ---------- the core: soft Ni-Fe saturation of the flux ----------
+// u -> a rational tanh (smooth, odd, settles at +-1), plus a trace of 2nd from the hysteresis term
+function td_sat(u) local(a) (
+  a = min(max(u, -3), 3);
+  a * (27 + a * a) / (27 + 9 * a * a);
+);
+
+// one side: the whole path
+function td_run(x) instance(ld, ph, up, fl, dc, e) local(y, u, uh, s) (
+  ld += td_kld * (x - ld); y = td_ld1 ? x : ld;                        // input LOAD (1M: none)
+  y *= td_gds;                                                         // DRIVE
+  y = y + td_rfs * (this.rf.bq_run(y) - y);                           // RF filter (always running: switched by a fade)
+  // the flux: the leaky integral of the voltage (a 25 Hz corner), normalised to the knee
+  ph += td_kph * (y - ph);
+  u = ph * td_fg;
+  uh = u + td_kh * (u - up); up = u;                                   // hysteresis: the flux lags its own change a little
+  s = td_sat(uh) - uh + 0.012 * uh * uh / (1 + uh * uh);              // what the core loses (odd) and the trace of even
+  e = s / td_fg;
+  y += e;                                                              // the magnetising loss leaves the output
+  y = this.bw.bq_run(y);                                               // bandwidth: 2nd-order low end (-3 dB at 14 Hz)
+  td_lft > 0 ? ( dc += td_kdc * (y - dc); y -= td_lft * dc; );         // LIFT: the DC-blocking pole (10 Hz), faded
+  fl += td_ktop * (y - fl); y = fl;                                    // the gentle top past 80 kHz
+  y * td_gout;
+);
+function td_reset() instance(ld, ph, up, fl, dc, e) (
+  ld = ph = up = fl = dc = e = 0;
+  this.rf.s1 = this.rf.s2 = this.bw.s1 = this.bw.s2 = 0;
+);
+function td_tidy() instance(ld, ph, up, fl, dc) (
+  ld = td_tn(ld); ph = td_tn(ph); up = td_tn(up); fl = td_tn(fl); dc = td_tn(dc);
+  this.rf.bq_tidy(); this.bw.bq_tidy();
+);
+function td_coef() (
+  this.rf.bq_rf(30000);
+  this.bw.bq_set(0, 14.6, 0.78);                                       // (2nd order: -0.5 dB at 20 Hz, -3 dB at 14 Hz)
+);
+
+// ---------- sample-rate set-up ----------
+function td_srinit() (
+  td_sr = srate;
+  td_kph = td_op(25);
+  td_kh = 0.04 * srate / (2 * $pi * 25);                               // the hysteresis lag, scaled to the core's band
+  td_kdc = td_op(10);
+  // the top past 80 kHz: a one-pole (about -0.5 dB at 20 kHz at 48 kHz)
+  td_ktop = 1 - exp(-2 * $pi * min(80000, 0.49 * srate) / srate);
+  td_ktop = max(td_ktop, 0.97);
+  td_sm = 1 - exp(-1 / (0.015 * srate));                               // gains and fades: 15 ms
+  td_mfall = exp(-1 / (0.35 * srate));
+  chL.td_coef(); chR.td_coef();
+  ost_init(0);
+);
+td_srinit();
+in_init();
+chL.td_reset(); chR.td_reset();
+td_fg = 1.5;                                                          // full-scale 40 Hz just reaches the knee at DRIVE 0
+td_gds = td_gd = 1; td_rfs = 0; td_lft = 0; td_pols = 1; td_outs = 1;
+td_snap = 1;
+
+// ---------- presets ----------
+#td_pm = "Init|Passive Bass|Hot 5-String|Drop-Tuned Push|Vintage Load|Keys DI|Clean Line|Bus Iron|Iron Kick|Synth Bass Weight";
+function td_set(d, l, lf, rf, ls) ( slider1 = d; slider2 = l; slider3 = lf; slider4 = rf; slider6 = ls; );
+function load_preset(p) local(i) (
+  p == 1  ? td_set(0, 0, 0, 0, 1) :                                    // Init
+  p == 2  ? td_set(3, 1, 0, 0, 1) :                                    // Passive Bass
+  p == 3  ? td_set(9, 0, 0, 0, 1) :                                    // Hot 5-String
+  p == 4  ? td_set(14, 0, 1, 0, 1) :                                   // Drop-Tuned Push
+  p == 5  ? td_set(4, 2, 0, 0, 1) :                                    // Vintage Load
+  p == 6  ? td_set(2, 0, 0, 1, 1) :                                    // Keys DI
+  p == 7  ? td_set(-6, 0, 0, 0, 0) :                                   // Clean Line
+  p == 8  ? td_set(6, 0, 0, 1, 0) :                                    // Bus Iron
+  p == 9  ? td_set(12, 0, 1, 0, 1) :                                   // Iron Kick
+  p == 10 ? td_set(10, 0, 0, 1, 1) :                                   // Synth Bass Weight
+  p == 11 ? ( td_set(0, 0, 0, 0, 1); slider5 = 0; slider7 = 0; );     // Reset all to defaults
+  i = 1; loop(7, ui_auto(i); i += 1; );
+  pr_cur = p == 11 ? 1 : p;
+);
+
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
+ui_dflt = 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@block
+srate != td_sr ? td_srinit();
+in_setup(0, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through (utility)
+// targets
+td_gd = 10 ^ (min(max(slider1, -12), 18) / 20);
+td_ld1 = slider2 < 0.5;
+td_kld = slider2 < 1.5 ? td_op(20000) : td_op(7000);  // 220k: the top just softens; 47k: a darker, vintage load
+td_rft = slider4 >= 0.5;
+td_lft_t = slider3 >= 0.5;
+td_polt = slider5 >= 0.5 ? -1 : 1;
+td_outt = 10 ^ (min(max(slider7, -12), 12) / 20) * (slider6 >= 0.5 ? 0.89125 : 1);   // OUTPUT and the 1.0 dB LOSS
+td_snap ? ( td_gds = td_gd; td_rfs = td_rft; td_lft = td_lft_t; td_pols = td_polt; td_outs = td_outt; td_snap = 0; );
+chL.td_tidy(); chR.td_tidy();
+// the panel's mailboxes (the audio thread writes, the panel reads and clears the peaks)
+tda_pi = max(tda_pi, td_pi); td_pi = 0; tda_po = max(tda_po, td_po); td_po = 0;
+tda_fx = max(tda_fx, td_fx); td_fx = 0;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+in_process(spl0, spl1);
+td_xl = in_l; td_xr = in_r;
+td_pi = max(td_pi, max(abs(td_xl), abs(td_xr)));
+// glides (15 ms): DRIVE, the RF and LIFT fades, polarity (through zero), OUTPUT
+td_gds += (td_gd - td_gds) * td_sm;
+td_rfs += (td_rft - td_rfs) * td_sm;
+td_lft += (td_lft_t - td_lft) * td_sm;
+td_pols += (td_polt - td_pols) * td_sm;
+td_outs += (td_outt - td_outs) * td_sm;
+td_gout = td_outs / td_gds;                                           // DRIVE compensated: it sets the iron, not the level
+td_xl *= td_pols; td_xr *= td_pols;
+td_yl = chL.td_run(td_xl);
+td_yr = chR.td_run(td_xr);
+td_fx = max(td_fx, max(abs(chL.ph), abs(chR.ph)) * td_fg);           // flux against the knee (1 = the knee)
+ost_out(td_yl, td_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+td_po = max(td_po, max(abs(spl0), abs(spl1)));
+
+@gfx 960 388
+ui_begin(960, 388);
+// =====================================================================
+// GUI - dark grey box with elephant's breath plates and yellow lit keys (design space 960 x 388; S / M / L).
+// One row: INPUT, CORE, SIGNAL, OUTPUT; the IN / OUT meter strip below.
+// Knobs: drag (SHIFT = fine), wheel, double-click = default; the label shows the value while the knob is touched.
+// =====================================================================
+sc != tg_lsc ? (
+  tg_lsc = sc;
+  gfx_setfont(11, "Trebuchet MS", 18 * sc, 'b');     // section titles
+  gfx_setfont(12, "Trebuchet MS", 14 * sc, 'b');     // knob labels / values
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print
+  gfx_setfont(14, "Trebuchet MS", 13 * sc, 'b');     // keys
+  gfx_setfont(15, "Trebuchet MS", 27 * sc, 'b');     // the unit's name
+);
+TG_FACE = 0x2C2E31; TG_PLATE = 0xC7BEB3; TG_EDGE = 0x8E867C; TG_INK = 0x24262A; TG_DIM = 0x6A635B;
+TG_HINK = 0xEDE7DF; TG_HDIM = 0xA59D93; TG_YEL = 0xF5C518; TG_TRAY = 0x222427;
+
+function tg_rr(x, y, w, h, r) local(x1, y1, x2, y2, rr) (
+  x1 = floor(x * sc + 0.5); y1 = floor(y * sc + 0.5); x2 = floor((x + w) * sc + 0.5); y2 = floor((y + h) * sc + 0.5);
+  rr = min(floor(r * sc + 0.5), floor((min(x2 - x1, y2 - y1)) * 0.5));
+  gfx_a < 1 ? ui_rrs(x1, y1, x2 - x1, y2 - y1, rr) : (
+    gfx_rect(x1 + rr, y1, x2 - x1 - 2 * rr, y2 - y1);
+    gfx_rect(x1, y1 + rr, rr + 1, y2 - y1 - 2 * rr); gfx_rect(x2 - rr - 1, y1 + rr, rr + 1, y2 - y1 - 2 * rr);
+    gfx_circle(x1 + rr, y1 + rr, rr, 1, 1); gfx_circle(x2 - rr - 1, y1 + rr, rr, 1, 1);
+    gfx_circle(x1 + rr, y2 - rr - 1, rr, 1, 1); gfx_circle(x2 - rr - 1, y2 - rr - 1, rr, 1, 1);
+  );
+);
+function tg_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function tg_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function tg_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function tg_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function tg_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+// a lit key on the plate (the caption on it); returns 1 when clicked
+function tg_key(x, y, w, h, on, s) local(hov, hit) (
+  hov = tg_in(x, y, w, h); hit = pressed && hov && drag_id == 0; hit ? drag_id = -1;
+  ui_cola(0x000000, 0.25); tg_rr(x + 1, y + 2, w, h, 4);
+  on ? ( ui_cola(TG_YEL, 0.3); tg_rr(x - 3, y - 3, w + 6, h + 6, 6); );
+  ui_col(on ? TG_YEL : 0x3A3C40); tg_rr(x, y, w, h, 4);
+  !on ? ( ui_col(ui_mix(TG_YEL, 0x3A3C40, 0.75)); tg_rr(x, y, w, max(2, 2 / sc), 1); );
+  hov ? ( ui_cola(0xFFFFFF, 0.12); tg_rr(x, y, w, h, 4); );
+  gfx_setfont(14); ui_col(on ? 0x1A1B1D : TG_HINK);
+  ui_keytext((x + w * 0.5) * sc, (y + h * 0.5) * sc, s);
+  hit;
+);
+function tg_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+function tg_sec(x0, w, title, sub) (
+  ui_cola(0x000000, 0.45); tg_rr(x0 + 1, 74, w, 226, 8);
+  ui_col(TG_EDGE); tg_rr(x0, 72, w, 226, 8);
+  ui_col(TG_PLATE); tg_rr(x0 + 1.5, 73.5, w - 3, 223, 7);
+  ui_col(TG_YEL); tg_r(x0 + 18, 84, 4, 22);
+  ui_col(0x8A7A1A); tg_r(x0 + 22, 84, 1, 22);
+  gfx_setfont(11); ui_col(TG_INK); tg_tl(x0 + 30, 85, title);
+  gfx_setfont(13); ui_col(TG_DIM); tg_tl(x0 + 18, 114, sub);
+  dy_bg = TG_PLATE; dy_ink = TG_INK;
+);
+// a knob on the plate: white cap, yellow arc; the label shows the value while touched (labels on y 268)
+function tg_knob(cx, r, idx, lo, hi, def, lbl, val) (
+  dy_kst = 35; dy_knob(cx, 214, r, idx, lo, hi, def, 0, 0xD9A70C, "", "");
+  gfx_setfont(12); ui_col(dy_act ? 0x7A5C00 : TG_INK); tg_tc(cx, 268, dy_act ? val : lbl);
+);
+function tg_inset(x, y, w, h) ( pk_inset(x * sc, y * sc, w * sc, h * sc, TG_TRAY); );
+
+// =====================================================================
+// Draw
+// =====================================================================
+ui_col(TG_FACE); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0x000000, 0.25); tg_r(0, 58, 960, 1);
+ui_cola(0xFFFFFF, 0.05); tg_r(0, 59, 960, 1);
+
+// ---------- header ----------
+ui_col(TG_PLATE); gfx_circle(48 * sc, 30 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(TG_FACE); ui_keytext(48 * sc, 30 * sc, "GFX");
+gfx_setfont(15); ui_col(TG_HINK); tg_tl(76, 13, "TRDI"); gfx_measurestr("TRDI", tg_tw, tg_th);
+tg_x = 88 + tg_tw / sc;
+ui_col(TG_YEL); tg_r(tg_x, 20, 8, 8); ui_col(TG_PLATE); tg_r(tg_x + 11, 20, 8, 8);
+gfx_setfont(13); ui_col(TG_HDIM); tg_tl(tg_x, 33, "NI-FE TRANSFORMER DI");
+pk_pextra = "Reset all to defaults";
+tg_k = pk_preset(366 * sc, 14 * sc, 430 * sc, 30 * sc, pr_cur, #td_pm);
+tg_k > 0 ? load_preset(tg_k);
+ui_size_picker(864 * sc, 20 * sc);
+
+// ---------- INPUT: the load and DRIVE ----------
+tg_x0 = 24;
+tg_sec(tg_x0, 292, "INPUT", "LOAD  ·  DRIVE INTO THE CORE");
+tg_l = floor(slider2 + 0.5);
+tg_key(tg_x0 + 18, 134, 80, 28, tg_l == 0, "1M") ? ( slider2 = 0; ui_auto(2); );
+tg_key(tg_x0 + 18, 172, 80, 28, tg_l == 1, "220k") ? ( slider2 = 1; ui_auto(2); );
+tg_key(tg_x0 + 18, 210, 80, 28, tg_l == 2, "47k") ? ( slider2 = 2; ui_auto(2); );
+gfx_setfont(12); ui_col(TG_INK); tg_tc(tg_x0 + 58, 268, "LOAD");
+sprintf(#tgv, "%+.1f dB", slider1); tg_knob(tg_x0 + 196, 44, 1, -12, 18, 0, "DRIVE", #tgv);
+
+// ---------- CORE: the lamp (how hard the iron is worked), the flux bar, LOSS ----------
+tg_x0 = 328;
+tg_sec(tg_x0, 280, "CORE", "1:1 NICKEL-IRON");
+tg_f = tda_fx; tda_fx = 0;
+tg_fs = tg_f > tg_fsm ? tg_f : tg_fsm * 0.9; tg_fsm = tg_fs;                 // the lamp falls back slowly
+tg_g = min(max((tg_fs - 0.35) / 0.9, 0), 1);                                // glows from well below the knee, full past it
+tg_cx = tg_x0 + 76; tg_cy = 200;
+tg_i = 0; loop(4, ui_cola(TG_YEL, (0.04 + 0.12 * tg_g) * (1 - tg_i * 0.22)); gfx_circle(tg_cx * sc, tg_cy * sc, (32 + tg_i * 7) * sc, 1, 1); tg_i += 1; );
+ui_col(0x3A3C40); gfx_circle(tg_cx * sc, tg_cy * sc, 29 * sc, 1, 1);
+ui_col(ui_mix(0x4A4126, TG_YEL, 0.15 + 0.85 * tg_g)); gfx_circle(tg_cx * sc, tg_cy * sc, 25 * sc, 1, 1);
+ui_cola(0xFFFFFF, 0.15 + 0.55 * tg_g); gfx_circle(tg_cx * sc, tg_cy * sc, 8 * sc, 1, 1);
+gfx_setfont(12); ui_col(TG_INK); tg_tc(tg_cx, 268, "CORE");
+// flux bar: 0 .. 1.6 x the knee, the knee marked
+tg_bx = tg_x0 + 146; tg_by = 146; tg_bw = 112;
+gfx_setfont(13); ui_col(TG_DIM); tg_tl(tg_bx, tg_by - 18, "FLUX");
+ui_col(0x3A3C40); tg_rr(tg_bx, tg_by, tg_bw, 12, 3);
+tg_n = min(tg_fs / 1.6, 1);
+tg_n > 0.005 ? ( ui_col(tg_fs > 1 ? 0xE8862A : TG_YEL); tg_rr(tg_bx + 2, tg_by + 2, (tg_bw - 4) * tg_n, 8, 2); );
+ui_col(TG_INK); tg_r(tg_bx + tg_bw / 1.6, tg_by - 4, 1.5, 20);
+gfx_setfont(13); ui_col(TG_DIM); tg_tc(tg_bx + tg_bw / 1.6, tg_by + 24, "KNEE");
+tg_key(tg_bx, 210, tg_bw, 28, slider6 >= 0.5, "LOSS -1 dB") ? tg_tog(6);
+
+// ---------- SIGNAL: LIFT, RF, polarity ----------
+tg_x0 = 620;
+tg_sec(tg_x0, 140, "SIGNAL", "");
+tg_key(tg_x0 + 18, 118, 104, 30, slider3 >= 0.5, "LIFT") ? tg_tog(3);
+tg_key(tg_x0 + 18, 164, 104, 30, slider4 >= 0.5, "RF") ? tg_tog(4);
+tg_key(tg_x0 + 18, 210, 104, 30, slider5 >= 0.5, "Ø  180°") ? tg_tog(5);
+
+// ---------- OUTPUT ----------
+tg_x0 = 772;
+tg_sec(tg_x0, 164, "OUTPUT", "");
+sprintf(#tgv, "%+.1f dB", slider7); tg_knob(tg_x0 + 82, 34, 7, -12, 12, 0, "OUTPUT", #tgv);
+
+// ---------- meter strip ----------
+tg_inset(24, 310, 912, 66);
+tg_pi = tda_pi; tda_pi = 0; tg_po = tda_po; tda_po = 0;
+tgmI.ui_ledm(80 * sc, 328 * sc, 760 * sc, 9 * sc, tg_pi);
+tgmO.ui_ledm(80 * sc, 350 * sc, 760 * sc, 9 * sc, tg_po);
+gfx_setfont(13); ui_col(TG_HDIM); tg_tr(66, 326, "IN"); tg_tr(66, 348, "OUT");
+ui_col(TG_HINK); tg_tl(856, 326, "PASSIVE"); ui_col(TG_HDIM); tg_tl(856, 348, "NO DRIFT");
+
+pk_end();
+ui_end();

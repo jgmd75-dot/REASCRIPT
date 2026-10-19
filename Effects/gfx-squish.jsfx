@@ -1,0 +1,328 @@
+desc:GFX Squish [comp pedal]
+//tags: compressor dynamics pedal ota sustainer guitar bass parallel stompbox
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn and gfx-faceplate (.jsfx-inc) in the same folder.
+//
+// SQUISH. A stompbox compressor with two characters (the sound is designed from scratch, in the spirit of the
+// classic orange / red OTA guitar sustainer pedals and the modern boutique studio-style pedal compressors).
+// Signal path: input (trim + guard) -> stereo-linked detector -> gain-reduction VCA -> BLEND (dry / wet) ->
+// TONE -> LEVEL -> OUT. Zero latency, so it is safe for live guitar monitoring.
+// Both modes have the same four controls:
+//             SENS    - how early it grabs (threshold about -10 to -40 dBFS) and how hard the OTA is driven.
+//             SUSTAIN - how much it squashes (the ratio; the knee tightens as it goes up).
+//             ATTACK 0.5 - 50 ms (default 3 ms), RELEASE 30 - 1500 ms (default 140 ms).
+//   VINTAGE - the OTA sustainer: ratio about 2:1 to 20:1, aggressive squish, and a programme-dependent release
+//             that stretches on long, heavy squash so it never pumps. The OTA adds a little asymmetric grit
+//             when it is hit hard (watch the OTA GRIT lamp); quiet playing stays clean. The grit is DC-blocked
+//             on its own, so BLEND stays perfectly in phase.
+//   STUDIO  - clean, transparent VCA: ratio about 1.5:1 to 8:1; the release lengthens only a touch.
+// Shared: BLEND (parallel compression: the dry signal under the compressed one, to bring the transients back),
+//         TONE (a high-shelf tilt at 3 kHz: left darkens, right adds spark, +/- 9 dB), LEVEL (output).
+// Detection: the louder channel's peak, in the dB domain with a smoothed attack / release - stereo linked,
+// no zipper or pumping artefacts. Make-up gain is automatic (about 70% of the reduction at a typical level).
+// DRIFT (0 - 100 %, default 15 %): an uneven supply - the OTA bias (the grit's asymmetry) and the threshold
+//         wander very slightly (up to about +/- 1.5 dB of threshold at 100 %).
+// Bypass (REAPER parameter list only, slider 10): a 10 ms crossfade, the bypass takes the input before TRIM;
+//         the OUT stage stays in. BLEND is the big knob beside the IN / OUT tray.
+// IN / OUT: TRIM (click it for GUARD) and DRIFT.
+//
+// GUI: drag knobs (Shift = fine), double-click = reset. Click the LCD for the preset list. S / M / L / ? = size and help.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:0<0,1,1{Vintage,Studio}>-Mode
+slider2:50<0,100,1>-Sensitivity (%)
+slider3:50<0,100,1>-Sustain (%)
+slider4:3<0.5,50,0.1>-Attack (ms)
+slider5:140<30,1500,1>-Release (ms)
+slider6:100<0,100,1>-Blend (%)
+slider7:0<-100,100,1>-Tone (%)
+slider8:0<-24,12,0.1>-Level (dB)
+slider9:15<0,100,1>-Drift (%)
+slider10:1<0,1,1{Bypass,On}>-On / bypass
+slider11:0<-24,12,0.1>-Input trim (dB)
+slider12:1<0,1,1{Off,On}>-Input guard
+slider13:1<0,1,1{Off,Clip}>-(unused, was output stage)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+ext_noinit = 1;                                       // keep the state across transport start / stop (no reset mid-signal)
+#ui_man = "gfx-squish";                                  // the ? pop-up links to this manual
+
+function sq_tc(ms) ( 1 - exp(-1 / (max(ms, 0.01) * 0.001 * srate)); );
+
+// soft-knee curve: gain reduction (dB, positive) for level lv, threshold t, ratio r, knee k
+function sq_curve(lv, t, r, k) local(o) (
+  o = lv - t;
+  o <= -k * 0.5 ? 0 : o >= k * 0.5 ? o * (1 - 1 / r) : (1 - 1 / r) * sqr(o + k * 0.5) / (2 * k);
+);
+
+// OTA transfer: a biased tanh, unity gain for small signals, no static offset (b = bias, k = drive)
+function sq_ota(x, k, b) local(tb) (
+  tb = ost_tanh(b);
+  (ost_tanh(k * x + b) - tb) / (k * (1 - tb * tb));
+);
+
+function update() (
+  sq_vint = slider1 < 0.5;
+  sq_sus = slider3 / 100;
+  // the same four controls in both modes: SENS = threshold, SUSTAIN = ratio, ATTACK, RELEASE
+  sq_thr0 = -10 - 0.30 * slider2;                      // SENS: -10 .. -40 dBFS
+  sq_att = slider4; sq_rel = slider5; sq_mkf = 0.7;
+  sq_vint ? (
+    sq_rat = 2 * 10 ^ sq_sus;                          // SUSTAIN: 2:1 .. 20:1, OTA squash
+    sq_knee = 6 - 2 * sq_sus;
+    sq_pd = 2;                                         // programme-dependent release
+  ) : (
+    sq_rat = 1.5 + 6.5 * sq_sus ^ 1.3;                 // SUSTAIN: 1.5:1 .. 8:1, clean VCA
+    sq_knee = 8 - 4 * sq_sus;
+    sq_pd = 0.3;
+  );
+  sq_k = 0.6 + 1.6 * slider2 / 100;                    // OTA drive (grit) follows SENS
+  sq_mk = sq_mkf * sq_curve(-16, sq_thr0, sq_rat, sq_knee);   // automatic make-up (dB)
+  sq_ca = sq_tc(sq_att);
+  sq_blt = slider6 / 100;
+  sq_tnt = slider7 / 100;
+  sq_ot = 10 ^ (slider8 / 20);
+  sq_dr = slider9 / 100;
+  sq_on = slider10 > 0.5;
+  in_setup(slider11, slider12);
+  ost_setup(0, 0.3, 120, 6000, -0.3, 0);   // output stage: straight through
+);
+
+// ---------- presets: mode, sens, sustain, attack, release, blend, tone, level, drift (IN / OUT left alone) ----------
+function sq_set(m, se, su, at, re, bl, tn, lv, dr) (
+  slider1 = m; slider2 = se; slider3 = su; slider4 = at; slider5 = re; slider6 = bl; slider7 = tn; slider8 = lv; slider9 = dr;
+  slider10 = 1;
+);
+function sq_load(p) (
+  p == 1  ? sq_set(0, 50, 50, 3,  140, 100,   0,  0,   15) :   // Init
+  p == 2  ? sq_set(0, 62, 72, 3,  140,  85,  35,  0,   15) :   // Country Chicken Pickin'
+  p == 3  ? sq_set(0, 76, 86, 3,  140, 100,  22, -1,   15) :   // Funk Squish
+  p == 4  ? sq_set(1, 42, 55, 12, 420,  80,  10,  0,   10) :   // Clean Sustain
+  p == 5  ? sq_set(1, 69, 82, 2,  120,  50,  15,  0,   10) :   // Parallel Punch
+  p == 6  ? sq_set(1, 47, 60, 15, 300,  90, -15,  0,    8) :   // Bass Even-Out
+  p == 7  ? sq_set(1, 32, 45, 20, 200,  70,  25,  0,   10) :   // Acoustic Strum
+  p == 8  ? sq_set(0, 86, 92, 3,  140,  90,   5,  0,   20) :   // Lead Sustain
+  p == 9  ? sq_set(1, 27, 40, 6,  350, 100,  10,  0,   10) :   // Vocal Glue
+  p == 10 ? sq_set(0, 70, 76, 3,  140,  75, -10,  0,   25);    // Slide Sustain
+  p >= 1 && p <= 10 ? slider_automate(1023);                     // sliders 1-10
+);
+
+// ---------- state ----------
+sq_sm  = sq_tc(30);                                   // parameter smoothing
+sq_c2  = sq_tc(0.7);                                  // rounds the corners of the gain curve
+sq_cfs = sq_tc(10);                                   // on / bypass crossfade
+sq_envr = exp(-1 / (0.008 * srate));                  // peak detector: instant rise, 8 ms fall
+sq_dcr = 1 - 2 * $pi * 5 / srate;                     // DC blocker on the OTA grit (5 Hz)
+sqD1.drift_init(0.8 + rand(0.5)); sqD2.drift_init(0.8 + rand(0.5));
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+sq_env = 0; sq_gr = 0; sq_gs = 0; sq_hold = 0; sq_grm = 0; sq_gpk = 0;
+sq_xL1 = sq_yL1 = sq_xR1 = sq_yR1 = 0;
+update();
+sq_mks = sq_mk; sq_bl = sq_blt; sq_os = sq_ot; sq_fs = sq_on; sq_mx = sq_vint; sq_tn = sq_tnt; sq_tnl = -9;
+sq_thr = sq_thr0; sq_b = 0.18; sq_cr = sq_tc(sq_rel);
+ui_thm = 5; ui_hw = 1;                                // the pedal faceplate is fixed (no theme picker on this panel)
+!ui_dflt ? ( ui_sz = 2; pr_cur = 1; );                // new instances open in Large, on Init
+ui_dflt = 1;
+
+@slider
+update();
+
+@block
+update();                                             // knobs moved on the panel do not run @slider
+// DRIFT: the supply wanders - the threshold and the OTA bias ease about very slightly
+sq_dinc = 0.25 * (0.5 + sq_dr) * samplesblock / srate;
+sq_v1 = sqD1.drift_tick(sq_dinc); sq_v2 = sqD2.drift_tick(sq_dinc);
+sq_thr = sq_thr0 + 1.5 * sq_dr * sq_v1;
+sq_b = 0.18 + 0.12 * sq_dr * sq_v2;
+// programme-dependent release: the longer and deeper the reduction, the slower it lets go
+sq_hold += (sq_gs - sq_hold) * min(1, samplesblock / srate);
+sq_cr = sq_tc(sq_rel * (1 + sq_pd * min(sq_hold / 12, 1)));
+// TONE: a high shelf at 3 kHz, glided per block
+sq_tn += (sq_tnt - sq_tn) * min(1, samplesblock / (0.05 * srate));
+abs(sq_tn - sq_tnl) > 0.0005 ? (
+  sq_tnl = sq_tn;
+  sqTL.bq_set(3, 3000, 0.6, 9 * sq_tn); sqTR.bq_set(3, 3000, 0.6, 9 * sq_tn);
+);
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@sample
+sq_rL = spl0; sq_rR = spl1;                           // the raw input, for the bypass
+in_process(spl0, spl1);
+sq_xL = in_l; sq_xR = in_r;
+
+// detector: the louder side's peak (stereo linked), smoothed in the dB domain
+sq_a = max(abs(sq_xL), abs(sq_xR));
+sq_env = sq_a > sq_env ? sq_a : sq_env * sq_envr;
+sq_lv = 8.68588963807 * log(max(sq_env, 0.00001));
+sq_tg = sq_curve(sq_lv, sq_thr, sq_rat, sq_knee);
+sq_gr += (sq_tg - sq_gr) * (sq_tg > sq_gr ? sq_ca : sq_cr);
+sq_gs += (sq_gr - sq_gs) * sq_c2;
+sq_mks += (sq_mk - sq_mks) * sq_sm;
+sq_g = exp((sq_mks - sq_gs) * 0.11512925465);
+
+// VINTAGE: the OTA sees the signal before the gain is set, so it only grits when the input is hot.
+// Only what the curve adds is DC-blocked, so the clean part (and BLEND) keeps its exact phase.
+sq_mx += (sq_vint - sq_mx) * sq_sm;
+sq_mx > 0.0001 ? (
+  sq_eL = (sq_ota(sq_xL, sq_k, sq_b) - sq_xL) * sq_mx;
+  sq_eR = (sq_ota(sq_xR, sq_k, sq_b) - sq_xR) * sq_mx;
+  sq_gpk = max(sq_gpk, sq_a * sq_k);
+) : ( sq_eL = 0; sq_eR = 0; );
+sq_yL1 = sq_eL - sq_xL1 + sq_dcr * sq_yL1; sq_xL1 = sq_eL;
+sq_yR1 = sq_eR - sq_xR1 + sq_dcr * sq_yR1; sq_xR1 = sq_eR;
+abs(sq_yL1) < 0.0000000001 ? sq_yL1 = 0; abs(sq_yR1) < 0.0000000001 ? sq_yR1 = 0;
+sq_wL = (sq_xL + sq_yL1) * sq_g;
+sq_wR = (sq_xR + sq_yR1) * sq_g;
+
+// BLEND -> TONE -> LEVEL
+sq_bl += (sq_blt - sq_bl) * sq_sm;
+sq_oL = sq_xL + (sq_wL - sq_xL) * sq_bl;
+sq_oR = sq_xR + (sq_wR - sq_xR) * sq_bl;
+sq_oL = sqTL.bq_run(sq_oL); sq_oR = sqTR.bq_run(sq_oR);
+sq_os += (sq_ot - sq_os) * sq_sm;
+sq_oL *= sq_os; sq_oR *= sq_os;
+
+// footswitch
+sq_fs += (sq_on - sq_fs) * sq_cfs;
+sq_oL = sq_rL + (sq_oL - sq_rL) * sq_fs;
+sq_oR = sq_rR + (sq_oR - sq_rR) * sq_fs;
+ost_out(sq_oL, sq_oR);
+spl0 = ost_l;
+spl1 = ost_r;
+sq_grm = max(sq_grm, sq_gs * sq_fs);
+
+@gfx 640 420
+ui_begin(640, 420);
+
+// ---------- the faceplate colours follow the mode ----------
+sg_v = slider1 < 0.5;
+PNL  = sg_v ? 0xD4562A : 0x4E7697;                    // VINTAGE warm orange-red / STUDIO cool steel blue
+INK  = sg_v ? 0x1E120C : 0xF4FDFF;
+INK2 = sg_v ? 0x4A2414 : 0xC7D8E6;
+SHA  = ui_mix(PNL, 0x000000, 0.14);                   // section shades (recessed trays)
+SHB  = ui_mix(PNL, 0x000000, 0.20);
+SHC  = ui_mix(PNL, 0x000000, 0.26);
+ACC  = sg_v ? 0xFFB040 : 0x8FD4FF;                    // lit mode key / accents
+RED  = 0xFF3A2A; AMB = 0xFFB030;
+dy_ink = INK; dy_nov = 1;
+
+function sg_setv(idx, v) ( slider(idx) = v; ui_auto(idx); );
+// panel keys: the house lamp key (gfx-ui) in the old key's footprint
+sc != sg_lsc ? ( sg_lsc = sc; gfx_setfont(15, "Trebuchet MS", 9 * sc, 'b'); );   // lamp key legends
+function sg_key(x, y, w, h, on, col, s) (
+  lk_well = ui_mix(PNL, 0x000000, 0.62); lk_font = 15; lk_font2 = 15;
+  lk_fit(x, y, w, h, on, col, s);
+);
+
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+
+// ---------- header strip: GFX, name, the house preset bar, S / M / L / ? ----------
+ui_col(0x1E2023); gfx_rect(0, 0, 640 * sc, 58 * sc);
+gfx_gradrect(0, 0, 640 * sc, 26 * sc, 1, 1, 1, 0.05, 0, 0, 0, 0, 0, 0, 0, -0.05 / (26 * sc));
+ui_col(PNL); gfx_rect(0, 56 * sc, 640 * sc, 3 * sc);
+ui_col(PNL); gfx_circle(34 * sc, 29 * sc, 17 * sc, 1, 1);
+gfx_setfont(4); ui_col(INK); ui_text(34 * sc, 24 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 28 * sc, 'b'); ui_col(0xEDEBE4); gfx_x = 62 * sc; gfx_y = 13 * sc; gfx_drawstr("SQUISH");
+k_ = pk_preset(198 * sc, 14 * sc, 352 * sc, 30 * sc, pr_cur,
+  "Init|Country Chicken Pickin'|Funk Squish|Clean Sustain|Parallel Punch|Bass Even-Out|Acoustic Strum|Lead Sustain|Vocal Glue|Slide Sustain");
+k_ > 0 ? ( sq_load(k_); pr_cur = k_; );
+ui_size_picker(568 * sc, 20 * sc);
+
+// ---------- the pedal ----------
+rd_plate(10, 68, 620, 344, PNL, 16);
+gfx_gradrect(12 * sc, 70 * sc, 616 * sc, 60 * sc, 1, 1, 1, 0.06, 0, 0, 0, 0, 0, 0, 0, -0.06 / (60 * sc));
+rd_screw(22, 80); rd_screw(618, 80); rd_screw(22, 401); rd_screw(618, 401);
+
+// printed model name and the mode keys
+rd_titlei(42, 74, sg_v ? "VINTAGE" : "STUDIO", 26, INK);
+rd_sub(44, 106, sg_v ? "OTA SUSTAINER  -  FAST, SQUISHY, GRITTY" : "PARALLEL COMPRESSOR  -  CLEAN, FULL CONTROL", INK2, 1);
+sg_key(442, 80, 82, 28, sg_v, LK_YEL, "VINTAGE") ? sg_setv(1, 0);
+sg_key(530, 80, 82, 28, !sg_v, LK_YEL, "STUDIO") ? sg_setv(1, 1);
+
+// knob caps: cream caps on dark knurled skirts
+function sg_kst() ( dy_kst = 7; sg_cap = 0xF3EBD3; );
+// ---------- tray A: the compressor (the same four controls in both modes) ----------
+pk_inset(34 * sc, 126 * sc, 386 * sc, 138 * sc, SHA);
+sg_kst();
+sprintf(#sg_v, "%.0f%%  (%.0f dBFS)", slider2, -10 - 0.3 * slider2);
+dy_knob(82, 184, 30, 2, 0, 100, 50, 0, sg_cap, "SENS", #sg_v);
+sprintf(#sg_v, "%.0f%%  (%.1f:1)", slider3, sg_v ? 2 * 10 ^ (slider3 / 100) : 1.5 + 6.5 * (slider3 / 100) ^ 1.3);
+dy_knob(178, 184, 30, 3, 0, 100, 50, 0, sg_cap, "SUSTAIN", #sg_v);
+sprintf(#sg_v, "%.1f ms", slider4);
+dy_knob(274, 184, 30, 4, 0.5, 50, 3, 1, sg_cap, "ATTACK", #sg_v);
+sprintf(#sg_v, "%.0f ms", slider5);
+dy_knob(370, 184, 30, 5, 30, 1500, 140, 1, sg_cap, "RELEASE", #sg_v);
+
+// ---------- tray B: TONE, LEVEL (both modes) ----------
+pk_inset(34 * sc, 284 * sc, 264 * sc, 108 * sc, SHB);
+sg_kst();
+abs(slider7) < 0.5 ? strcpy(#sg_v, "FLAT") : sprintf(#sg_v, slider7 < 0 ? "DARK %.0f%%" : "SPARK %.0f%%", abs(slider7));
+dy_knob(108, 326, 25, 7, -100, 100, 0, 0, sg_cap, "TONE", #sg_v);
+sprintf(#sg_v, "%+.1f dB", slider8);
+dy_knob(224, 326, 25, 8, -24, 12, 0, 0, sg_cap, "LEVEL", #sg_v);
+
+// ---------- tray C: IN / OUT ----------
+pk_inset(312 * sc, 284 * sc, 108 * sc, 108 * sc, SHC);
+dy_kst = 20;
+sprintf(#sg_v, "%+.1f dB", slider11);
+dy_knob(338, 334, 14, 11, -24, 12, 0, 0, 0x9DA2A8, "TRIM", #sg_v);
+ui_guardclick(1600 + 11, 12, 338, 334, 23);           // click TRIM for GUARD
+sprintf(#sg_v, "%.0f%%", slider9);
+dy_knob(394, 334, 14, 9, 0, 100, 15, 0, 0x9DA2A8, "DRIFT", #sg_v);
+dy_kst = 1;
+
+// ---------- tray D: gain reduction ----------
+pk_inset(436 * sc, 126 * sc, 178 * sc, 138 * sc, SHA);
+sg_gr = max(sq_grm, sg_gr * 0.88); sq_grm = 0;
+ui_col(0x0A0A0B); gfx_rect(448 * sc, 132 * sc, 30 * sc, 126 * sc);
+gi = 0;
+loop(12,
+  gd = gi == 0 ? 1 : gi == 1 ? 2 : gi == 2 ? 3 : gi == 3 ? 4 : gi == 4 ? 6 : gi == 5 ? 8 : gi == 6 ? 10 :
+       gi == 7 ? 12 : gi == 8 ? 15 : gi == 9 ? 18 : gi == 10 ? 21 : 24;
+  gy = 248 - gi * 10.2;
+  gc = gd <= 8 ? AMB : RED;
+  ui_col(sg_gr >= gd ? gc : ui_mix(gc, 0x000000, 0.8)); gfx_rect(451 * sc, gy * sc, 24 * sc, 8 * sc);
+  sg_gr >= gd ? ( ui_cola(0xFFFFFF, 0.3); gfx_rect(452 * sc, (gy + 1) * sc, 22 * sc, 2 * sc); );
+  (gi % 2 == 0 && gi != 10 || gi == 11) ? (
+    sprintf(#sg_l, "%d", gd); gfx_setfont(4); ui_cola(INK, 0.85);
+    gfx_measurestr(#sg_l, gtw, gth); gfx_x = 484 * sc; gfx_y = (gy + 4) * sc - gth * 0.5; gfx_drawstr(#sg_l);
+  );
+  gi += 1;
+);
+// the readout
+ui_col(0x050505); rd_rr(510 * sc, 136 * sc, 94 * sc, 50 * sc, 4 * sc);
+ui_col(0x160606); gfx_rect(514 * sc, 140 * sc, 86 * sc, 42 * sc);
+sprintf(#sg_l, "%.1f", min(sg_gr, 99.9));
+rd_seg(526, 147, 15, 28, 3, #sg_l, RED, 0x2A0C0A);
+rd_lbl(557, 192, "dB  GR", INK, 1);
+// the OTA lamp: glows as the input drives the OTA into grit (VINTAGE); dark in STUDIO
+sg_gl = sg_v ? max(min((sq_gpk - 0.35) / 0.65, 1), 0) : 0; sq_gpk = 0;
+sg_glow = max(sg_gl, sg_glow * 0.86);
+ui_cola(0x000000, 0.25); gfx_circle(557 * sc, 224 * sc, 15 * sc, 1, 1);
+rd_lamp(557, 224, 10, 0.08 + 0.92 * sg_glow, 0xFFA030);
+rd_lbl(557, 246, sg_v ? "OTA GRIT" : "CLEAN VCA", INK, 1);
+
+// ---------- BLEND: the big knob (parallel compression) ----------
+sg_kst();
+sprintf(#sg_v, "%.0f%% WET", slider6);
+dy_knob(525, 326, 38, 6, 0, 100, 100, 0, sg_cap, "BLEND", #sg_v);
+
+pk_end();
+ui_end();

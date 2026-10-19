@@ -1,0 +1,517 @@
+desc:GFX G Tonewheel [tonewheel organ]
+//tags: instrument synth organ tonewheel drawbar
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel and gfx-instrument (.jsfx-inc) in the same folder.
+//
+// Tonewheel organ (instrument: put it on a track and play it from MIDI):
+//   - 91 always-spinning tonewheels, nine drawbars (16' to 1') with the classic foldback
+//   - percussion: 2nd / 3rd harmonic, normal / soft, fast / slow decay, single-trigger
+//     (it only re-strikes once all keys are lifted, as on the B3; percussion borrows the 1' drawbar)
+//   - key click: the instant on/off of the contacts, plus a little contact noise
+//   - scanner vibrato / chorus V1-V3, C1-C3, valve DRIVE, TONE, SWELL (also MIDI CC11)
+//   - MIDI is passed on: put GFX Rotary after it and the mod wheel / sustain pedal switch its speed.
+// Drift: GFX instrument standard (motor pitch, tone, scanner speed). The tonewheels stay locked together.
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:8<0,8,1>-Drawbar 16'
+slider2:8<0,8,1>-Drawbar 5 1/3'
+slider3:8<0,8,1>-Drawbar 8'
+slider4:0<0,8,1>-Drawbar 4'
+slider5:0<0,8,1>-Drawbar 2 2/3'
+slider6:0<0,8,1>-Drawbar 2'
+slider7:0<0,8,1>-Drawbar 1 3/5'
+slider8:0<0,8,1>-Drawbar 1 1/3'
+slider9:0<0,8,1>-Drawbar 1'
+slider10:1<0,1,1{Off,On}>-Percussion
+slider11:1<0,1,1{Second,Third}>-Percussion harmonic
+slider12:0<0,1,1{Normal,Soft}>-Percussion volume
+slider13:0<0,1,1{Fast,Slow}>-Percussion decay
+slider14:6<0,6,1{Off,V1,V2,V3,C1,C2,C3}>-Vibrato / chorus
+slider15:40<0,100,1>-Key click (%)
+slider16:15<0,100,1>-Drive (%)
+slider17:70<0,100,1>-Tone (%)
+slider18:100<0,100,1>-Swell (%)
+slider19:0<-50,50,1>-Tuning (cents)
+slider20:0<0,16,1>-MIDI channel (0 = omni)
+slider21:25<0,100,1>-Drift (%)
+slider23:0<-24,12,0.1>-Output (dB)
+slider24:0<0,100,1>-Band sat (%)
+slider25:30<0,100,1>-Bias (%)
+slider26:120<40,400,1>-Sat low band (Hz)
+slider27:6000<2000,16000,10>-Sat high band (Hz)
+slider28:-0.3<-24,0,0.1>-Ceiling (dB)
+slider29:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider30:40<0,100,1>-Room size (%)
+slider31:0<0,100,1>-Room mix (%)
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-tonewheel";                                  // the ? pop-up links to this manual
+
+// ---------- memory map ----------
+ws = 0;       // wheel sine          (91)
+wc = 100;     // wheel cosine        (91)
+wsi = 200;    // wheel step sin      (91)
+wco = 300;    // wheel step cos      (91)
+tg = 400;     // drawbar gain target (91)
+pg = 500;     // percussion gain     (91)
+cg = 600;     // current gain        (91)
+held = 700;   // held keys           (128)
+evq = 1000;   // MIDI event queue    (3 x 512)
+vbuf = 4096; vmask = 4095;   // scanner delay line
+dbo = 3000;   // drawbar semitone offsets (9)
+dgn = 3010;   // drawbar gains (9)
+wdt = 3100;   // per-wheel gear-ratio detune (91)
+
+dbo[0] = -12; dbo[1] = 7; dbo[2] = 0; dbo[3] = 12; dbo[4] = 19; dbo[5] = 24; dbo[6] = 28; dbo[7] = 31; dbo[8] = 36;
+i = 0; loop(91, ws[i] = 0; wc[i] = 1; cg[i] = 0; wdt[i] = (rand(2) - 1) * 0.0003; i += 1; );   // up to ~0.5 cent, like the gears
+memset(held, 0, 128); memset(vbuf, 0, 4096);
+nheld = 0; dirty = 1; penv = 0; clk = 0; vwp = 0; vph = 0; tl = 0; bpz1 = 0; bpz2 = 0;
+
+function fold(w) ( while (w < 0) ( w += 12; ); while (w > 90) ( w -= 12; ); w; );
+
+// recompute wheel targets from the held keys and drawbars
+function rebuild() local(n, d, w, b) (
+  memset(tg, 0, 91); memset(pg, 0, 91);
+  n = 0;
+  loop(128,
+    held[n] ? (
+      b = n - 24;                                  // MIDI 24 (C1) = wheel 0; C2 key = 65 Hz on 8'
+      d = 0;
+      loop(9, dgn[d] > 0 ? ( w = fold(b + dbo[d]); tg[w] += dgn[d]; ); d += 1; );
+      perc_on ? ( w = fold(b + (perc_h ? 19 : 12)); pg[w] += 1; );
+    );
+    n += 1;
+  );
+);
+
+function note_on(n) (
+  !held[n] ? (
+    nheld == 0 ? penv = 1;                         // single-trigger percussion
+    held[n] = 1; nheld += 1; dirty = 1;
+    clk = max(clk, click);
+  );
+);
+function note_off(n) (
+  held[n] ? ( held[n] = 0; nheld -= 1; dirty = 1; clk = max(clk, click * 0.4); );
+);
+function all_off() ( memset(held, 0, 128); nheld = 0; dirty = 1; );
+
+function update() local(d, v) (
+  perc_on = slider10; perc_h = slider11;
+  d = 0;
+  loop(9,
+    v = slider(d + 1);
+    dgn[d] = v > 0 ? 10 ^ (-(8 - v) * 3 / 20) : 0;   // ~3 dB per drawbar step
+    d += 1;
+  );
+  perc_on ? (
+    dgn[8] = 0;                                      // percussion borrows the 1' drawbar
+    slider12 == 0 ? ( d = 0; loop(9, dgn[d] *= 0.708; d += 1; ); );   // NORMAL percussion: organ drops ~3 dB
+  );
+  plev = slider12 ? 0.5 : 1;
+  pdec = exp(-1 / ((slider13 ? 0.9 : 0.25) * srate));
+  vc = slider14;
+  vdep = (vc == 1 || vc == 4 ? 0.15 : vc == 2 || vc == 5 ? 0.3 : 0.5) * 0.001 * srate;
+  click = slider15 / 100;
+  ksm = click > 0.98 ? 1 : 1 - exp(-1 / ((0.0002 + 0.004 * (1 - click)) * srate));   // contact speed
+  dv = slider16 / 100;
+  drv_g = 1 + 15 * dv * dv; drv_w = min(dv * 3, 1);
+  drv_n = 1 / (1 - sqr(ost_tanh(0.25 * dv)));
+  tone_f = 2000 * 6 ^ (slider17 / 100);
+  swell_t = slider18 / 100;
+  tune = 2 ^ (slider19 / 1200);
+  chan = slider20;
+  drift = slider21 / 100;
+  out_t = 10 ^ (slider23 / 20);
+  ins_output_setup(24);   // output stage: CLIP, always on
+  // ROOM: lengths in samples for the early reflections, tails and diffusers
+  rm_sz = 0.4 + 1.2 * slider30 / 100; rm_mix = slider31 / 100;
+  rm_fb = 0.3 + 0.35 * slider30 / 100; rm_dc = 1 - exp(-2 * $pi * (7000 - 3500 * slider30 / 100) / srate);
+  rm_k = srate * 0.001 * rm_sz;
+  rm_t0 = 7.3 * rm_k; rm_t1 = 11.9 * rm_k; rm_t2 = 17.1 * rm_k; rm_t3 = 23.7 * rm_k; rm_t4 = 31.3 * rm_k;
+  rm_u0 = 8.9 * rm_k; rm_u1 = 13.7 * rm_k; rm_u2 = 19.9 * rm_k; rm_u3 = 27.1 * rm_k; rm_u4 = 35.3 * rm_k;
+  rm_cl = min(41.3 * rm_k, 8000); rm_cr = min(47.9 * rm_k, 8000);
+  rm_al = min(srate * 0.0051, 1000); rm_ar = min(srate * 0.0063, 1000);
+  dirty = 1;
+);
+
+// ---------- drawbar registrations ----------
+function reg(a, b, c, d, e, f, g, h, i, pon, ph, pv, pd, vib, clv, drv) (
+  slider1 = a; slider2 = b; slider3 = c; slider4 = d; slider5 = e; slider6 = f; slider7 = g; slider8 = h; slider9 = i;
+  slider10 = pon; slider11 = ph; slider12 = pv; slider13 = pd; slider14 = vib; slider15 = clv; slider16 = drv;
+);
+function load_preset(p) (
+  p == 1 ? reg(8,8,8,0,0,0,0,0,0, 1,1,0,0, 6, 40, 15) :     // Soul Jazz
+  p == 2 ? reg(8,8,8,8,0,0,0,0,0, 0,1,0,0, 6, 30, 25) :     // Memphis Groove
+  p == 3 ? reg(8,8,8,8,8,8,8,8,8, 0,1,0,0, 6, 30, 30) :     // Full Organ
+  p == 4 ? reg(8,8,6,8,0,0,0,0,8, 0,1,0,0, 6, 35, 35) :     // Gospel
+  p == 5 ? reg(8,3,8,0,0,0,0,0,0, 1,1,1,1, 0, 25, 5) :      // Modern Jazz
+  p == 6 ? reg(8,0,8,0,0,0,0,0,0, 0,1,0,0, 4, 20, 5) :      // Jazz Ballad
+  p == 7 ? reg(8,8,8,8,8,8,0,0,0, 0,1,0,0, 6, 50, 70) :     // Rock Overdrive
+  p == 8 ? reg(0,0,8,8,0,0,0,0,0, 1,0,1,0, 0, 30, 10) :     // Reggae Bubble
+  p == 9 ? reg(0,0,8,0,0,0,0,0,0, 0,1,0,0, 1, 10, 0) :      // Flute
+  p == 10 ? reg(8,8,8,0,0,0,0,0,0, 1,1,0,1, 6, 40, 20);     // Slow Perc
+  p >= 1 && p <= 10 ? slider_automate(65535);               // sliders 1-16
+  p == 11 ? (                                                // Reset all to defaults
+    reg(8,8,8,0,0,0,0,0,0, 1,1,0,0, 6, 40, 15);
+    slider17 = 70; slider18 = 100; slider19 = 0; slider20 = 0; slider21 = 25; slider23 = 0;
+    slider24 = 0; slider25 = 30; slider26 = 120; slider27 = 6000; slider28 = -0.3; slider29 = 1; slider30 = 40; slider31 = 0;
+    slider_automate(2147483647 - 2097152);                   // sliders 1-31 (22 unused)
+  );
+);
+
+// ---------- drawbar drawing ----------
+function drawbar(x, y0, step, d) local(v, col, tc, bw, ln, hov, by, i, k, ty, sw, st, sl) (
+  v = slider(d + 1);
+  bw = 22 * sc; st = 10 * sc; ln = y0 + st + v * step;   // st: the stub of stalk still showing when the bar is pushed home
+  sl = 8 * step + 24 * sc + st;                           // slot length
+  col = d < 2 ? 0x6B3A1E : (d == 4 || d == 6 || d == 7) ? 0x1C1C1E : 0xEDE8DC;
+  tc  = d < 2 ? 0xF2E6CC : (d == 4 || d == 6 || d == 7) ? 0xF0F0F0 : 0x1C1C1E;
+  // slot: a deep channel in the felt, darker at the top where the rod disappears into the console
+  ui_col(0x0A0706); ui_rrect(x - 3 * sc, y0 - 3 * sc, bw + 6 * sc, sl, 3 * sc);
+  gfx_gradrect(x - 2 * sc, y0 - 2 * sc, bw + 4 * sc, 14 * sc, 0, 0, 0, 0.6, 0, 0, 0, 0, 0, 0, 0, -0.6 / (14 * sc));
+  ui_cola(0xFFFFFF, 0.10); gfx_line(x - 3 * sc, y0 + sl - 3 * sc, x + bw + 2 * sc, y0 + sl - 3 * sc);
+  // rod: brushed steel, shaded as a cylinder, engraved 1 - 8 as it is pulled out
+  (
+    sw = bw - 8 * sc; i = 0;
+    loop(ceil(sw),
+      k = i / sw; k = 0.55 + 0.45 * sin(k * $pi) - 0.25 * (k > 0.7) * (k - 0.7) / 0.3;
+      ui_col(ui_mix(0x4A4A4C, 0xE8E6E0, k)); gfx_line(x + 4 * sc + i, y0, x + 4 * sc + i, ln);
+      i += 1;
+    );
+    ui_cola(0x000000, 0.45); gfx_rect(x + 4 * sc, y0, sw, 3 * sc);   // shadow of the console lip
+    i = 1;
+    loop(v,
+      ty = ln - i * step + 3 * sc;
+      ty > y0 + 2 * sc ? (
+        ui_cola(0x000000, 0.55); gfx_line(x + 5 * sc, ty, x + bw - 6 * sc, ty);
+        gfx_setfont(4); ui_cola(0x1A1A1C, 0.75); sprintf(#dr, "%d", v - i + 1);
+        step > 14 * sc ? ui_text(x + bw * 0.5, ty + 2 * sc, #dr);
+      );
+      i += 1;
+    );
+  );
+  // tab: a rounded cap with a domed face; soft drop shadow onto the felt
+  ui_cola(0x000000, 0.5); ui_rrect(x + 1 * sc, ln + 3 * sc, bw, 19 * sc, 4 * sc);
+  ui_col(ui_mix(col, 0x000000, 0.35)); ui_rrect(x, ln, bw, 19 * sc, 4 * sc);
+  ui_col(col); ui_rrect(x + 1 * sc, ln, bw - 2 * sc, 17 * sc, 4 * sc);
+  gfx_gradrect(x + 2 * sc, ln + 1 * sc, bw - 4 * sc, 8 * sc, 1, 1, 1, 0.32, 0, 0, 0, 0, 0, 0, 0, -0.32 / (8 * sc));
+  gfx_gradrect(x + 2 * sc, ln + 10 * sc, bw - 4 * sc, 7 * sc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.25 / (7 * sc));
+  ui_cola(0xFFFFFF, 0.45); gfx_line(x + 4 * sc, ln + 1 * sc, x + bw - 5 * sc, ln + 1 * sc);
+  gfx_setfont(2);
+  sprintf(#dv, "%d", v);
+  ui_cola(tc == 0x1C1C1E ? 0xFFFFFF : 0x000000, 0.35); ui_text(x + bw * 0.5, ln + 3 * sc, #dv);   // engraved
+  ui_col(tc); ui_text(x + bw * 0.5, ln + 2 * sc, #dv);
+  // drag / wheel
+  hov = mouse_x >= x - 4 * sc && mouse_x < x + bw + 4 * sc && mouse_y >= y0 - 4 * sc && mouse_y < y0 + sl;
+  pressed && drag_id == 0 && hov ? drag_id = 300 + d;
+  drag_id == 300 + d && mdown ? (
+    by = floor((mouse_y - y0 - st - 9 * sc) / step + 0.5);
+    by = min(max(by, 0), 8);
+    by != v ? ( slider(d + 1) = by; slider_automate(2 ^ d); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    slider(d + 1) = min(max(v + (mouse_wheel < 0 ? 1 : -1), 0), 8); slider_automate(2 ^ d); mouse_wheel = 0;
+  );
+);
+
+// the ivory panel with its grain (fine speckle, faint vertical fibre), rendered once into image 126
+function ivory_panel(fh) local(i, n, xx, yy, k, x, y, w, h) (
+  (gfx_w != tw_bw || gfx_h != tw_bh || fh != tw_fh || sc != tw_sc) ? (
+    tw_bw = gfx_w; tw_bh = gfx_h; tw_fh = fh; tw_sc = sc;
+    gfx_setimgdim(126, gfx_w, gfx_h); gfx_dest = 126;
+    ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+    pk_chassis(16 * sc, 4 * sc, 608 * sc, fh * sc, IVR);
+    x = 18 * sc; y = 6 * sc; w = 604 * sc; h = (fh - 6) * sc;
+    i = 0;
+    loop(floor(w / 3),
+      k = ui_hash(i * 2.37 + 0.7);
+      ui_cola(0x6A5034, 0.02 + 0.035 * k); gfx_line(x + i * 3 + k * 2, y, x + i * 3 + k * 2, y + h);
+      i += 1;
+    );
+    n = floor(w * h / 40); i = 0;
+    loop(n,
+      xx = x + ui_hash(i * 3.17 + 0.3) * w; yy = y + ui_hash(i * 7.91 + 2.1) * h; k = ui_hash(i * 1.61 + 5.2);
+      ui_cola(k > 0.6 ? 0xFFFFFF : 0x6A5034, k > 0.6 ? 0.35 : 0.14); gfx_rect(xx, yy, 1, 1);
+      i += 1;
+    );
+    gfx_dest = -1;
+  );
+  gfx_x = 0; gfx_y = 0; gfx_a = 1; gfx_mode = 0;
+  gfx_blit(126, 1, 0);
+);
+
+// ---------- state ----------
+ins_drift_init();
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+// ROOM buffers (well clear of the output stage's memory)
+RMB = 200000; RCL = 210000; RCR = 220000; RAL = 230000; RAR = 232000; RMSK = 8191; RAMSK = 1023;
+memset(RMB, 0, 40000); rm_w = 0; rm_aw = 0; rm_ll = 0; rm_lr = 0;
+sm = 1 - exp(-1 / (0.03 * srate));
+pkL = 0; pkR = 0; evn = 0; spos = 0; midi_led = 0;
+!ui_dflt ? ui_thm = 9; !ui_dflt ? ui_hw = 1;   // fixed walnut-and-ivory faceplate
+!ui_dflt ? ui_kstyle = 0;           // GFX standard knobs
+IVR = 0xF1EAD8; INKD = 0x3A2A1E; REDL = 0xFF3A2A; AMB = 0xE8A33A;
+FELT = 0x2A1F18; SH1 = 0xEEE6D2; SH2 = 0xE5DBC4; SH3 = 0xD9CDB3;       // sound, voice, utility
+function mgroup(x, y, w, h, sec, title, shade) (
+  pk_inset(x * sc, y * sc, w * sc, h * sc, shade);
+  pk_box(x * sc, y * sc, w * sc, h * sc, INKD, title);
+  ui_section(sec == 0 ? 2 : sec); C_INK = INKD;
+);
+update();
+swell_s = swell_t; out_s = out_t;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update();
+
+@block
+// queue MIDI with sample offsets (everything is passed on, so a Rotary after this can switch speed)
+evn = 0;
+while (midirecv(mofs, m1, m2, m3)) (
+  stt = m1 & 0xF0; mch = (m1 & 0x0F) + 1;
+  (chan == 0 || mch == chan) && evn < 512 ? (
+    evq[evn * 4] = mofs; evq[evn * 4 + 1] = stt; evq[evn * 4 + 2] = m2; evq[evn * 4 + 3] = m3; evn += 1;
+  );
+  midisend(mofs, m1, m2, m3);
+);
+// transport stop: release whatever is still held (as an all-notes-off would; a safety net if the stop's note-offs go missing)
+gfx_pst = play_state == 1 || play_state == 5;
+gfx_pst_prev && !gfx_pst ? ( all_off(); );
+gfx_pst_prev = gfx_pst;
+evi = 0; spos = 0;
+panic_req ? ( all_off(); panic_req = 0; );   // PANIC from the screen
+update();
+// wheel speeds (tuning + tiny motor drift)
+ins_drift_block(drift, samplesblock);                      // GFX instrument drift
+mot = tune * ins_pitch;
+tone_c = 1 - exp(-2 * $pi * min(tone_f * 2 ^ ins_tone, srate * 0.45) / srate);
+ai = 0;
+loop(91,
+  wf = 2 * $pi * 32.7032 * 2 ^ (ai / 12) * mot * (1 + wdt[ai]) / srate;
+  wsi[ai] = sin(wf); wco[ai] = cos(wf);
+  // keep the oscillators exactly on their circle
+  wr = sqrt(ws[ai] * ws[ai] + wc[ai] * wc[ai]); wr > 0 ? ( ws[ai] /= wr; wc[ai] /= wr; );
+  ai += 1;
+);
+
+@serialize
+file_var(0, ui_sz);
+file_avail(0) != 0 ? file_var(0, pr_cur);    // the preset in use (older projects end before it)
+
+@sample
+// MIDI events due at this sample
+while (evi < evn && (evq[evi * 4] <= spos || spos >= samplesblock - 1)) (   // (an event stamped at / past the block end: handled at its last sample)
+  e1 = evq[evi * 4 + 1]; e2 = evq[evi * 4 + 2]; e3 = evq[evi * 4 + 3];
+  e1 == 0x90 && e3 > 0 ? ( note_on(e2); midi_led = 1; ins_midi_hit(); ) :
+  e1 == 0x80 || e1 == 0x90 ? note_off(e2) :
+  e1 == 0xB0 ? (
+    e2 == 11 ? ( slider18 = floor(e3 / 127 * 100 + 0.5); swell_t = slider18 / 100; sliderchange(slider18); );
+    e2 == 120 || e2 == 123 ? all_off();
+  );
+  evi += 1;
+);
+spos += 1;
+dirty ? ( rebuild(); dirty = 0; );
+
+// tonewheels
+penv *= pdec;
+pk_ = penv * plev;
+sum = 0;
+ai = 0;
+loop(91,
+  gt = tg[ai] + pg[ai] * pk_;
+  (gt + cg[ai]) > 0.000001 ? (
+    cg[ai] += (gt - cg[ai]) * ksm;
+    s_ = ws[ai] * wco[ai] + wc[ai] * wsi[ai];
+    wc[ai] = wc[ai] * wco[ai] - ws[ai] * wsi[ai];
+    ws[ai] = s_;
+    sum += cg[ai] * s_;
+  ) : cg[ai] = 0;
+  ai += 1;
+);
+sum *= 0.09;
+
+// key click: contact noise burst
+clk > 0.0005 ? (
+  nz = (rand(2) - 1) * clk * 0.05;
+  bpz1 += (nz - bpz1) * 0.5; bpz2 += (bpz1 - bpz2) * 0.5;      // tame the top
+  sum += bpz1 - bpz2 * 0.7;
+  clk *= 0.996;
+);
+
+// scanner vibrato / chorus
+vbuf[vwp] = sum;
+vc > 0 ? (
+  vph += 2 * $pi * 6.9 * (1 + 0.1 * ins_fx) / srate; vph > 2 * $pi ? vph -= 2 * $pi;
+  rp = vwp - (0.0012 * srate + vdep * sin(vph));
+  ri = floor(rp); rf = rp - ri;
+  wet = vbuf[ri & vmask] * (1 - rf) + vbuf[(ri + 1) & vmask] * rf;
+  sum = vc >= 4 ? 0.5 * (sum + wet) : wet;
+);
+vwp = (vwp + 1) & vmask;
+
+// valve preamp, tone, swell
+dv > 0 ? (
+  y = (ost_tanh(drv_g * sum + 0.25 * dv) - ost_tanh(0.25 * dv)) / drv_g ^ 0.75 * drv_n;
+  sum += drv_w * (y - sum);
+);
+tl += (sum - tl) * tone_c; sum = tl;
+swell_s += (swell_t - swell_s) * sm;
+out_s += (out_t - out_s) * sm;
+sum *= swell_s * swell_s * out_s;
+
+// ROOM: stereo early reflections + a short damped tail, so the mono organ sits in a space
+rm_mix > 0 ? (
+  RMB[rm_w] = sum;
+  rm_el = 0.70 * RMB[(rm_w - rm_t0) & RMSK] - 0.55 * RMB[(rm_w - rm_t1) & RMSK] + 0.45 * RMB[(rm_w - rm_t2) & RMSK]
+        - 0.35 * RMB[(rm_w - rm_t3) & RMSK] + 0.28 * RMB[(rm_w - rm_t4) & RMSK];
+  rm_er = 0.70 * RMB[(rm_w - rm_u0) & RMSK] + 0.55 * RMB[(rm_w - rm_u1) & RMSK] - 0.45 * RMB[(rm_w - rm_u2) & RMSK]
+        + 0.35 * RMB[(rm_w - rm_u3) & RMSK] - 0.28 * RMB[(rm_w - rm_u4) & RMSK];
+  rm_ol = RCL[(rm_w - rm_cl) & RMSK]; rm_or = RCR[(rm_w - rm_cr) & RMSK];
+  rm_ll += (rm_ol - rm_ll) * rm_dc; rm_lr += (rm_or - rm_lr) * rm_dc;
+  RCL[rm_w] = 0.5 * rm_el + rm_lr * rm_fb;                    // tails cross-feed for a wider image
+  RCR[rm_w] = 0.5 * rm_er + rm_ll * rm_fb;
+  rm_xl = rm_el + 0.7 * rm_ol; rm_xr = rm_er + 0.7 * rm_or;
+  rm_yl = RAL[(rm_aw - rm_al) & RAMSK]; rm_vl = rm_xl + 0.5 * rm_yl; RAL[rm_aw] = rm_vl; rm_xl = rm_yl - 0.5 * rm_vl;
+  rm_yr = RAR[(rm_aw - rm_ar) & RAMSK]; rm_vr = rm_xr + 0.5 * rm_yr; RAR[rm_aw] = rm_vr; rm_xr = rm_yr - 0.5 * rm_vr;
+  rm_w = (rm_w + 1) & RMSK; rm_aw = (rm_aw + 1) & RAMSK;
+  rmL = sum * (1 - 0.3 * rm_mix) + rm_xl * rm_mix * 0.6;
+  rmR = sum * (1 - 0.3 * rm_mix) + rm_xr * rm_mix * 0.6;
+) : ( rmL = sum; rmR = sum; );
+
+// output stage
+oL = ostL.ost_band(rmL);
+oR = ostR.ost_band(rmR);
+ost_out(oL, oR);
+spl0 = ost_l;
+spl1 = ost_r;
+pkL = max(pkL, abs(spl0)); pkR = max(pkR, abs(spl1));
+
+@gfx 960 540
+ui_begin(960, 540);
+// ---------- faceplate: walnut, cream insets, deep-brown section bands, cream caps, lit amber keys (house style) ----------
+WAL = 0x5A3620; CRM1 = 0xEEE5D0; CRM2 = 0xE7DCC4; CRM3 = 0xDDD0B5; INKW = 0xF3E9D6; DIMW = 0xD8C2A4;
+INKD = 0x2A1C12; DIMD = 0x6E5A48; BND = 0x4A2A18; BTX = 0xF3E9D6; CAPD = 0xF6EFE0; AMB = 0xF2B23A; SQBG = 0x3A2416; REDL = 0xFF3A2A;
+dy_ink = INKD; dy_bg = CRM1; dy_nov = 1; rd_sqbg = SQBG;
+#tw_pm = "Soul Jazz|Memphis Groove|Full Organ|Gospel|Modern Jazz|Jazz Ballad|Rock Overdrive|Reggae Bubble|Flute|Slow Perc";
+function setv(idx, v) ( slider(idx) = v; slider_automate(2 ^ (idx - 1)); );
+function band(x, y, w, s) ( ui_col(BND); gfx_rect(x * sc, y * sc, w * sc, 18 * sc); gfx_setfont(4); ui_col(BTX); gfx_x = (x + 8) * sc; gfx_y = (y + 3) * sc; gfx_drawstr(s); );
+function inset2(x, y, w, h, col) local(b, ox, oy, ow, oh) (
+  x *= sc; y *= sc; w *= sc; h *= sc; b = 5 * sc;
+  ox = x - b; oy = y - b; ow = w + 2 * b; oh = h + 2 * b;
+  ui_col(ui_mix(WAL, 0x000000, 0.45)); gfx_triangle(ox, oy, ox + ow, oy, x + w, y, x, y);
+  ui_col(ui_mix(WAL, 0x000000, 0.30)); gfx_triangle(ox, oy, x, y, x, y + h, ox, oy + oh);
+  ui_col(ui_mix(WAL, 0xFFFFFF, 0.22)); gfx_triangle(ox, oy + oh, x, y + h, x + w, y + h, ox + ow, oy + oh);
+  ui_col(ui_mix(WAL, 0xFFFFFF, 0.10)); gfx_triangle(ox + ow, oy, ox + ow, oy + oh, x + w, y + h, x + w, y);
+  ui_col(col); gfx_rect(x, y, w, h);
+);
+function sect(x, y, w, h, col, s) ( inset2(x, y, w, h, col); band(x, y, w, s); );
+function kn(cx, cy, r, idx, lo, hi, def, lg, cap, lbl, fmt) ( sprintf(#v, fmt, slider(idx)); dy_knob(cx, cy, r, idx, lo, hi, def, lg, cap, lbl, #v); );
+function pname(n) local(i, k, c) (
+  strcpy(#tpn, ""); i = 0; k = 1;
+  while (i < strlen(#tw_pm) && k <= n) (
+    c = str_getchar(#tw_pm, i);
+    c == '|' ? k += 1 : k == n ? strcat(#tpn, " ") + str_setchar(#tpn, strlen(#tpn) - 1, c);
+    i += 1;
+  );
+  #tpn;
+);
+function pr_go(n) ( load_preset(n); pr_cur = n > 10 ? 0 : n; );
+
+// ---------- panel: walnut throughout ----------
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+pk_wood(0, 0, 960 * sc, 540 * sc);
+ui_cola(0x000000, 0.18); gfx_rect(0, 0, 960 * sc, 540 * sc);
+ui_col(AMB); gfx_rect(0, 64 * sc, 960 * sc, 3 * sc);
+
+// header: badge, name, presets [PRESETS][◄][►][LCD], MIDI, size
+rd_badge(36, 32, 16, INKW, WAL);
+rd_title(62, 14, "TONEWHEEL", 28, INKW);
+rd_sub(66, 46, "DRAWBAR ORGAN", DIMW, 1);
+pm_ = rd_sq(376, 17, 78, 32, 0, AMB, "PRESETS");
+rd_sq(458, 17, 32, 32, 0, AMB, "◄") ? pr_go(pr_cur <= 1 ? 10 : pr_cur - 1);
+rd_sq(494, 17, 32, 32, 0, AMB, "►") ? pr_go(pr_cur >= 10 || pr_cur < 1 ? 1 : pr_cur + 1);
+pk_lcd(534 * sc, 9 * sc, 236 * sc, 48 * sc, 0);
+ui_col(pk_lcdc); strcpy(#l1, pr_cur >= 1 ? pname(pr_cur) : "- -");
+pk_lcdfont(9, 24 * sc); gfx_measurestr(#l1, pn_w, pn_h); pk_fitstr(#l1, 546 * sc, 33 * sc - pn_h * 0.5, 24 * sc, 216 * sc);
+pm_ || (pressed && drag_id == 0 && mouse_x >= 534 * sc && mouse_x < 770 * sc && mouse_y >= 9 * sc && mouse_y < 57 * sc) ? (
+  drag_id = -1; strcpy(#pm, ""); k_ = 1;
+  loop(10, k_ == pr_cur ? strcat(#pm, "!"); strcat(#pm, pname(k_)); strcat(#pm, "|"); k_ += 1; );
+  strcat(#pm, "Reset all to defaults");
+  gfx_x = 376 * sc; gfx_y = 58 * sc; k_ = gfx_showmenu(#pm); k_ > 0 ? pr_go(k_);
+);
+rd_led(796, 33, 5, ins_midi_lit() || nheld > 0, 0x3ADF6A); rd_lbl(796, 44, "MIDI", DIMW, 1);
+ui_size_picker(830 * sc, 24 * sc);
+
+// ---------- DRAWBARS: the felt tray ----------
+inset2(16, 88, 512, 284, FELT); band(16, 88, 512, "DRAWBARS");
+i = 0; loop(floor(266 * sc / 2), ui_cola(i % 2 ? 0x000000 : 0xFFFFFF, 0.025); gfx_line(16 * sc, 106 * sc + i * 2, 528 * sc, 106 * sc + i * 2); i += 1; );
+d = 0;
+loop(9,
+  dx = (40 + d * 54) * sc;
+  gfx_setfont(4); ui_col(0xE8DCC0);
+  ui_text(dx + 11 * sc, 114 * sc, d == 0 ? "16'" : d == 1 ? "5 1/3" : d == 2 ? "8'" : d == 3 ? "4'" : d == 4 ? "2 2/3" :
+                              d == 5 ? "2'" : d == 6 ? "1 3/5" : d == 7 ? "1 1/3" : "1'");
+  drawbar(dx, 132 * sc, 24 * sc, d);
+  d += 1;
+);
+
+// ---------- PERCUSSION ----------
+sect(540, 88, 404, 132, CRM1, "PERCUSSION");
+rd_sq(556, 128, 84, 40, slider10 >= 0.5, AMB, "ON") ? setv(10, slider10 >= 0.5 ? 0 : 1);
+rd_sq(648, 128, 90, 40, slider10 >= 0.5 && slider11 >= 0.5, AMB, slider11 >= 0.5 ? "THIRD" : "SECOND") ? setv(11, slider11 >= 0.5 ? 0 : 1);
+rd_sq(746, 128, 90, 40, slider10 >= 0.5 && slider12 >= 0.5, AMB, slider12 >= 0.5 ? "SOFT" : "NORMAL") ? setv(12, slider12 >= 0.5 ? 0 : 1);
+rd_sq(844, 128, 86, 40, slider10 >= 0.5 && slider13 >= 0.5, AMB, slider13 >= 0.5 ? "SLOW" : "FAST") ? setv(13, slider13 >= 0.5 ? 0 : 1);
+rd_lbl(742, 186, "HARMONIC  ·  VOLUME  ·  DECAY", DIMD, 1);
+
+// ---------- VIBRATO / CHORUS ----------
+sect(540, 240, 404, 132, CRM2, "VIBRATO / CHORUS");
+vc_ = floor(slider14 + 0.5); i = 0;
+loop(6,
+  rd_sq(556 + i * 64, 280, 56, 40, vc_ == i + 1, AMB, i == 0 ? "V1" : i == 1 ? "V2" : i == 2 ? "V3" : i == 3 ? "C1" : i == 4 ? "C2" : "C3") ? setv(14, vc_ == i + 1 ? 0 : i + 1);
+  i += 1;
+);
+rd_lbl(742, 338, vc_ == 0 ? "OFF  ·  CLICK A LIT KEY TO SWITCH IT OFF" : "CLICK THE LIT KEY TO SWITCH IT OFF", DIMD, 1);
+
+// ---------- row 2: VOICE, ROOM, MIDI, MASTER ----------
+sect(16, 392, 388, 132, CRM2, "VOICE");
+kn(56, 462, 18, 15, 0, 100, 40, 0, CAPD, "CLICK", "%.0f%%");
+kn(130, 462, 18, 16, 0, 100, 15, 0, CAPD, "DRIVE", "%.0f%%");
+kn(204, 462, 18, 17, 0, 100, 70, 0, CAPD, "TONE", "%.0f%%");
+kn(278, 462, 18, 18, 0, 100, 100, 0, AMB, "SWELL", "%.0f%%");
+kn(352, 462, 18, 19, -50, 50, 0, 0, CAPD, "TUNE", "%+.0f cents");
+
+sect(416, 392, 152, 132, CRM3, "ROOM");
+kn(450, 462, 18, 30, 0, 100, 40, 0, CAPD, "SIZE", "%.0f%%");
+kn(530, 462, 18, 31, 0, 100, 0, 0, CAPD, "MIX", "%.0f%%");
+
+sect(580, 392, 164, 132, CRM1, "MIDI");
+dy_step = 17; dy_steps = "";
+dy_knob(614, 462, 18, 20, 0, 16, 0, 0, CAPD, "CHANNEL", slider20 == 0 ? "OMNI" : (sprintf(#chv, "CH %.0f", slider20); #chv));
+sprintf(#nh, "%d DOWN", nheld); rd_lbl(696, 420, #nh, DIMD, 1);
+rd_sq(660, 440, 72, 28, 0, REDL, "PANIC") ? panic_req = 1;
+rd_lbl(696, 486, "CC11 = SWELL", DIMD, 1);
+
+sect(756, 392, 188, 132, CRM3, "MASTER");
+kn(784, 462, 16, 21, 0, 100, 25, 0, CAPD, "DRIFT", "%.0f%%");
+kn(830, 462, 16, 24, 0, 100, 0, 0, 0xD8B040, "SAT", "%.0f%%");
+kn(880, 462, 18, 23, -24, 12, 0, 0, CAPD, "OUTPUT", "%.1f dB");
+ui_col(0x1E140C); gfx_rect(912 * sc, 418 * sc, 26 * sc, 96 * sc);
+mL.ui_ledm(915 * sc, 422 * sc, 9 * sc, 88 * sc, pkL); mR.ui_ledm(926 * sc, 422 * sc, 9 * sc, 88 * sc, pkR);
+pkL *= 0.85; pkR *= 0.85;
+
+pk_end();
+ui_end();

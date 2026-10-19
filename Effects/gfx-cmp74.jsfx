@@ -1,0 +1,632 @@
+desc:GFX CMP74 [compressor]
+//tags: dynamics compressor limiter fet diode-bridge peak feedback memory freeze pumping parallel broadcast series74
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-clip, gfx-ui, gfx-panel and gfx-s74 (.jsfx-inc) in the same folder.
+//
+// CMP74 (Series 74: the OB remote and broadcast series): the series' compressor, with two gain cells on one switch.
+//   input -> TRIM / GUARD -> INPUT (0 .. 36 dB, into a fixed threshold) -> 2x oversampling ->
+//   FET:   a FET peak limiter, feedback style (the side-chain hears the gain cell's output; the loop is solved every
+//          sample, so it holds at 20 us with 20:1 in the loop). RATIO 4 / 8 / 12 / 20 : 1 with the FET's curved knee,
+//          or ALL (all buttons in): about 40:1 just over the threshold bending over to about 12:1, a lazier attack, a
+//          detector overshoot that digs in after every hit and lets go (pumping), a quicker release and the FET's bias
+//          shifted. The FET adds harmonic distortion (mostly 2nd) that grows with the gain it takes away; then the
+//          CLASS-A stage (a biased soft knee) -> back to 1x -> the OUTPUT TRANSFORMER (the lows saturate when hot).
+//   DIODE: a diode-bridge limiter, feed-forward: a peak detector into a 4 dB soft knee, RATIO 1.5 / 3 / 6 / 10 : 1 or
+//          LIMIT, attack 0.05 .. 20 ms. The balanced bridge distorts symmetrically (mostly 3rd, a trace of 2nd), and
+//          the more gain it takes away the harder it is driven.
+//   -> MIX (parallel, with the dry signal delayed to match) -> OUTPUT -> the house output stage (band SAT, CLIP
+//   always on).
+//   ATTACK   FET 20 .. 800 us; DIODE 0.05 .. 20 ms (each model keeps its own).
+//   RELEASE  30 ms .. 1.5 s. FET: a fast stage recovers short peaks in the set time, a slow stage remembers sustained
+//            reduction and lets the last of it go 1.6 .. 2.5x more slowly.
+//   MEMORY   (both models) the capacitor memory: a charge that follows how much gain reduction there has been over
+//            the last half second or so (it drains over 1.5 s). Short peaks snap back faster than the set release;
+//            sustained squashing stretches the release up to 6x, a long suck-back. 0 = the plain release.
+//   COLOUR   how hard the gain cell distorts: FET, the FET's own distortion (50 % = the classic amount); DIODE, the
+//            bridge's drive. 0 = the cleanest the cell goes.
+//   FREEZE   (both models) holds the gain reduction where it is: the gain stops moving until FREEZE is released,
+//            then glides back to the detector (80 ms). AUTO (HOLD IN GAPS) holds it by itself whenever the input falls
+//            below THRESH (a pause, the gap between hits), so the room and the noise floor do not pump up.
+//   SC HPF   the side-chain high-pass: OFF, 60, 120, 250 Hz (12 dB / oct): the lows stop pulling the gain down.
+//   The two channels share one detector (linked). The gate of the old diode limiter is left to the GFX Gate.
+// The colour stages follow the house drive standard (gfx-clip): anti-aliased (ADAA) soft-knee clippers, a pre-filter
+// and a knee that track INPUT. Every INPUT and RATIO setting is level matched by the makeup in both models, and the
+// models are matched to each other, so INPUT changes the amount of compression rather than the loudness.
+// WANDER (0-100 %, 50 % = the standard amount): the threshold (about +/-0.5 dB), the release timing (+/-8 %) and the
+// two channels' tracking (FET) or the bridge's balance (DIODE) drift.
+// Changing the model or the side-chain high-pass fades the sound out and back in (the new detector settles in the
+// gap). Latency 31 samples (reported).
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-clip.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-s74.jsfx-inc
+
+slider1:0<-24,12,0.1>-Input trim (dB)
+slider2:1<0,1,1{Off,On}>-Input guard
+slider3:12<0,36,0.1>-Input (dB)
+slider4:250<20,800,1>-Attack FET (us)
+slider5:150<30,1500,1>-Release (ms)
+slider6:0<0,4,1{4 or 1.5,8 or 3,12 or 6,20 or 10,All or Limit}>-Ratio (FET or Diode)
+slider7:0<0,3,1{Off,60 Hz,120 Hz,250 Hz}>-SC high-pass
+slider8:100<0,100,1>-Mix (%)
+slider9:0<-24,12,0.1>-Output (dB)
+slider10:0<0,1,1{FET,Diode}>-Model
+slider11:50<0,100,1>-Wander (%)
+slider12:0<0,100,1>-Band sat (%)
+slider13:30<0,100,1>-Bias (output stage, %)
+slider14:120<40,400,1>-Sat low band (Hz)
+slider15:6000<2000,16000,10>-Sat high band (Hz)
+slider16:-0.3<-24,0,0.1>-Ceiling (dB)
+slider17:1<0,1,1{Off,Clip}>-(unused, output stage)
+slider18:0.8<0.05,20,0.01>-Attack Diode (ms)
+slider19:30<0,100,1>-Memory (%)
+slider20:50<0,100,1>-Colour (%)
+slider21:0<0,1,1{Off,On}>-Freeze
+slider22:0<0,1,1{Off,On}>-Auto hold (in pauses)
+slider23:-50<-70,-25,0.1>-Auto hold threshold (dB)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-cmp74";
+ext_noinit = 1;
+clp_aa = 1; clp_pf_on = 1; clp_kt_on = 1;              // gfx-clip: ADAA, the pre-filter and knee tracking all on
+
+// ---------- memory ----------
+s74_mem = 0;
+c7_H1 = s74_alloc(64);
+c7_MK = s74_alloc(160);                                 // the makeup tables: model x ratio, 13 points each (dB)
+c7_ostm = s74_alloc(4096);
+c7_DRY = s74_alloc(256);                                // the dry signal's delay (L at 0, R at 128)
+
+// ---------- oversampling: 2x, the house half-band ----------
+s74_hbdesign(c7_H1, 63, 8);
+c7uL.s74_upinit(63, c7_H1, 64); c7uR.s74_upinit(63, c7_H1, 64); c7dL.s74_dninit(63, c7_H1, 64); c7dR.s74_dninit(63, c7_H1, 64);
+c7_LAT = 31;
+
+// ---------- the makeup that keeps every INPUT and RATIO setting level matched (dB, INPUT 0 .. 36 in 3 dB steps) ----------
+function c7_row(k, a, b, c, d, e, f, g, h, i, j, l, m, n) local(p) (
+  p = c7_MK + k * 13; p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e; p[5] = f; p[6] = g; p[7] = h; p[8] = i; p[9] = j; p[10] = l; p[11] = m; p[12] = n;
+);
+//     model * 5 + ratio      (FET 0-4, DIODE 5-9; measured on pink noise at -21 dBFS RMS, every other control at default)
+c7_row(0, 0.78, 2.45, 4.34, 6.67, 8.96, 11.10, 13.34, 15.66, 18.02, 20.20, 22.53, 24.82, 27.20);
+c7_row(1, 1.66, 2.70, 5.48, 7.65, 10.68, 12.88, 15.38, 18.20, 21.04, 23.45, 26.31, 28.58, 31.48);
+c7_row(2, 1.89, 2.95, 5.39, 8.25, 10.87, 13.94, 16.14, 18.93, 21.79, 24.63, 27.38, 30.27, 32.80);
+c7_row(3, 2.03, 3.03, 5.57, 8.76, 11.67, 13.93, 16.75, 19.70, 22.35, 25.55, 28.19, 31.35, 34.02);
+c7_row(4, 1.07, 1.74, 4.19, 6.73, 9.70, 12.26, 14.55, 17.52, 20.40, 22.63, 25.68, 28.30, 30.91);
+c7_row(5, 1.08, 1.86, 3.02, 4.09, 5.13, 6.35, 7.43, 8.58, 9.68, 10.94, 12.06, 13.20, 14.35);
+c7_row(6, 1.78, 3.76, 5.78, 7.91, 10.13, 12.25, 14.36, 16.66, 18.85, 20.56, 22.88, 25.22, 27.12);
+c7_row(7, 2.31, 4.65, 7.13, 10.00, 12.48, 15.07, 17.82, 20.43, 23.08, 25.68, 28.52, 31.04, 33.55);
+c7_row(8, 2.53, 4.81, 7.83, 10.81, 13.16, 16.39, 19.20, 21.89, 24.98, 27.56, 30.49, 33.21, 36.00);
+c7_row(9, 2.78, 5.36, 8.72, 11.97, 14.81, 17.97, 21.13, 24.27, 27.68, 30.75, 33.70, 36.70, 39.82);
+// the makeup as a gain: the table (dB) less INPUT, so the wet path comes back at the level it went in
+function c7_mk(md, rt, d) local(p, i, f, q) (
+  p = min(max(d, 0), 36) / 3; i = min(floor(p), 11); f = p - i; q = c7_MK + (md * 5 + min(max(rt, 0), 4)) * 13;
+  10 ^ ((q[i] * (1 - f) + q[i + 1] * f - d) / 20);
+);
+
+// ---------- FET: the gain law (feedback domain: u = the output's level over the threshold, dB) ----------
+function c7_q(u, k)  ( u <= -0.5 * k ? 0 : u >= 0.5 * k ? u : sqr(u + 0.5 * k) / (2 * k) );
+function c7_qd(u, k) ( u <= -0.5 * k ? 0 : u >= 0.5 * k ? 1 : (u + 0.5 * k) / k );
+// C(u): the gain reduction (dB) the loop settles on; its slope goes to c7_cd
+function c7_cc(u) local(c, d, ca, da) (
+  c = c7_rm * c7_q(u, c7_kn); d = c7_rm * c7_qd(u, c7_kn);
+  c7_wa > 0.0001 ? (
+    ca = 39 * c7_q(u, 0.3) - 30 * c7_q(u - 0.25, 0.5);  // ALL: ~40:1 at first, bending over to ~12:1
+    da = 39 * c7_qd(u, 0.3) - 30 * c7_qd(u - 0.25, 0.5);
+    c += (ca - c) * c7_wa; d += (da - d) * c7_wa;
+  );
+  c7_cd = d;
+  c;
+);
+// the FET detector: lev = the side-chain's peak level (linear), thr = the threshold (dBFS). Returns the GR (dB).
+// c7_gap (HOLD IN GAPS) stops the release.
+function c7_det(lev, thr) instance(gn, gs, gl, ga, hd) local(p, t0, gx, c, h, fl) (
+  p = 8.68588963807 * log(max(lev, 0.000001)) - thr;
+  t0 = c7_cc(p - gn);
+  t0 > gn ? (
+    // attack: an implicit (zero-delay) step of the feedback loop, by Newton
+    gx = gn;
+    loop(4,
+      c = c7_cc(p - gx);
+      h = gx - gn - c7_a * (c - gx);
+      gx -= h / (1 + c7_a + c7_a * c7_cd);
+      gx = min(max(gx, gn), max(p, gn) + 1);
+    );
+    gn = gx;
+  ) : !c7_gap ? (
+    // release: the fast stage falls towards the slow stage's memory, then both let go
+    fl = c7_kap * gs;
+    gn = gn > fl ? fl + (gn - fl) * c7_rf : gn * c7_rs;
+    gn = max(gn, t0);
+  );
+  hd = max(t0, hd * c7_hd);
+  gn > gs && hd > 0.85 * gn ? gs += (gn - gs) * c7_cs : !c7_gap ? gs *= c7_rs;
+  gl += (gn - gl) * c7_cl;                              // ALL: the lagging copy for the overshoot
+  gn < 0.000001 ? gn = 0; gs < 0.000001 ? gs = 0; hd < 0.000001 ? hd = 0; abs(gl) < 0.000001 ? gl = 0;
+  ga = max(gn + c7_ov * (gn - gl), 0);
+  ga;
+);
+function c7_detclr() instance(gn, gs, gl, ga, hd) ( gn = gs = gl = ga = hd = 0; );
+
+// ---------- DIODE: the detector (feed-forward): an instant-charge peak detector (10 ms fall), a 4 dB soft knee ----------
+function c7_ddet(lev, thr) instance(pk, e) local(lv, t) (
+  pk = lev > pk ? lev : pk * c7_pkr;
+  lv = 8.68588963807 * log(max(pk, 0.000001)) - thr;
+  t = c7_slp * (lv <= -2 ? 0 : lv >= 2 ? lv : sqr(lv + 2) * 0.125);
+  t > e ? e += (t - e) * c7_dac : !c7_gap ? e += (t - e) * c7_drc;
+  e < 0.000001 ? e = 0; pk < 0.000000001 ? pk = 0;
+  e;
+);
+function c7_ddclr() instance(pk, e) ( pk = e = 0; );
+
+// ---------- FET: the FET's colour, the makeup, the class-A gain stage (one channel, at 2x) ----------
+// the class-A stage: a gfx-clip KNEE clipper, lopsided (+1.45 / -2.1), its knee widening as INPUT rises; the
+// pre-filter (gfx-clip) in front of it
+c7_ap = 1.6; c7_an = 2.2;
+function c7_nl(y, g) instance(e2, lo, e2l) local(v, s, s2, l2, gr1) (
+  v = y * g; gr1 = 1 - g; gr1 *= gr1 * c7_fcol;         // the FET's distortion grows with the gain it takes away
+  s = v / sqrt(1 + v * v); s2 = s * s;
+  e2 += (s2 - e2) * c7_ce;                              // the running mean square keeps the even terms DC-free
+  lo += (s - lo) * c7_clo; l2 = lo * lo; e2l += (l2 - e2l) * c7_ce;
+  v += gr1 * (c7_cf * (s2 - e2) + c7_cfl * (l2 - e2l) - c7_c3 * s * s2);
+  v = this.pf.clp_pf_run(v * c7_m);
+  this.k.clp_run(v);                                    // unity small-signal gain, no rest value to remove
+);
+// the output transformer (1x): the lows saturate at high levels; a 2 Hz DC blocker
+function c7_xfm(x) instance(lo, dx, dy) local(y) (
+  lo += (x - lo) * c7_cxf;
+  x += lo / sqrt(1 + sqr(0.6 * lo)) - lo;
+  y = x - dx + c7_dcr * dy; dx = x; dy = y;
+  y;
+);
+function c7_flush() instance(e2, lo, e2l, dx, dy) (
+  abs(e2) < 0.000000000001 ? e2 = 0; abs(lo) < 0.000000000001 ? lo = 0; abs(e2l) < 0.000000000001 ? e2l = 0;
+  abs(dx) < 0.000000000001 ? dx = 0; abs(dy) < 0.000000000001 ? dy = 0;
+);
+function c7_nlclr() instance(e2, lo, e2l) ( e2 = lo = e2l = 0; this.k.clp_reset(); this.pf.clp_pf_reset(); );
+
+// ---------- DIODE: the bridge (one channel, at 2x). u = the signal after the gain, gr = the reduction (dB) ----------
+// a balanced bridge: a symmetric gfx-clip KNEE curve (limit 1), driven harder (d) as the reduction deepens, with a
+// small imbalance (b: the trace of 2nd); the rest value and the slope at rest are taken out, so the small-signal gain
+// stays 1. It runs at half the output level (the bridge's own headroom), the makeup comes after.
+function c7_cell(u, gr, bb) instance(cr) local(amt, d, b, y, w, sl) (
+  amt = c7_col * (0.15 + 0.85 * min(gr * 0.0555556, 1));
+  d = 1 + 3 * amt; b = bb * amt;
+  u = this.pf.clp_pf_run(u * c7_m * 0.5);
+  w = c7_kw; sl = b <= 1 - w ? 1 : 1 - (b - 1 + w) / (2 * w);
+  cr += (this.k.clp_crv(b) - cr) * c7_kcr;              // the rest value (glided: no DC steps)
+  y = (this.k.clp_run(d * u + b) - cr) / (d * sl);
+  2 * y;
+);
+function c7_cellclr() instance(cr) ( cr = 0; this.k.clp_reset(); this.pf.clp_pf_reset(); );
+
+// ---------- one 2x sample (c7_a0 / c7_b0 in, out): the side-chain, the detector, FREEZE, the gain cell ----------
+function c7_step() local(sa, sb, gr, gl, gq) (
+  sa = c7_a0; sb = c7_b0;
+  c7_sc > 0 ? ( sa = c7hA.s74_bq(sa); sb = c7hB.s74_bq(sb); );
+  gr = !c7_mod ? c7dt.c7_det(max(abs(sa), abs(sb)), c7_thr) : c7dd.c7_ddet(max(abs(sa), abs(sb)), c7_thd);
+  gr += (c7_gf - gr) * c7_fz;                           // FREEZE: hold the reduction (glides back on release)
+  c7_gapp = gr; c7_gsum += gr;
+  !c7_mod ? (
+    gl = exp(-0.115129255 * gr * (1 + c7_ml)); gq = exp(-0.115129255 * gr * (1 + c7_mr));
+    c7_a0 = c7nL.c7_nl(c7_a0, gl); c7_b0 = c7nR.c7_nl(c7_b0, gq);
+  ) : (
+    gl = exp(-0.115129255 * gr);
+    c7_a0 = c7cL.c7_cell(c7_a0 * gl, gr, c7_bl); c7_b0 = c7cR.c7_cell(c7_b0 * gl, gr, c7_br);
+  );
+  c7_grm = max(c7_grm, gr);
+);
+
+// ---------- settings ----------
+function c7_update() local(rt, rs) (
+  in_setup(slider1, slider2 >= 0.5);
+  rt = slider6 | 0; c7_rt = rt;
+  c7_trm = rt == 0 ? 3 : rt == 1 ? 7 : rt == 2 ? 11 : 19;
+  c7_tkn = rt == 0 ? 3.2 : rt == 1 ? 1.3333 : rt == 2 ? 0.7692 : 0.381;   // the knee's width on the output side
+  c7_twa = rt == 4;
+  c7_tsl = rt == 0 ? 1 / 3 : rt == 1 ? 2 / 3 : rt == 2 ? 5 / 6 : rt == 3 ? 0.9 : 1;   // DIODE: 1.5 / 3 / 6 / 10 / LIMIT
+  c7_tg = 10 ^ (slider3 / 20);
+  c7_tmo = slider10 >= 0.5;
+  c7_tm = c7_mk(c7_mod, rt, slider3);
+  c7_att = min(max(slider4, 20), 800) * 0.000001;
+  c7_datt = min(max(slider18, 0.05), 20) * 0.001;
+  c7_rel = min(max(slider5, 30), 1500) * 0.001;
+  c7_tsc = slider7 | 0;
+  c7_tmix = slider8 / 100; c7_tog = 10 ^ (slider9 / 20);
+  c7_memo = min(max(slider19, 0), 100) / 100;
+  c7_tcol = min(max(slider20, 0), 100) / 100;
+  c7_tfz = slider21 >= 0.5;
+  c7_gon = slider22 >= 0.5;
+  c7_glo = 10 ^ (slider23 / 10); c7_ghi = 10 ^ ((slider23 + 3) / 10);   // the gap sense's thresholds (mean square), 3 dB apart
+  drift_macro(slider11);
+  ost_setup(slider12 / 100, slider13 / 100, slider14, slider15, slider16, 1);   // output stage: CLIP, always on
+  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = c7_LAT;
+  rs = min(max(log(c7_rel / 0.05) / log(22), 0), 1);   // 0 = fastest release .. 1 = slowest
+  c7_smul = 2.5 - 0.9 * rs;                             // FET's slow stage: 2.5x the set time (fast) .. 1.6x (slow)
+  c7_cf  = 0.11 * (1 + 2.6 * c7_wa);
+  c7_cfl = 0.16 * (0.3 + 0.7 * rs) * (1 + c7_wa);
+  c7_c3  = 0.6 * c7_wa;
+);
+// the side-chain high-pass (at 2x): Butterworth
+function c7_scset() local(f) (
+  f = c7_sc == 1 ? 60 : c7_sc == 2 ? 120 : 250;
+  c7hA.s74_bqset(1, f, 0, 0.707, c7_fs2); c7hB.s74_bqset(1, f, 0, 0.707, c7_fs2);
+  c7hA.s74_bqclr(); c7hB.s74_bqclr();
+);
+// the colour stages' curves, pre-filters and knee tracking, per model (gfx-clip)
+function c7_clipset() (
+  !c7_mod ? (
+    c7nL.k.clp_set(2, c7_ap, c7_an, 0); c7nR.k.clp_set(2, c7_ap, c7_an, 0);
+    c7kt.clp_kt_cfg(1.0, 1.6);
+  ) : (
+    c7cL.k.clp_set(2, 1, 1, 0); c7cR.k.clp_set(2, 1, 1, 0);
+    c7kt.clp_kt_cfg(0.85, 1);
+  );
+  c7kt.kti = 0;
+);
+function c7_srinit() (
+  c7_sr = srate; c7_fs2 = 2 * srate;
+  c7_sm  = 1 - exp(-1 / (0.02 * srate));                // knob glide
+  c7_smr = 1 - exp(-1 / (0.03 * srate));                // ratio glide
+  c7_cs  = s74_kt(0.3, c7_fs2);                         // FET: the slow release stage: charge
+  c7_hd  = exp(-1 / (0.02 * c7_fs2));                   // FET: signal-present hold, 20 ms
+  c7_cl  = s74_kt(0.04, c7_fs2);                        // FET ALL: the overshoot's lag
+  c7_ce  = s74_kt(0.01, c7_fs2);                        // FET: the mean-square tracker, 10 ms
+  c7_clo = s74_k(250, c7_fs2);                          // FET: the low-frequency weighting
+  c7_pkr = exp(-1 / (0.01 * c7_fs2));                   // DIODE: the peak detector lets go in 10 ms
+  c7_kcr = s74_kt(0.005, c7_fs2);                       // DIODE: the rest value's glide
+  c7_kgs = s74_kt(0.004, srate);                        // the gap sense: a quick (4 ms) mean square
+  c7_cxf = s74_k(90, srate); c7_dcr = 1 - 2 * $pi * 2 / srate;
+  c7_fd = 1 / (0.006 * srate);
+  c7_fzd = 1 / (0.08 * srate);                          // FREEZE: the glide back to the detector
+  ost_init(c7_ostm);
+  c7_scset();
+  c7nL.pf.clp_pf_cfg(40000, 13000, -1.5, 100); c7nR.pf.clp_pf_cfg(40000, 13000, -1.5, 100);
+  c7cL.pf.clp_pf_cfg(40000, 10000, -1.5, 100); c7cR.pf.clp_pf_cfg(40000, 10000, -1.5, 100);
+);
+c7_kap = 0.7;
+c7_sc = c7_tsc = slider7 | 0; c7_mod = c7_tmo = slider10 >= 0.5;
+in_init();
+c7_srinit();
+c7_drT.drift_init(0.8 + rand(0.4)); c7_drR.drift_init(0.8 + rand(0.4));
+c7_drA.drift_init(0.8 + rand(0.5)); c7_drB.drift_init(0.8 + rand(0.5));
+c7L.ost_ch_init(); c7R.ost_ch_init();
+c7_update();
+c7_g = c7_tg; c7_m = c7_tm; c7_mix = c7_tmix; c7_og = c7_tog; c7_col = 0.8 * c7_tcol; c7_fcol = 1.4 * c7_tcol;
+c7_rm = c7_trm; c7_kn = c7_tkn; c7_wa = c7_twa; c7_slp = c7_tsl;
+c7_fade = 1; c7_fst = 0; c7_hold = 0; c7_dw = 0;
+c7_fz = 0; c7_fzon = 0; c7_gf = 0; c7_mem = 0; c7_mmul = 1;
+c7_clipset();
+
+// ---------- presets ----------
+function c7_set(mo, ip, ra, rd, rl, rt, sc, mm, cl, gh, gt, mx, ou) (
+  slider10 = mo; slider3 = ip; slider4 = ra; slider18 = rd; slider5 = rl; slider6 = rt; slider7 = sc;
+  slider19 = mm; slider20 = cl; slider21 = 0; slider22 = gh; slider23 = gt; slider8 = mx; slider9 = ou;
+  slider_automate(8258556);                             // 3-10, 18-23 (TRIM, GUARD, WANDER and the output stage stay)
+);
+#c7_pm = "Init|Vocal Grab|De-Harsh Vocal|Bass Even|Kick Punch|Drum Bus Punch|Parallel Smash|Room Mic Smash|Shouty Vocal|Big Suck-back|Gentle Glue Pump|Colour Only";
+function load_preset(p) (
+  //               mo  in  atF  atD   rel  rt sc mem col gap thr  mix  out
+  p == 1  ? c7_set(0, 12, 250, 0.8,  150, 0, 0, 30, 50, 0, -50, 100, 0) :      // Init
+  p == 2  ? c7_set(0, 18, 200, 0.8,  150, 0, 1, 30, 50, 0, -50, 100, -0.8) :      // Vocal Grab
+  p == 3  ? c7_set(0, 14, 50,  0.8,  100, 0, 3, 20, 50, 0, -50, 100, -1.6) :      // De-Harsh Vocal
+  p == 4  ? c7_set(0, 16, 500, 0.8,  400, 1, 0, 40, 50, 0, -50, 100, 0.9) :      // Bass Even
+  p == 5  ? c7_set(0, 15, 700, 0.8,  60,  0, 0, 0,  60, 0, -50, 100, -1.4) :      // Kick Punch
+  p == 6  ? c7_set(0, 14, 400, 0.8,  100, 0, 2, 20, 50, 0, -50, 100, -1.9) :      // Drum Bus Punch
+  p == 7  ? c7_set(0, 30, 250, 0.8,  50,  4, 0, 0,  70, 0, -50, 40,  -0.6) :      // Parallel Smash
+  p == 8  ? c7_set(1, 24, 250, 0.2,  120, 4, 1, 70, 85, 1, -50, 100, -1) :      // Room Mic Smash
+  p == 9  ? c7_set(1, 16, 250, 1.5,  180, 2, 1, 50, 55, 1, -55, 100, -1) :      // Shouty Vocal
+  p == 10 ? c7_set(1, 20, 250, 0.3,  300, 3, 0, 100, 50, 0, -50, 100, 1.1) :     // Big Suck-back
+  p == 11 ? c7_set(1, 10, 250, 2,    400, 1, 2, 40, 25, 1, -50, 100, -0.9) :      // Gentle Glue Pump
+  p == 12 ? c7_set(1, 6,  250, 20,   1500, 0, 0, 0, 75, 0, -50, 100, 0.3) :      // Colour Only
+  p == 13 ? (                                           // Reset all to defaults
+    c7_set(0, 12, 250, 0.8, 150, 0, 0, 30, 50, 0, -50, 100, 0);
+    slider1 = 0; slider2 = 1; slider11 = 50; slider12 = 0; slider13 = 30; slider14 = 120; slider15 = 6000; slider16 = -0.3; slider17 = 1;
+    slider_automate(8388607);
+  );
+  pr_cur = p;
+);
+
+// ---------- the faces: FET (slate, amber lamps) and DIODE (desert tan, signal-orange lamps) ----------
+function c7_face(m) (
+  s74_pal(0);
+  !m ? (
+    S74_OLIVE = 0x3C4752; S74_OLIVED = 0x303943; S74_OLIVEL = 0x4A5661;
+    S74_INK = 0xEAEDEB; S74_DIM = 0xA4AFB8; S74_LAMP = 0xFFB23E; S74_CHAR = 0x161A1E; s74_m = 0;
+    C7_KB = 0x121417; C7_KCAP = 0xC4C8CB; C7_KIDX = 0x111315;
+    C7_WIN = 0xE6A24A; C7_WINK = 0x2A1906; C7_WRED = 0x9A1E0E;
+    C7_LIT = 0xFFB23E; C7_LITX = 0x2A1606; C7_KBG = 0x22272C; C7_KTX = 0xA7B0B8; C7_SEG = 0x2B2F33;
+  ) : (
+    S74_OLIVE = 0xB5A57D; S74_OLIVED = 0x9E8E67; S74_OLIVEL = 0xC4B48C;
+    S74_INK = 0x1C1B17; S74_DIM = 0x4E4734; S74_LAMP = 0xFF6A2A; S74_CHAR = 0x1C1B17; s74_m = 1;
+    C7_KB = 0x1A1917; C7_KCAP = 0x2C2A26; C7_KIDX = 0xF4EFE0;
+    C7_WIN = 0xEEE5C7; C7_WINK = 0x1C1B17; C7_WRED = 0xB4261A;
+    C7_LIT = 0xFF5A1E; C7_LITX = 0xFFF6EE; C7_KBG = 0x2A2925; C7_KTX = 0xB8AE92; C7_SEG = 0x8A7C58;
+  );
+  S74_PLATE = S74_OLIVE;
+  C7_ICE = 0x8FE3FF; C7_ICED = 0x3E6D80;
+);
+// a lit key: a black bezel, a smoked cap that lights in its lamp colour when engaged; returns 1 on a click
+// now the house lamp key (gfx-ui's lk_fit) in the old footprint: lc = its lamp colour (an LK_ colour); lx is unused
+function c7_key(x, y, w, h, on, s, lc, lx) (
+  lk_fit(x, y, w, h, on, lc, s);
+);
+// a flat pointer knob: printed ticks, a flat body, a flat cap (the colour code when s74_kc is set), a stark index line.
+// Drag, SHIFT fine, double-click / Ctrl-click default, wheel; the value shows only while touched.
+function c7_knob(cx, cy, r, idx, lo, hi, def, lg, label, fmt, stp) local(v, n, dx, dy, hov, did, a, ca, sa, i, t, l, k) (
+  did = 4000 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 6) * sc);
+  pressed && hov && drag_id == 0 ? (
+    (time_precise() - s74_lt < 0.35 && s74_lid == idx && !s74_mv) || (mouse_cap & 4) ? ( s74_set(idx, def); drag_id = -1; s74_lt = 0; ) : (
+      drag_id = did; s74_ky = mouse_y; s74_ky0 = mouse_y; s74_mv = 0; s74_lt = time_precise(); s74_lid = idx;
+      s74_kn = lg ? log(v / lo) / log(hi / lo) : (v - lo) / (hi - lo);
+    );
+  );
+  drag_id == did && !s74_mv && abs(mouse_y - s74_ky0) > 3 * sc ? ( s74_mv = 1; s74_ky = mouse_y; );
+  drag_id == did && s74_mv ? (
+    s74_kn = min(max(s74_kn + (s74_ky - mouse_y) / (((mouse_cap & 8) ? 1200 : 220) * sc), 0), 1); s74_ky = mouse_y;
+    v = lg ? lo * (hi / lo) ^ s74_kn : lo + s74_kn * (hi - lo);
+    stp > 0 ? v = lo + floor((v - lo) / stp + 0.5) * stp;
+    slider(idx) != v ? s74_set(idx, v);
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    n = lg ? log(v / lo) / log(hi / lo) : (v - lo) / (hi - lo);
+    n = min(max(n + mouse_wheel / 120 * (stp > 0 ? stp / (hi - lo) : ((mouse_cap & 8) ? 0.005 : 0.025)), 0), 1);
+    v = lg ? lo * (hi / lo) ^ n : lo + n * (hi - lo);
+    stp > 0 ? v = lo + floor((v - lo) / stp + 0.5) * stp;
+    s74_set(idx, v); mouse_wheel = 0;
+  );
+  v = slider(idx); n = lg ? log(v / lo) / log(hi / lo) : (v - lo) / (hi - lo); n = min(max(n, 0), 1);
+  i = 0;
+  loop(11,
+    t = -0.75 * $pi + i * 0.15 * $pi; l = i == 0 || i == 5 || i == 10 ? 10 : 7;
+    ui_cola(S74_INK, 0.85); s74_ln(cx + sin(t) * (r + 4), cy - cos(t) * (r + 4), cx + sin(t) * (r + l), cy - cos(t) * (r + l), i == 0 || i == 5 || i == 10 ? 1.8 : 1.2);
+    i += 1;
+  );
+  a = -0.75 * $pi + n * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+  ui_col(C7_KB); gfx_circle(cx * sc, cy * sc, r * sc, 1, 1);
+  k = s74_kc ? s74_kc : C7_KCAP;
+  ui_col(k); gfx_circle(cx * sc, cy * sc, r * 0.74 * sc, 1, 1);
+  ui_col(s74_kc ? 0xF6F4EE : C7_KIDX);
+  s74_ln(cx + ca * r * 0.12, cy + sa * r * 0.12, cx + ca * r * 0.97, cy + sa * r * 0.97, max(3, r * 0.14));
+  (hov || drag_id == did) ? (
+    strlen(fmt) ? sprintf(#s74_vv, fmt, v) : strcpy(#s74_vv, #s74_vs);
+    s74_pill(cx, cy + r + 8, #s74_vv);
+  ) : (
+    strlen(label) ? ( gfx_setfont(11); ui_col(S74_INK); s74_tc(cx, cy + r + 18, label); );
+  );
+);
+// the gain-reduction meter: a VU movement in a backlit window, reading the reduction (0 at the right, 20 dB at the
+// left), its needle on VU ballistics (about 300 ms)
+function c7_vpos(g) ( (10 ^ (-max(g, 0) / 20) - 0.1) / 0.9; );
+function c7_vu(x, y, w, h, gr, fz) instance(pos, vel, lt) local(dt, px, py, R, i, d, p, a, s, c, x1, y1, x2, y2) (
+  dt = min(max(time_precise() - lt, 0.001), 0.05); lt = time_precise();
+  vel += (150 * (c7_vpos(gr) - pos) - 17 * vel) * dt; pos += vel * dt; pos = min(max(pos, -0.04), 1.03);
+  ui_cola(0x000000, 0.4); s74_r(x + 1, y + 2, w, h);
+  ui_col(0x0E0F10); s74_r(x, y, w, h);
+  ui_col(C7_WIN); s74_r(x + 5, y + 5, w - 10, h - 10);
+  px = x + w * 0.5; py = y + h + 30; R = h - 10;
+  // the scale: an arc (red from 10 dB), the marks, the numerals (dB of reduction) outside it
+  i = 0; loop(40, a = (-40 + 2 * i) * $pi / 180; p = (i + 0.5) / 40;
+    ui_col(p < c7_vpos(10) ? C7_WRED : C7_WINK); s74_ln(px + sin(a) * R, py - cos(a) * R, px + sin(a + 2 * $pi / 180) * R, py - cos(a + 2 * $pi / 180) * R, p < c7_vpos(10) ? 2.6 : 1.4); i += 1; );
+  i = 0;
+  loop(8,
+    d = i == 0 ? 20 : i == 1 ? 10 : i == 2 ? 7 : i == 3 ? 5 : i == 4 ? 3 : i == 5 ? 2 : i == 6 ? 1 : 0;
+    p = c7_vpos(d); a = (-40 + 80 * p) * $pi / 180; s = sin(a); c = cos(a);
+    ui_col(d >= 10 ? C7_WRED : C7_WINK);
+    s74_ln(px + s * R, py - c * R, px + s * (R - 9), py - c * (R - 9), 1.8);
+    gfx_setfont(13); sprintf(#c7_e, "%d", d); s74_tc(px + s * (R + 12), py - c * (R + 12), #c7_e);
+    i += 1;
+  );
+  // FREEZE lit in the window
+  fz ? ( ui_col(C7_ICE); s74_r(x + 12, y + 12, 62, 16); gfx_setfont(13); ui_col(0x0B2230); s74_tc(x + 43, y + 20, "FROZEN"); );
+  // the needle, from a pivot below the window
+  p = min(max(pos, -0.04), 1.03); a = (-40 + 80 * p) * $pi / 180;
+  x1 = px + sin(a) * 54; y1 = py - cos(a) * 54; x2 = px + sin(a) * (R + 3); y2 = py - cos(a) * (R + 3);
+  ui_cola(0x000000, 0.22); s74_ln(x1 + 1.5, y1 + 1.5, x2 + 1.5, y2 + 1.5, 2);
+  ui_col(0x16181A); s74_ln(x1, y1, x2, y2, 2);
+  // the pivot cover along the foot of the window, the glass
+  ui_col(0x16181A); s74_r(x + 5, y + h - 21, w - 10, 16);
+  gfx_setfont(13); ui_col(0xB4B8BC); s74_tc(px, y + h - 13, "GAIN REDUCTION  ·  dB");
+  ui_cola(0xFFFFFF, 0.08); s74_r(x + 5, y + 5, w - 10, (h - 10) * 0.38);
+);
+// the header (on the steel): the 74 plate, the name, two lines of small print, the presets, the FET / DIODE keys, the
+// size picker. Returns the preset picked (0 = none).
+function c7_header(w, name, l1, l2, pm, midx) local(k) (
+  ui_col(S74_HAZ); s74_r(16, 13, 30, 28);
+  gfx_setfont(15); ui_col(0x16181A); s74_tc(31, 27, "74");
+  gfx_setfont(14); gfx_measurestr(name, k, s74_hh);
+  ui_col(0xE9E6D6); gfx_x = 56 * sc; gfx_y = 13 * sc - s74_hh * 0.17; gfx_drawstr(name);
+  s74_sx = 56 + k / sc + 14;
+  gfx_setfont(13); ui_col(0xA9A98E); s74_t(s74_sx, 15, l1); s74_t(s74_sx, 29, l2);
+  pk_pextra = "Reset all to defaults";
+  k = pk_preset(320 * sc, 10 * sc, (w - 580) * sc, 34 * sc, pr_cur, pm);
+  c7_key(w - 240, 14, 60, 26, slider(midx) < 0.5, "FET", LK_YEL, 0) ? s74_set(midx, 0);
+  c7_key(w - 172, 14, 76, 26, slider(midx) >= 0.5, "DIODE", LK_YEL, 0) ? s74_set(midx, 1);
+  ui_size_picker((w - 74) * sc, 18 * sc);
+  k;
+);
+
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+@slider
+c7_update();
+
+@block
+srate != c7_sr ? c7_srinit();
+c7_update();                                            // keys and knobs moved on the panel do not run @slider
+// WANDER: the threshold, the release timing, the channels' tracking (FET) or the bridge's balance (DIODE)
+c7_di = 0.25 * dm_s * samplesblock / srate;
+c7_thr = -12 + 0.5 * dm_a * c7_drT.drift_tick(c7_di);  // FET: the threshold (INPUT drives into it)
+c7_thd = -14 + 0.5 * dm_a * c7_drT.v;                   // DIODE
+c7_drr = 1 + 0.08 * dm_a * c7_drR.drift_tick(c7_di);
+c7_ml = 0.015 * dm_a * c7_drA.drift_tick(c7_di);
+c7_mr = 0.015 * dm_a * c7_drB.drift_tick(c7_di);
+c7_bl = 0.06 * (1 + 2 * dm_a * c7_drA.v); c7_br = 0.06 * (1 + 2 * dm_a * c7_drB.v);
+// MEMORY: the charge follows the block's mean reduction (up over 0.5 s, down over 1.5 s); the release stretches with it
+c7_gavg = c7_gsum / max(2 * samplesblock, 1); c7_gsum = 0;
+c7_mem += (c7_gavg - c7_mem) * (1 - exp(-samplesblock / ((c7_gavg > c7_mem ? 0.5 : 1.5) * srate)));
+c7_mem < 0.000001 ? c7_mem = 0;
+c7_mf = min(c7_mem / 10, 1);
+c7_mmul = (1 - c7_memo) + c7_memo * (0.25 + 5.75 * c7_mf * sqrt(c7_mf));
+// the timing (from the gliding ratio), at 2x
+c7_rn = 1 + c7_rm * (1 - c7_wa) + 39 * c7_wa;           // FET: the loop gain: the attack stays the set time at any ratio
+c7_a  = (exp(1 / (c7_att * (1 + 2 * c7_wa) * c7_fs2)) - 1) / c7_rn;
+c7_tr = c7_rel * (1 - 0.3 * c7_wa) * c7_drr * c7_mmul;
+c7_rf = exp(-1 / (c7_tr * c7_fs2));
+c7_rs = exp(-1 / (c7_smul * c7_tr * c7_fs2));
+c7_ov = 0.6 * c7_wa;
+c7_dac = s74_kt(c7_datt, c7_fs2);                       // DIODE: attack and release (one pole each)
+c7_drc = s74_kt(c7_rel * c7_drr * c7_mmul, c7_fs2);
+// the colour stages: the pre-filter and the knee follow INPUT (the drive)
+c7_drv = min(max(slider3 / 36, 0), 1);
+!c7_mod ? (
+  c7nL.pf.clp_pf_block(c7_drv, c7_fs2, 2 * samplesblock); c7nR.pf.clp_pf_block(c7_drv, c7_fs2, 2 * samplesblock);
+  c7_kw = c7kt.clp_kt_block(c7_drv, c7_fs2, 2 * samplesblock); c7nL.k.clp_knee(c7_kw); c7nR.k.clp_knee(c7_kw);
+  c7nL.k.clp_tidy(); c7nR.k.clp_tidy();
+) : (
+  c7cL.pf.clp_pf_block(c7_drv, c7_fs2, 2 * samplesblock); c7cR.pf.clp_pf_block(c7_drv, c7_fs2, 2 * samplesblock);
+  c7_kw = c7kt.clp_kt_block(c7_drv, c7_fs2, 2 * samplesblock); c7cL.k.clp_knee(c7_kw); c7cR.k.clp_knee(c7_kw);
+  c7cL.k.clp_tidy(); c7cR.k.clp_tidy();
+);
+c7nL.c7_flush(); c7nR.c7_flush(); c7xL.c7_flush(); c7xR.c7_flush();
+abs(c7cL.cr) < 0.000000000001 ? c7cL.cr = 0; abs(c7cR.cr) < 0.000000000001 ? c7cR.cr = 0;
+c7_gms < 0.000000000001 ? c7_gms = 0;
+c7a_gr = max(c7a_gr, c7_grm); c7_grm = 0;
+c7a_mem = c7_mf; c7a_gap = max(c7a_gap, c7_gap);
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@sample
+// ---------- glides ----------
+c7_g += (c7_tg - c7_g) * c7_sm; c7_m += (c7_tm - c7_m) * c7_sm;
+c7_mix += (c7_tmix - c7_mix) * c7_sm; c7_og += (c7_tog - c7_og) * c7_sm;
+c7_col += (c7_tcol * 0.8 - c7_col) * c7_sm; c7_fcol += (1.4 * c7_tcol - c7_fcol) * c7_sm;   // COLOUR: DIODE 0 .. 0.8, FET 0 .. 1.4x
+c7_rm += (c7_trm - c7_rm) * c7_smr; c7_kn += (c7_tkn - c7_kn) * c7_smr; c7_wa += (c7_twa - c7_wa) * c7_smr;
+c7_slp += (c7_tsl - c7_slp) * c7_smr;
+c7_wa < 0.00001 ? c7_wa = 0;
+// a change of model or side-chain high-pass: fade out, switch at the silent point, wait, fade in
+(c7_tmo != c7_mod || c7_tsc != c7_sc) && c7_fst == 0 ? c7_fst = 1;
+c7_fst == 1 ? ( c7_fade -= c7_fd; c7_fade <= 0 ? (
+  c7_fade = 0;
+  // the new detector runs while it is silent, so it has settled when the sound comes back
+  c7_hold = c7_LAT + 0.03 * srate;
+  c7_tmo != c7_mod ? (
+    c7_mod = c7_tmo; c7_m = c7_tm = c7_mk(c7_mod, c7_rt, slider3);
+    c7dt.c7_detclr(); c7dd.c7_ddclr(); c7nL.c7_nlclr(); c7nR.c7_nlclr(); c7cL.c7_cellclr(); c7cR.c7_cellclr();
+    c7_clipset(); c7_fz = 0;
+    c7_hold = c7_LAT + 0.08 * srate;
+  );
+  c7_tsc != c7_sc ? ( c7_sc = c7_tsc; c7_scset(); );
+  c7_fst = 2; ); ) :
+c7_fst == 2 ? ( c7_hold -= 1; c7_hold <= 0 ? ( c7_fst = 3; c7_fzon ? ( c7_gf = c7_gapp; c7_fz = 1; ); ); ) :
+c7_fst == 3 ? ( c7_fade += c7_fd; c7_fade >= 1 ? ( c7_fade = 1; c7_fst = 0; ); );
+// FREEZE: engaging holds the reduction where it is (no step); releasing glides back to the detector
+c7_tfz && !c7_fzon ? ( c7_fzon = 1; c7_fst != 2 ? ( c7_gf = c7_gapp; c7_fz = 1; ); ) :
+!c7_tfz && c7_fzon ? c7_fzon = 0;
+!c7_fzon && c7_fz > 0 ? c7_fz = max(c7_fz - c7_fzd, 0);
+
+// ---------- input: TRIM, GUARD ----------
+in_process(spl0, spl1);
+c7_xl = in_l; c7_xr = in_r;
+// HOLD IN GAPS: a quick mean square of the input; below the threshold the release stops (3 dB hysteresis)
+c7_gms += (max(c7_xl * c7_xl, c7_xr * c7_xr) - c7_gms) * c7_kgs;
+c7_gap = c7_gon && (c7_gap ? c7_gms < c7_ghi : c7_gms < c7_glo);
+c7_DRY[c7_dw] = c7_xl; c7_DRY[128 + c7_dw] = c7_xr;
+c7_dr = (c7_dw - c7_LAT) & 127; c7_yld = c7_DRY[c7_dr]; c7_yrd = c7_DRY[128 + c7_dr]; c7_dw = (c7_dw + 1) & 127;
+
+c7uL.s74_up(c7_xl * c7_g); c7uR.s74_up(c7_xr * c7_g);
+c7_a0 = c7uL.o0; c7_b0 = c7uR.o0; c7_step(); c7_q0l = c7_a0; c7_q0r = c7_b0;
+c7_a0 = c7uL.o1; c7_b0 = c7uR.o1; c7_step(); c7_q1l = c7_a0; c7_q1r = c7_b0;
+c7_yl = c7dL.s74_dn(c7_q0l, c7_q1l); c7_yr = c7dR.s74_dn(c7_q0r, c7_q1r);
+// FET: the output transformer
+!c7_mod ? ( c7_yl = c7xL.c7_xfm(c7_yl); c7_yr = c7xR.c7_xfm(c7_yr); );
+
+// ---------- MIX, the fade, OUTPUT and the house output stage ----------
+c7_yl = (c7_yld + (c7_yl - c7_yld) * c7_mix) * c7_fade; c7_yr = (c7_yrd + (c7_yr - c7_yrd) * c7_mix) * c7_fade;
+c7_yl = c7L.ost_band(c7_yl) * c7_og; c7_yr = c7R.ost_band(c7_yr) * c7_og;
+ost_out(c7_yl, c7_yr);
+spl0 = abs(ost_l) < 0.00000000000000000001 ? 0 : ost_l;
+spl1 = abs(ost_r) < 0.00000000000000000001 ? 0 : ost_r;
+
+@gfx 960 396
+ui_begin(960, 396);
+c7_dio = slider10 >= 0.5;
+c7_face(c7_dio);
+s74_fonts();
+s74_face(960, 396);
+s74_lamp = 1;                                           // the house lamp keys (gfx-ui); this unit draws its own keys (c7_key)
+sc != c7_lsc ? ( c7_lsc = sc; gfx_setfont(16, "Arial", 10 * sc, 'b'); gfx_setfont(10, "Arial", 10 * sc, 'b'); );
+lk_font = 16; lk_font2 = 10;                            // lamp-key legends: caps 26 px tall or more / smaller caps
+ck_font = 10;                                           // the SC HPF cream selector keys (ck_key): slot 10 too
+lk_well = 0x141518;                                     // the header's FET / DIODE keys sit on the dark steel
+
+// ---------- the header ----------
+k_ = c7_header(960, "CMP74", "SERIES 74", c7_dio ? "DIODE-BRIDGE LIMITER" : "FET PEAK LIMITER", #c7_pm, 10);
+k_ > 0 ? load_preset(k_);
+lk_well = c7_dio ? 0x2A2722 : 0x141518;                 // the panel keys: DIODE's desert-tan plates are a light face
+
+// ---------- INPUT: the trim, GUARD, the side-chain high-pass ----------
+s74_mod(14, 62, 150, 322, "INPUT");
+c7_knob(89, 130, 20, 1, -24, 12, 0, 0, "TRIM", "%+.1f dB", 0);
+s74_smallc(89, 196, "GUARD");
+c7_key(63, 206, 52, 24, slider2 >= 0.5, slider2 >= 0.5 ? "ON" : "OFF", c7_dio ? LK_YEL : LK_WHT, 0) ? s74_set(2, slider2 >= 0.5 ? 0 : 1);
+in_grd > 0.5 ? pk_led(130 * sc, 218 * sc, 3.5 * sc, 1, S74_HAZ); in_grd = 0;
+s74_smallc(89, 256, "SC HIGH-PASS");
+i_ = 0; loop(4, pk_pitem("OFF|60|120|250", i_ + 1, #t_);
+  ck_key(30 + (i_ % 2) * 62, 268 + floor(i_ / 2) * 34, 56, 26, slider7 == i_, #t_) ? s74_set(7, i_); i_ += 1; );
+s74_smallc(89, 346, "Hz  ·  12 dB / OCT");
+
+// ---------- the gain cell: the GR meter, INPUT, ATTACK, RELEASE, COLOUR, RATIO ----------
+s74_mod(176, 62, 400, 322, c7_dio ? "DIODE BRIDGE" : "FET LIMITER");
+c7mG.c7_vu(190, 96, 220, 140, c7a_gr, slider21 >= 0.5);
+c7a_gr *= 0.5;
+c7_knob(494, 158, 36, 3, 0, 36, 12, 0, "INPUT", "%.1f dB", 0);
+s74_small(440, 204, "0"); s74_small(536, 204, "36");
+c7_dio ? c7_knob(214, 286, 21, 18, 0.05, 20, 0.8, 1, "ATTACK", "%.2f ms", 0) :
+         c7_knob(214, 286, 21, 4, 20, 800, 250, 1, "ATTACK", "%.0f us", 0);
+c7_knob(300, 286, 21, 5, 30, 1500, 150, 1, "RELEASE", "%.0f ms", 0);
+c7_knob(386, 286, 21, 20, 0, 100, 50, 0, "COLOUR", "%.0f%%", 0);
+c7_dio ? ( s74_smallc(502, 266, "FEED-FORWARD"); s74_smallc(502, 284, "PEAK  ·  4 dB KNEE"); s74_smallc(502, 302, "BALANCED BRIDGE"); ) :
+         ( s74_smallc(502, 266, "FEEDBACK"); s74_smallc(502, 284, "PEAK  ·  CURVED KNEE"); s74_smallc(502, 302, "FET  ·  CLASS A"); );
+gfx_setfont(11); ui_col(S74_INK); s74_t(192, 346, "RATIO");
+i_ = 0; loop(5, c7_dio ? pk_pitem("1.5|3|6|10|LIMIT", i_ + 1, #t_) : pk_pitem("4|8|12|20|ALL", i_ + 1, #t_);
+  c7_key(256 + i_ * 60, 340, 54, 26, slider6 == i_, #t_, LK_YEL, 0) ? s74_set(6, i_); i_ += 1; );
+
+// ---------- MEMORY · FREEZE ----------
+s74_mod(588, 62, 176, 322, "MEMORY · FREEZE");
+c7_knob(676, 130, 21, 19, 0, 100, 30, 0, "MEMORY", "%.0f%%", 0);
+i_ = 0; loop(12, ui_col(i_ < c7a_mem * 12 - 0.01 && slider19 > 0 ? C7_LIT : C7_SEG); s74_r(606 + i_ * 12, 190, 9, 10); i_ += 1; );
+s74_small(606, 206, "SNAP"); gfx_setfont(13); gfx_measurestr("SUCK", tw_, th_); s74_t(749 - tw_ / sc, 206, "SUCK");
+c7_key(604, 228, 144, 36, slider21 >= 0.5, "FREEZE", c7_dio ? LK_BLU_LT : LK_BLU, 0) ? s74_set(21, slider21 >= 0.5 ? 0 : 1);
+s74_smallc(676, 292, "HOLD IN GAPS");
+c7_key(604, 310, 60, 26, slider22 >= 0.5, "AUTO", LK_YEL, 0) ? s74_set(22, slider22 >= 0.5 ? 0 : 1);
+pk_led(616 * sc, 356 * sc, 3.5 * sc, slider22 >= 0.5 && c7a_gap > 0, C7_ICE); c7a_gap = 0;
+s74_small(626, 350, "HOLD");
+c7_knob(720, 326, 15, 23, -70, -25, -50, 0, "THRESH", "%.0f dB", 0);
+
+// ---------- OUTPUT: WANDER, SAT; MIX and OUTPUT on faders ----------
+s74_mod(776, 62, 170, 322, "OUTPUT");
+c7_knob(812, 132, 18, 11, 0, 100, 50, 0, "WANDER", "%.0f%%", 0);
+c7_knob(812, 240, 14, 12, 0, 100, 0, 0, "SAT", "%.0f%%", 0);
+ost_clipped ? pk_led(834 * sc, 226 * sc, 3.5 * sc, 1, 0xFF3A22); ost_clipped = 0;
+s74_fc = S74_F_BLUE; s74_fader(872, 110, 170, 8, 0, 100, 100, 0, "MIX", "%.0f%%", 0);
+s74_fc = S74_F_CREAM; s74_fader(920, 110, 170, 9, -24, 12, 0, 0, "OUTPUT", "%+.1f dB", 0);
+s74_fc = 0;
+s74_smallc(861, 346, "CLIP  ·  ALWAYS ON");
+
+pk_end();
+ui_end();

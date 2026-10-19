@@ -1,0 +1,465 @@
+desc:GFX Haas Doubler [stereo doubler]
+//tags: stereo delay doubler haas width
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output and gfx-ui (.jsfx-inc) in the same folder.
+//
+// Modes:
+//   L/R    - dry on one side, delayed copy on the other (classic Haas)
+//   LCR    - dry centre, delayed copies hard L and R (R = delay x multiplier)
+//   Spread - delayed copies only, L and R (R = delay x multiplier)
+// Dry off = wet only, for use on an FX send.
+// Drift: smoothed random wander of time, pan and level per copy. The DRIFT dial scales the three drift
+// amounts (50% = the drift settings, 100% = twice, 0 = none) and speeds the wander up with them.
+// Detune: each side pitch-shifted by +/- cents (a dual-tap delay-line shifter), for the classic
+// detuned-doubler width. In L/R mode the dry side takes its side's detune too.
+// IN / OUT: TRIM (with the GUARD key) and SAT sit on the panel.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+
+slider1:1<0,2,1{L/R,LCR,Spread}>-Mode
+slider2:12<1,40,0.1>-Delay (ms)
+slider3:0<0,4,1{x2,x3,x4,x5,x6}>-Right multiplier
+slider4:0<0,1,1{Off,On}>-Swap sides
+slider5:0<-24,6,0.1>-Doubled level (dB)
+slider6:150<20,1000,1>-Low cut (Hz)
+slider7:100<0,100,1>-Width (%)
+slider8:0.5<0,5,0.01>-Time drift (ms)
+slider9:15<0,100,1>-Pan drift (%)
+slider10:0.5<0,6,0.1>-Level drift (dB)
+slider11:0.25<0.02,2,0.01>-Drift speed (Hz)
+slider12:0<0,1,1{Mono sum,Stereo}>-Input
+slider13:0<-24,12,0.1>-Output (dB)
+slider14:0<0,1,1{Off,On}>-Mono check
+slider15:1<0,1,1{Off,On}>-Dry
+slider16:0<0,100,1>-Band sat (%)
+slider17:30<0,100,1>-Bias (%)
+slider18:120<40,400,1>-Sat low band (Hz)
+slider19:6000<2000,16000,10>-Sat high band (Hz)
+slider20:-0.3<-24,0,0.1>-(unused, was output ceiling)
+slider21:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider22:0<-24,12,0.1>-Input trim (dB)
+slider23:1<0,1,1{Off,On}>-Input guard
+slider24:0<-50,50,0.1>-Detune left (cents)
+slider25:0<-50,50,0.1>-Detune right (cents)
+slider26:50<0,100,1>-Drift (%)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-haas-doubler";                                  // the ? pop-up links to this manual
+
+// 12 dB/oct high-pass (shared coefficients, per-instance state)
+function hp_proc(x) instance(z1, z2) local(y) (
+  y = hb0 * x + z1;
+  z1 = hb1 * x - ha1 * y + z2;
+  z2 = hb2 * x - ha2 * y;
+  y;
+);
+
+// Fractional delay read, 4-point Hermite interpolation
+function dread(buf, d) local(rp, i, f, xm1, x0, x1, x2) (
+  rp = wp - d;
+  rp < 0 ? rp += bufsize;
+  i = floor(rp); f = rp - i;
+  xm1 = buf[(i + bufsize - 1) & mask];
+  x0  = buf[i & mask];
+  x1  = buf[(i + 1) & mask];
+  x2  = buf[(i + 2) & mask];
+  ((((0.5 * (x2 - xm1) + 1.5 * (x0 - x1)) * f
+     + (xm1 - 2.5 * x0 + 2 * x1 - 0.5 * x2)) * f
+     + 0.5 * (x1 - xm1)) * f + x0);
+);
+
+// Pitch shift: two taps sweeping a 30 ms window half a cycle apart, Hann crossfaded.
+// rt = 1 - pitch ratio (samples of delay added per sample). amt fades the shifter in and out of bypass
+// so the knob passing through 0 does not click (at exactly 0 a static two-tap read would comb-filter).
+function pshift(buf, d0, rt, on) instance(ph, amt) local(ws, p2, y, w) (
+  amt += ((on ? 1 : 0) - amt) * psm;
+  amt < 0.0001 ? ( ph = 0; dread(buf, d0); ) : (
+    ws = 0.03 * srate;
+    ph += rt / ws; ph -= floor(ph);
+    p2 = ph + 0.5; p2 -= floor(p2);
+    w = sin($pi * ph); w *= w;
+    y = w * dread(buf, d0 + ph * ws) + (1 - w) * dread(buf, d0 + p2 * ws);
+    amt > 0.9999 ? y : amt * y + (1 - amt) * dread(buf, d0);
+  );
+);
+
+function update() local(w0, cw, al, q0) (
+  mode = slider1;
+  base = slider2;
+  rmult = slider3 + 2;
+  sideA = slider4 ? 1 : -1;
+  sideB = -sideA;
+  dbl_t = 10 ^ (slider5 / 20);
+  slider6 != lastHP ? (
+    lastHP = slider6;
+    w0 = 2 * $pi * min(slider6, srate * 0.45) / srate;
+    cw = cos(w0); al = sin(w0) / (2 * 0.70710678);
+    q0 = 1 + al;
+    hb0 = (1 + cw) * 0.5 / q0; hb1 = -(1 + cw) / q0; hb2 = hb0;
+    ha1 = -2 * cw / q0; ha2 = (1 - al) / q0;
+  );
+  wid_t = slider7 / 100;
+  drift_macro(slider26);
+  tdrift = slider8 * dm_a;
+  pdrift = min(slider9 / 100 * dm_a, 1);
+  ldrift = slider10 * dm_a;
+  dspeed = slider11 * dm_s;
+  inmode = slider12;
+  out_t = 10 ^ (slider13 / 20);
+  monochk = slider14;
+  dryon = slider15;
+  in_setup(slider22, slider23);
+  ost_setup(slider16 / 100, slider17 / 100, slider18, slider19, slider20, 0);   // output stage: straight through
+  // detune follows the side each copy sits on
+  cA = sideA < 0 ? slider24 : slider25; cB = sideA < 0 ? slider25 : slider24;
+  rtA = 1 - 2 ^ (cA / 1200); rtB = 1 - 2 ^ (cB / 1200);
+  onA = abs(cA) >= 0.05; onB = abs(cB) >= 0.05;
+  mode == 0 ? ( dA_t = 0; dB_t = base; ) : ( dA_t = base; dB_t = base * rmult; );
+);
+
+// ---------- presets (leave Dry, Swap, Input, Output, Mono check alone) ----------
+function setp(m, d, x, lv, lc, w, td, pd, ld, sp) (
+  slider1 = m; slider2 = d; slider3 = x; slider5 = lv; slider6 = lc;
+  slider7 = w; slider8 = td; slider9 = pd; slider10 = ld; slider11 = sp;
+);
+function load_preset(p) (
+  hd_dst = 1;                                  // duck the output, swap the settings at silence, fade back in
+  p == 1 ? setp(1,  6, 0, -3, 150, 100, 0.2,  5, 0.3, 0.2 ) :   // Short
+  p == 2 ? setp(1, 12, 0,  0, 150, 100, 0.5, 15, 0.5, 0.25) :   // Med
+  p == 3 ? setp(1, 20, 0, -4, 200, 100, 0.8, 15, 0.5, 0.2 ) :   // Long
+  p == 4 ? setp(0, 18, 0,  0, 120, 100, 0,    0, 0,   0.25) :   // Classic Haas
+  p == 5 ? setp(2, 12, 0,  0, 100, 100, 0.6, 20, 0.5, 0.3 ) :   // Wide Spread
+  p == 6 ? setp(2, 12, 1,  0, 120, 100, 4,   60, 3,   1.5 ) :   // Super Wobble
+  p == 7 ? setp(0, 22, 0, -1,  80,  70, 2.5,  0, 1,   0.7 ) :   // Vintage ADT
+  p == 8 ? setp(1,  8, 1, -6, 300,  70, 0.3, 10, 0.3, 0.2 );    // Mono Safe
+  p >= 1 && p <= 8 ? slider_automate(2039);   // sliders 1,2,3,5-11
+  p == 9 ? (                                   // Reset all to defaults
+    slider1 = 1; slider2 = 12; slider3 = 0; slider4 = 0; slider5 = 0;
+    slider6 = 150; slider7 = 100; slider8 = 0.5; slider9 = 15; slider10 = 0.5;
+    slider11 = 0.25; slider12 = 0; slider13 = 0; slider14 = 0; slider15 = 1;
+    slider16 = 0; slider17 = 30; slider18 = 120; slider19 = 6000; slider20 = -0.3; slider21 = 1;
+    slider22 = 0; slider23 = 1; slider24 = 0; slider25 = 0; slider26 = 50;
+    slider_automate(8388607); slider_automate(58720256);   // sliders 1-23, 24-26
+  );
+);
+
+// ---------- state ----------
+bufsize = 131072; mask = bufsize - 1;
+bufA = 0; bufB = bufsize;
+memset(0, 0, bufsize * 2);
+wp = 0;
+msr = srate / 1000;
+sm = 1 - exp(-1 / (0.03 * srate));
+psm = 1 - exp(-1 / (0.02 * srate));
+hd_dkr = 1 / (0.012 * srate); hd_dk = 1; hd_dst = 0;   // preset duck: 12 ms out, 12 ms in
+
+tdA.drift_init(0.8 + rand(0.5)); tdB.drift_init(0.8 + rand(0.5));
+pdA.drift_init(0.8 + rand(0.5)); pdB.drift_init(0.8 + rand(0.5));
+ldA.drift_init(0.8 + rand(0.5)); ldB.drift_init(0.8 + rand(0.5));
+hpA.z1 = 0; hpA.z2 = 0; hpB.z1 = 0; hpB.z2 = 0;
+
+ost_init(300000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+vuc = 1 - exp(-1 / (0.01 * srate)); vu_ms = 0;
+vu_sine = 10 * log10(2);   // +3.01 dB: RMS -> sine peak, so a sine peaking at the ref level reads 0 VU
+ui_thm = 5; ui_hw = 1;                       // one look: house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 0; );       // new instances open in Medium, on Init
+lastHP = -1;
+update();
+dA_s = dA_t * msr; dB_s = dB_t * msr;
+dbl_s = dbl_t; out_s = out_t; wid_s = wid_t; dry_s = dryon;
+pkL = 0; pkR = 0;
+ui_dflt = 1;   // the defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved size
+
+@slider
+hd_dst != 1 ? update();                      // during a preset duck the swap applies the new settings
+
+@block
+hd_dst != 1 ? update();
+
+@serialize
+file_var(0, ui_thm);
+file_var(0, ui_sz);
+file_var(0, ui_hw);
+file_avail(0) != 0 ? file_var(0, pr_cur);    // the preset in use (older projects end before it)
+
+@sample
+// preset duck-and-swap: the mode (which voice is dry, which is delayed) and the low cut change in silence
+hd_dst == 1 ? ( hd_dk -= hd_dkr; hd_dk <= 0 ? ( hd_dk = 0; update(); hd_dst = 2; ); ) :
+hd_dst == 2 ? ( hd_dk += hd_dkr; hd_dk >= 1 ? ( hd_dk = 1; hd_dst = 0; ); );
+// input stage: DC block, trim, guard
+in_process(spl0, spl1);
+inL = in_l; inR = in_r;
+vu_ms += (0.5 * (inL * inL + inR * inR) - vu_ms) * vuc;
+inmode == 0 ? ( sL = 0.5 * (inL + inR); sR = sL; ) : ( sL = inL; sR = inR; );
+bufA[wp] = sL; bufB[wp] = sR;
+
+// drift
+dinc = dspeed / srate;
+tA = tdA.drift_tick(dinc); tB = tdB.drift_tick(dinc);
+pA = pdA.drift_tick(dinc); pB = pdB.drift_tick(dinc);
+lA = ldA.drift_tick(dinc); lB = ldB.drift_tick(dinc);
+
+// parameter smoothing
+dbl_s += (dbl_t - dbl_s) * sm;
+out_s += (out_t - out_s) * sm;
+wid_s += (wid_t - wid_s) * sm;
+dry_s += (dryon - dry_s) * sm;
+dA_s  += ((dA_t + tdrift * tA) * msr - dA_s) * sm;
+dB_s  += ((dB_t + tdrift * tB) * msr - dB_s) * sm;
+dA = min(max(dA_s, 2), bufsize - 4);
+dB = min(max(dB_s, 2), bufsize - 4);
+
+// voices
+mode == 0 ? (
+  yA = onA || psA.amt > 0.0001 ? psA.pshift(bufA, 2, rtA, onA) : sL; gA = dry_s;   // L/R: voice A is the dry side
+  cL = 0; cR = 0;
+) : (
+  yA = hpA.hp_proc(psA.pshift(bufA, dA, rtA, onA)); gA = dbl_s;
+  mode == 1 ? ( cL = sL * dry_s; cR = sR * dry_s; ) : ( cL = 0; cR = 0; );
+);
+yB = hpB.hp_proc(psB.pshift(bufB, dB, rtB, onB)); gB = dbl_s;
+
+gA *= exp(ldrift * lA * 0.11512925);
+gB *= exp(ldrift * lB * 0.11512925);
+
+// pan (wanders inward from its side), equal-power law
+posA = sideA * (1 - pdrift * (0.5 + 0.5 * pA));
+posB = sideB * (1 - pdrift * (0.5 + 0.5 * pB));
+angA = (posA + 1) * 0.25 * $pi;
+angB = (posB + 1) * 0.25 * $pi;
+
+oL = cL + yA * gA * cos(angA) + yB * gB * cos(angB);
+oR = cR + yA * gA * sin(angA) + yB * gB * sin(angB);
+
+// width, mono check, output
+mid  = 0.5 * (oL + oR);
+side = 0.5 * (oL - oR) * wid_s;
+monochk ? side = 0;
+hd_dst ? ( hd_dkg = hd_dk * hd_dk * (3 - 2 * hd_dk); mid *= hd_dkg; side *= hd_dkg; );
+// output stage: band saturation -> output gain (no clip: straight through)
+oL = ostL.ost_band(mid + side) * in_comp * out_s;
+oR = ostR.ost_band(mid - side) * in_comp * out_s;
+ost_out(oL, oR);
+spl0 = ost_l;
+spl1 = ost_r;
+
+pkL = max(pkL, abs(spl0)); pkR = max(pkR, abs(spl1));
+wp = (wp + 1) & mask;
+
+// for display
+dispPA = posA; dispPB = posB; dispGA = gA; dispGB = gB;
+dispDA = dA / msr; dispDB = dB / msr;
+
+@gfx 960 388
+ui_thm = 5; ui_hw = 1;                                // one look (old projects may have saved another theme / flat)
+ui_begin(960, 388);
+// =====================================================================
+// GUI - plum panel, gold / lavender / teal accents (design space 960 x 388; S / M / L).
+// MODE | DELAY | VOICE | OUTPUT; the DRIFT + IN / OUT meter strip below.
+// Knobs: drag (SHIFT = fine), wheel, double-click = default; the label shows the value while the knob is touched
+// (DETUNE L / R always show theirs). Click TRIM for GUARD (its LED, upper right).
+// =====================================================================
+sc != hd_lsc ? (
+  hd_lsc = sc;
+  gfx_setfont(11, "Trebuchet MS", 18 * sc, 'b');     // section titles
+  gfx_setfont(12, "Trebuchet MS", 14 * sc, 'b');     // big knob label, DRIFT, mode keys
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print, small knob labels
+  gfx_setfont(14, "Trebuchet MS", 13 * sc, 'b');     // keys
+  gfx_setfont(15, "Trebuchet MS", 27 * sc, 'b');     // the unit's name
+  gfx_setfont(10, "Trebuchet MS", 10 * sc, 'b');     // the tap display
+  gfx_setfont(16, "Trebuchet MS", 10.5 * sc, 'b');   // DETUNE labels (clear of the section edge)
+);
+HD_FACE = 0x1A1220; HD_PLATE = 0x241A2C; HD_EDGE = 0x3E2F4A; HD_INK = 0xF2EEF4; HD_DIM = 0xA596AE;
+HD_ACC = 0xE8B84A; HD_LAV = 0xB49CE8; HD_TEAL = 0x6CC4B0; HD_TRAY = 0x100A14; HD_KEY = 0x2E2238;
+
+function hd_rr(x, y, w, h, r) local(x1, y1, x2, y2, rr) (
+  x1 = floor(x * sc + 0.5); y1 = floor(y * sc + 0.5); x2 = floor((x + w) * sc + 0.5); y2 = floor((y + h) * sc + 0.5);
+  rr = min(floor(r * sc + 0.5), floor((min(x2 - x1, y2 - y1)) * 0.5));
+  gfx_a < 1 ? ui_rrs(x1, y1, x2 - x1, y2 - y1, rr) : (
+    gfx_rect(x1 + rr, y1, x2 - x1 - 2 * rr, y2 - y1);
+    gfx_rect(x1, y1 + rr, rr + 1, y2 - y1 - 2 * rr); gfx_rect(x2 - rr - 1, y1 + rr, rr + 1, y2 - y1 - 2 * rr);
+    gfx_circle(x1 + rr, y1 + rr, rr, 1, 1); gfx_circle(x2 - rr - 1, y1 + rr, rr, 1, 1);
+    gfx_circle(x1 + rr, y2 - rr - 1, rr, 1, 1); gfx_circle(x2 - rr - 1, y2 - rr - 1, rr, 1, 1);
+  );
+);
+function hd_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function hd_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function hd_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function hd_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function hd_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+// a flat key: lit in its colour when on; en = 0: dimmed and inert (not used in this mode)
+function hd_key(x, y, w, h, on, col, s, en, fnt) local(hov, hit) (
+  hov = en && hd_in(x, y, w, h); hit = pressed && hov && drag_id == 0; hit ? drag_id = -1;
+  ui_cola(0x000000, 0.4); hd_rr(x + 1, y + 2, w, h, 4);
+  on ? ( ui_cola(col, 0.22); hd_rr(x - 3, y - 3, w + 6, h + 6, 6); );
+  ui_col(on ? col : HD_KEY); hd_rr(x, y, w, h, 4);
+  !on ? ( ui_col(ui_mix(col, HD_KEY, 0.7)); hd_r(x + 3, y, w - 6, 2); );
+  hov ? ( ui_cola(0xFFFFFF, 0.1); hd_rr(x, y, w, h, 4); );
+  gfx_setfont(fnt); ui_col(on ? 0x14161C : ui_mix(col, HD_INK, 0.45));
+  ui_keytext((x + w * 0.5) * sc, (y + h * 0.5) * sc, s);
+  !en ? ( ui_cola(HD_PLATE, 0.62); hd_rr(x - 3, y - 3, w + 6, h + 8, 6); );
+  hit;
+);
+function hd_sec(x0, w, title) (
+  ui_cola(0x000000, 0.47); hd_rr(x0 + 1, 74, w, 226, 8);
+  ui_col(HD_EDGE); hd_rr(x0, 72, w, 226, 8);
+  ui_col(HD_PLATE); hd_rr(x0 + 1.5, 73.5, w - 3, 223, 7);
+  ui_col(HD_ACC); hd_r(x0 + 18, 84, 4, 22);
+  gfx_setfont(11); ui_col(HD_INK); hd_tl(x0 + 30, 85, title);
+  dy_bg = 0x503C61; dy_ink = HD_INK;                  // (dy_bg sets the knobs' unlit track: 30 % darker = 0x382A44)
+);
+function hd_inset(x, y, w, h) ( pk_inset(x * sc, y * sc, w * sc, h * sc, HD_TRAY); );
+function hd_set(idx, v) ( slider(idx) = v; ui_auto(idx); );
+// the knob: dy_knob draws the arc and does the mouse; a light cap with a dark pointer goes over its cap
+function hd_cap(cx, cy, r, n, cap) local(a, ca, sa) (
+  ui_col(cap); gfx_circle(cx * sc, cy * sc, r * sc, 1, 1);
+  ui_col(ui_mix(cap, 0xFFFFFF, 0.05)); gfx_circle(cx * sc, cy * sc, r * 0.86 * sc, 1, 1);
+  a = -0.75 * $pi + n * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+  ui_col(0x181C26);
+  ui_ssline((cx + ca * r * 0.3) * sc, (cy + sa * r * 0.3) * sc, (cx + ca * (r - 4)) * sc, (cy + sa * (r - 4)) * sc, 3 * sc, 1);
+  dy_act ? ( ui_cola(0xFFFFFF, 0.08); gfx_circle(cx * sc, cy * sc, r * sc, 1, 1); );
+);
+function hd_knob(cx, cy, r, idx, lo, hi, def, lg, arc, cap) local(n) (
+  dy_kst = 36; dy_knob(cx, cy, r, idx, lo, hi, def, lg, arc, "", "");
+  n = lg ? log(slider(idx) / lo) / log(hi / lo) : (slider(idx) - lo) / (hi - lo);
+  hd_cap(cx, cy, r, min(max(n, 0), 1), cap);
+);
+// knob + label under it; the label turns into the value (gold) while the knob is touched
+function hd_kl(cx, cy, r, idx, lo, hi, def, lg, cap, fnt, dy, lbl, val) (
+  hd_knob(cx, cy, r, idx, lo, hi, def, lg, HD_ACC, cap);
+  gfx_setfont(fnt); ui_col(dy_act ? HD_ACC : HD_INK); hd_tc(cx, cy + r + dy, dy_act ? val : lbl);
+);
+function hd_rivet(x, y) ( ui_col(0x4A3A58); gfx_circle(x * sc, y * sc, 3 * sc, 1, 1); );
+// the tap display: x on the ms scale (hd_fs = full scale), a bar whose height follows the tap's level
+function hd_tx(t) ( 300 + min(max(t / hd_fs, 0), 1) * 198; );
+function hd_tap(t, g, col, lbl, a) local(x, h) (
+  x = hd_tx(t); h = min(40, 4 + 32 * max(g, 0));
+  ui_cola(col, 0.16 * a); hd_r(x - 3.5, 168 - h, 7, h);
+  ui_cola(col, a); hd_r(x - 1.5, 168 - h, 3, h); gfx_circle(x * sc, (168 - h) * sc, 2.5 * sc, 1, 1);
+  gfx_setfont(10); ui_cola(HD_DIM, a < 1 ? 0.45 : 1); hd_tc(x, 174, lbl);
+);
+// detune in whole cents into buf ("0¢", "+7¢", "-7¢")
+function hd_cents(v, buf) ( abs(v) < 0.5 ? strcpy(buf, "0¢") : v > 0 ? sprintf(buf, "+%d¢", floor(v + 0.5)) : sprintf(buf, "-%d¢", floor(-v + 0.5)); buf; );
+
+// =====================================================================
+// Draw
+// =====================================================================
+ui_col(HD_FACE); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(HD_ACC); hd_r(0, 58, 960, 1.5);
+hd_rivet(8, 8); hd_rivet(952, 8); hd_rivet(8, 380); hd_rivet(952, 380);
+
+// ---------- header ----------
+ui_col(HD_ACC); gfx_circle(48 * sc, 30 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(HD_FACE); ui_keytext(48 * sc, 30 * sc, "GFX");
+gfx_setfont(15); ui_col(HD_INK); hd_tl(76, 13, "DOUBLER"); gfx_measurestr("DOUBLER", hd_tw, hd_th);
+hd_x = 88 + hd_tw / sc;
+ui_col(HD_ACC); hd_r(hd_x, 20, 8, 8); ui_col(HD_LAV); hd_r(hd_x + 11, 20, 8, 8);
+gfx_setfont(13); ui_col(HD_DIM); hd_tl(hd_x, 33, "HAAS  ·  L/R · LCR · SPREAD");
+pk_pextra = "Reset all to defaults";
+k_ = pk_preset(452 * sc, 14 * sc, 390 * sc, 30 * sc, pr_cur, "Short|Med|Long|Classic Haas|Wide Spread|Super Wobble|Vintage ADT|Mono Safe");
+k_ > 0 ? ( load_preset(k_); pr_cur = k_ > 8 ? 0 : k_; );
+// no preset in use (new instance, or after Reset all): the LCD reads Init (laid out as pk_preset lays it out)
+pr_cur < 1 || pr_cur > 8 ? (
+  hd_ph = 30 * sc; hd_lx = 452 * sc + floor(max(hd_ph * 1.65, 64 * sc)) + 2 * floor(hd_ph * 0.7) + 12 * sc; hd_lw = 842 * sc - hd_lx;
+  pk_lcd(hd_lx, 14 * sc, hd_lw, hd_ph, 0); ui_col(pk_lcdc);
+  pk_lcdfont(9, max(9, hd_ph * 0.58)); gfx_measurestr("Init", hd_tw, hd_th);
+  pk_fitstr("Init", hd_lx + 8 * sc, 14 * sc + (hd_ph - hd_th) * 0.5, max(9, hd_ph * 0.58), hd_lw - 14 * sc);
+);
+ui_size_picker(864 * sc, 20 * sc);
+
+// ---------- MODE ----------
+hd_sec(24, 214, "MODE");
+hd_key(42, 112, 86, 32, slider1 == 0, HD_ACC, "L/R", 1, 12) ? hd_set(1, 0);
+hd_key(42, 150, 86, 32, slider1 == 1, HD_ACC, "LCR", 1, 12) ? hd_set(1, 1);
+hd_key(42, 188, 86, 32, slider1 == 2, HD_ACC, "SPREAD", 1, 12) ? hd_set(1, 2);
+hd_key(136, 112, 84, 32, slider4 >= 0.5, HD_LAV, "SWAP", 1, 13) ? hd_set(4, slider4 >= 0.5 ? 0 : 1);
+hd_key(136, 150, 84, 32, slider15 >= 0.5, HD_LAV, "DRY", slider1 != 2, 13) ? hd_set(15, slider15 >= 0.5 ? 0 : 1);   // Spread has no dry
+hd_key(136, 188, 84, 32, slider14 >= 0.5, HD_LAV, "MONO CHK", 1, 13) ? hd_set(14, slider14 >= 0.5 ? 0 : 1);
+gfx_setfont(13); ui_col(HD_DIM); hd_tl(42, 228, "INPUT");
+hd_key(42, 244, 86, 28, slider12 < 0.5, HD_TEAL, "MONO", 1, 14) ? hd_set(12, 0);
+hd_key(136, 244, 84, 28, slider12 >= 0.5, HD_TEAL, "STEREO", 1, 14) ? hd_set(12, 1);
+
+// ---------- DELAY ----------
+hd_sec(248, 286, "DELAY");
+hd_inset(266, 108, 250, 92);
+// the taps: L/R = the dry side and one delayed copy; LCR = dry centre + L and R copies; Spread = L and R copies
+hd_mx = (mode == 0 ? base : base * rmult) + tdrift;
+hd_fs = hd_mx * 1.08; hd_fs = hd_fs <= 10 ? 10 : hd_fs <= 20 ? 20 : hd_fs <= 30 ? 30 : hd_fs <= 50 ? 50 : hd_fs <= 80 ? 80 :
+        hd_fs <= 100 ? 100 : hd_fs <= 150 ? 150 : hd_fs <= 200 ? 200 : hd_fs <= 250 ? 250 : 300;
+ui_col(0x4A3A58); hd_r(278, 168, 228, 1);
+hd_i = 0; loop(6, hd_r(hd_tx(hd_fs * hd_i / 5) - 0.5, 168, 1, 4); hd_i += 1; );
+sprintf(#hd_sv, "0 - %d ms", hd_fs); ui_cola(HD_DIM, 0.6); hd_tr(508, 186, #hd_sv);
+mode == 0 ? (
+  hd_tap(0, dispGA, HD_INK, sideA < 0 ? "DRY L" : "DRY R", slider15 >= 0.5 ? 1 : 0.25);
+  hd_tap(dispDB, dispGB, sideB < 0 ? HD_ACC : HD_LAV, sideB < 0 ? "L" : "R", 1);
+) : (
+  mode == 1 ? hd_tap(0, 1, HD_INK, "DRY", slider15 >= 0.5 ? 1 : 0.25);
+  hd_tap(dispDA, dispGA, sideA < 0 ? HD_ACC : HD_LAV, sideA < 0 ? "L" : "R", 1);
+  hd_tap(dispDB, dispGB, sideB < 0 ? HD_ACC : HD_LAV, sideB < 0 ? "L" : "R", 1);
+);
+// the read-out: each side's set delay and detune
+hd_dl = mode == 0 ? ( sideA < 0 ? 0 : base ) : ( sideA < 0 ? base : base * rmult );
+hd_dr = mode == 0 ? ( sideA < 0 ? base : 0 ) : ( sideA < 0 ? base * rmult : base );
+mode == 0 && sideA < 0 ? strcpy(#hd_l, "L DRY") : sprintf(#hd_l, "L %.1f ms", hd_dl);
+mode == 0 && sideA > 0 ? strcpy(#hd_r, "R DRY") : sprintf(#hd_r, "R %.1f ms", hd_dr);
+hd_cents(slider24, #hd_cl); hd_cents(slider25, #hd_cr);
+sprintf(#hd_ro, "%s  %s   ·   %s  %s", #hd_l, #hd_cl, #hd_r, #hd_cr);
+gfx_setfont(10); ui_col(HD_DIM); hd_tr(510, 114, #hd_ro);
+gfx_measurestr(#hd_ro, hd_tw, hd_th); hd_tw < (510 - 316) * sc ? hd_tl(276, 114, "TAPS");   // (TAPS gives way to a long read-out)
+gfx_setfont(13); ui_cola(HD_DIM, slider1 != 0 ? 1 : 0.4); hd_tl(266, 216, "RIGHT = LEFT ×");
+hd_i = 0;
+loop(5,
+  sprintf(#hd_mb, "x%d", hd_i + 2);
+  hd_key(266 + hd_i * 51, 236, 46, 30, floor(slider3 + 0.5) == hd_i, HD_TEAL, #hd_mb, slider1 != 0, 14) ? hd_set(3, hd_i);   // not used in L/R
+  hd_i += 1;
+);
+
+// ---------- VOICE ----------
+hd_sec(544, 250, "VOICE");
+sprintf(#hd_v, "%.1f ms", slider2); hd_kl(608, 178, 36, 2, 1, 40, 12, 0, 0xC9CED8, 12, 18, "DELAY", #hd_v);
+hd_knob(694, 140, 20, 24, -50, 50, 0, 0, HD_ACC, 0xC9CED8);
+gfx_setfont(16); ui_col(HD_INK); hd_tc(694, 175, "DETUNE L");
+hd_knob(760, 140, 20, 25, -50, 50, 0, 0, HD_ACC, 0xC9CED8);
+gfx_setfont(16); ui_col(HD_INK); hd_tc(760, 175, "DETUNE R");
+gfx_setfont(13); ui_col(HD_ACC);
+abs(slider24) < 0.05 ? strcpy(#hd_v, "0.0 ¢") : sprintf(#hd_v, "%+.1f ¢", slider24); hd_tc(694, 190, #hd_v);
+abs(slider25) < 0.05 ? strcpy(#hd_v, "0.0 ¢") : sprintf(#hd_v, "%+.1f ¢", slider25); hd_tc(760, 190, #hd_v);
+sprintf(#hd_v, "%+.1f dB", slider5); hd_kl(694, 240, 20, 5, -24, 6, 0, 0, 0xC9CED8, 13, 14, "DOUBLE", #hd_v);
+sprintf(#hd_v, "%.0f Hz", slider6); hd_kl(760, 240, 20, 6, 20, 1000, 150, 1, 0xC9CED8, 13, 14, "LOW CUT", #hd_v);
+
+// ---------- OUTPUT ----------
+hd_sec(804, 132, "OUTPUT");
+sprintf(#hd_v, "%.0f%%", slider7); hd_kl(840, 140, 18, 7, 0, 100, 100, 0, 0xC9CED8, 13, 14, "WIDTH", #hd_v);
+sprintf(#hd_v, "%+.1f dB", slider13); hd_kl(900, 140, 18, 13, -24, 12, 0, 0, 0xC9CED8, 13, 14, "LEVEL", #hd_v);
+sprintf(#hd_v, "%+.1f dB", slider22); hd_kl(840, 232, 18, 22, -24, 12, 0, 0, 0x605A6A, 13, 14, "TRIM", #hd_v);
+ui_guardclick(1600 + 22, 23, 840, 232, 27);           // click TRIM for GUARD; its LED sits at the knob's upper right
+sprintf(#hd_v, "%.0f%%", slider16); hd_kl(900, 232, 18, 16, 0, 100, 0, 0, 0xD8B040, 13, 14, "SAT", #hd_v);
+
+// ---------- strip: DRIFT, IN / OUT meters ----------
+hd_inset(24, 310, 376, 66);
+hd_knob(62, 343, 18, 26, 0, 100, 50, 0, HD_LAV, 0xC9CED8);
+sprintf(#hd_v, "DRIFT  %.0f%%", slider26);
+gfx_setfont(12); ui_col(dy_act ? HD_LAV : HD_INK); hd_tl(92, 328, dy_act ? #hd_v : "DRIFT");
+gfx_setfont(13); ui_col(HD_DIM); hd_tl(92, 350, "TIME · PAN · LEVEL WANDER");
+hd_inset(412, 310, 524, 66);
+hd_pi = in_pk; in_pk = 0; hd_po = max(pkL, pkR); pkL = 0; pkR = 0;
+hdmI.ui_ledm(470 * sc, 326 * sc, 464 * sc, 9 * sc, hd_pi);
+hdmO.ui_ledm(470 * sc, 348 * sc, 464 * sc, 9 * sc, hd_po);
+gfx_setfont(13); ui_col(HD_DIM); hd_tr(456, 324, "IN"); hd_tr(456, 346, "OUT");
+
+pk_end();
+ui_end();

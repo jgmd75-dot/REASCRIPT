@@ -1,0 +1,468 @@
+desc:GFX G Lead 8 [poly lead synth]
+//tags: instrument synth poly lead analogue arpeggiator
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel, gfx-instrument, gfx-voice and gfx-arp (.jsfx-inc)
+// in the same folder.
+//
+// 8-voice analogue-style polysynth for leads (and polyphonic parts), with a built-in arpeggiator.
+//   OSCILLATORS - two per voice, SAW or PULSE each; osc 2 COARSE (semitones) and FINE (cents); MIX; PW
+//   FILTER      - 24 dB ladder: CUTOFF, RESONANCE, ENV amount, KEY tracking; its own ADSR
+//   AMP         - ADSR; VELOCITY sets how much playing harder opens the amp and filter
+//   LFO         - SHAPE, RATE, VIBRATO (the mod wheel adds more), to PWM, to CUTOFF
+//   ARP         - the GFX arpeggiator: MODE, RATE, OCTAVES, GATE, SWING, LATCH (tempo-locked when playing)
+//   PERFORMANCE - POLY / MONO (mono is legato, last note wins), GLIDE, VELOCITY, DRIFT, VOLUME, MIDI channel
+// DRIFT (GFX): the tuning wanders (whole instrument), each voice's oscillators drift apart in fine pitch on
+//   their own, and each voice's pulse width wanders; every note also lands slightly differently in tune.
+// MIDI: pitch bend +/-2, CC1 vibrato, CC64 sustain, CC123 all notes off. Voices are spread a little in stereo.
+// IN / OUT: the strip along the bottom holds SAT and STEREO (MONO, WIDTH).
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-voice.jsfx-inc
+import gfx-arp.jsfx-inc
+
+slider1:0<0,1,1{Saw,Pulse}>-Osc 1 wave
+slider2:0<0,1,1{Saw,Pulse}>-Osc 2 wave
+slider3:0<-24,24,1>-Osc 2 coarse (st)
+slider4:8<-50,50,0.1>-Osc 2 fine (cents)
+slider5:50<0,100,1>-Osc mix (%)
+slider6:50<5,95,1>-Pulse width (%)
+slider7:2200<20,18000,1>-Cutoff (Hz)
+slider8:25<0,100,1>-Resonance (%)
+slider9:45<-100,100,1>-Filter env amount (%)
+slider10:50<0,100,1>-Key track (%)
+slider11:2<0.5,3000,0.1>-Filter attack (ms)
+slider12:350<5,5000,1>-Filter decay (ms)
+slider13:35<0,100,1>-Filter sustain (%)
+slider14:300<5,5000,1>-Filter release (ms)
+slider15:3<0.5,3000,0.1>-Amp attack (ms)
+slider16:200<5,5000,1>-Amp decay (ms)
+slider17:90<0,100,1>-Amp sustain (%)
+slider18:250<5,5000,1>-Amp release (ms)
+slider19:5.2<0.05,20,0.01>-LFO rate (Hz)
+slider20:1<0,4,1{Sine,Triangle,Saw,Square,S&H}>-LFO shape
+slider21:6<0,100,1>-Vibrato (cents)
+slider22:0<0,100,1>-LFO to PWM (%)
+slider23:0<0,100,1>-LFO to cutoff (%)
+slider24:0<0,1000,1>-Glide (ms)
+slider25:1<0,1,1{Poly,Mono}>-Voice mode
+slider26:40<0,100,1>-Velocity (%)
+slider27:25<0,100,1>-Drift (%)
+slider28:0<0,16,1>-MIDI channel (0 = omni)
+slider29:0<-24,6,0.1>-Volume (dB)
+slider30:0<0,1,1{Off,On}>-Arp
+slider31:0<0,6,1{Up,Down,Up-Down,Down-Up,As played,Random,Chord}>-Arp mode
+slider32:3<0,5,1{1/4,1/8,1/8T,1/16,1/16T,1/32}>-Arp rate
+slider33:1<1,4,1>-Arp octaves
+slider34:60<10,200,1>-Arp gate (%)
+slider35:0<0,1,1{Off,On}>-Arp latch
+slider36:0<0,75,1>-Arp swing (%)
+slider37:0<0,100,1>-Band sat (%)
+slider38:30<0,100,1>-Bias (%)
+slider39:120<40,400,1>-Sat low band (Hz)
+slider40:6000<2000,16000,10>-Sat high band (Hz)
+slider41:-0.3<-24,0,0.1>-Ceiling (dB)
+slider42:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider43:20<20,500,1>-Mono below (Hz, 20 = off)
+slider44:0<0,100,1>-Stereo width (%)
+slider45:0<0,11,1{Classic Lead,Poly Brass,Fat Mono,Square Lead,PWM Strings,Hollow Pipe,Fifths,Soft Poly,Resonant Sweep,Vintage Detune,Wobble Lead,Init}>-Patch
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-lead-8";                                  // the ? pop-up links to this manual
+
+NV = 8;
+VN = 50000; VG = 50010; VT = 50020; VS = 50030;   // per voice: note (-1 free), gate, age, held by sustain
+HN = 50100;                                       // mono: held-note stack (128)
+EQO = 50300; EQT = 50600; EQN = 50900; EQV = 51200;   // note event queue (300 each)
+LEV = 52000; ACC = 52020; TIE = 52040;            // arp pattern: all steps on
+gi = 0; loop(16, LEV[gi] = 1; ACC[gi] = 0; TIE[gi] = 0; gi += 1; );
+gi = 0; loop(NV, VN[gi] = -1; VG[gi] = 0; VT[gi] = 0; VS[gi] = 0; gi += 1; );
+arp_init(30000);
+arp_pattern(LEV, ACC, TIE);
+
+// ---------- one voice ----------
+function vinit(p) instance(pan, cur, tgt, nd, df1, df2, dpw, drA, drB, drP) (
+  pan = p; cur = 60; tgt = 60; nd = 1; df1 = 0; df2 = 0; dpw = 0;
+  drA.drift_init(0.8 + rand(0.5)); drB.drift_init(0.8 + rand(0.5)); drP.drift_init(0.8 + rand(0.5));
+);
+// once a block: this voice's own drift (fine pitch of each oscillator, pulse width)
+function vblock(inc) instance(df1, df2, dpw, drA, drB, drP) (
+  df1 = drA.drift_tick(inc) * drift * 8;           // cents
+  df2 = drB.drift_tick(inc) * drift * 8;
+  dpw = drP.drift_tick(inc) * drift * 0.2;
+);
+function vstart(n, v, retrig) instance(cur, tgt, vel, nd, fe, ae, played) (
+  tgt = n; vel = v / 127;
+  glide_c >= 1 || !played ? cur = n;
+  retrig ? nd = ins_note_detune();
+  fe.vo_adsr_gate(1, retrig); ae.vo_adsr_gate(1, retrig);
+  played = 1;
+);
+function vstop() instance(fe, ae) ( fe.vo_adsr_gate(0, 0); ae.vo_adsr_gate(0, 0); );
+function vglide(n) instance(tgt) ( tgt = n; );
+function vrun() instance(o1, o2, flt, fe, ae, cur, tgt, vel, nd, df1, df2, dpw) local(f, i1, i2, pwv, y, e, oct, vgain) (
+  ae.st == 0 ? 0 : (
+    cur += (tgt - cur) * glide_c;
+    f = 440 * 2 ^ ((cur + vib_st - 69) / 12) * bend * ins_pitch * nd;
+    i1 = min(f * 2 ^ (df1 / 1200) / srate, 0.45);
+    i2 = min(f * o2_ratio * 2 ^ (df2 / 1200 + ins_aux / 12) / srate, 0.45);
+    pwv = min(max(pw + lfo * lfo_pwm * 0.4 + dpw, 0.05), 0.95);
+    y = (w1 ? o1.vo_pulse(i1, pwv) : o1.vo_saw(i1)) * (1 - mix) + (w2 ? o2.vo_pulse(i2, pwv) : o2.vo_saw(i2)) * mix;
+    vgain = 1 - velsens + velsens * vel;
+    oct = envamt * fe.vo_adsr() * 6 * (0.6 + 0.4 * vgain) + keytr * (cur - 60) / 12 + lfo * lfo_cut * 3;
+    y = flt.vo_ladder(y * 0.45, min(max(cutoff * 2 ^ oct, 20), srate * 0.45), res, 0);
+    e = ae.vo_adsr();
+    y * e * vgain;
+  );
+);
+
+// dispatch to a voice by number
+function v_start(i, n, v, r) (
+  i == 0 ? v0.vstart(n, v, r) : i == 1 ? v1.vstart(n, v, r) : i == 2 ? v2.vstart(n, v, r) : i == 3 ? v3.vstart(n, v, r) :
+  i == 4 ? v4.vstart(n, v, r) : i == 5 ? v5.vstart(n, v, r) : i == 6 ? v6.vstart(n, v, r) : v7.vstart(n, v, r);
+);
+function v_stop(i) (
+  i == 0 ? v0.vstop() : i == 1 ? v1.vstop() : i == 2 ? v2.vstop() : i == 3 ? v3.vstop() :
+  i == 4 ? v4.vstop() : i == 5 ? v5.vstop() : i == 6 ? v6.vstop() : v7.vstop();
+);
+function v_idle(i) (
+  i == 0 ? v0.ae.st == 0 : i == 1 ? v1.ae.st == 0 : i == 2 ? v2.ae.st == 0 : i == 3 ? v3.ae.st == 0 :
+  i == 4 ? v4.ae.st == 0 : i == 5 ? v5.ae.st == 0 : i == 6 ? v6.ae.st == 0 : v7.ae.st == 0;
+);
+
+// ---------- notes ----------
+function all_off() local(i) (
+  i = 0; loop(NV, VG[i] ? v_stop(i); VG[i] = 0; VS[i] = 0; VN[i] = -1; i += 1; );
+  hcount = 0;
+);
+function poly_on(n, v) local(i, best, ba) (
+  best = -1;
+  i = 0; loop(NV, VN[i] == n ? best = i; i += 1; );                          // same note: retrigger it
+  best < 0 ? ( ba = -1; i = 0; loop(NV, v_idle(i) && (best < 0 || VT[i] < ba) ? ( best = i; ba = VT[i]; ); i += 1; ); );
+  best < 0 ? ( ba = -1; i = 0; loop(NV, !VG[i] && (best < 0 || VT[i] < ba) ? ( best = i; ba = VT[i]; ); i += 1; ); );
+  best < 0 ? ( ba = -1; i = 0; loop(NV, best < 0 || VT[i] < ba ? ( best = i; ba = VT[i]; ); i += 1; ); );
+  vage += 1; VT[best] = vage; VN[best] = n; VG[best] = 1; VS[best] = 0;
+  v_start(best, n, v, 1);
+);
+function poly_off(n) local(i) (
+  i = 0; loop(NV, VN[i] == n && VG[i] ? ( pedal ? VS[i] = 1 : ( v_stop(i); VG[i] = 0; ); ); i += 1; );
+);
+function mono_on(n, v) local(i, f, legato) (
+  legato = hcount > 0;
+  f = -1; i = 0; loop(hcount, HN[i] == n ? f = i; i += 1; );
+  f >= 0 ? ( i = f; loop(hcount - f - 1, HN[i] = HN[i + 1]; i += 1; ); hcount -= 1; );
+  hcount < 127 ? ( HN[hcount] = n; hcount += 1; );
+  legato ? ( v0.vglide(n); v0.vstart(n, v, 0); ) : v0.vstart(n, v, 1);
+  VN[0] = n; VG[0] = 1;
+);
+function mono_off(n) local(i, f) (
+  f = -1; i = 0; loop(hcount, HN[i] == n ? f = i; i += 1; );
+  f >= 0 ? (
+    i = f; loop(hcount - f - 1, HN[i] = HN[i + 1]; i += 1; ); hcount -= 1;
+    hcount > 0 ? v0.vglide(HN[hcount - 1]) : ( pedal ? VS[0] = 1 : ( v0.vstop(); VG[0] = 0; ); );
+  );
+);
+function note_on(n, v) ( ins_midi_hit(); vmode ? mono_on(n, v) : poly_on(n, v); );
+function note_off(n) ( vmode ? mono_off(n) : poly_off(n); );
+function pedal_up() local(i) ( i = 0; loop(NV, VS[i] ? ( v_stop(i); VG[i] = 0; VS[i] = 0; ); i += 1; ); );
+
+// event queue, kept in time order
+function q_push(ofs, t, n, v) local(i) (
+  qcount < 300 ? (
+    i = qcount; while (i > 0 && EQO[i - 1] > ofs) ( EQO[i] = EQO[i - 1]; EQT[i] = EQT[i - 1]; EQN[i] = EQN[i - 1]; EQV[i] = EQV[i - 1]; i -= 1; );
+    EQO[i] = ofs; EQT[i] = t; EQN[i] = n; EQV[i] = v; qcount += 1;
+  );
+);
+
+function rate_beats(r) ( r == 0 ? 1 : r == 1 ? 0.5 : r == 2 ? 1 / 3 : r == 3 ? 0.25 : r == 4 ? 1 / 6 : 0.125; );
+function rate_name(r) ( r == 0 ? "1/4" : r == 1 ? "1/8" : r == 2 ? "1/8T" : r == 3 ? "1/16" : r == 4 ? "1/16T" : "1/32"; );
+function amode_name(m) ( m == 0 ? "UP" : m == 1 ? "DOWN" : m == 2 ? "UP-DN" : m == 3 ? "DN-UP" : m == 4 ? "PLAYED" : m == 5 ? "RANDOM" : "CHORD"; );
+function lfo_name(s) ( s == 0 ? "SINE" : s == 1 ? "TRI" : s == 2 ? "SAW" : s == 3 ? "SQUARE" : "S&H"; );
+function patch_name(p) (
+  p == 0 ? "CLASSIC LEAD" : p == 1 ? "POLY BRASS" : p == 2 ? "FAT MONO" : p == 3 ? "SQUARE LEAD" :
+  p == 4 ? "PWM STRINGS" : p == 5 ? "HOLLOW PIPE" : p == 6 ? "FIFTHS" : p == 7 ? "SOFT POLY" :
+  p == 8 ? "RESO SWEEP" : p == 9 ? "VINTAGE DETUNE" : p == 10 ? "WOBBLE LEAD" : "INIT";
+);
+
+// ---------- parameters ----------
+function update() (
+  w1 = slider1; w2 = slider2;
+  o2_ratio = 2 ^ ((slider3 + slider4 / 100) / 12);
+  mix = slider5 / 100; pw = slider6 / 100;
+  cutoff = slider7; res = slider8 / 100 * 0.95; envamt = slider9 / 100; keytr = slider10 / 100;
+  lfo_rate = slider19; lfo_shape = slider20; vib = slider21; lfo_pwm = slider22 / 100; lfo_cut = slider23 / 100;
+  glide_c = slider24 > 0 ? vo_coef(slider24) : 1;
+  vmode = slider25; velsens = slider26 / 100; drift = slider27 / 100; chan = slider28;
+  vol_t = 10 ^ (slider29 / 20);
+  ins_output_setup(37); ins_stereo_setup(43);   // output stage: CLIP, always on
+);
+function env_update() (
+  v0.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v0.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+  v1.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v1.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+  v2.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v2.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+  v3.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v3.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+  v4.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v4.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+  v5.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v5.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+  v6.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v6.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+  v7.fe.vo_adsr_set(slider11, slider12, slider13 / 100, slider14); v7.ae.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
+);
+
+// ---------- patches (the arp, drift, volume, channel and output rows are left alone) ----------
+function sp(a, b, c, d, e, f) ( slider1 = a; slider2 = b; slider3 = c; slider4 = d; slider5 = e; slider6 = f; );
+function sf(a, b, c, d, e, f, g, h) ( slider7 = a; slider8 = b; slider9 = c; slider10 = d; slider11 = e; slider12 = f; slider13 = g; slider14 = h; );
+function sa(a, b, c, d) ( slider15 = a; slider16 = b; slider17 = c; slider18 = d; );
+function sl(a, b, c, d, e, f, g) ( slider19 = a; slider20 = b; slider21 = c; slider22 = d; slider23 = e; slider24 = f; slider25 = g; );
+function load_patch(p) (
+  p == 0  ? ( sp(0, 0, 0, 8, 50, 50);    sf(2200, 25, 45, 50, 2, 350, 35, 300);  sa(3, 200, 90, 250);   sl(5.2, 1, 6, 0, 0, 0, 1); ) :
+  p == 1  ? ( sp(0, 0, 0, 10, 50, 50);   sf(900, 15, 60, 40, 60, 500, 40, 400);  sa(30, 400, 85, 400);  sl(5, 1, 0, 0, 0, 0, 0); ) :
+  p == 2  ? ( sp(0, 0, -12, 6, 45, 50);  sf(1400, 35, 50, 40, 1, 300, 25, 200);  sa(2, 300, 85, 150);   sl(5, 1, 0, 0, 0, 60, 1); ) :
+  p == 3  ? ( sp(1, 1, 12, 4, 35, 50);   sf(3500, 10, 20, 60, 2, 400, 60, 300);  sa(4, 200, 90, 250);   sl(5.5, 0, 12, 0, 0, 30, 1); ) :
+  p == 4  ? ( sp(1, 1, 0, 9, 50, 40);    sf(3000, 5, 15, 30, 300, 600, 70, 900); sa(400, 600, 90, 900); sl(0.8, 0, 0, 40, 0, 0, 0); ) :
+  p == 5  ? ( sp(1, 1, 12, 0, 20, 14);   sf(5000, 45, 10, 70, 2, 300, 50, 300);  sa(25, 200, 85, 300);  sl(5, 0, 10, 0, 0, 20, 1); ) :
+  p == 6  ? ( sp(0, 0, 7, 4, 45, 50);    sf(2600, 25, 35, 50, 1, 400, 40, 300);  sa(2, 300, 85, 250);   sl(5, 1, 0, 0, 0, 40, 1); ) :
+  p == 7  ? ( sp(0, 1, 0, 6, 40, 35);    sf(1800, 10, 35, 50, 1, 600, 20, 400);  sa(2, 800, 50, 500);   sl(5, 1, 0, 0, 0, 0, 0); ) :
+  p == 8  ? ( sp(0, 0, 0, 5, 30, 50);    sf(500, 70, 70, 50, 1, 250, 0, 200);    sa(1, 300, 80, 200);   sl(5, 1, 0, 0, 0, 0, 1); ) :
+  p == 9  ? ( sp(0, 0, 0, 18, 50, 50);   sf(2600, 15, 25, 40, 5, 500, 50, 500);  sa(10, 300, 90, 600);  sl(4.5, 0, 4, 0, 0, 0, 0); ) :
+  p == 10 ? ( sp(0, 0, -12, 3, 40, 50);  sf(900, 40, 20, 40, 1, 300, 40, 200);   sa(2, 300, 90, 200);   sl(4, 0, 0, 0, 35, 20, 1); ) :
+            ( sp(0, 0, 0, 7, 50, 50);    sf(2500, 20, 40, 50, 2, 400, 30, 300);  sa(2, 300, 80, 250);   sl(5, 1, 0, 0, 0, 0, 0); );
+  slider45 = p; last_patch = p;
+  slider_automate(67108863 + 17592186044416);                   // sliders 1-26 and 45
+  panic_req = 1; update(); env_update();
+);
+
+v0.vinit(-0.30); v1.vinit(0.30); v2.vinit(-0.15); v3.vinit(0.15);
+v4.vinit(-0.22); v5.vinit(0.22); v6.vinit(-0.07); v7.vinit(0.07);
+ins_drift_init();
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+sm = 1 - exp(-1 / (0.03 * srate));
+// per-patch level trim: every patch plays a single-note line at about the same loudness (-21 LUFS at
+// velocity 100). The poly patches stop short of that where needed so a three-note chord still peaks under
+// -6 dBFS; big full-velocity chords on them are caught by the output stage (CLIP by default).
+function patch_trim(p) (
+  p == 0 ? 0.923 :
+  p == 1 ? 0.881 :
+  p == 2 ? 1.072 :
+  p == 3 ? 0.437 :
+  p == 4 ? 0.519 :
+  p == 5 ? 0.708 :
+  p == 6 ? 0.933 :
+  p == 7 ? 0.724 :
+  p == 8 ? 0.966 :
+  p == 9 ? 0.881 :
+  p == 10 ? 1.023 :
+  0.955;
+);
+ptr_s = patch_trim(slider45);
+bend = 1; modw = 0; pedal = 0; hcount = 0; vage = 0; was_arp = 0; was_arp_on = 0; last_vm = -1; qcount = 0; last_patch = -1;
+!ui_dflt ? ui_thm = 5; !ui_dflt ? ui_hw = 1;   // fixed black-and-wood faceplate
+!ui_dflt ? ui_kstyle = 0;
+BLK = 0x17181B; INKL = 0xDCDDE0; REDL = 0xFF3A2A; AMBL = 0xFFB030;
+SH1 = 0x202125; SH2 = 0x1C1D21; SH3 = 0x19191C;      // sound, shaping, performance / output
+function mgroup(x, y, w, h, sec, title, shade) (
+  pk_inset(x * sc, y * sc, w * sc, h * sc, shade);
+  pk_box(x * sc, y * sc, w * sc, h * sc, INKL, title);
+  ui_section(sec == 0 ? 2 : sec); C_INK = INKL;
+);
+update(); env_update();
+last_vm = vmode; was_arp = was_arp_on = slider30;   // (so the first block does not queue an all-off over its own notes)
+vol_s = vol_t;
+// @init runs again when playback starts and the note bookkeeping above starts afresh: release every voice too,
+// or a note sounding at that moment would never get its note-off (a hung note)
+i = 0; loop(NV, v_stop(i); VG[i] = 0; VS[i] = 0; VN[i] = -1; i += 1; ); hcount = 0;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update(); env_update();
+
+@block
+update(); env_update();                       // knobs moved on the panel do not run @slider, so read them here
+// a patch chosen from Reaper's parameter list or automation loads here
+last_patch < 0 ? last_patch = slider45 : slider45 != last_patch ? ( load_patch(slider45); last_patch = slider45; );
+// arp settings
+arp_params(slider31, rate_beats(slider32), slider33, slider34 / 100, slider36 / 100, 16, slider35, 1, 0, 0, 0, 100, 0);
+
+// MIDI in: notes go to the arp when it is on, otherwise into the queue
+qcount = 0;
+while (midirecv(mofs, m1, m2, m3)) (
+  ins_chan_ok(m1, chan) ? (
+    st = m1 & 0xF0;
+    st == 0x90 || st == 0x80 ? (
+      slider30 ? arp_key(m2, m3, 0, st == 0x90 && m3 > 0) : q_push(mofs, st == 0x90 && m3 > 0, m2, m3);
+      st == 0x90 && m3 > 0 ? ins_midi_hit();
+    ) :
+    st == 0xE0 ? bend = ins_bend(m2, m3, 2) :
+    st == 0xB0 ? (
+      m2 == 1 ? modw = m3 / 127 :
+      m2 == 64 ? ( pedal = m3 >= 64; !pedal ? q_push(mofs, 2, 0, 0); ) :
+      m2 == 123 || m2 == 120 ? q_push(mofs, 3, 0, 0);
+    );
+  );
+);
+// transport stop: release whatever is still held (as an all-notes-off would; a safety net if the stop's note-offs go missing)
+gfx_pst = play_state == 1 || play_state == 5;
+gfx_pst_prev && !gfx_pst ? ( q_push(0, 3, 0, 0); );
+gfx_pst_prev = gfx_pst;
+// the arp switched off: stop its notes, forget its note set
+!slider30 && was_arp ? ( arp_outn = 0; arp_flush(); arp_sn = 0; arp_pn = 0; q_push(0, 3, 0, 0); );
+was_arp = slider30;
+// switching the arp on, or poly / mono, while notes sound: their note-offs would go to the new mode, so clear them
+slider30 && !was_arp_on ? q_push(0, 3, 0, 0); was_arp_on = slider30;
+vmode != last_vm ? ( q_push(0, 3, 0, 0); last_vm = vmode; );
+slider30 ? (
+  arp_block(play_state & 1, beat_position, tempo, samplesblock);
+  ab_i = 0; loop(arp_outn, q_push(arp_out_ofs[ab_i], arp_out_on[ab_i], arp_out_note[ab_i], arp_out_vel[ab_i]); ab_i += 1; );   // (not gi: @gfx loops with it)
+);
+panic_req ? ( all_off(); panic_req = 0; );
+eqi = 0; spos = 0;
+
+// drift: tuning for the whole instrument, fine pitch and pulse width for each voice
+ins_drift_block(drift, samplesblock);
+dvi = 0.35 * samplesblock / srate;
+v0.vblock(dvi); v1.vblock(dvi); v2.vblock(dvi); v3.vblock(dvi);
+v4.vblock(dvi); v5.vblock(dvi); v6.vblock(dvi); v7.vblock(dvi);
+
+@serialize
+file_var(0, ui_sz);
+
+@sample
+while (eqi < qcount && (EQO[eqi] <= spos || spos >= samplesblock - 1)) (   // (an event stamped at / past the block end: handled at its last sample)
+  et = EQT[eqi];
+  et == 1 ? note_on(EQN[eqi], EQV[eqi]) : et == 0 ? note_off(EQN[eqi]) : et == 2 ? pedal_up() : all_off();
+  eqi += 1;
+);
+spos += 1;
+
+lfo = lfo1.vo_lfo(lfo_rate, lfo_shape);
+vib_st = lfo * (vib + modw * 50) / 100;
+
+y0 = v0.vrun(); y1 = v1.vrun(); y2 = v2.vrun(); y3 = v3.vrun();
+y4 = v4.vrun(); y5 = v5.vrun(); y6 = v6.vrun(); y7 = v7.vrun();
+pan0 = vmode ? 0 : v0.pan;                         // mono plays voice 1 in the centre
+oL = y0 * (1 - max(pan0, 0)) + y1 * (1 - max(v1.pan, 0)) + y2 * (1 - max(v2.pan, 0)) + y3 * (1 - max(v3.pan, 0))
+   + y4 * (1 - max(v4.pan, 0)) + y5 * (1 - max(v5.pan, 0)) + y6 * (1 - max(v6.pan, 0)) + y7 * (1 - max(v7.pan, 0));
+oR = y0 * (1 + min(pan0, 0)) + y1 * (1 + min(v1.pan, 0)) + y2 * (1 + min(v2.pan, 0)) + y3 * (1 + min(v3.pan, 0))
+   + y4 * (1 + min(v4.pan, 0)) + y5 * (1 + min(v5.pan, 0)) + y6 * (1 + min(v6.pan, 0)) + y7 * (1 + min(v7.pan, 0));
+
+vol_s += (vol_t - vol_s) * sm;
+ptr_s = patch_trim(slider45);                    // follows the patch at once (a patch change is a discrete event)
+oL = ostL.ost_band((oL * 0.75) * ptr_s) * vol_s;
+oR = ostR.ost_band((oR * 0.75) * ptr_s) * vol_s;
+ins_stereo(oL, oR); ost_out(ins_sl, ins_sr);           // mono-maker / widener, then the output stage
+spl0 = ost_l;
+spl1 = ost_r;
+
+@gfx 960 420
+ui_begin(960, 420);
+
+// ---------- chassis: black panel between wooden cheeks ----------
+fh = 412;                                          // the panel, with the IN / OUT strip along the bottom
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+pk_chassis(16 * sc, 8 * sc, 928 * sc, fh * sc, BLK);
+C_INK = INKL;
+
+// header: name, patch display, patch buttons, size, OUTPUT
+ui_col(INKL); gfx_circle(48 * sc, 38 * sc, 14 * sc, 1, 1);
+gfx_setfont(4); ui_col(BLK); ui_text(48 * sc, 33 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 24 * sc, 'b'); ui_col(INKL); gfx_x = 70 * sc; gfx_y = 24 * sc; gfx_drawstr("LEAD 8"); gfx_measurestr("LEAD 8", l8_tw, l8_th);
+gfx_setfont(4); ui_cola(INKL, 0.6); gfx_x = 70 * sc + l8_tw + 10 * sc; gfx_y = 34 * sc; gfx_drawstr("POLYPHONIC SYNTHESIZER");
+pk_lcd(350 * sc, 18 * sc, 250 * sc, 44 * sc, 2);
+pk_lcdfont(7, 13 * sc); ui_col(pk_lcdc);
+sprintf(#l1, "P%02d %s", slider45 + 1, patch_name(slider45)); gfx_x = 360 * sc; gfx_y = 24 * sc; gfx_drawstr(#l1);
+pk_lcdfont(8, 10 * sc);
+gn = 0; gi = 0; loop(NV, !v_idle(gi) ? gn += 1; gi += 1; );
+sprintf(#l2, "%s  %d/8  %s", slider25 ? "MONO" : "POLY", gn, slider30 ? "ARP ON" : "");
+gfx_x = 360 * sc; gfx_y = 44 * sc; gfx_drawstr(#l2);
+pressed && drag_id == 0 && mouse_x >= 350 * sc && mouse_x < 600 * sc && mouse_y >= 18 * sc && mouse_y < 62 * sc ? (
+  drag_id = -1; gfx_x = 350 * sc; gfx_y = 62 * sc;
+  gsel = gfx_showmenu("Classic Lead|Poly Brass|Fat Mono|Square Lead|PWM Strings|Hollow Pipe|Fifths|Soft Poly|Resonant Sweep|Vintage Detune|Wobble Lead|Init");
+  gsel > 0 ? load_patch(gsel - 1);
+);
+pk_ledbtn(610 * sc, 22 * sc, 28 * sc, 36 * sc, 0, AMBL) ? load_patch(slider45 <= 0 ? 11 : slider45 - 1);
+pk_ledbtn(642 * sc, 22 * sc, 28 * sc, 36 * sc, 0, AMBL) ? load_patch(slider45 >= 11 ? 0 : slider45 + 1);
+gfx_setfont(4); ui_col(INKL); ui_text(624 * sc, 46 * sc, "<"); ui_text(656 * sc, 46 * sc, ">");
+pk_led(690 * sc, 40 * sc, 3 * sc, ins_midi_lit(), 0x3ADF6A);
+gfx_x = 698 * sc; gfx_y = 35 * sc; gfx_drawstr("MIDI");
+ui_size_picker(740 * sc, 31 * sc);
+
+// ---------- row 1: OSCILLATORS | FILTER ----------
+mgroup(32, 80, 488, 100, 0, "OSCILLATORS", SH1);
+gi = 0;
+loop(4,
+  gx = (gi < 2 ? 44 : 120) * sc; gy = (gi % 2 ? 132 : 98) * sc;
+  pk_ledbtn(gx, gy, 26 * sc, 22 * sc, (gi < 2 ? slider1 : slider2) == gi % 2, REDL) ? (
+    gi < 2 ? ( slider1 = gi % 2; slider_automate(1); ) : ( slider2 = gi % 2; slider_automate(2); ); );
+  gfx_setfont(4); ui_col(INKL); gfx_x = gx + 32 * sc; gfx_y = gy + 6 * sc; gfx_drawstr(gi % 2 ? "PULSE" : "SAW");
+  gi += 1;
+);
+ui_cola(INKL, 0.6); ui_text(70 * sc, 160 * sc, "OSC 1"); ui_text(146 * sc, 160 * sc, "OSC 2");
+knob_step = 1; ui_knob(250 * sc, 130 * sc, 3, -24, 24, 0, 0, "COARSE", "%+.0f st");
+ui_knob(316 * sc, 130 * sc, 4, -50, 50, 7, 0, "FINE", "%+.1f c");
+ui_knob(382 * sc, 130 * sc, 5, 0, 100, 50, 0, "MIX", slider5 < 1 ? "OSC 1" : slider5 > 99 ? "OSC 2" : "%.0f%%");
+ui_knob(448 * sc, 130 * sc, 6, 5, 95, 50, 0, "PW", "%.0f%%");
+
+mgroup(528, 80, 400, 100, 0, "FILTER", SH1);
+ui_knob(580 * sc, 130 * sc, 7, 20, 18000, 2500, 1, "CUTOFF", "%.0f Hz");
+ui_knob(676 * sc, 130 * sc, 8, 0, 100, 20, 0, "RESONANCE", "%.0f%%");
+ui_knob(772 * sc, 130 * sc, 9, -100, 100, 40, 0, "ENV", "%+.0f%%");
+ui_knob(868 * sc, 130 * sc, 10, 0, 100, 50, 0, "KEY", "%.0f%%");
+
+// ---------- row 2: FILTER ENV | AMP ENV | LFO ----------
+mgroup(32, 192, 264, 100, 0, "FILTER ENVELOPE", SH2);
+ui_knob(66 * sc,  242 * sc, 11, 0.5, 3000, 2, 1, "ATTACK", "%.1f ms");
+ui_knob(130 * sc, 242 * sc, 12, 5, 5000, 400, 1, "DECAY", "%.0f ms");
+ui_knob(194 * sc, 242 * sc, 13, 0, 100, 30, 0, "SUSTAIN", "%.0f%%");
+ui_knob(258 * sc, 242 * sc, 14, 5, 5000, 300, 1, "RELEASE", "%.0f ms");
+mgroup(304, 192, 264, 100, 0, "AMP ENVELOPE", SH2);
+ui_knob(338 * sc, 242 * sc, 15, 0.5, 3000, 2, 1, "ATTACK", "%.1f ms");
+ui_knob(402 * sc, 242 * sc, 16, 5, 5000, 300, 1, "DECAY", "%.0f ms");
+ui_knob(466 * sc, 242 * sc, 17, 0, 100, 80, 0, "SUSTAIN", "%.0f%%");
+ui_knob(530 * sc, 242 * sc, 18, 5, 5000, 250, 1, "RELEASE", "%.0f ms");
+mgroup(576, 192, 352, 100, 0, "LFO", SH2);
+knob_step = 1; ui_knob(612 * sc, 242 * sc, 20, 0, 4, 1, 0, "SHAPE", lfo_name(slider20));
+ui_knob(680 * sc, 242 * sc, 19, 0.05, 20, 5, 1, "RATE", "%.2f Hz");
+ui_knob(748 * sc, 242 * sc, 21, 0, 100, 0, 0, "VIBRATO", "%.0f c");
+ui_knob(816 * sc, 242 * sc, 22, 0, 100, 0, 0, "PWM", "%.0f%%");
+ui_knob(884 * sc, 242 * sc, 23, 0, 100, 0, 0, "CUTOFF", "%.0f%%");
+
+// ---------- row 3: ARP | PERFORMANCE ----------
+mgroup(32, 304, 488, 100, 0, "ARPEGGIATOR", SH3);
+pk_ledbtn(44 * sc, 318 * sc, 34 * sc, 30 * sc, slider30, REDL) ? ( slider30 = 1 - slider30; slider_automate(536870912); );
+pk_ledbtn(92 * sc, 318 * sc, 34 * sc, 30 * sc, slider35, AMBL) ? ( slider35 = 1 - slider35; slider_automate(17179869184); );
+gfx_setfont(4); ui_col(INKL); ui_text(61 * sc, 354 * sc, "ARP"); ui_text(109 * sc, 354 * sc, "LATCH");
+pk_ledbtn(68 * sc, 368 * sc, 34 * sc, 26 * sc, 0, REDL) ? panic_req = 1;
+ui_cola(INKL, 0.7); gfx_x = 108 * sc; gfx_y = 376 * sc; gfx_drawstr("PANIC");
+knob_step = 1; ui_knob(200 * sc, 354 * sc, 31, 0, 6, 0, 0, "MODE", amode_name(slider31));
+knob_step = 1; ui_knob(266 * sc, 354 * sc, 32, 0, 5, 3, 0, "RATE", rate_name(slider32));
+knob_step = 1; ui_knob(332 * sc, 354 * sc, 33, 1, 4, 1, 0, "OCTAVES", "%.0f");
+ui_knob(398 * sc, 354 * sc, 34, 10, 200, 60, 0, "GATE", "%.0f%%");
+ui_knob(464 * sc, 354 * sc, 36, 0, 75, 0, 0, "SWING", "%.0f%%");
+
+mgroup(528, 304, 400, 100, 0, "PERFORMANCE", SH3);
+pk_ledbtn(540 * sc, 318 * sc, 26 * sc, 22 * sc, slider25 == 0, REDL) ? ( slider25 = 0; slider_automate(16777216); panic_req = 1; );
+pk_ledbtn(540 * sc, 352 * sc, 26 * sc, 22 * sc, slider25 == 1, REDL) ? ( slider25 = 1; slider_automate(16777216); panic_req = 1; );
+gfx_setfont(4); ui_col(INKL);
+gfx_x = 572 * sc; gfx_y = 324 * sc; gfx_drawstr("POLY"); gfx_x = 572 * sc; gfx_y = 358 * sc; gfx_drawstr("MONO");
+ui_knob(642 * sc, 354 * sc, 24, 0, 1000, 0, 0, "GLIDE", "%.0f ms");
+ui_knob(704 * sc, 354 * sc, 26, 0, 100, 40, 0, "VELOCITY", "%.0f%%");
+ui_section(1); C_INK = INKL;
+ui_knob(764 * sc, 354 * sc, 27, 0, 100, 25, 0, "DRIFT", "%.0f%%");
+ui_section(2); C_INK = INKL;
+ui_knob(826 * sc, 354 * sc, 29, -24, 6, 0, 0, "VOLUME", "%.1f dB");
+ui_section(3); C_INK = INKL; knob_step = 1;
+ui_knob(890 * sc, 354 * sc, 28, 0, 16, 0, 0, "CHANNEL", slider28 == 0 ? "OMNI" : "CH %.0f");
+
+// ---------- IN / OUT strip: SAT, OUT, STEREO ----------
+// ins_strip(32, 414, 896, 37, 43, INKL, SH3);
+
+// wooden cheeks last, so the trays tuck under them
+pk_wood(2 * sc, 4 * sc, 22 * sc, (fh + 8) * sc); pk_wood(936 * sc, 4 * sc, 22 * sc, (fh + 8) * sc);
+pk_end();
+ui_end();

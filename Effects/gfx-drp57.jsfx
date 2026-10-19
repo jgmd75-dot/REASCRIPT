@@ -1,0 +1,348 @@
+desc:GFX DRP57 [tape echo/chamber]
+//tags: reverb delay echo chamber tape slapback steed send tape echo echo delay valve vintage space series57
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel and gfx-s57 (.jsfx-inc) in the same folder.
+//
+// DRP57 (Series 57). The 1957 counterpart of DRP81: where DRP81 is an early digital reverb / delay, DRP57 is the
+// late-50s studio trick of sending to a tape machine and feeding its replay into the echo chamber - the tape gives
+// the chamber its pre-delay and its repeats, the chamber turns every repeat into a room.
+//   TAPE ECHO  the send (L + R) is recorded at SATURATION through a valve record amp (oversampled 2x) and played
+//     back a moment later: SPEED 7 1/2, 15 or 30 ips (about 260, 130 or 65 ms between the heads), VARISPEED
+//     -40 .. +40 %. FEEDBACK recirculates the replay, through TONE (dark .. bright). WOW is the transport's speed
+//     wander. Each speed has its own replay character (the head bump and the top). ECHO is the repeats' level.
+//   ECHO CHAMBER  a speaker and two microphones in a hard room (an 8-line feedback delay network, two input
+//     diffusers per side): FEED blends what goes into it, from the dry send (0 %) to the tape replay only (100 %);
+//     SIZE, DECAY (0.4 - 8 s), TONE (the room's surfaces, dark .. bright), CHAMBER its level. LOOP sends the
+//     chamber's return back onto the tape - the echo of the echo (kept safe below runaway).
+//   MIX (dry / wet; the dry is untouched), OUTPUT, the house output stage (CLIP always on).
+// ULM / COPENHAGEN (the face): ULM - a tiled chamber, bright and dense; the tape crisp. COPENHAGEN - a plastered
+//   room, warmer and softer (more air absorption); the tape rounder, its head bump fuller, its wow a little wider.
+//   Level matched; presets leave the face alone.
+// DRIFT (0 - 100 %, 50 % = standard): the capstan speed wanders (the echo time breathes) and the chamber's
+//   microphones move a hair.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-s57.jsfx-inc
+
+slider1:0<-24,12,0.1>-Input trim (dB)
+slider2:1<0,1,1{Off,On}>-Input guard
+slider3:1<0,2,1{7 1/2 ips,15 ips,30 ips}>-Tape speed
+slider4:0<-40,40,0.1>-Varispeed (%)
+slider5:30<0,100,1>-Feedback (%)
+slider6:0<-100,100,1>-Tape tone
+slider7:20<0,100,1>-Wow (%)
+slider8:30<0,100,1>-Saturation (%)
+slider9:60<0,100,1>-Echo level (%)
+slider10:70<0,100,1>-Feed: dry to tape (%)
+slider11:50<0,100,1>-Size (%)
+slider12:1.8<0.4,8,0.01>-Decay (s)
+slider13:0<-100,100,1>-Chamber tone
+slider14:0<0,100,1>-Loop (%)
+slider15:70<0,100,1>-Chamber level (%)
+slider16:30<0,100,1>-Mix (%)
+slider17:0<-24,12,0.1>-Output (dB)
+slider18:50<0,100,1>-Drift (%)
+slider19:0<0,100,1>-Band sat (%)
+slider20:30<0,100,1>-Bias (output stage, %)
+slider21:120<40,400,1>-Sat low band (Hz)
+slider22:6000<2000,16000,10>-Sat high band (Hz)
+slider23:-0.3<-24,0,0.1>-Ceiling (dB)
+slider24:0<0,1,1{Ulm,Copenhagen}>-Face
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-drp57";
+s57_lamp = 1;                                           // Series 57 keys drawn as the house lamp keys
+ext_noinit = 1;
+s57_mem = 0;
+
+dp_HB = s57_alloc(64); s57_hbdesign(dp_HB, 63, 8);
+dpu.s57_upinit(63, dp_HB, 64); dpd.s57_dninit(63, dp_HB, 64);
+dpT.s57_dlinit(131072);                                 // the tape (about 0.65 s at 192 kHz)
+// the chamber: 8 lines (ms at SIZE 100 %)
+dp_LN = s57_alloc(8);
+dp_LN[0] = 31.7; dp_LN[1] = 37.9; dp_LN[2] = 41.3; dp_LN[3] = 46.1; dp_LN[4] = 52.9; dp_LN[5] = 59.3; dp_LN[6] = 66.7; dp_LN[7] = 73.9;
+dpc0.s57_dlinit(32768); dpc1.s57_dlinit(32768); dpc2.s57_dlinit(32768); dpc3.s57_dlinit(32768);
+dpc4.s57_dlinit(32768); dpc5.s57_dlinit(32768); dpc6.s57_dlinit(32768); dpc7.s57_dlinit(32768);
+dpa0.s57_dlinit(4096); dpa1.s57_dlinit(4096); dpa2.s57_dlinit(4096); dpa3.s57_dlinit(4096);
+dp_LP = s57_alloc(8); dp_GN = s57_alloc(8); dp_DL = s57_alloc(8); dp_YY = s57_alloc(8);
+
+function dp_update() (
+  in_setup(slider1, slider2 >= 0.5);
+  dp_tspd = slider3; dp_tfc = slider24 >= 0.5;
+  dp_tvs = 1 + slider4 / 100;
+  dp_fb = min(slider5 / 100 * 0.98, 0.98);
+  dp_sat = slider8 / 100;
+  dp_tel = slider9 / 100 * 1.2; dp_tfeed = slider10 / 100;
+  dp_tsize = 0.45 + 1.1 * slider11 / 100; dp_dec = slider12;
+  dp_loop = slider14 / 100 * 0.3 * min(1, 1.2 / slider12);   // (held below runaway at any DECAY) dp_tcl = slider15 / 100;
+  dp_tmix = slider16 / 100; dp_tog = 10 ^ (slider17 / 20);
+  drift_macro(slider18);
+  ost_setup(slider19 / 100, slider20 / 100, slider21, slider22, slider23, 1);
+  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = 0;
+);
+// the tape's replay character: speed and face
+function dp_tapeeq() local(s, top, bump) (
+  s = dp_spd;
+  top = (s == 0 ? 6500 : s == 1 ? 10500 : 15000) * (dp_fc ? 0.8 : 1);
+  bump = s == 0 ? 55 : s == 1 ? 80 : 120;
+  dpE1.s57_bqset(3, bump, dp_fc ? 3 : 2, 1.2, srate);
+  dpE2.s57_bqset(0, top, 0, 0.6, srate);
+  dpE3.s57_bqset(1, 40, 0, 0.7, srate);
+  // the feedback TONE: a tilt around 1.2 kHz
+  dpT1.s57_bqset(5, 1200, slider6 / 100 * 6, 0.6, srate);
+  dpT2.s57_bqset(1, 60 + max(slider6, 0) * 2, 0, 0.6, srate);
+  dp_tsl = slider6; dp_tse = dp_spd;
+);
+// the chamber's surfaces and its speaker
+function dp_room() local(i, t, damp) (
+  dp_szl = dp_size; dp_dcl = dp_dec; dp_ctl = slider13;
+  damp = (dp_fc ? 3800 : 6500) * 2 ^ (slider13 / 100 * 1.6);
+  dp_kd = s57_k(min(damp, 0.45 * srate), srate);
+  i = 0; loop(8,
+    dp_DL[i] = dp_LN[i] * dp_size * srate / 1000;
+    dp_GN[i] = 10 ^ (-3 * dp_DL[i] / (dp_dec * srate));
+    i += 1; );
+  dpS1.s57_bqset(1, 120, 0, 0.7, srate); dpS2.s57_bqset(1, 120, 0, 0.7, srate);
+  dpS3.s57_bqset(0, dp_fc ? 8000 : 11000, 0, 0.7, srate); dpS4.s57_bqset(0, dp_fc ? 8000 : 11000, 0, 0.7, srate);
+  dpS5.s57_bqset(3, dp_fc ? 500 : 2500, dp_fc ? 1.5 : 1.5, 0.8, srate); dpS6.s57_bqset(3, dp_fc ? 500 : 2500, 1.5, 0.8, srate);
+  // the level of the tail: a bigger, longer room is denser - keep its loudness about steady
+  dp_cg = 0.69 / sqrt(max(dp_dec, 0.4) / 1.8) * (dp_fc ? 1.1 : 1);
+);
+function dp_srinit() (
+  dp_sr = srate; dp_sm = s57_kt(0.03, srate); dp_svs = s57_kt(0.25, srate);
+  dp_fd = 1 / (0.01 * srate);
+  dp_tapeeq(); dp_room();
+  ost_init(0);
+);
+
+in_init();
+dp_update();
+dp_spd = dp_tspd; dp_fc = dp_tfc; dp_size = dp_tsize; dp_vs = dp_tvs;
+dp_srinit();
+dp_dfS.drift_init(0.7 + rand(0.4)); dp_dfM.drift_init(0.9 + rand(0.4));
+dpo.ost_ch_init(); dpp.ost_ch_init();
+dp_el = dp_tel; dp_cl = dp_tcl; dp_mix = dp_tmix; dp_og = dp_tog; dp_feed = dp_tfeed;
+dp_fade = 1; dp_fst = 0; dp_pb = 0; dp_ret = 0; dp_ph = 0; dp_fph = 0;
+
+// ---------- presets ----------
+function dp_set(sp, vs, fb, tn, wo, sa, el, fe, sz, dc, ct, lp, cl, mx) (
+  slider3 = sp; slider4 = vs; slider5 = fb; slider6 = tn; slider7 = wo; slider8 = sa; slider9 = el;
+  slider10 = fe; slider11 = sz; slider12 = dc; slider13 = ct; slider14 = lp; slider15 = cl; slider16 = mx;
+  slider_automate(65532);                               // sliders 3 - 16
+);
+#dp_pm = "Init|Abbey Slap|Vocal Chamber|Plain Chamber|Rockabilly Echo|Long Corridor|Tape Loop Dub|Small Tiled Room|Cathedral Send|Echo of the Echo|Dark Plaster|Varispeed Smear";
+function load_preset(p) (
+  //                sp  vs  fb  tn  wo  sa  el  fe  sz  dc   ct  lp  cl  mx
+  p == 1  ? dp_set(1,   0, 30,  0, 20, 30, 60, 70, 50, 1.8,  0,  0, 70, 30) :     // Init
+  p == 2  ? dp_set(1,  -8, 10, 10, 15, 35, 70, 85, 45, 1.4, 10,  0, 60, 28) :     // Abbey Slap
+  p == 3  ? dp_set(2,   0, 15,  0, 10, 25, 30, 90, 55, 2.2, 20,  0, 80, 24) :     // Vocal Chamber
+  p == 4  ? dp_set(1,   0,  0,  0, 10, 20,  0,  0, 55, 2.0,  0,  0, 85, 25) :     // Plain Chamber
+  p == 5  ? dp_set(1,  10, 25, 20, 25, 45, 90, 20, 30, 0.8, 20,  0, 30, 32) :     // Rockabilly Echo
+  p == 6  ? dp_set(0,   0, 45,-20, 20, 30, 60, 80, 90, 4.5,-10,  0, 75, 30) :     // Long Corridor
+  p == 7  ? dp_set(0, -20, 70,-40, 35, 55, 65, 60, 60, 2.5,-30,  0, 50, 35) :     // Tape Loop Dub
+  p == 8  ? dp_set(2,   0,  5, 30,  5, 20, 40, 70, 15, 0.7, 40,  0, 70, 25) :     // Small Tiled Room
+  p == 9  ? dp_set(0,  15, 20,-10, 15, 25, 30, 95,100, 7.0,-20,  0, 90, 30) :     // Cathedral Send
+  p == 10 ? dp_set(1,   0, 30,  0, 20, 35, 55, 85, 60, 2.6,  0, 70, 65, 30) :     // Echo of the Echo
+  p == 11 ? dp_set(1,   0, 25,-50, 20, 40, 50, 75, 50, 2.0,-70,  0, 70, 30) :     // Dark Plaster
+  p == 12 ? dp_set(0, -35, 55,-20, 80, 40, 70, 70, 70, 3.0,-20, 20, 60, 32) :     // Varispeed Smear
+  p == 13 ? (
+    dp_set(1, 0, 30, 0, 20, 30, 60, 70, 50, 1.8, 0, 0, 70, 30);
+    slider1 = 0; slider2 = 1; slider17 = 0; slider18 = 50; slider19 = 0; slider20 = 30; slider21 = 120; slider22 = 6000; slider23 = -0.3;
+    slider_automate(8388607);
+  );
+  pr_cur = p;
+);
+
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+@slider
+dp_update();
+
+@block
+srate != dp_sr ? dp_srinit();
+dp_update();
+// a new speed or face: fade the wet out, switch, fade in (the tape keeps running)
+(dp_tspd != dp_spd || dp_tfc != dp_fc) && dp_fst == 0 ? dp_fst = 1;
+(slider6 != dp_tsl) ? dp_tapeeq();
+(dp_dec != dp_dcl || slider13 != dp_ctl || abs(dp_size - dp_szl) > 0.0005) ? dp_room();
+// the delay between the heads (samples), with VARISPEED; the size glides
+dp_hd = (dp_spd == 0 ? 0.26 : dp_spd == 1 ? 0.13 : 0.065) * srate - 31 / 2;   // (less the record amp's oversampling)
+dp_tsz = dp_tsize;
+// DRIFT: the capstan, the microphones
+dp_di = 0.12 * dm_s * samplesblock / srate;
+dp_dsp = dm_a * 0.012 * dp_dfS.drift_tick(dp_di);
+dp_dmc = dm_a * 0.6 * dp_dfM.drift_tick(dp_di);
+// the wow: about 0.6 Hz and a 6 Hz flutter; COPENHAGEN a little wider
+dp_wa = slider7 / 100 * 0.004 * dp_hd * (dp_fc ? 1.25 : 1);
+dp_fa = slider7 / 100 * 0.0007 * dp_hd;
+dp_wi = 0.6 / srate; dp_fi = 6.3 / srate;
+dpa_rec = max(dpa_rec, dp_rv); dp_rv = 0;
+dpa_ch = max(dpa_ch, dp_cv); dp_cv = 0;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@sample
+dp_el += (dp_tel - dp_el) * dp_sm; dp_cl += (dp_tcl - dp_cl) * dp_sm; dp_mix += (dp_tmix - dp_mix) * dp_sm;
+dp_og += (dp_tog - dp_og) * dp_sm; dp_feed += (dp_tfeed - dp_feed) * dp_sm;
+dp_vs += (dp_tvs - dp_vs) * dp_svs;
+dp_size += (dp_tsz - dp_size) * 0.0002;
+dp_fst == 1 ? ( dp_fade -= dp_fd; dp_fade <= 0 ? ( dp_fade = 0; dp_spd = dp_tspd; dp_fc = dp_tfc; dp_tapeeq(); dp_room(); dp_hold = 64; dp_fst = 2; ); ) :
+dp_fst == 2 ? ( dp_hold -= 1; dp_hold <= 0 ? dp_fst = 3; ) :
+dp_fst == 3 ? ( dp_fade += dp_fd; dp_fade >= 1 ? ( dp_fade = 1; dp_fst = 0; ); );
+
+in_process(spl0, spl1);
+dp_xl = in_l; dp_xr = in_r;
+dp_send = (dp_xl + dp_xr) * 0.5;
+
+// ---------- the tape: record (the valve record amp at 2x), replay, feedback ----------
+dp_in = dp_send + dp_fb * dp_fbs + dp_loop * dp_ret;
+dp_k = 1 + 5 * dp_sat;
+dpu.s57_up(dp_in);
+dp_r0 = s57_th(dpu.o0 * dp_k * 0.9 + 0.05 * dp_sat) - s57_th(0.05 * dp_sat);
+dp_r1 = s57_th(dpu.o1 * dp_k * 0.9 + 0.05 * dp_sat) - s57_th(0.05 * dp_sat);
+dp_rec = dpd.s57_dn(dp_r0, dp_r1) / (dp_k * 0.9) * (1 + 0.6 * dp_sat);
+dp_rv = max(dp_rv, abs(dp_rec));
+dpT.s57_dlw(dp_rec);
+dp_ph += dp_wi; dp_ph >= 1 ? dp_ph -= 1; dp_fph += dp_fi; dp_fph >= 1 ? dp_fph -= 1;
+dp_d = dp_hd / (dp_vs * (1 + dp_dsp)) + dp_wa * sin(2 * $pi * dp_ph) + dp_fa * sin(2 * $pi * dp_fph);
+dp_pb = dpT.s57_dlr3(dp_d);
+dp_pb = dpE2.s57_bq(dpE1.s57_bq(dpE3.s57_bq(dp_pb)));
+dp_fbs = dpT2.s57_bq(dpT1.s57_bq(dp_pb));
+
+// ---------- the chamber: the speaker plays FEED, two microphones listen ----------
+dp_cin = (dp_send + (dp_pb - dp_send) * dp_feed);
+dp_cin = dpS5.s57_bq(dp_cin);
+// input diffusion (two all-passes per side)
+dp_il = dpa1.s57_ap(dpa0.s57_ap(dp_cin, 142 * dp_size * srate / 48000, 0.6), 107 * dp_size * srate / 48000, 0.6);
+dp_ir = dpa3.s57_ap(dpa2.s57_ap(dp_cin, 179 * dp_size * srate / 48000, 0.6), 89 * dp_size * srate / 48000, 0.6);
+// read the eight lines, damp them
+dp_YY[0] = dpc0.s57_dlr(dp_DL[0] * dp_size / dp_szl); dp_YY[1] = dpc1.s57_dlr(dp_DL[1] * dp_size / dp_szl + dp_dmc);
+dp_YY[2] = dpc2.s57_dlr(dp_DL[2] * dp_size / dp_szl); dp_YY[3] = dpc3.s57_dlr(dp_DL[3] * dp_size / dp_szl - dp_dmc);
+dp_YY[4] = dpc4.s57_dlr(dp_DL[4] * dp_size / dp_szl); dp_YY[5] = dpc5.s57_dlr(dp_DL[5] * dp_size / dp_szl);
+dp_YY[6] = dpc6.s57_dlr(dp_DL[6] * dp_size / dp_szl); dp_YY[7] = dpc7.s57_dlr(dp_DL[7] * dp_size / dp_szl);
+i_ = 0; loop(8, dp_LP[i_] += (dp_YY[i_] - dp_LP[i_]) * dp_kd; dp_YY[i_] = dp_LP[i_] * dp_GN[i_]; i_ += 1; );
+// the microphones
+dp_cl0 = dp_YY[0] - dp_YY[2] + dp_YY[4] + dp_YY[6] * 0.7;
+dp_cr0 = dp_YY[1] + dp_YY[3] - dp_YY[5] + dp_YY[7] * 0.7;
+// the 8 x 8 Hadamard mix (in place, scaled), the inputs added, written back
+dp_a = dp_YY[0] + dp_YY[1]; dp_b = dp_YY[0] - dp_YY[1]; dp_c = dp_YY[2] + dp_YY[3]; dp_e = dp_YY[2] - dp_YY[3];
+dp_f = dp_YY[4] + dp_YY[5]; dp_g = dp_YY[4] - dp_YY[5]; dp_h = dp_YY[6] + dp_YY[7]; dp_j = dp_YY[6] - dp_YY[7];
+dp_YY[0] = dp_a + dp_c; dp_YY[2] = dp_a - dp_c; dp_YY[1] = dp_b + dp_e; dp_YY[3] = dp_b - dp_e;
+dp_YY[4] = dp_f + dp_h; dp_YY[6] = dp_f - dp_h; dp_YY[5] = dp_g + dp_j; dp_YY[7] = dp_g - dp_j;
+dp_a = dp_YY[0]; dp_YY[0] = (dp_a + dp_YY[4]) * 0.35355339; dp_YY[4] = (dp_a - dp_YY[4]) * 0.35355339;
+dp_a = dp_YY[1]; dp_YY[1] = (dp_a + dp_YY[5]) * 0.35355339; dp_YY[5] = (dp_a - dp_YY[5]) * 0.35355339;
+dp_a = dp_YY[2]; dp_YY[2] = (dp_a + dp_YY[6]) * 0.35355339; dp_YY[6] = (dp_a - dp_YY[6]) * 0.35355339;
+dp_a = dp_YY[3]; dp_YY[3] = (dp_a + dp_YY[7]) * 0.35355339; dp_YY[7] = (dp_a - dp_YY[7]) * 0.35355339;
+dpc0.s57_dlw(dp_YY[0] + dp_il); dpc1.s57_dlw(dp_YY[1] + dp_ir); dpc2.s57_dlw(dp_YY[2] + dp_il * 0.7); dpc3.s57_dlw(dp_YY[3] - dp_ir * 0.7);
+dpc4.s57_dlw(dp_YY[4] - dp_il * 0.5); dpc5.s57_dlw(dp_YY[5] + dp_ir * 0.5); dpc6.s57_dlw(dp_YY[6]); dpc7.s57_dlw(dp_YY[7]);
+// the microphones' lines: the old speaker's band
+dp_cl0 = dpS3.s57_bq(dpS1.s57_bq(dp_cl0)) * dp_cg; dp_cr0 = dpS4.s57_bq(dpS2.s57_bq(dp_cr0)) * dp_cg;
+dp_ret = (dp_cl0 + dp_cr0) * 0.5;
+dp_cv = max(dp_cv, abs(dp_ret));
+
+// ---------- the wet: the repeats (centred) and the chamber (wide) ----------
+dp_wl = (dp_pb * dp_el + dp_cl0 * dp_cl) * dp_fade; dp_wr = (dp_pb * dp_el + dp_cr0 * dp_cl) * dp_fade;
+// MIX: the dry stays at full level up to 50 %, the wet comes up to full by 50 % (a send-style law)
+dp_gd = min(1, 2 - 2 * dp_mix); dp_gw = min(1, 2 * dp_mix);
+dp_yl = dp_xl * dp_gd + dp_wl * dp_gw; dp_yr = dp_xr * dp_gd + dp_wr * dp_gw;
+dp_yl = dpo.ost_band(dp_yl) * dp_og; dp_yr = dpp.ost_band(dp_yr) * dp_og;
+ost_out(dp_yl, dp_yr);
+spl0 = abs(ost_l) < 0.00000000000000000001 ? 0 : ost_l;
+spl1 = abs(ost_r) < 0.00000000000000000001 ? 0 : ost_r;
+
+@gfx 960 400
+ui_begin(960, 400);
+s57_pal(slider24);
+s57_fonts();
+s57_face(960, 400);
+k_ = s57_header(960, "DRP57", "SERIES 57", "ECHO / CHAMBER", #dp_pm, 24);
+k_ > 0 ? load_preset(k_);
+
+s57_path(960, 372, 4);
+s57_small(30, 378, "IN"); s57_small(330, 378, "TAPE"); s57_small(634, 378, "CHAMBER"); s57_small(892, 378, "OUT");
+
+// ---------- TAPE ECHO ----------
+s57_plate(20, 68, 400, 292);
+s57_title(32, 76, "TAPE ECHO");
+// the tape loop past the heads: erase, record, replay; the capstan turns
+x_ = 34; y_ = 100; w_ = 196; h_ = 70;
+ui_col(S57_INK); s57_rr(x_, y_, w_, h_, 8);
+ui_col(S57_PLATE); s57_rr(x_ + 3, y_ + 3, w_ - 6, h_ - 6, 6);
+ui_col(0x5A3A24); s57_rr(x_ + 10, y_ + 10, w_ - 20, h_ - 20, 18);
+ui_col(S57_PLATE); s57_rr(x_ + 14, y_ + 14, w_ - 28, h_ - 28, 14);
+gi_ = 0; loop(3, ui_col(gi_ == 1 ? S57_ORNG : S57_INK); s57_r(x_ + 50 + gi_ * 38, y_ + h_ - 18, 18, 10); gi_ += 1; );
+gfx_setfont(13); ui_col(S57_DIM); s57_tc(x_ + 59, y_ + 30, "E"); s57_tc(x_ + 97, y_ + 30, "R"); s57_tc(x_ + 135, y_ + 30, "P");
+dp_cap += 0.08 * (slider3 + 1) * (1 + slider4 / 100);
+ui_col(0x9EA3AA); gfx_circle((x_ + 174) * sc, (y_ + h_ - 14) * sc, 7 * sc, 1, 1);
+ui_col(S57_INK); s57_ln(x_ + 174, y_ + h_ - 14, x_ + 174 + cos(dp_cap) * 6, y_ + h_ - 14 + sin(dp_cap) * 6, 1.5);
+// the time between the heads
+dp_ms = (slider3 == 0 ? 260 : slider3 == 1 ? 130 : 65) / (1 + slider4 / 100);
+sprintf(#t_, "%.0f ms", dp_ms); gfx_setfont(11); ui_col(S57_INK); s57_tc(x_ + 98, y_ + 46, #t_);
+dpM.s57_edge(240, 100, 168, 70, dpa_rec * 4, "RECORD");
+dpa_rec *= 0.6;
+s57_knob(72, 230, 20, 4, -40, 40, 0, 0, "VARISPEED", "%+.0f%%", 0);
+s57_knob(167, 230, 20, 5, 0, 100, 30, 0, "FEEDBACK", "%.0f%%", 0);
+s57_knob(262, 230, 20, 6, -100, 100, 0, 0, "TONE", "%+.0f", 0);
+s57_knob(357, 230, 20, 7, 0, 100, 20, 0, "WOW", "%.0f%%", 0);
+s57_knob(72, 316, 18, 8, 0, 100, 30, 0, "SATURATION", "%.0f%%", 0);
+s57_knob(357, 316, 18, 9, 0, 100, 60, 0, "ECHO", "%.0f%%", 0);
+gfx_setfont(13); ui_col(S57_INK); s57_tc(215, 294, "SPEED  (IPS)");
+m_ = 0; loop(3, s57_lcol = LK_BLU_LT; s57_key(140 + m_ * 52, 306, 46, 22, slider3 == m_, m_ == 0 ? "7 1/2" : m_ == 1 ? "15" : "30") ? s57_set(3, m_); m_ += 1; );
+
+// ---------- ECHO CHAMBER ----------
+s57_well(436, 68, 300, 292);
+s57_title(448, 76, "ECHO CHAMBER");
+// the room in plan: the speaker, the two microphones, the paths lighting with the return
+rx_ = 448; ry_ = 100; rw_ = 276; rh_ = 92;
+ui_col(S57_INK); s57_r(rx_, ry_, rw_, 2); s57_r(rx_, ry_ + rh_ - 2, rw_, 2); s57_r(rx_, ry_, 2, rh_); s57_r(rx_ + rw_ - 2, ry_, 2, rh_);
+ui_cola(S57_INK, 0.12); gi_ = 1; loop(13, s57_r(rx_ + gi_ * 20, ry_ + 2, 1, rh_ - 4); gi_ += 1; ); gi_ = 1; loop(4, s57_r(rx_ + 2, ry_ + gi_ * 18.4, rw_ - 4, 1); gi_ += 1; );
+sz_ = 0.55 + 0.45 * slider11 / 100;
+spx_ = rx_ + 30; spy_ = ry_ + rh_ * 0.5;
+m1x_ = rx_ + rw_ * (0.3 + 0.6 * sz_); m1y_ = ry_ + 24; m2x_ = m1x_; m2y_ = ry_ + rh_ - 24;
+dp_gl = min(dpa_ch * 6, 1);
+ui_cola(S57_ORNG, 0.15 + 0.6 * dp_gl);
+s57_ln(spx_, spy_, m1x_, m1y_, 1.2); s57_ln(spx_, spy_, m2x_, m2y_, 1.2);
+s57_ln(spx_, spy_, rx_ + rw_ * 0.55, ry_ + 2, 1); s57_ln(rx_ + rw_ * 0.55, ry_ + 2, m2x_, m2y_, 1);
+s57_ln(spx_, spy_, rx_ + rw_ * 0.6, ry_ + rh_ - 2, 1); s57_ln(rx_ + rw_ * 0.6, ry_ + rh_ - 2, m1x_, m1y_, 1);
+ui_col(S57_INK); s57_rr(spx_ - 9, spy_ - 12, 14, 24, 2); ui_col(S57_ORNG); gfx_circle((spx_ - 2) * sc, spy_ * sc, 4 * sc, 1, 1);
+ui_col(S57_INK); gfx_circle(m1x_ * sc, m1y_ * sc, 5 * sc, 1, 1); gfx_circle(m2x_ * sc, m2y_ * sc, 5 * sc, 1, 1);
+gfx_setfont(13); ui_col(S57_DIM); s57_tc(m1x_ + 18, m1y_, "L"); s57_tc(m2x_ + 18, m2y_, "R");
+dpa_ch *= 0.7;
+s57_knob(496, 240, 20, 10, 0, 100, 70, 0, "FEED", "%.0f%%", 0);
+s57_small(446, 250, "DRY"); s57_small(520, 250, "TAPE");
+s57_knob(586, 240, 20, 11, 0, 100, 50, 0, "SIZE", "%.0f%%", 0);
+s57_knob(676, 240, 20, 12, 0.4, 8, 1.8, 1, "DECAY", "%.2f s", 0);
+s57_knob(496, 318, 16, 13, -100, 100, 0, 0, "TONE", "%+.0f", 0);
+s57_knob(586, 318, 16, 14, 0, 100, 0, 0, "LOOP", "%.0f%%", 0);
+s57_knob(676, 318, 16, 15, 0, 100, 70, 0, "CHAMBER", "%.0f%%", 0);
+
+// ---------- IN / OUT ----------
+s57_plate(752, 68, 188, 292);
+s57_title(764, 76, "IN · OUT");
+s57_knob(796, 130, 13, 1, -24, 12, 0, 0, "INPUT", "%+.1f dB", 0);
+gfx_setfont(13); ui_col(S57_INK); s57_tc(886, 112, "GUARD");
+s57_lcol = LK_YEL; s57_key(862, 122, 48, 20, slider2 >= 0.5, slider2 >= 0.5 ? "ON" : "OFF") ? s57_set(2, slider2 >= 0.5 ? 0 : 1);
+in_grd > 0.5 ? ( pk_led(918 * sc, 132 * sc, 3 * sc, 1, S57_ORNG); ); in_grd = 0;
+s57_knob(796, 226, 20, 16, 0, 100, 30, 0, "MIX", "%.0f%%", 0);
+s57_knob(886, 226, 20, 17, -24, 12, 0, 0, "OUTPUT", "%+.1f dB", 0);
+s57_knob(796, 312, 13, 18, 0, 100, 50, 0, "DRIFT", "%.0f%%", 0);
+s57_knob(886, 312, 13, 19, 0, 100, 0, 0, "SAT", "%.0f%%", 0);
+ost_clipped ? pk_led(914 * sc, 296 * sc, 3.5 * sc, 1, 0xFF3A22); ost_clipped = 0;
+
+s57_cheeks(960, 400);
+pk_end();
+ui_end();

@@ -1,0 +1,1461 @@
+desc:GFX Meter [level meter]
+//tags: meter vu ppm peak loudness correlation goniometer utility
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-ui, gfx-panel, gfx-s57, gfx-s74 and gfx-s92 (.jsfx-inc) in the same folder.
+//
+// METER: the four GFX series meters in one plug-in. The 57 / 74 / 81 / 92 keys on each face pick the model; each
+// model keeps its own face, controls and presets (the former GFX Meter57, Meter74, Meter81 and Meter92, unchanged).
+//   57 - Series 57: twin VU / PPM / PEAK arc meters, peak nixies, an M / S scope and a magic-eye correlation (ULM or
+//        COPENHAGEN face).
+//   74 - Series 74: the OB PPM - PPM bars (L/R or M/S), true peak, RMS, correlation and loudness; an optional line
+//        transformer in the path (heard only with 74 selected; it fades in and out, no clicks).
+//   81 - Series 81: PPM / VU / PEAK with switchable references and peak hold, VFD or MATRIX face (English labels).
+//   92 - Series 92: the meter bridge - ANALOG VU movements or DIGITAL peak bars with hold, overs, bits in use,
+//        correlation, goniometer and loudness.
+// Only the selected model's meters run. Audio passes through bit-exact, except through the 74 line transformer.
+
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-s57.jsfx-inc
+import gfx-s74.jsfx-inc
+import gfx-s92.jsfx-inc
+
+slider1:0<0,3,1{57,74,81,92}>-Model
+slider2:0<0,2,1{VU,PPM,Peak}>-57 Scale
+slider3:0<0,3,1{-18 dBFS,-14 dBFS,-12 dBFS,-9 dBFS}>-57 Ref level
+slider4:1<0,2,1{Off,2 s,Inf}>-57 Hold
+slider5:0<0,1,1{Ulm,Copenhagen}>-57 Face
+slider6:0<0,1,1{OB,Clean}>-74 Model
+slider7:0<0,2,1{-18 dBFS,-14 dBFS,-12 dBFS}>-74 Align (PPM 4)
+slider8:0<0,1,1{Off,On}>-74 Line transformer
+slider9:0<0,1,1{L/R,M/S}>-74 Needles
+slider10:0<0,2,1{PPM,VU,Peak}>-81 Scale
+slider11:0<0,5,1{-9 dBFS,-12 dBFS,-14 dBFS,-15 dBFS,-18 dBFS,-20 dBFS}>-81 PPM ref (0 dB =)
+slider12:4<0,5,1{-9 dBFS,-12 dBFS,-14 dBFS,-15 dBFS,-18 dBFS,-20 dBFS}>-81 VU ref (0 VU =)
+slider13:1<0,3,1{Off,2 s,5 s,Inf}>-81 Peak hold
+slider14:1<1,2,1{VFD,Matrix}>-81 Mode
+slider15:0<0,1,1{Analog,Digital}>-92 Model
+slider16:0<0,2,1{-18 dBFS,-14 dBFS,-12 dBFS}>-92 VU reference (0 VU)
+slider17:1<0,2,1{-6 dBFS,-3 dBFS,-1 dBFS}>-92 Peak LED
+slider18:1<0,2,1{Off,3 s,Hold}>-92 Peak hold
+slider19:2<0,3,1{1,2,3,4}>-92 Over (consecutive full-scale samples)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+gdc_r = 1 - 2 * $pi / srate; gdc_x0 = gdc_y0 = gdc_x1 = gdc_y1 = 0;
+// the magic eye's rays: plain overlapping triangles (the striated glow is the look; not the supersampled line)
+function mt_ray(x1, y1, x2, y2, w) local(dx, dy, l, nx, ny) (
+  x1 *= sc; y1 *= sc; x2 *= sc; y2 *= sc; w *= sc * 0.5;
+  dx = x2 - x1; dy = y2 - y1; l = max(sqrt(dx * dx + dy * dy), 0.001); nx = -dy / l * w; ny = dx / l * w;
+  gfx_triangle(x1 + nx, y1 + ny, x2 + nx, y2 + ny, x2 - nx, y2 - ny, x1 - nx, y1 - ny);
+);
+#ui_man = "gfx-meter";
+ext_noinit = 1;
+s57_mem = 0; s74_mem = 10000; s92_mem = 20000;       // each series' allocator has its own memory (81 uses 50000+)
+
+// ============================================== MODEL 57 ==============================================
+mt_SC = s57_alloc(2048);                                // the scope's points: mid, side
+mt_sp = 0;
+function mt_init() (
+  mt_sr = srate;
+  mt_w = 13.6; mt_z = 0.81;                             // the VU needle: natural frequency (rad/s), damping
+  mt_ka = s57_kt(0.0015, srate);                        // the PPM's integration (5 ms: a 10 ms burst reads -1 dB)
+  mt_kc = s57_kt(0.3, srate);                           // the correlation's averaging
+);
+mt_init();
+mt_vuL = mt_vuR = mt_vvL = mt_vvR = 0; mt_ppL = mt_ppR = 0; mt_pkL = mt_pkR = 0;
+mt_hL = mt_hR = 0; mt_cLR = mt_cLL = mt_cRR = 0.000001;
+
+function mt_set(s, r, h) ( slider2 = s; slider3 = r; slider4 = h; slider_automate(14); );
+#mt_pm = "Init|Broadcast PPM|PPM Align -18|Live Desk -12|Tracking VU|Mix VU -14|Hot Master VU|Mastering Peak|Peak Hold|Film VU -18|Stereo Check|Programme PPM -9";
+function m57_load_preset(p) (
+  p == 1  ? mt_set(0, 0, 1) :
+  p == 2  ? mt_set(1, 3, 1) :
+  p == 3  ? mt_set(1, 0, 1) :
+  p == 4  ? mt_set(1, 2, 1) :
+  p == 5  ? mt_set(0, 0, 0) :
+  p == 6  ? mt_set(0, 1, 1) :
+  p == 7  ? mt_set(0, 2, 1) :
+  p == 8  ? mt_set(2, 0, 1) :
+  p == 9  ? mt_set(2, 0, 2) :
+  p == 10 ? mt_set(0, 0, 2) :
+  p == 11 ? mt_set(0, 0, 0) :
+  p == 12 ? mt_set(1, 3, 2) :
+  p == 13 ? mt_set(0, 0, 1);
+  pr_cur = p;
+);
+
+
+
+// ============================================== MODEL 74 ==============================================
+
+// ---------- memory ----------
+m4_TPH = s74_alloc(48);                                 // the true-peak interpolator: 4 phases x 12 taps
+m4tL.buf = s74_alloc(32); m4tR.buf = s74_alloc(32);
+m4_EKB = s74_alloc(32);                                  // the K-weighted energy of each 100 ms sub-block (a ring)
+m4_HS = s74_alloc(750); m4_HC = s74_alloc(750);         // the integrated loudness: energy and count per 0.1 dB bin
+
+// ---------- the true-peak interpolator: a 48-tap Kaiser-windowed sinc for 4x, split into its 4 phases ----------
+function m4_tpdesign() local(n, t, x, w, i0, ph, j, s) (
+  i0 = s74_bi0(7); n = 0;
+  loop(48, t = (n - 23.5) / 4; x = 2 * n / 47 - 1; w = s74_bi0(7 * sqrt(max(0, 1 - x * x))) / i0;
+    m4_TPH[(n % 4) * 12 + floor(n / 4)] = sin($pi * t) / ($pi * t) * w; n += 1; );
+  ph = 0; loop(4, s = 0; j = 0; loop(12, s += m4_TPH[ph * 12 + j]; j += 1; );
+    j = 0; loop(12, m4_TPH[ph * 12 + j] /= s; j += 1; ); ph += 1; );
+);
+m4_tpdesign();
+// one channel: the largest of the four interpolated points (and the sample itself)
+function m4_tp(x) instance(buf, w) local(p, j, a, b, c, d, v) (
+  w = (w + 1) & 15; buf[w] = x; buf[w + 16] = x; p = buf + w + 16;
+  a = b = c = d = 0; j = 0;
+  loop(12, v = p[-j]; a += m4_TPH[j] * v; b += m4_TPH[12 + j] * v; c += m4_TPH[24 + j] * v; d += m4_TPH[36 + j] * v; j += 1; );
+  max(max(abs(a), abs(b)), max(max(abs(c), abs(d)), abs(x)));
+);
+
+// ---------- the K-weighting (ITU-R BS.1770): the head shelf, then the RLB high-pass, at any sample rate ----------
+function m4_kset() local(f, g, q, k, vh, vb, a0) (
+  f = 1681.974450955533; g = 3.999843853973347; q = 0.7071752369554196;
+  k = tan($pi * f / srate); vh = 10 ^ (g / 20); vb = vh ^ 0.4996667741545416; a0 = 1 + k / q + k * k;
+  m4_pb0 = (vh + vb * k / q + k * k) / a0; m4_pb1 = 2 * (k * k - vh) / a0; m4_pb2 = (vh - vb * k / q + k * k) / a0;
+  m4_pa1 = 2 * (k * k - 1) / a0; m4_pa2 = (1 - k / q + k * k) / a0;
+  f = 38.13547087602444; q = 0.5003270373238773;
+  k = tan($pi * f / srate); a0 = 1 + k / q + k * k;
+  m4_ra1 = 2 * (k * k - 1) / a0; m4_ra2 = (1 - k / q + k * k) / a0;
+);
+function m4_kw(x) instance(z1, z2, u1, u2) local(y) (
+  y = m4_pb0 * x + z1; z1 = m4_pb1 * x - m4_pa1 * y + z2; z2 = m4_pb2 * x - m4_pa2 * y;
+  x = y; y = x + u1; u1 = -2 * x - m4_ra1 * y + u2; u2 = x - m4_ra2 * y;
+  y;
+);
+
+// ---------- the line transformer (OB): gentle iron ----------
+// the core saturates the lows first (softly), a trace of high-frequency loss, the coupling capacitor
+function m4_iron(x) instance(cp, lo, hf) local(y) (
+  cp += (x - cp) * m4_kc4; y = x - cp;
+  lo += (y - lo) * m4_klo;
+  y = (y - lo) + s74_th(lo);
+  hf += (y - hf) * m4_khf;
+  y - 0.12 * (y - hf);
+);
+
+// ---------- the integrated loudness ----------
+function m4_iclear() ( memset(m4_HS, 0, 750); memset(m4_HC, 0, 750); m4_nb = 0; m4_li = -999; );
+function m4_integ() local(i, s, c, thr) (
+  s = c = 0; i = 0; loop(750, s += m4_HS[i]; c += m4_HC[i]; i += 1; );
+  c > 0 ? (
+    thr = -0.691 + 10 * log10(s / c) - 10;
+    s = c = 0; i = 0; loop(750, -70 + (i + 0.5) / 10 > thr ? ( s += m4_HS[i]; c += m4_HC[i]; ); i += 1; );
+    m4_li = c > 0 ? -0.691 + 10 * log10(s / c) : -999;
+  ) : m4_li = -999;
+);
+
+// ---------- settings ----------
+function m4_srinit() (
+  m4_sr = srate;
+  m4_ka = s74_kt(0.0028, srate);                        // the PPM's integration (10 ms: a 10 ms burst reads -2 dB)
+  m4_kr = 10 ^ (-24 / 20 / (2.8 * srate));              // the PPM's fall: 24 dB in 2.8 s
+  m4_kk = 10 ^ (-20 / 20 / (1.7 * srate));              // the true-peak bars' fall: 20 dB in 1.7 s
+  m4_krm = s74_kt(0.3, srate);                          // RMS (300 ms)
+  m4_kcr = s74_kt(0.3, srate);                          // the correlation's averaging
+  m4_kc4 = s74_k(4, srate); m4_klo = s74_k(100, srate); m4_khf = s74_k(14000, srate);
+  m4_xd = 1 / (0.02 * srate);                           // the transformer's crossfade (20 ms)
+  m4_nsb = floor(0.1 * srate + 0.5);                      // samples per 100 ms sub-block
+  m4_kset();
+  m4kL.z1 = m4kL.z2 = m4kL.u1 = m4kL.u2 = 0; m4kR.z1 = m4kR.z2 = m4kR.u1 = m4kR.u2 = 0;
+  m4_ek = 0; m4_n = 0; m4_sb = 0; memset(m4_EKB, 0, 32); m4_lm = m4_ls = -999; m4_iclear();
+);
+function m4_update() (
+  m4_cln = slider6 >= 0.5;
+  m4_tx = slider8 >= 0.5 && !m4_cln && mm_m == 1;   // only heard with model 74 selected                    // the line transformer: OB only
+  m4_msn = slider9 >= 0.5;
+  m4_al = slider7 < 0.5 ? -18 : slider7 < 1.5 ? -14 : -12;
+);
+m4_PPC = 10 ^ (0.216 / 20);                             // the PPM's calibration: a steady sine reads its peak
+m4_srinit();
+m4_update();
+m4_xf = m4_tx; m4_hL = m4_hR = -200;
+m4_ppA = m4_ppB = 0; m4_tdL = m4_tdR = 0; m4_mqL = m4_mqR = 0; m4_cLR = m4_cLL = m4_cRR = 0.000001;
+
+// ---------- the faces (this unit's own, drawn in @gfx) ----------
+// the PPM's scale: marks 1 .. 7 evenly spaced; 1-2 is 6 dB, then 4 dB per mark; d = dB relative to PPM 4
+function m4_ppos(d) (
+  d < -14 ? 0.05 * (max(d, -26) + 26) / 12 :
+  d < -8 ? 0.05 + 0.15 * (d + 14) / 6 :
+  min(0.2 + 0.15 * (d + 8) / 4, 1.03);
+);
+// a black-faced peak programme meter: white marks and numerals, a white needle, a warm lamp behind on OB
+function m4_ppm(x, y, w, h, d, ch, chc) local(px, py, R, i, p, a, s, c, x1, y1, x2, y2) (
+  ui_cola(0x000000, 0.45); s74_r(x + 1, y + 3, w, h);
+  ui_col(0x101112); s74_r(x, y, w, h);
+  ui_col(0x34383B); s74_r(x + 1, y + 1, w - 2, 1);
+  ui_col(0x050506); s74_r(x + 6, y + 6, w - 12, h - 12);
+  i = 0; loop(16, ui_cola(S74_LAMP, 0.008); s74_r(x + 6 + i * 2, y + 6, w - 12 - i * 4, (h - 12) * (0.8 - i * 0.04)); i += 1; );
+  px = x + w * 0.5; py = y + h - 10; R = h - 70;
+  // the marks: bold white bars, the numerals beyond
+  i = 1;
+  loop(7,
+    p = 0.05 + 0.15 * (i - 1); a = (-46 + 92 * p) * $pi / 180; s = sin(a); c = cos(a);
+    ui_col(0xF2F1EA); s74_ln(px + s * (R - 15), py - c * (R - 15), px + s * R, py - c * R, 3.4);
+    gfx_setfont(15); sprintf(#m4_e, "%d", i); s74_tc(px + s * (R + 15), py - c * (R + 15), #m4_e);
+    i += 1;
+  );
+  gfx_setfont(13); ui_col(0xBDBCB4); s74_tc(px, py - R * 0.52, "PPM");
+  // the channel: its letter and a coloured dot
+  gfx_setfont(11); ui_col(0xF2F1EA); s74_tc(px, py - R * 0.52 + 18, ch);
+  ui_col(chc); gfx_circle(px * sc, (py - R * 0.52 + 33) * sc, 3 * sc, 1, 1);
+  // the needle
+  p = min(max(m4_ppos(d), -0.03), 1.03); a = (-46 + 92 * p) * $pi / 180;
+  x1 = px + sin(a) * (R * 0.2); y1 = py - cos(a) * (R * 0.2); x2 = px + sin(a) * (R + 4); y2 = py - cos(a) * (R + 4);
+  ui_cola(0x000000, 0.6); s74_ln(x1 + 1.5, y1 + 1.5, x2 + 1.5, y2 + 1.5, 2);
+  ui_col(0xF4F2E8); s74_ln(x1, y1, x2, y2, 1.8);
+  // the pivot cover and the glass
+  ui_col(0x16181A); s74_r(x + 6, y + h - 30, w - 12, 24);
+  ui_col(0x2A2D30); s74_r(x + 6, y + h - 30, w - 12, 1);
+  ui_cola(0xFFFFFF, 0.05); s74_r(x + 6, y + 6, w - 12, (h - 12) * 0.36);
+);
+// the true-peak bar's scale: -60 .. -30 compressed, -30 .. 0 open, 0 .. +3 the overs
+function m4_bpos(d) (
+  d < -30 ? 0.24 * (max(d, -60) + 60) / 30 : d < 0 ? 0.24 + 0.70 * (d + 30) / 30 : min(0.94 + 0.06 * d / 3, 1);
+);
+// a backlit window in the house edge-meter style (orange-red on CLEAN): a black bezel, the lamp, a warm glow
+function m4_lit(x, y, w, h) local(i, g) (
+  ui_cola(0x000000, 0.4); s74_r(x + 1, y + 2, w, h);
+  ui_col(0x101112); s74_r(x, y, w, h);
+  ui_col(S74_LAMPD); s74_r(x + 4, y + 4, w - 8, h - 8);
+  g = min(w, h) * 0.04; i = 0;
+  loop(10, ui_cola(S74_LAMPW, 0.12); s74_r(x + 4 + g * i, y + 4 + g * i, w - 8 - 2 * g * i, h - 8 - 2 * g * i); i += 1; );
+);
+function m4_glass(x, y, w, h) ( ui_cola(0xFFFFFF, 0.08); s74_r(x + 4, y + 4, w - 8, (h - 8) * 0.4); );
+// a laboratory bar in a lit window: true peak (wide, charcoal), RMS (narrow); the 2 s hold as a cream line
+function m4_bar(x, y, w, h, tp, rm, hd) local(p, q, yb, ht) (
+  m4_lit(x, y, w, h);
+  yb = y + h - 5; ht = h - 10;
+  ui_cola(0x000000, 0.10); s74_r(x + 6, y + 5, w - 22, ht); s74_r(x + w - 13, y + 5, 7, ht);
+  p = min(max(m4_bpos(tp), 0), 1); q = m4_bpos(0);
+  ui_col(S74_NDL); s74_r(x + 6, yb - ht * min(p, q), w - 22, ht * min(p, q));
+  p > q ? ( ui_col(S74_RED); s74_r(x + 6, yb - ht * p, w - 22, ht * (p - q)); );
+  p = min(max(m4_bpos(rm), 0), 1);
+  ui_cola(S74_NDL, 0.55); s74_r(x + w - 13, yb - ht * p, 7, ht * p);
+  hd > -100 ? ( p = min(max(m4_bpos(hd), 0), 1); ui_col(0xFFF4EA); s74_r(x + 6, yb - ht * p - 1, w - 22, 2); );
+  m4_glass(x, y, w, h);
+);
+// a lit read-out window with charcoal digits
+function m4_win(x, y, w, h, s, f) (
+  m4_lit(x, y, w, h);
+  gfx_setfont(f); ui_col(S74_NDL); s74_tc(x + w * 0.5, y + h * 0.5 + 1, s);
+  m4_glass(x, y, w, h);
+);
+function m4_fmt(d, n) ( d > -70 ? sprintf(n, "%.1f", d) : strcpy(n, "---"); n; );
+function m4_db(v) ( 20 * log10(max(v, 0.0000001)); );
+
+// ---------- presets ----------
+function m4_set(mo, al, tr, ne) ( slider6 = mo; slider7 = al; slider8 = tr; slider9 = ne; slider_automate(480); );
+#m4_pm = "Init|Stereo M/S|Align -14|Hot Desk -12|Line Transformer|Lab Reference";
+function m74_load_preset(p) (
+  p == 1 ? m4_set(0, 0, 0, 0) :                         // Init
+  p == 2 ? m4_set(0, 0, 0, 1) :                         // Stereo M/S
+  p == 3 ? m4_set(0, 1, 0, 0) :                         // Align -14
+  p == 4 ? m4_set(0, 2, 0, 0) :                         // Hot Desk -12
+  p == 5 ? m4_set(0, 0, 1, 0) :                         // Line Transformer
+  p == 6 ? m4_set(1, 0, 0, 0) :                         // Lab Reference
+  p == 7 ? m4_set(0, 0, 0, 0);                          // Reset all to defaults
+  pr_cur = p;
+);
+
+
+
+// ============================================== MODEL 81 ==============================================
+ext_nodenorm = 1;                                       // no anti-denormal noise added to the input: the pass-through stays bit-exact
+
+// ---------- helpers ----------
+function pg_g2db(g) ( 8.68588963807 * log(max(g, 0.00000001)) );    // floor -160 dB
+function pg_refdb(i) ( i == 0 ? -9 : i == 1 ? -12 : i == 2 ? -14 : i == 3 ? -15 : i == 4 ? -18 : -20 );
+function pg_holds(i) ( i == 0 ? 0 : i == 1 ? 2 : i == 2 ? 5 : 1000000 );   // hold time in seconds (INF = huge)
+
+// ---------- audio-thread ballistics (shared with the panel through the pga_ variables) ----------
+pga_pa = 1 - exp(-1 / (0.0017 * srate));                // PPM charge (10 ms burst -> -1 dB)
+pga_pr = 10 ^ (-(20 / 1.5) / 20 / srate);               // PPM return: 20 dB in 1.5 s
+pga_pcal = 1 / 0.97676;                                 // PPM: a steady sine reads its peak (rectifier ripple)
+pga_fa = 1 - exp(-1 / (0.00015 * srate));               // VFD fast PPM charge (1 ms burst -> -1 dB)
+pga_fr = 10 ^ (-(20 / 2.5) / 20 / srate);               // VFD fast PPM fall: 20 dB in 2.5 s
+pga_fcal = 1 / 0.9968;                                  // VFD fast PPM: a steady sine reads its peak
+pga_w = 13.6; pga_z = 0.81;                             // VU needle: natural frequency (rad/s), damping
+pga_w2 = pga_w * pga_w; pga_zw = 2 * pga_z * pga_w; pga_dt = 1 / srate;
+pga_kr = 10 ^ (-(20 / 1.7) / 20 / srate);               // PEAK return: 20 dB in 1.7 s
+pga_cc = 1 - exp(-1 / (0.2 * srate));                   // correlation integration (200 ms)
+pga_p0 = pga_p1 = 0; pga_f0 = pga_f1 = 0; pga_vy0 = pga_vy1 = 0; pga_vv0 = pga_vv1 = 0; pga_k0 = pga_k1 = 0;
+pga_b0 = pga_b1 = 0; pga_cl = pga_cr = pga_cx = 0; pga_cor = 0;
+pga_m0 = pga_m1 = -160; pga_h0 = pga_h1 = -160; pga_ht0 = pga_ht1 = 0;
+pga_r0 = pga_r1 = -160; pga_rt0 = pga_rt1 = 0; pga_ov0 = pga_ov1 = 0;
+pga_scl = -1; pga_mdl = -1; pga_req0 = pg_req;
+
+// ---------- scale geometry (shared by all three themes) ----------
+// position 0..1 along the scale for a reading d in the scale's own units (dB rel. REF, VU, or dBFS)
+function pg_pos(d, s) local(v) (
+  s == 0 ? (
+    d = min(max(d, -52), 5.6);
+    d < -20 ? (d + 50) * 0.01 : d < -10 ? 0.3 + (d + 20) * 0.016 : 0.46 + (d + 10) * 0.036;
+  ) : s == 1 ? (
+    v = 10 ^ (min(max(d, -40), 3.6) / 20);              // VU: the needle deflects with voltage
+    (v - 0.1) / 1.3125;
+  ) : (
+    d = min(max(d, -62), 0.4);
+    d < -30 ? (d + 60) * 0.01 : 0.3 + (d + 30) * 0.0233333;
+  );
+);
+// tick tables: per scale up to 32 entries of (value, kind) - kind 2 = numbered, 1 = major (number on bargraphs
+// only), 0 = minor
+PG_TK = 50000; PG_TN = 50100;      // (Meter81 memory: clear of the other models)
+function pg_tick(s, d, k) local(n) ( n = PG_TN[s]; PG_TK[s * 64 + n * 2] = d; PG_TK[s * 64 + n * 2 + 1] = k; PG_TN[s] = n + 1; );
+PG_TN[0] = PG_TN[1] = PG_TN[2] = 0;
+pg_tick(0, -50, 2); pg_tick(0, -45, 0); pg_tick(0, -40, 2); pg_tick(0, -35, 0); pg_tick(0, -30, 2); pg_tick(0, -25, 0);
+pg_tick(0, -20, 2); pg_tick(0, -15, 0); pg_tick(0, -10, 2); pg_tick(0, -9, 0); pg_tick(0, -8, 0); pg_tick(0, -7, 0);
+pg_tick(0, -6, 0); pg_tick(0, -5, 2); pg_tick(0, -4, 0); pg_tick(0, -3, 0); pg_tick(0, -2, 0); pg_tick(0, -1, 0);
+pg_tick(0, 0, 2); pg_tick(0, 1, 0); pg_tick(0, 2, 0); pg_tick(0, 3, 0); pg_tick(0, 4, 0); pg_tick(0, 5, 2);
+pg_tick(1, -20, 2); pg_tick(1, -15, 0); pg_tick(1, -10, 2); pg_tick(1, -7, 2); pg_tick(1, -5, 2); pg_tick(1, -4, 0);
+pg_tick(1, -3, 2); pg_tick(1, -2, 2); pg_tick(1, -1, 2); pg_tick(1, -0.5, 0); pg_tick(1, 0, 2); pg_tick(1, 0.5, 0);
+pg_tick(1, 1, 2); pg_tick(1, 1.5, 0); pg_tick(1, 2, 2); pg_tick(1, 2.5, 0); pg_tick(1, 3, 2);
+pg_tick(2, -60, 2); pg_tick(2, -55, 0); pg_tick(2, -50, 1); pg_tick(2, -45, 0); pg_tick(2, -40, 2); pg_tick(2, -35, 0);
+pg_tick(2, -30, 2); pg_tick(2, -27, 0); pg_tick(2, -24, 2); pg_tick(2, -21, 0); pg_tick(2, -18, 2); pg_tick(2, -15, 0);
+pg_tick(2, -12, 2); pg_tick(2, -9, 1); pg_tick(2, -6, 2); pg_tick(2, -3, 2); pg_tick(2, 0, 2);
+
+// ---------- presets: scale, PPM ref, VU ref, hold, mode (1 VFD, 2 MATRIX) ----------
+// (the PPM presets that used to read DIN ballistics on any theme are MATRIX now, so they still read DIN)
+function pg_set(s, rp, rv, h, t) (
+  slider10 = s; slider11 = rp; slider12 = rv; slider13 = h; slider14 = t;
+  slider_automate(15872);                                  // sliders 1-5
+);
+function m81_load_preset(p) (
+  p == 1  ? pg_set(0, 0, 4, 1, 1) :                     // Init: PPM, -9 dBFS, VFD
+  p == 2  ? pg_set(0, 0, 4, 2, 2) :                     // Broadcast PPM -9
+  p == 3  ? pg_set(0, 4, 4, 1, 2) :                     // PPM Align -18
+  p == 4  ? pg_set(0, 1, 4, 1, 2) :                     // Live Desk PPM -12
+  p == 5  ? pg_set(1, 0, 4, 0, 1) :                     // Tracking VU -18
+  p == 6  ? pg_set(1, 0, 2, 1, 1) :                     // Mix VU -14
+  p == 7  ? pg_set(1, 0, 1, 1, 1) :                     // Hot Master VU -12
+  p == 8  ? pg_set(2, 0, 4, 3, 2) :                     // Mastering Peak
+  p == 9  ? pg_set(2, 0, 4, 1, 1) :                     // VFD Peak
+  p == 10 ? pg_set(0, 0, 4, 2, 1) :                     // VFD PPM
+  p == 11 ? pg_set(0, 0, 4, 1, 2) :                     // Matrix PPM
+  p == 12 ? pg_set(1, 0, 4, 0, 2);                      // Matrix VU
+);
+
+
+
+// ============================================== MODEL 92 ==============================================
+
+// ---------- memory ----------
+m9_EKB = s92_alloc(32);                                  // the K-weighted energy of each 100 ms sub-block (a ring)
+m9_GB = s92_alloc(4096);                                 // the goniometer's ring: M at 0, S at 2048
+
+// ---------- the K-weighting (ITU-R BS.1770): the head shelf, then the RLB high-pass, at any sample rate ----------
+function m9_kset() local(f, g, q, k, vh, vb, a0) (
+  f = 1681.974450955533; g = 3.999843853973347; q = 0.7071752369554196;
+  k = tan($pi * f / srate); vh = 10 ^ (g / 20); vb = vh ^ 0.4996667741545416; a0 = 1 + k / q + k * k;
+  m9_pb0 = (vh + vb * k / q + k * k) / a0; m9_pb1 = 2 * (k * k - vh) / a0; m9_pb2 = (vh - vb * k / q + k * k) / a0;
+  m9_pa1 = 2 * (k * k - 1) / a0; m9_pa2 = (1 - k / q + k * k) / a0;
+  f = 38.13547087602444; q = 0.5003270373238773;
+  k = tan($pi * f / srate); a0 = 1 + k / q + k * k;
+  m9_ra1 = 2 * (k * k - 1) / a0; m9_ra2 = (1 - k / q + k * k) / a0;
+);
+function m9_kw(x) instance(z1, z2, u1, u2) local(y) (
+  y = m9_pb0 * x + z1; z1 = m9_pb1 * x - m9_pa1 * y + z2; z2 = m9_pb2 * x - m9_pa2 * y;
+  x = y; y = x + u1; u1 = -2 * x - m9_ra1 * y + u2; u2 = x - m9_ra2 * y;
+  y;
+);
+
+// ---------- the VU movement: a full-wave average rectifier into a second-order needle (ANSI C16.5 ballistics) ----------
+// the needle's position is in sine-peak units (a steady sine reads its peak); 99 % of a step in 300 ms, ~1 % overshoot
+function m9_vu(x) instance(p, v) (
+  v += ((abs(x) * m9_VUC - p) * m9_w2 - m9_zw * v) * m9_dt;
+  p += v * m9_dt;
+  p;
+);
+// the overs: a run of m9_on consecutive full-scale samples counts once
+function m9_ov(a) instance(run, n, lamp) (
+  a >= m9_FS ? ( run += 1; run == m9_on ? ( n += 1; lamp = m9_olt; ); ) : run = 0;
+);
+// the digital peak bar: an instant rise, a fall of 20 dB in 1.7 s; the hold segment; the maximum since RESET
+function m9_pk(a) instance(pd, ph, ht, mx, led) (
+  pd = max(a, pd * m9_kk);
+  a >= ph ? ( ph = a; ht = m9_hlen; );
+  mx = max(mx, a);
+  a >= m9_plt ? led = m9_llen;
+);
+
+// ---------- settings ----------
+function m9_srinit() (
+  m9_sr = srate; m9_dt = 1 / srate;
+  m9_wn = 2 * $pi * 2.15; m9_w2 = m9_wn * m9_wn; m9_zw = 2 * 0.81 * m9_wn;
+  m9_kk = 10 ^ (-20 / 20 / (1.7 * srate));              // the plasma bars' fall: 20 dB in 1.7 s
+  m9_krm = s92_kt(0.3, srate);                          // RMS (300 ms)
+  m9_kcr = s92_kt(0.3, srate);                          // the correlation's averaging
+  m9_nsb = floor(0.1 * srate + 0.5);                    // samples per 100 ms sub-block
+  m9_hlen = 3 * srate; m9_llen = 0.25 * srate; m9_olt = 2 * srate; m9_bwin = 0.4 * srate;
+  m9_kset();
+  m9kL.z1 = m9kL.z2 = m9kL.u1 = m9kL.u2 = 0; m9kR.z1 = m9kR.z2 = m9kR.u1 = m9kR.u2 = 0;
+  m9_ek = 0; m9_n = 0; m9_sb = 0; memset(m9_EKB, 0, 32); m9_lm = m9_ls = -999;
+);
+function m9_update() (
+  m9_dig = slider15 >= 0.5;
+  m9_ref = slider16 < 0.5 ? -18 : slider16 < 1.5 ? -14 : -12;
+  m9_plt = 10 ^ ((slider17 < 0.5 ? -6 : slider17 < 1.5 ? -3 : -1) / 20);
+  m9_hm = slider18 < 0.5 ? 0 : slider18 < 1.5 ? 1 : 2;
+  m9_on = floor(slider19 + 1.5);
+);
+function m9_reset() (
+  m9pL.ph = m9pR.ph = 0; m9pL.mx = m9pR.mx = 0;
+  m9oL.n = m9oR.n = 0; m9oL.lamp = m9oR.lamp = 0;
+);
+m9_VUC = $pi / 2;                                       // the rectifier's calibration: a sine's mean x pi / 2 = its peak
+m9_FS = 32767 / 32768;                                  // full scale: the 16-bit top code
+m9_srinit();
+m9_update();
+m9_reset();
+m9_cLR = m9_cLL = m9_cRR = 0.000001; m9_gw = 0; m9_bor = 0; m9_bfl = 0; m9_bac = 0; m9_bfx = 0; m9_bn = 0;
+
+// ---------- the faces (this unit's own, drawn in @gfx; locals only) ----------
+// the VU scale: the needle's travel is linear in voltage, +3 VU = full travel
+function m9_vpos(d) ( 10 ^ ((d - 3) / 20); );
+function m9_vang(p) ( (-40 + 80 * p) * $pi / 180; );
+// a backlit VU meter: a black bezel, an amber-lit cream face, the black scale with the red zone, a black needle, the
+// peak LED and the channel on the plate below
+function m9_vum(x, y, w, h, p, led, ch, ref) local(fx, fy, fw, fh, px, py, R, i, d, a, s, c, k, l, x1, y1, x2, y2, r0, fb) (
+  ui_cola(0x000000, 0.5); s92_rr(x + 1, y + 3, w, h, 5);
+  ui_col(0x0B0C0D); s92_rr(x, y, w, h, 5);
+  ui_col(0x2E3134); s92_r(x + 4, y + 1, w - 8, 1);
+  fx = x + 9; fy = y + 9; fw = w - 18; fh = h - 52; fb = fy + fh;
+  // the face, lit from behind by warm lamps: deep amber at the rim, pale cream in the middle
+  ui_col(0xB8772E); s92_r(fx, fy, fw, fh);
+  i = 0; loop(14, ui_cola(0xFFE4AA, 0.16); s92_r(fx + 3 + i * 4, fy + 2 + i * 2.6, fw - 6 - i * 8, fh - 4 - i * 4.2); i += 1; );
+  px = fx + fw * 0.5; py = fb + 12; R = min(fh + 10, (fw * 0.5 - 10) / sin(40 * $pi / 180) + 26);
+  // the scale arc: black from -20 to 0, a thick red band from 0 to +3
+  i = 0; loop(40, a = m9_vang(m9_vpos(-20) + (m9_vpos(0) - m9_vpos(-20)) * i / 40); k = m9_vang(m9_vpos(-20) + (m9_vpos(0) - m9_vpos(-20)) * (i + 1) / 40);
+    ui_col(0x1A1410); s92_ln(px + sin(a) * (R - 52), py - cos(a) * (R - 52), px + sin(k) * (R - 52), py - cos(k) * (R - 52), 1.4); i += 1; );
+  i = 0; loop(16, a = m9_vang(m9_vpos(0) + (1 - m9_vpos(0)) * i / 16); k = m9_vang(m9_vpos(0) + (1 - m9_vpos(0)) * (i + 1) / 16);
+    ui_col(0xC4261C); s92_ln(px + sin(a) * (R - 49), py - cos(a) * (R - 49), px + sin(k) * (R - 49), py - cos(k) * (R - 49), 6); i += 1; );
+  // the marks and numerals
+  i = 0;
+  loop(11,
+    d = i == 0 ? -20 : i == 1 ? -10 : i == 2 ? -7 : i == 3 ? -5 : i == 4 ? -3 : i == 5 ? -2 : i == 6 ? -1 : i == 7 ? 0 : i == 8 ? 1 : i == 9 ? 2 : 3;
+    a = m9_vang(m9_vpos(d)); s = sin(a); c = cos(a); l = d == -20 || d == -10 || d == 0 || d == 3 ? 14 : 10;
+    ui_col(d > 0 ? 0xC4261C : 0x1A1410); s92_ln(px + s * (R - 53), py - c * (R - 53), px + s * (R - 53 + l), py - c * (R - 53 + l), 1.8);
+    gfx_setfont(15); ui_col(d > 0 ? 0xB8221A : 0x1A1410);
+    sprintf(#m9_e, "%d", abs(d)); s92_tc(px + s * (R - 26), py - c * (R - 26), #m9_e);
+    i += 1;
+  );
+  // the minor marks between -20 and -10
+  i = 0; loop(3, a = m9_vang(m9_vpos(-20 + 2.5 * (i + 1))); s = sin(a); c = cos(a);
+    ui_col(0x1A1410); s92_ln(px + s * (R - 53), py - c * (R - 53), px + s * (R - 47), py - c * (R - 47), 1.2); i += 1; );
+  gfx_setfont(15); ui_col(0x1A1410); a = m9_vang(m9_vpos(-20)) - 0.1; s92_tc(px + sin(a) * (R - 26), py - cos(a) * (R - 26), "-");
+  ui_col(0xB8221A); a = m9_vang(0.92); s92_tc(px + sin(a) * (R - 4), py - cos(a) * (R - 4), "+");
+  // the legend
+  gfx_setfont(14); ui_col(0x1A1410); s92_tc(px, fb - 46, "VU");
+  gfx_setfont(13); ui_col(0x4A3A28); sprintf(#m9_e, "0 VU = %d DBFS", ref); s92_tc(px, fb - 20, #m9_e);
+  // the needle, from the bottom of the face (its pivot is hidden below)
+  p = min(max(p, -0.04), 1.06); a = m9_vang(p); s = sin(a); c = cos(a);
+  r0 = (py - fb) / c; x1 = px + s * r0; y1 = fb; x2 = px + s * (R - 6); y2 = py - c * (R - 6);
+  ui_cola(0x000000, 0.25); s92_ln(x1 + 2, y1, x2 + 2, y2 + 2, 2);
+  ui_col(0x141210); s92_ln(x1, y1, x2, y2, 1.8);
+  // the glass, the pivot cover
+  ui_cola(0xFFFFFF, 0.07); s92_r(fx, fy, fw, fh * 0.33);
+  ui_col(0x16181A); s92_r(fx, fb - 4, fw, 4); ui_cola(0x000000, 0.35); s92_r(fx, fb - 6, fw, 2);
+  // the plate under the window: the channel, the peak LED
+  gfx_setfont(11); ui_col(S92_INK); s92_t(x + 14, y + h - 33, ch);
+  gfx_setfont(13); ui_col(S92_DIM); s92_t(x + w - 72, y + h - 31, "PEAK");
+  pk_led((x + w - 22) * sc, (y + h - 26) * sc, 4 * sc, led, S92_RED);
+);
+// the plasma bars' scale: -60 .. -30 compressed, -30 .. 0 open
+function m9_bpos(d) ( d < -30 ? 0.25 * (max(d, -60) + 60) / 30 : min(0.25 + 0.75 * (d + 30) / 30, 1); );
+function m9_db(v) ( 20 * log10(max(v, 0.0000001)); );
+// a plasma-style bar: 64 segments lit in the lamp colour (yellow from -6, red from -1), the hold segment, the RMS row
+// under it, the OVER lamp and the maximum since RESET at the end
+function m9_bar(x, y, w, h, ch, pk, rm, hd, mx, ovl) local(sx, sw, n, i, sg, q, c, on, pp, pr, ph) (
+  ui_col(0x050506); s92_rr(x, y, w, h, 3);
+  gfx_setfont(11); ui_col(S92_LDIM); s92_tc(x + 13, y + h * 0.5 + 1, ch);
+  sx = x + 26; sw = w - 154; n = 64; sg = sw / n;
+  pp = m9_bpos(m9_db(pk)); pr = m9_bpos(m9_db(rm)); ph = hd > 0.0000001 ? m9_bpos(m9_db(hd)) : -1;
+  i = 0;
+  loop(n,
+    q = (i + 1) / n;
+    c = q > m9_bpos(-1) ? S92_RED : q > m9_bpos(-6) ? S92_YEL : S92_LAMP;
+    on = pp >= q - 0.5 / n;
+    ui_col(on ? c : ui_mix(c, 0x000000, 0.84)); s92_r(sx + i * sg + 0.6, y + 5, sg - 1.2, h - 15);
+    (ph >= 0 && abs(ph - (q - 0.5 / n)) <= 0.5 / n) ? ( ui_col(c); s92_r(sx + i * sg + 0.6, y + 5, sg - 1.2, h - 15); );
+    on = pr >= q - 0.5 / n;
+    ui_col(on ? ui_mix(c, 0x000000, 0.25) : ui_mix(c, 0x000000, 0.88)); s92_r(sx + i * sg + 0.6, y + h - 8, sg - 1.2, 3);
+    i += 1;
+  );
+  ui_cola(S92_LAMP, 0.06); s92_r(sx, y + 3, sw, h - 6);
+  // the OVER lamp
+  ui_col(ovl ? S92_RED : 0x2A0B08); s92_r(x + w - 122, y + 5, 36, h - 10);
+  ovl ? ( ui_cola(S92_RED, 0.25); s92_r(x + w - 124, y + 3, 40, h - 6); );
+  gfx_setfont(13); ui_col(ovl ? 0xFFFFFF : 0x6A2A22); s92_tc(x + w - 104, y + h * 0.5 + 1, "OVER");
+  // the maximum since RESET
+  ui_col(S92_LCDB); s92_r(x + w - 80, y + 4, 74, h - 8);
+  gfx_setfont(15); ui_col(S92_LCDT);
+  mx > 0.0000001 ? sprintf(#m9_e, "%.1f", m9_db(mx)) : strcpy(#m9_e, "---");
+  s92_tc(x + w - 43, y + h * 0.5 + 1, #m9_e);
+);
+
+// ---------- presets ----------
+function m9_set(mo, rf, pl, hd, ov) ( slider15 = mo; slider16 = rf; slider17 = pl; slider18 = hd; slider19 = ov; slider_automate(507904); );
+#m9_pm = "Init|Hot Tape -14|Desk Peaks -12|DAT Master|CD Overs|Digital Tracking";
+function m92_load_preset(p) (
+  p == 1 ? m9_set(0, 0, 1, 1, 2) :                      // Init
+  p == 2 ? m9_set(0, 1, 1, 1, 2) :                      // Hot Tape -14
+  p == 3 ? m9_set(0, 2, 0, 1, 2) :                      // Desk Peaks -12
+  p == 4 ? m9_set(1, 0, 2, 2, 0) :                      // DAT Master
+  p == 5 ? m9_set(1, 0, 1, 2, 2) :                      // CD Overs
+  p == 6 ? m9_set(1, 0, 1, 1, 0) :                      // Digital Tracking
+  p == 7 ? m9_set(0, 0, 1, 1, 2);                       // Reset all to defaults
+  pr_cur = p;
+);
+
+
+
+// ============================================== the unit ==============================================
+mm_m = floor(slider1 + 0.5);
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; m57_pr = m74_pr = m81_pr = m92_pr = 1; );
+ui_dflt = 1;
+
+@slider
+mm_m = floor(slider1 + 0.5);
+// 74
+m4_update();
+// 81
+pga_sc = slider10;
+// 92
+m9_update();
+
+@block
+mm_m = floor(slider1 + 0.5);
+// ---------------- 57 ----------------
+srate != mt_sr ? mt_init();
+mt_fc = slider5 >= 0.5;
+// the PPM's return: linear in dB (DIN 20 dB in 1.5 s, Nordic 20 dB in 1.7 s); the PEAK's: 20 dB in 1.7 s
+mt_kp = 10 ^ (-20 / 20 / ((mt_fc ? 1.7 : 1.5) * srate));
+mt_kk = 10 ^ (-20 / 20 / (1.7 * srate));
+mt_ref = slider3 == 0 ? -18 : slider3 == 1 ? -14 : slider3 == 2 ? -12 : -9;
+// ---------------- 74 ----------------
+srate != m4_sr ? m4_srinit();
+m4_update();                                            // lenses pressed on the panel do not run @slider
+m4_rq ? ( m4_iclear(); m4_rq = 0; );
+// ---------------- 81 ----------------
+// ---- settings ----
+pga_sc = slider10 | 0;
+pga_md = slider14 >= 1.5;                                // 0 VFD (fast PPM), 1 MATRIX (DIN PPM)
+pga_ref = pga_sc == 0 ? pg_refdb(slider11) : pga_sc == 1 ? pg_refdb(slider12) : 0;
+pga_hs = pg_holds(slider13);
+pga_bdt = samplesblock / srate;
+// the panel asks for a hold reset by bumping pg_req (a one-way mailbox: written only by the panel);
+// a new scale or REF starts the hold markers afresh too
+(pg_req != pga_req0 || pga_sc != pga_scl || pga_ref != pga_refl || slider13 != pga_hl || pga_md != pga_mdl) ? (
+  pga_req0 = pg_req; pga_scl = pga_sc; pga_refl = pga_ref; pga_hl = slider13; pga_mdl = pga_md;
+  pga_h0 = pga_h1 = -160; pga_r0 = pga_r1 = -160; pga_ov0 = pga_ov1 = 0;
+  pga_b0 = pga_b1 = 0;                                  // and forget the block before the click
+);
+// ---- flush decayed states (no denormals after long silence) ----
+pga_p0 < 0.000000001 ? pga_p0 = 0; pga_p1 < 0.000000001 ? pga_p1 = 0;
+pga_f0 < 0.000000001 ? pga_f0 = 0; pga_f1 < 0.000000001 ? pga_f1 = 0;
+pga_k0 < 0.000000001 ? pga_k0 = 0; pga_k1 < 0.000000001 ? pga_k1 = 0;
+abs(pga_vy0) + abs(pga_vv0) < 0.000000001 ? pga_vy0 = pga_vv0 = 0;
+abs(pga_vy1) + abs(pga_vv1) < 0.000000001 ? pga_vy1 = pga_vv1 = 0;
+pga_cl < 0.0000000001 ? pga_cl = 0; pga_cr < 0.0000000001 ? pga_cr = 0; abs(pga_cx) < 0.0000000001 ? pga_cx = 0;
+// ---- the selected scale's reading (scale units) and its block maximum for the hold ----
+pga_sc == 0 ? (
+  pga_md ? ( pga_m0 = pg_g2db(pga_p0 * pga_pcal) - pga_ref; pga_m1 = pg_g2db(pga_p1 * pga_pcal) - pga_ref; )
+         : ( pga_m0 = pg_g2db(pga_f0 * pga_fcal) - pga_ref; pga_m1 = pg_g2db(pga_f1 * pga_fcal) - pga_ref; );
+  pga_x0 = pga_m0; pga_x1 = pga_m1;
+) : pga_sc == 1 ? (
+  pga_m0 = pg_g2db(max(pga_vy0, 0)) - pga_ref; pga_m1 = pg_g2db(max(pga_vy1, 0)) - pga_ref;
+  pga_x0 = pga_m0; pga_x1 = pga_m1;
+) : (
+  pga_m0 = pg_g2db(pga_k0); pga_m1 = pg_g2db(pga_k1);
+  pga_x0 = pg_g2db(pga_b0); pga_x1 = pg_g2db(pga_b1);   // instant attack: hold the true block peak
+);
+// ---- hold markers: hold, then fall back at 20 dB/s onto the reading ----
+pga_x0 >= pga_h0 ? ( pga_h0 = pga_x0; pga_ht0 = 0; ) : (
+  pga_ht0 += pga_bdt; pga_ht0 > pga_hs ? pga_h0 = max(pga_m0, pga_h0 - 20 * pga_bdt); );
+pga_x1 >= pga_h1 ? ( pga_h1 = pga_x1; pga_ht1 = 0; ) : (
+  pga_ht1 += pga_bdt; pga_ht1 > pga_hs ? pga_h1 = max(pga_m1, pga_h1 - 20 * pga_bdt); );
+// ---- numeric readout: true sample peak in dBFS, held (HOLD OFF still holds 1 s so it can be read) ----
+pga_rh = slider13 == 0 ? 1 : pga_hs;
+pga_d0 = pg_g2db(pga_b0); pga_d1 = pg_g2db(pga_b1);
+pga_d0 >= pga_r0 ? ( pga_r0 = pga_d0; pga_rt0 = 0; ) : ( pga_rt0 += pga_bdt; pga_rt0 > pga_rh ? ( pga_r0 = pga_d0; pga_rt0 = 0; ); );
+pga_d1 >= pga_r1 ? ( pga_r1 = pga_d1; pga_rt1 = 0; ) : ( pga_rt1 += pga_bdt; pga_rt1 > pga_rh ? ( pga_r1 = pga_d1; pga_rt1 = 0; ); );
+pga_b0 >= 1 ? ( pga_ov0 = 1; pga_ot0 = 0; ) : ( pga_ot0 += pga_bdt; pga_ot0 > max(pga_rh, 2) ? pga_ov0 = 0; );
+pga_b1 >= 1 ? ( pga_ov1 = 1; pga_ot1 = 0; ) : ( pga_ot1 += pga_bdt; pga_ot1 > max(pga_rh, 2) ? pga_ov1 = 0; );
+pga_b0 = pga_b1 = 0;
+// ---- correlation ----
+pga_cd = sqrt(pga_cl * pga_cr);
+pga_cor = pga_cd > 0.0000000001 ? min(max(pga_cx / pga_cd, -1), 1) : 0;
+pga_blk += 1;                                           // block counter: the panel sees fresh values
+// ---------------- 92 ----------------
+srate != m9_sr ? m9_srinit();
+m9_update();                                            // keys pressed on the panel do not run @slider
+m9_rq ? ( m9_reset(); m9_rq = 0; );
+// the timers: the hold segment (3 S), the peak LEDs, the OVER lamps
+m9_hm == 0 ? ( m9pL.ph = m9pL.pd; m9pR.ph = m9pR.pd; ) :
+m9_hm == 1 ? (
+  m9pL.ht -= samplesblock; m9pL.ht <= 0 ? m9pL.ph = m9pL.pd;
+  m9pR.ht -= samplesblock; m9pR.ht <= 0 ? m9pR.ph = m9pR.pd;
+);
+m9pL.led = max(m9pL.led - samplesblock, 0); m9pR.led = max(m9pR.led - samplesblock, 0);
+m9_hm < 2 ? ( m9oL.lamp = max(m9oL.lamp - samplesblock, 0); m9oR.lamp = max(m9oR.lamp - samplesblock, 0); );
+// the bits in use: publish the window's word and start the next
+m9_bn += samplesblock;
+m9_bn >= m9_bwin ? ( m9_bor = m9_bac; m9_bfl = m9_bfx; m9_bac = 0; m9_bfx = 0; m9_bn = 0; );
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, m57_pr); file_var(0, m74_pr); file_var(0, m81_pr); file_var(0, m92_pr);
+
+@sample
+// the 74 line transformer runs always (warm) and is heard only with model 74 selected; it fades in / out on its own
+// ---------- the line transformer: always running (so it is warm), heard only when switched in ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; m4_x0 = gdc_y0;   // 1 Hz DC blocker into the iron (the meters still read the raw input)
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; m4_x1 = gdc_y1;
+m4_yl = m4iL.m4_iron(m4_x0); m4_yr = m4iR.m4_iron(m4_x1);
+m4_tx ? m4_xf = min(1, m4_xf + m4_xd) : m4_xf > 0 ? m4_xf = max(0, m4_xf - m4_xd);
+m4_xf > 0 ? (                                           // otherwise spl0 / spl1 are never written: bit-exact
+  m4_yl = m4_x0 + (m4_yl - m4_x0) * m4_xf; m4_yr = m4_x1 + (m4_yr - m4_x1) * m4_xf;
+  spl0 = abs(m4_yl) < 0.00000000000000000001 ? 0 : m4_yl;
+  spl1 = abs(m4_yr) < 0.00000000000000000001 ? 0 : m4_yr;
+);
+
+mm_m == 0 ? (
+  mt_l = spl0; mt_r = spl1;
+  // VU: the rectified signal drives the needle (a mass on a spring, damped). A sine reads its average (2 / pi of the
+  // peak); the scale is calibrated so a sine at REF peak reads 0 VU.
+  mt_vvL += (mt_w * mt_w * (abs(mt_l) * 1.5708 - mt_vuL) - 2 * mt_z * mt_w * mt_vvL) / srate; mt_vuL += mt_vvL / srate;
+  mt_vvR += (mt_w * mt_w * (abs(mt_r) * 1.5708 - mt_vuR) - 2 * mt_z * mt_w * mt_vvR) / srate; mt_vuR += mt_vvR / srate;
+  // PPM: quick integration up, a steady return
+  mt_a = abs(mt_l); mt_ppL = mt_a > mt_ppL ? mt_ppL + (mt_a - mt_ppL) * mt_ka : mt_ppL * mt_kp;
+  mt_a = abs(mt_r); mt_ppR = mt_a > mt_ppR ? mt_ppR + (mt_a - mt_ppR) * mt_ka : mt_ppR * mt_kp;
+  // PEAK
+  mt_pkL = max(abs(mt_l), mt_pkL * mt_kk); mt_pkR = max(abs(mt_r), mt_pkR * mt_kk);
+  // the true sample peaks for the nixies
+  mt_hL = max(mt_hL, abs(mt_l)); mt_hR = max(mt_hR, abs(mt_r));
+  // correlation
+  mt_cLR += (mt_l * mt_r - mt_cLR) * mt_kc; mt_cLL += (mt_l * mt_l - mt_cLL) * mt_kc; mt_cRR += (mt_r * mt_r - mt_cRR) * mt_kc;
+  // the scope: mid and side, every 4th sample
+  (mt_dec += 1) >= 4 ? ( mt_dec = 0; mt_SC[mt_sp * 2] = (mt_l + mt_r) * 0.7071; mt_SC[mt_sp * 2 + 1] = (mt_r - mt_l) * 0.7071; mt_sp = (mt_sp + 1) & 1023; );
+) : mm_m == 1 ? (
+  // ---------- the meters read the output ----------
+  m4_l = spl0; m4_r = spl1;
+  m4_spk = max(m4_spk, max(abs(m4_l), abs(m4_r)));
+  // PPM: L / R or M / S, full-wave, a quick integration up, a steady fall
+  m4_msn ? ( m4_a = abs(m4_l + m4_r) * 0.70711; m4_b = abs(m4_l - m4_r) * 0.70711; ) : ( m4_a = abs(m4_l); m4_b = abs(m4_r); );
+  m4_ppA = m4_a > m4_ppA ? m4_ppA + (m4_a - m4_ppA) * m4_ka : m4_ppA * m4_kr;
+  m4_ppB = m4_b > m4_ppB ? m4_ppB + (m4_b - m4_ppB) * m4_ka : m4_ppB * m4_kr;
+  // true peak (4x), the bars' fall, the maxima for the read-outs
+  m4_a = m4tL.m4_tp(m4_l); m4_b = m4tR.m4_tp(m4_r);
+  m4_tdL = max(m4_a, m4_tdL * m4_kk); m4_tdR = max(m4_b, m4_tdR * m4_kk);
+  m4_tmL = max(m4_tmL, m4_a); m4_tmR = max(m4_tmR, m4_b);
+  // RMS and correlation
+  m4_mqL += (m4_l * m4_l - m4_mqL) * m4_krm; m4_mqR += (m4_r * m4_r - m4_mqR) * m4_krm;
+  m4_cLR += (m4_l * m4_r - m4_cLR) * m4_kcr; m4_cLL += (m4_l * m4_l - m4_cLL) * m4_kcr; m4_cRR += (m4_r * m4_r - m4_cRR) * m4_kcr;
+  // loudness: K-weighted energy in 100 ms sub-blocks; momentary = 4 of them, short-term = 30, integrated = gated 400 ms
+  m4_a = m4kL.m4_kw(m4_l); m4_b = m4kR.m4_kw(m4_r);
+  m4_ek += m4_a * m4_a + m4_b * m4_b; m4_n += 1;
+  m4_n >= m4_nsb ? (
+    m4_EKB[m4_sb & 31] = m4_ek / m4_nsb; m4_sb += 1; m4_ek = 0; m4_n = 0;
+    m4_sb >= 4 ? (
+      m4_z = (m4_EKB[(m4_sb - 1) & 31] + m4_EKB[(m4_sb - 2) & 31] + m4_EKB[(m4_sb - 3) & 31] + m4_EKB[(m4_sb - 4) & 31]) / 4;
+      m4_lm = -0.691 + 10 * log10(max(m4_z, 0.00000000000000000001));
+      m4_lm > -70 ? ( m4_i = min(749, floor((m4_lm + 70) * 10)); m4_HS[m4_i] += m4_z; m4_HC[m4_i] += 1; m4_nb += 1; );
+      m4_j = min(m4_sb, 30); m4_z = 0; m4_i = 1; loop(m4_j, m4_z += m4_EKB[(m4_sb - m4_i) & 31]; m4_i += 1; );
+      m4_ls = -0.691 + 10 * log10(max(m4_z / m4_j, 0.00000000000000000001));
+      m4_integ();
+    );
+  );
+) : mm_m == 2 ? (
+  // read only: spl0 / spl1 are never written, so the audio passes through bit-exact
+  pga_a0 = abs(spl0); pga_a1 = abs(spl1);
+  // PPM (MATRIX, DIN): quasi-peak rectifier, fast charge, slow linear-in-dB return
+  pga_a0 > pga_p0 ? pga_p0 += (pga_a0 - pga_p0) * pga_pa : pga_p0 *= pga_pr;
+  pga_a1 > pga_p1 ? pga_p1 += (pga_a1 - pga_p1) * pga_pa : pga_p1 *= pga_pr;
+  // PPM (VFD, fast peak programme): 0.15 ms charge, slow fall (both run always: a mode switch reads at once)
+  pga_a0 > pga_f0 ? pga_f0 += (pga_a0 - pga_f0) * pga_fa : pga_f0 *= pga_fr;
+  pga_a1 > pga_f1 ? pga_f1 += (pga_a1 - pga_f1) * pga_fa : pga_f1 *= pga_fr;
+  // VU: the rectified signal (x pi/2: a sine reads its peak) drives the needle's mass-spring-damper
+  pga_vv0 += (pga_w2 * (pga_a0 * 1.5707963 - pga_vy0) - pga_zw * pga_vv0) * pga_dt; pga_vy0 += pga_vv0 * pga_dt;
+  pga_vv1 += (pga_w2 * (pga_a1 * 1.5707963 - pga_vy1) - pga_zw * pga_vv1) * pga_dt; pga_vy1 += pga_vv1 * pga_dt;
+  // PEAK: instant attack, heavy return
+  pga_a0 > pga_k0 ? pga_k0 = pga_a0 : pga_k0 *= pga_kr;
+  pga_a1 > pga_k1 ? pga_k1 = pga_a1 : pga_k1 *= pga_kr;
+  pga_b0 = max(pga_b0, pga_a0); pga_b1 = max(pga_b1, pga_a1);
+  // correlation sums
+  pga_cl += (spl0 * spl0 - pga_cl) * pga_cc;
+  pga_cr += (spl1 * spl1 - pga_cr) * pga_cc;
+  pga_cx += (spl0 * spl1 - pga_cx) * pga_cc;
+) : (
+  // The output is never written: spl0 / spl1 pass through bit-exact. Everything below only reads them.
+  m9_l = spl0; m9_r = spl1;
+  m9_al = abs(m9_l); m9_ar = abs(m9_r);
+  // ---------- ANALOG: the VU movements ----------
+  m9_vxL = m9vL.m9_vu(m9_l); m9_vxR = m9vR.m9_vu(m9_r);
+  // ---------- DIGITAL: the peak bars, the hold, the peak LEDs, the overs ----------
+  m9pL.m9_pk(m9_al); m9pR.m9_pk(m9_ar);
+  m9oL.m9_ov(m9_al); m9oR.m9_ov(m9_ar);
+  // ---------- the bits in use: the 24-bit words seen in this window (and whether anything was finer) ----------
+  m9_q = floor(min(m9_al, 1.99) * 8388608); m9_q != min(m9_al, 1.99) * 8388608 ? m9_bfx = 1; m9_bac = m9_bac | m9_q;
+  m9_q = floor(min(m9_ar, 1.99) * 8388608); m9_q != min(m9_ar, 1.99) * 8388608 ? m9_bfx = 1; m9_bac = m9_bac | m9_q;
+  // ---------- RMS, correlation, the goniometer's ring ----------
+  m9_mqL += (m9_l * m9_l - m9_mqL) * m9_krm; m9_mqR += (m9_r * m9_r - m9_mqR) * m9_krm;
+  m9_cLR += (m9_l * m9_r - m9_cLR) * m9_kcr; m9_cLL += (m9_l * m9_l - m9_cLL) * m9_kcr; m9_cRR += (m9_r * m9_r - m9_cRR) * m9_kcr;
+  m9_GB[m9_gw] = (m9_l + m9_r) * 0.70711; m9_GB[2048 + m9_gw] = (m9_r - m9_l) * 0.70711; m9_gw = (m9_gw + 1) & 2047;
+  // ---------- loudness: K-weighted energy in 100 ms sub-blocks; momentary = 4 of them, short-term = 30 ----------
+  m9_a = m9kL.m9_kw(m9_l); m9_b = m9kR.m9_kw(m9_r);
+  m9_ek += m9_a * m9_a + m9_b * m9_b; m9_n += 1;
+  m9_n >= m9_nsb ? (
+    m9_EKB[m9_sb & 31] = m9_ek / m9_nsb; m9_sb += 1; m9_ek = 0; m9_n = 0;
+    m9_sb >= 4 ? (
+      m9_z = (m9_EKB[(m9_sb - 1) & 31] + m9_EKB[(m9_sb - 2) & 31] + m9_EKB[(m9_sb - 3) & 31] + m9_EKB[(m9_sb - 4) & 31]) / 4;
+      m9_lm = -0.691 + 10 * log10(max(m9_z, 0.00000000000000000001));
+      m9_j = min(m9_sb, 30); m9_z = 0; m9_i = 1; loop(m9_j, m9_z += m9_EKB[(m9_sb - m9_i) & 31]; m9_i += 1; );
+      m9_ls = -0.691 + 10 * log10(max(m9_z / m9_j, 0.00000000000000000001));
+    );
+  );
+);
+
+@gfx 960 434
+// the 81 face's drawing functions (defined once, here)
+function pg_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+function pg_frame(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc, 0); );
+function pg_txt(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function pg_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function pg_rtxt(rx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = rx * sc - tw; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function pg_key(x, y, w, h, lbl, on, en) local(hov, hit) (
+  hov = en && mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  pgv_th == 0 ? (
+    ui_col(PGI); pg_r(x, y, w, h);
+    on ? ui_col(PGA) : ui_col(hov ? 0xEDEAE0 : ui_mix(PGF, 0xFFFFFF, 0.35)); pg_r(x + 1, y + 1, w - 2, h - 2);
+    on ? ( ui_cola(0xFFFFFF, 0.25); pg_r(x + 1, y + 1, w - 2, 1); );
+    ui_cola(PGI, en ? 1 : 0.35);
+  ) : pgv_th == 1 ? (
+    ui_col(on ? PGI : ui_mix(PGI, PGP, 0.7)); pg_r(x, y, w, h);
+    ui_col(0x0A0B0C); pg_r(x + 1, y + 1, w - 2, h - 2);
+    on ? ( ui_cola(PGI, 0.22); pg_r(x + 1, y + 1, w - 2, h - 2); ui_cola(PGI, 0.12); pg_r(x - 2, y - 2, w + 4, h + 4); )
+       : hov ? ( ui_cola(PGI, 0.08); pg_r(x + 1, y + 1, w - 2, h - 2); );
+    on ? ui_col(ui_mix(PGI, 0xFFFFFF, 0.35)) : ui_cola(PGI, en ? 0.55 : 0.2);
+  ) : (
+    ui_col(0x0B0C0D); pg_r(x, y, w, h);
+    on ? ui_col(PGL2) : ui_col(hov ? ui_mix(PGG, 0xFFFFFF, 0.06) : PGG); pg_r(x + 1, y + 1, w - 2, h - 2);
+    on ? ( ui_cola(PGL2, 0.25); pg_r(x - 2, y - 2, w + 4, h + 4); ui_cola(0xFFFFFF, 0.3); pg_r(x + 1, y + 1, w - 2, 1); );
+    on ? ui_col(0x17191B) : ui_cola(PGI, en ? 0.85 : 0.3);
+  );
+  gfx_setfont(12); pg_ctxt(x + w * 0.5, y + h * 0.5 + 0.5, lbl);
+  hit;
+);
+function pg_lbl(x, y, s) ( gfx_setfont(11); ui_col(PGI2); pg_txt(x, y, s); );
+function pg_tlbl(s, d) (
+  s == 1 ? sprintf(#pgv_t, "%d", abs(d)) : d > 0 ? sprintf(#pgv_t, "+%d", d) : sprintf(#pgv_t, "%d", d);
+  #pgv_t;
+);
+function pg_needle_meter(x, y, w, h, q, hq, ch) local(cx, py, R, i, n, d, k, a, p, r1, r2, ca, sa, bw, bt, ox, oy) (
+  ui_col(PGI); pg_r(x, y, w, h);
+  ui_col(PGF); pg_r(x + 1.5, y + 1.5, w - 3, h - 3);
+  cx = x + w * 0.5; py = y + h - 12; R = 150;
+  // over-zone band (safety orange) and the scale arc
+  ui_col(PGA); i = 0;                                   // (anti-aliased arcs every half pixel: a smooth band)
+  ui_ssarc(cx * sc, py * sc, R * sc + (0 + (floor(14 * sc) - 1) * 0.5) * 0.5, -pgv_span + 2 * pgv_span * pgv_zR, pgv_span, ((floor(14 * sc) - 1) * 0.5 + 1));
+  ui_col(PGI); gfx_arc(cx * sc, py * sc, R * sc, -pgv_span, pgv_span, 1);
+  gfx_arc(cx * sc, py * sc, R * sc - 1, -pgv_span, pgv_span, 1);
+  // ticks and numbers
+  gfx_setfont(10);
+  n = PG_TN[pgv_sc]; i = 0;
+  loop(n,
+    d = PG_TK[pgv_sc * 64 + i * 2]; k = PG_TK[pgv_sc * 64 + i * 2 + 1];
+    p = pg_pos(d, pgv_sc); a = -pgv_span + 2 * pgv_span * p; ca = cos(a); sa = sin(a);
+    r1 = R - (k > 0 ? 11 : 6); r2 = R + (k > 0 ? 7 : 3);
+    ui_col(PGI);
+    gfx_line((cx + sa * r1) * sc, (py - ca * r1) * sc, (cx + sa * r2) * sc, (py - ca * r2) * sc, 1);
+    k > 0 ? gfx_line((cx + sa * r1) * sc + 1, (py - ca * r1) * sc, (cx + sa * r2) * sc + 1, (py - ca * r2) * sc, 1);
+    k == 2 ? ( ui_col(p >= pgv_zR - 0.001 && d > (pgv_sc == 2 ? -3.1 : 0) ? 0xB24A00 : PGI);
+               pg_ctxt(cx + sa * (R + 19), py - ca * (R + 19), pg_tlbl(pgv_sc, d)); );
+    i += 1;
+  );
+  // captions inside the arc
+  gfx_setfont(14); ui_col(PGI); pg_txt(x + 14, y + h - 80, pgv_sc == 1 ? "VU" : "dB");
+  gfx_setfont(11); ui_col(PGI2); pg_rtxt(x + w - 14, y + h - 66, pgv_de ? "PEGEL" : "LEVEL");
+  // hold: an orange drag pointer
+  pgv_hon && hq > 0.001 ? (
+    a = -pgv_span + 2 * pgv_span * min(hq, 1.02); ca = cos(a); sa = sin(a);
+    ui_col(0xD95F00);
+    gfx_line((cx + sa * (R - 30)) * sc, (py - ca * (R - 30)) * sc, (cx + sa * (R + 4)) * sc, (py - ca * (R + 4)) * sc, 1);
+    gfx_line((cx + sa * (R - 30)) * sc + 1, (py - ca * (R - 30)) * sc, (cx + sa * (R + 4)) * sc + 1, (py - ca * (R + 4)) * sc, 1);
+    gfx_line((cx + sa * (R - 30)) * sc + 2, (py - ca * (R - 30)) * sc, (cx + sa * (R + 4)) * sc + 2, (py - ca * (R + 4)) * sc, 1);
+  );
+  // needle: tapered, matte black, a faint flat shadow
+  a = -pgv_span + 2 * pgv_span * min(max(q, -0.03), 1.03); ca = cos(a); sa = sin(a);
+  r1 = 34; r2 = R + 6; bw = 2.2; bt = 0.8;
+  ox = ca; oy = sa;                                      // the needle's normal
+  ui_cola(0x000000, 0.12);
+  ui_ssquad((cx + sa * r1 - ox * bw + 2) * sc, (py - ca * r1 - oy * bw + 3) * sc, (cx + sa * r1 + ox * bw + 2) * sc, (py - ca * r1 + oy * bw + 3) * sc,
+               (cx + sa * r2 + ox * bt + 2) * sc, (py - ca * r2 + oy * bt + 3) * sc, (cx + sa * r2 - ox * bt + 2) * sc, (py - ca * r2 - oy * bt + 3) * sc);
+  ui_col(PGN);
+  ui_ssquad((cx + sa * r1 - ox * bw) * sc, (py - ca * r1 - oy * bw) * sc, (cx + sa * r1 + ox * bw) * sc, (py - ca * r1 + oy * bw) * sc,
+               (cx + sa * r2 + ox * bt) * sc, (py - ca * r2 + oy * bt) * sc, (cx + sa * r2 - ox * bt) * sc, (py - ca * r2 - oy * bt) * sc);
+  // bottom band: the pivot cover, channel letter and alignment
+  ui_col(PGI); pg_r(x + 1.5, y + h - 46, w - 3, 44.5);
+  ui_col(ui_mix(PGI, PGF, 0.12)); pg_r(x + 1.5, y + h - 46, w - 3, 1);
+  gfx_setfont(14); ui_col(PGF); pg_txt(x + 12, y + h - 36, ch);
+  gfx_setfont(11); ui_col(ui_mix(PGF, PGI, 0.15)); pg_rtxt(x + w - 12, y + h - 24, #pgv_ds);
+  gfx_setfont(11); ui_col(ui_mix(PGF, PGI, 0.3)); pg_txt(x + 40, y + h - 31, #pgv_sn);
+);
+function pg_segcol(p) (
+  pgv_th == 1 ? ( p >= pgv_zR ? PGA : PGI ) : ( p >= pgv_zR ? PGL3 : p >= pgv_zA ? PGL2 : PGL1 );
+);
+function pg_bar(x, y, w, h, q, hq) local(n, i, sx, sw, p, lit, c, hold, hi, cy, ch) (
+  n = pgv_th == 1 ? 70 : 35; sw = w / n;
+  hi = pgv_hon && hq > 0.001 ? min(max(floor(min(hq, 1) * n - 0.0001), 0), n - 1) : -1;
+  i = 0;
+  loop(n,
+    sx = x + i * sw; p = (i + 0.5) / n;
+    lit = q >= (i + 0.5) / n;
+    hold = i == hi;
+    c = pg_segcol(p);
+    pgv_th == 1 ? (
+      lit || hold ? (
+        ui_cola(c, 0.22); pg_r(sx - 0.5, y - 2, sw, h + 4);           // glow
+        ui_col(hold && !lit ? ui_mix(c, 0xFFFFFF, 0.25) : c); pg_r(sx + 0.5, y, sw - 2, h);
+        ui_cola(0xFFFFFF, hold ? 0.55 : 0.28); pg_r(sx + 0.5 + (sw - 2) * 0.5 - 0.5, y + 2, 1, h - 4);
+      ) : (
+        ui_col(PGG); pg_r(sx + 0.5, y, sw - 2, h);                    // ghost segment
+        ui_cola(c, 0.05); pg_r(sx + 0.5, y, sw - 2, h);
+      );
+    ) : (
+      ch = (h - 4) * 0.5;
+      cy = y; loop(2,
+        lit || hold ? (
+          ui_cola(c, 0.16); pg_r(sx - 0.5, cy - 1, sw + 0, ch + 2);
+          ui_col(hold && !lit ? ui_mix(c, 0xFFFFFF, 0.2) : c); pg_r(sx + 1, cy, sw - 3, ch);
+          ui_cola(0xFFFFFF, 0.22); pg_r(sx + 1, cy, sw - 3, 1.5);
+          ui_cola(0x000000, 0.18); pg_r(sx + 1, cy + ch - 1.5, sw - 3, 1.5);
+        ) : (
+          ui_col(PGG); pg_r(sx + 1, cy, sw - 3, ch);
+          ui_cola(0x000000, 0.25); pg_r(sx + 1, cy + ch - 1, sw - 3, 1);
+        );
+        cy += ch + 4;
+      );
+    );
+    i += 1;
+  );
+);
+function pg_scaleband(x, y, w, h) local(n, i, d, k, p, xx) (
+  n = PG_TN[pgv_sc]; i = 0;
+  gfx_setfont(10);
+  loop(n,
+    d = PG_TK[pgv_sc * 64 + i * 2]; k = PG_TK[pgv_sc * 64 + i * 2 + 1];
+    p = pg_pos(d, pgv_sc); xx = x + p * w;
+    ui_col(p >= pgv_zR - 0.001 && d > (pgv_sc == 2 ? -3.1 : 0) ? PGA : PGI2);
+    pg_r(xx - 0.5, y, 1, k > 0 ? 5 : 3); pg_r(xx - 0.5, y + h - (k > 0 ? 5 : 3), 1, k > 0 ? 5 : 3);
+    k > 0 ? ( ui_col(p >= pgv_zR - 0.001 && d > (pgv_sc == 2 ? -3.1 : 0) ? PGA : PGI); pg_ctxt(xx, y + h * 0.5, pg_tlbl(pgv_sc, d)); );
+    i += 1;
+  );
+);
+
+// the model keys (57 / 74 / 81 / 92) on each face, in that face's own key style
+function mm_keys57(x, y) local(i) ( i = 0; loop(4, s57_lcol = i == 0 ? LK_RED : i == 1 ? LK_ORA : i == 2 ? LK_GRN : LK_BLU_LT; s57_key(x + i * 40, y, 36, 22, mm_m == i, i == 0 ? "57" : i == 1 ? "74" : i == 2 ? "81" : "92") ? s57_set(1, i); i += 1; ); );
+function mm_keys74(x, y) local(i) ( i = 0; loop(4, s74_lens(x + i * 40, y, 36, 22, mm_m == i, i == 0 ? "57" : i == 1 ? "74" : i == 2 ? "81" : "92") ? s74_set(1, i); i += 1; ); );
+function mm_keys81(x, y) local(i) ( i = 0; loop(4, pg_key(x + i * 40, y, 36, 22, i == 0 ? "57" : i == 1 ? "74" : i == 2 ? "81" : "92", mm_m == i, 1) ? ( slider1 = i; ui_auto(1); ); i += 1; ); );
+function mm_keys92(x, y) local(i) ( i = 0; loop(4, s92_key(x + i * 40, y, 36, 22, mm_m == i, i == 0 ? "57" : i == 1 ? "74" : i == 2 ? "81" : "92") ? s92_set(1, i); i += 1; ); );
+// the model strip along the bottom of each face (34 px, in the face's own colour)
+function mm_strip(w, h, bg, ink) (
+  ui_col(bg); gfx_rect(0, h * sc, w * sc, 34 * sc);
+  ui_cola(ink, 0.25); gfx_rect(12 * sc, h * sc, (w - 24) * sc, 1 * sc);
+  gfx_setfont(16, "Trebuchet MS", 13 * sc, 'b'); ui_col(ink); gfx_x = (w - 236) * sc; gfx_y = (h + 11) * sc; gfx_drawstr("MODEL");
+);
+mm_m = floor(slider1 + 0.5);
+mm_m == 0 ? (
+  pr_cur = m57_pr;
+  s57_lamp = 1;                                         // the 57 face only: its keys as the house lamp keys
+  ui_begin(960, 400 + 34);
+  s57_pal(slider5);
+  s57_fonts();
+  s57_face(960, 400);
+  k_ = s57_header(960, "METER57", "SERIES 57", "LEVEL METER", #mt_pm, 5);
+  k_ > 0 ? m57_load_preset(k_);
+
+  // the readings, in the scale's units
+  md_ = slider2 == 0 ? 0 : slider2 == 1 ? (slider5 >= 0.5 ? 2 : 1) : 3;
+  mt_rf = mt_ref;
+  md_ == 0 ? ( rL_ = 20 * log10(max(mt_vuL, 0.0000001)) - mt_rf; rR_ = 20 * log10(max(mt_vuR, 0.0000001)) - mt_rf; ) :
+  md_ <= 2 ? ( rL_ = 20 * log10(max(mt_ppL, 0.0000001)) - mt_rf; rR_ = 20 * log10(max(mt_ppR, 0.0000001)) - mt_rf; ) :
+             ( rL_ = 20 * log10(max(mt_pkL, 0.0000001)); rR_ = 20 * log10(max(mt_pkR, 0.0000001)); );
+  // HOLD: the drag pointers
+  t_ = time_precise();
+  slider4 == 0 ? ( mt_dL = mt_dR = -999; ) : (
+    (rL_ > mt_dL || (slider4 == 1 && t_ - mt_tL > 2)) ? ( mt_dL = rL_; mt_tL = t_; );
+    (rR_ > mt_dR || (slider4 == 1 && t_ - mt_tR > 2)) ? ( mt_dR = rR_; mt_tR = t_; );
+    slider4 == 1 && t_ - mt_tL > 2 ? mt_dL = rL_; slider4 == 1 && t_ - mt_tR > 2 ? mt_dR = rR_;
+  );
+  mt_dL < -200 && slider4 > 0 ? mt_dL = rL_; mt_dR < -200 && slider4 > 0 ? mt_dR = rR_;
+  // the nixies: the held true peaks
+  mt_nL = max(mt_nL, mt_hL); mt_nR = max(mt_nR, mt_hR); mt_hL = mt_hR = 0;
+  slider4 == 0 && t_ - mt_nt > 2 ? ( mt_nL = mt_nR = 0; mt_nt = t_; );
+  mt_ov = mt_nL >= 1 || mt_nR >= 1;
+
+  lb_ = md_ == 0 ? "VU" : md_ == 1 ? "PPM  DIN" : md_ == 2 ? "PPM  NORDIC" : "dBFS";
+  s57_plate(20, 68, 624, 292);
+  mtA.s57_arcm(34, 80, 296, 186, rL_, slider4 > 0 ? mt_dL : -999, md_, lb_, "LEFT");
+  mtB.s57_arcm(334, 80, 296, 186, rR_, slider4 > 0 ? mt_dR : -999, md_, lb_, "RIGHT");
+  // the keys and the nixies
+  gfx_setfont(13); ui_col(S57_INK);
+  s57_t(34, 278, "SCALE"); s57_t(196, 278, "REF  (dBFS)"); s57_t(424, 278, "HOLD");
+  m_ = 0; loop(3, s57_lcol = LK_YEL; s57_key(34 + m_ * 52, 292, 48, 22, slider2 == m_, m_ == 0 ? "VU" : m_ == 1 ? "PPM" : "PEAK") ? s57_set(2, m_); m_ += 1; );
+  m_ = 0; loop(4, s57_lcol = LK_YEL; s57_key(196 + m_ * 54, 292, 50, 22, slider3 == m_, m_ == 0 ? "-18" : m_ == 1 ? "-14" : m_ == 2 ? "-12" : "-9") ? s57_set(3, m_); m_ += 1; );
+  m_ = 0; loop(3, s57_lcol = LK_BLU_LT; s57_key(424 + m_ * 70, 292, 64, 22, slider4 == m_, m_ == 0 ? "OFF" : m_ == 1 ? "2 S" : "INF") ? s57_set(4, m_); m_ += 1; );
+  slider2 == 2 ? ( ui_cola(S57_PLATE, 0.6); s57_r(194, 290, 220, 26); );
+  // the peak nixies (click to reset)
+  s57_small(34, 330, "PEAK  L");
+  sprintf(#nl_, "%+5.1f", 20 * log10(max(mt_nL, 0.0000001))); mt_nL < 0.00001 ? strcpy(#nl_, " ---");
+  s57_nixie(96, 324, 120, 28, #nl_, mt_nL >= 0.00001);
+  s57_small(236, 330, "R");
+  sprintf(#nr_, "%+5.1f", 20 * log10(max(mt_nR, 0.0000001))); mt_nR < 0.00001 ? strcpy(#nr_, " ---");
+  s57_nixie(252, 324, 120, 28, #nr_, mt_nR >= 0.00001);
+  s57_hov(96, 324, 276, 28) && pressed && drag_id == 0 ? ( drag_id = -1; mt_nL = mt_nR = 0; mt_dL = mt_dR = -999; );
+  s57_small(384, 330, "OVER"); pk_led(436 * sc, 336 * sc, 5 * sc, mt_ov, 0xFF3A22);
+  s57_small(458, 330, "CLICK THE TUBES TO RESET");
+
+  // ---------- the stereo picture ----------
+  s57_well(660, 68, 280, 292);
+  s57_title(672, 76, "STEREO");
+  cx_ = 744; cy_ = 168; r_ = 62;
+  ui_col(S57_INK); gfx_circle(cx_ * sc, cy_ * sc, (r_ + 8) * sc, 1, 1);
+  ui_col(0x0B140F); gfx_circle(cx_ * sc, cy_ * sc, r_ * sc, 1, 1);
+  ph_ = slider5 >= 0.5 ? 0xFFB347 : 0x7CFFB0;                // the phosphor: green (ULM) or amber (COPENHAGEN)
+  ui_cola(ph_, 0.15); s57_r(cx_ - r_ + 6, cy_, 2 * r_ - 12, 1); s57_r(cx_, cy_ - r_ + 6, 1, 2 * r_ - 12);
+  // the trace: auto-scaled gently so quiet material still shows a shape
+  mx_ = 0.000001; i_ = 0; loop(256, mx_ = max(mx_, abs(mt_SC[((mt_sp - i_) & 1023) * 2]) + abs(mt_SC[((mt_sp - i_) & 1023) * 2 + 1])); i_ += 1; );
+  mt_sg = max(mt_sg * 0.9, mx_); g_ = (r_ - 6) / max(mt_sg, 0.05);
+  i_ = 0; loop(255,
+    j_ = (mt_sp - 1 - i_) & 1023; k2_ = (j_ - 1) & 1023;
+    ui_cola(ph_, 0.65 * (1 - i_ / 256));
+    x1_ = cx_ + mt_SC[j_ * 2 + 1] * g_; y1_ = cy_ - mt_SC[j_ * 2] * g_;
+    x2_ = cx_ + mt_SC[k2_ * 2 + 1] * g_; y2_ = cy_ - mt_SC[k2_ * 2] * g_;
+    gfx_line(x1_ * sc, y1_ * sc, x2_ * sc, y2_ * sc, 1);
+    i_ += 1; );
+  ui_cola(0xFFFFFF, 0.06); gfx_circle((cx_ - 18) * sc, (cy_ - 22) * sc, 26 * sc, 1, 1);
+  gfx_setfont(13); ui_col(S57_DIM); s57_tc(cx_, cy_ + r_ + 18, "M  /  S");
+  // the magic eye: the correlation
+  co_ = mt_cLR / sqrt(max(mt_cLL * mt_cRR, 0.000000000001)); co_ = min(max(co_, -1), 1);
+  (mt_cLL + mt_cRR) < 0.0000001 ? co_ = 1;
+  mt_co += (co_ - mt_co) * 0.25;
+  ex_ = 878; ey_ = 168; er_ = 40;
+  ui_col(S57_INK); gfx_circle(ex_ * sc, ey_ * sc, (er_ + 6) * sc, 1, 1);
+  ui_col(0x0E1A10); gfx_circle(ex_ * sc, ey_ * sc, er_ * sc, 1, 1);
+  // the glowing fan (the shadow's angle opens as the correlation falls)
+  sh_ = (1 - mt_co) * 0.5 * $pi * 0.95 + 0.05;             // half-angle of the shadow, from the top
+  i_ = 0; loop(64,
+    a_ = i_ / 64 * 2 * $pi;
+    d_ = abs(a_ - $pi) ; d_ = $pi - d_;                    // distance from the top (0 .. pi)
+    d_ > sh_ ? ( ui_cola(0x5CFF7A, 0.55 + 0.35 * cos(a_ * 3) * 0.2);
+                 mt_ray(ex_ + sin(a_) * 10, ey_ - cos(a_) * 10, ex_ + sin(a_) * (er_ - 3), ey_ - cos(a_) * (er_ - 3), 3.2); ) :
+               ( mt_co < 0 ? ( ui_cola(0xFF3A22, 0.25); mt_ray(ex_ + sin(a_) * 10, ey_ - cos(a_) * 10, ex_ + sin(a_) * (er_ - 3), ey_ - cos(a_) * (er_ - 3), 3.2); ); );
+    i_ += 1; );
+  ui_col(0x22301F); gfx_circle(ex_ * sc, ey_ * sc, 9 * sc, 1, 1);
+  gfx_setfont(13); ui_col(S57_INK); s57_tc(ex_, ey_ + er_ + 18, "CORRELATION");
+  sprintf(#co_, "%+.2f", mt_co); s57_nixie(ex_ - 40, ey_ + er_ + 30, 80, 26, #co_, 1);
+  s57_small(672, 316, "VERTICAL = MONO, A CIRCLE = WIDE,");
+  s57_small(672, 330, "HORIZONTAL = OUT OF PHASE");
+
+  s57_cheeks(960, 400);
+  mm_strip(960, 400, 0xE3DED2, 0x3A3530); mm_keys57(960 - 176, 400 + 6);
+  pk_end();
+  ui_end();
+  m57_pr = pr_cur;
+  s57_lamp = 0;
+) : mm_m == 1 ? (
+  pr_cur = m74_pr;
+  ui_begin(960, 366 + 34);
+  s74_pal(slider6);
+  s74_fonts();
+  s74_face(960, 366);
+  m4_cl = slider6 >= 0.5;
+
+  // ---------- the header ----------
+  k_ = s74_header(960, "METER74", "SERIES 74", "OB PPM", #m4_pm, 6);
+  k_ > 0 ? m74_load_preset(k_);
+
+  // ---------- the over lamp (held for a second) ----------
+  t_ = time_precise();
+  m4_spk >= 1 ? m4_ovt = t_; m4_spk = 0;
+  m4_ov = t_ - m4_ovt < 1 && m4_ovt > 0;
+
+  !m4_cl ? (
+    // ---------- OB: the twin peak programme meters ----------
+    s74_mod(14, 62, 620, 292, "PEAK PROGRAMME METERS");
+    m4_ms_ = slider9 >= 0.5;
+    m4mA.m4_ppm(28, 92, 292, 230, m4_db(m4_ppA * m4_PPC) - m4_al, m4_ms_ ? "M" : "L", m4_ms_ ? 0xF2F1EA : 0xE0402A);
+    m4mB.m4_ppm(328, 92, 292, 230, m4_db(m4_ppB * m4_PPC) - m4_al, m4_ms_ ? "S" : "R", m4_ms_ ? 0xF2C63A : 0x3CC060);
+    sprintf(#m4_s, "4 DB PER MARK  ·  1-2 = 6 DB  ·  PPM 4 = %d DBFS", m4_al);
+    s74_small(32, 330, #m4_s);
+    s74_small(540, 330, "OVER"); pk_led(588 * sc, 336 * sc, 3.5 * sc, m4_ov, 0xFF3A22);
+  ) : (
+    // ---------- CLEAN: true peak and RMS ----------
+    s74_mod(14, 62, 240, 292, "TRUE PEAK · RMS");
+    rL_ = 10 * log10(max(m4_mqL, 0.00000000000001)); rR_ = 10 * log10(max(m4_mqR, 0.00000000000001));
+    pL_ = m4_db(m4_tdL); pR_ = m4_db(m4_tdR);
+    (pL_ > m4_hL || t_ - m4_htL > 2) ? ( m4_hL = pL_; m4_htL = t_; );
+    (pR_ > m4_hR || t_ - m4_htR > 2) ? ( m4_hR = pR_; m4_htR = t_; );
+    m4bL.m4_bar(46, 96, 40, 172, pL_, rL_, m4_hL);
+    m4bR.m4_bar(182, 96, 40, 172, pR_, rR_, m4_hR);
+    i_ = 0;
+    loop(10,
+      d_ = i_ == 0 ? 3 : i_ == 1 ? 0 : i_ == 2 ? -3 : i_ == 3 ? -6 : i_ == 4 ? -12 : i_ == 5 ? -18 : i_ == 6 ? -24 : i_ == 7 ? -30 : i_ == 8 ? -40 : -60;
+      y_ = 96 + 4 + 164 * (1 - m4_bpos(d_));
+      ui_col(d_ > 0 ? S74_RED : S74_DIM); s74_r(90, y_, 6, 1); s74_r(172, y_, 6, 1);
+      sprintf(#m4_e, d_ > 0 ? "+%d" : "%d", d_); gfx_setfont(13); s74_tc(134, y_, #m4_e);
+      i_ += 1;
+    );
+    sprintf(#m4_s, "L   RMS %.1f", max(rL_, -99)); s74_smallc(66, 282, #m4_s);
+    sprintf(#m4_s, "R   RMS %.1f", max(rR_, -99)); s74_smallc(202, 282, #m4_s);
+    m4_nL = max(m4_nL, m4_tmL); m4_nR = max(m4_nR, m4_tmR); m4_tmL = m4_tmR = 0;
+    s74_small(26, 296, "TP MAX  ·  DBTP  ·  CLICK TO RESET");
+    m4_win(26, 308, 92, 26, m4_nL > 0.0000001 ? m4_fmt(m4_db(m4_nL), #m4_a1) : "---", 15);
+    m4_win(150, 308, 92, 26, m4_nR > 0.0000001 ? m4_fmt(m4_db(m4_nR), #m4_a2) : "---", 15);
+    s74_hov(26, 308, 216, 26) && pressed && drag_id == 0 ? ( drag_id = -1; m4_nL = m4_nR = 0; );
+    pk_led(134 * sc, 321 * sc, 3.5 * sc, m4_ov, 0xFF3A22);
+
+    // ---------- CLEAN: loudness and correlation ----------
+    s74_mod(266, 62, 368, 292, "LOUDNESS · BS.1770");
+    i_ = 0;
+    loop(3,
+      x_ = 282 + i_ * 116;
+      s74_smallc(x_ + 52, 100, i_ == 0 ? "MOMENTARY" : i_ == 1 ? "SHORT-TERM" : "INTEGRATED");
+      m4_win(x_, 110, 104, 54, m4_fmt(i_ == 0 ? m4_lm : i_ == 1 ? m4_ls : m4_li, #m4_a3), 14);
+      s74_smallc(x_ + 52, 176, "LUFS");
+      i_ += 1;
+    );
+    s74_small(282, 196, "GATED  -70 LUFS / -10 LU");
+    s74_lens(526, 188, 80, 24, 0, "RESET") ? m4_rq = 1;
+    // correlation: a bar from the centre, telemetry white for positive, red for negative
+    co_ = m4_cLR / sqrt(max(m4_cLL * m4_cRR, 0.000000000001)); co_ = min(max(co_, -1), 1);
+    (m4_cLL + m4_cRR) < 0.0000001 ? co_ = 1;
+    m4_co += (co_ - m4_co) * 0.25;
+    s74_small(282, 228, "CORRELATION");
+    m4_lit(282, 242, 336, 34);
+    i_ = 0; loop(9, x_ = 296 + i_ * 38; ui_col(i_ < 4 ? S74_RED : S74_CHAR); s74_r(x_, 247, 1.2, i_ == 0 || i_ == 4 || i_ == 8 ? 8 : 4); i_ += 1; );
+    x_ = 448 + m4_co * 152;
+    ui_col(m4_co < 0 ? S74_RED : S74_NDL); s74_r(min(448, x_), 258, abs(x_ - 448), 10);
+    ui_col(S74_NDL); s74_r(x_ - 1, 252, 2, 18);
+    m4_glass(282, 242, 336, 34);
+    s74_smallc(296, 290, "-1"); s74_smallc(448, 290, "0"); s74_smallc(600, 290, "+1");
+    sprintf(#m4_a4, "%+.2f", m4_co);
+    s74_small(282, 314, "+1 MONO  ·  0 WIDE  ·  -1 OUT OF PHASE");
+    m4_win(546, 306, 72, 24, #m4_a4, 15);
+  );
+
+  // ---------- ALIGN · LINE: the PPM's alignment, the needles, the line transformer ----------
+  s74_mod(646, 62, 300, 292, "ALIGN · LINE");
+  s74_smallc(796, 96, "ALIGN  ·  PPM 4 =");
+  i_ = 0; loop(3, s74_lens(668 + i_ * 88, 106, 80, 26, slider7 == i_, i_ == 0 ? "-18" : i_ == 1 ? "-14" : "-12") ? s74_set(7, i_); i_ += 1; );
+  s74_smallc(796, 146, "DBFS  ·  SINE PEAK");
+  s74_smallc(796, 178, "NEEDLES");
+  s74_lens(700, 188, 80, 26, slider9 < 0.5, "L / R") ? s74_set(9, 0);
+  s74_lens(812, 188, 80, 26, slider9 >= 0.5, "M / S") ? s74_set(9, 1);
+  m4_cl ? ( ui_cola(S74_OLIVE, 0.6); s74_r(660, 86, 272, 136); s74_smallc(796, 228, "PPM SETTINGS  ·  OB FACE ONLY"); );
+  s74_smallc(796, 252, "LINE TRANSFORMER");
+  s74_lens(756, 262, 80, 26, slider8 >= 0.5, slider8 >= 0.5 ? "ON" : "OFF") ? s74_set(8, slider8 >= 0.5 ? 0 : 1);
+  m4_cl ? ( ui_cola(S74_OLIVE, 0.6); s74_r(740, 244, 112, 50); );
+  m4_cl ? ( s74_smallc(796, 308, "FORCED OUT ON CLEAN"); s74_smallc(796, 324, "BIT-EXACT PASS-THROUGH"); ) :
+  slider8 >= 0.5 ? ( gfx_setfont(13); ui_col(S74_HAZ); s74_tc(796, 308, "IRON IN PATH"); s74_tc(796, 324, "OUTPUT NOT BIT-EXACT"); ) :
+  ( s74_smallc(796, 308, "BIT-EXACT PASS-THROUGH"); s74_smallc(796, 324, "AUDIO UNTOUCHED"); );
+
+  mm_strip(960, 366, 0x25282A, 0xC9C2A8); mm_keys74(960 - 176, 366 + 6);
+  pk_end();
+  ui_end();
+  m74_pr = pr_cur;
+) : mm_m == 2 ? (
+  pr_cur = m81_pr;
+  slider14 < 1 ? slider14 = 1;                              // ENAMEL retired: the first theme stands in
+  ui_begin(760, 340 + 34);
+
+  // =====================================================================
+  // Theme colours (the recipe's palette)
+  // =====================================================================
+  pgv_th = slider14 | 0; pgv_sc = slider10 | 0;
+  pgv_de = 0;                                             // English labels in both modes
+  pgv_th == 0 ? (                                         // ENAMEL: light industrial faceplate
+    PGF  = 0xD6D2C4;                                      // bone-grey baked enamel (meter faces)
+    PGP  = ui_mix(PGF, 0x000000, 0.10);                   // the panel around them, a shade deeper
+    PGH  = ui_mix(PGF, 0x000000, 0.20);                   // header strip
+    PGI  = 0x1C1C1C;                                      // deep charcoal print
+    PGI2 = 0x4A4842;
+    PGA  = 0xFF7900;                                      // raw safety orange
+    PGN  = 0x101010;                                      // matte black needle
+  ) : pgv_th == 1 ? (                                     // VFD: dark gas-discharge panel
+    PGF  = 0x070808;                                      // display glass
+    PGP  = 0x181A1B;                                      // charcoal-black slate
+    PGH  = ui_mix(PGP, 0x000000, 0.35);
+    PGI  = 0x4EE1DC;                                      // cold turquoise glow
+    PGI2 = ui_mix(0x4EE1DC, PGP, 0.45);
+    PGA  = 0xFF8C00;                                      // neon amber
+    PGG  = 0x0D0E0F;                                      // unlit ghost segments
+  ) : (                                                   // MATRIX: Eastern Bloc LED matrix
+    PGP  = 0x222528;                                      // battleship-grey anodised aluminium
+    PGF  = ui_mix(PGP, 0x000000, 0.45);
+    PGH  = ui_mix(PGP, 0x000000, 0.30);
+    PGI  = 0xC7BEB3;                                      // print: elephant's breath
+    PGI2 = ui_mix(0xC7BEB3, PGP, 0.4);
+    PGA  = 0xD4A373;                                      // pale mustard amber
+    PGL1 = 0x1E5631; PGL2 = 0xD4A373; PGL3 = 0xBC3908;    // forest green -> mustard amber -> safety red
+    PGG  = 0x2C302E;                                      // muddy olive-drab unlit cells
+  );
+
+  // =====================================================================
+  // Frame-rate independent display smoothing (the ballistics themselves run on the audio thread)
+  // =====================================================================
+  pgv_now = time_precise();
+  pgv_dt = pgv_t0 > 0 ? min(max(pgv_now - pgv_t0, 0), 0.25) : 1;   // first frame: snap to the reading
+  pgv_t0 = pgv_now;
+  pgv_k = 1 - exp(-pgv_dt / 0.012);
+  pgv_sc != pgv_scl ? ( pgv_k = 1; pgv_scl = pgv_sc; );   // a new scale: no swing from the old one
+  pgv_q0 += (pg_pos(pga_m0, pgv_sc) - pgv_q0) * pgv_k;
+  pgv_q1 += (pg_pos(pga_m1, pgv_sc) - pgv_q1) * pgv_k;
+  pgv_cr += (pga_cor - pgv_cr) * (1 - exp(-pgv_dt / 0.06));
+  pgv_hon = slider13 > 0;
+
+  // zone starts (position units): amber and over / red
+  pgv_sc == 0 ? ( pgv_zA = pg_pos(-6, 0); pgv_zR = pg_pos(0, 0); ) :
+  pgv_sc == 1 ? ( pgv_zA = pg_pos(-3, 1); pgv_zR = pg_pos(0, 1); ) :
+                ( pgv_zA = pg_pos(-12, 2); pgv_zR = pg_pos(-3, 2); );
+
+  // fonts (the house face, bold; sizes in design pixels)
+  gfx_setfont(6,  "Trebuchet MS", 27 * sc, 'b');          // title
+  gfx_setfont(10, "Trebuchet MS", 15 * sc, 'b');          // scale numbers
+  gfx_setfont(11, "Trebuchet MS", 12 * sc, 'b');          // labels
+  gfx_setfont(12, "Trebuchet MS", 12.5 * sc, 'b');        // key captions
+  gfx_setfont(13, "Courier New", 23 * sc, 'b');           // readout digits
+  gfx_setfont(14, "Trebuchet MS", 20 * sc, 'b');          // big channel letters
+
+
+
+
+
+
+
+  // a flat, sharp-cornered lit key in the theme's manner; returns 1 when clicked
+
+
+
+  // =====================================================================
+  // Panel and header
+  // =====================================================================
+  ui_col(PGP); gfx_rect(0, 0, gfx_w, gfx_h);
+  ui_col(PGH); pg_r(0, 0, 760, 54);
+  ui_col(pgv_th == 0 ? PGI : PGA); pg_r(0, 54, 760, 2);
+  // GFX badge and the name
+  ui_col(pgv_th == 0 ? PGI : pgv_th == 1 ? PGI : PGA); gfx_circle(31 * sc, 27 * sc, 16 * sc, 1, 1);
+  gfx_setfont(4); ui_col(pgv_th == 0 ? PGF : 0x111213); ui_text(31 * sc, 21.5 * sc, "GFX");
+  gfx_setfont(6); ui_col(pgv_th == 0 ? PGI : PGI); pg_txt(58, 12, "METER81");
+  gfx_setfont(11); ui_col(PGI2); pg_txt(204, 15, "STEREO"); pg_txt(204, 29, pgv_de ? "PEGELMESSER" : "LEVEL METER");
+  // the house preset bar: PRESETS, prev / next, LCD (click it for the list)
+  k_ = pk_preset(296 * sc, 10 * sc, 262 * sc, 34 * sc, pr_cur,
+    "Init|Broadcast PPM -9|PPM Align -18|Live Desk PPM -12|Tracking VU -18|Mix VU -14|Hot Master VU -12|Mastering Peak|VFD Peak|VFD PPM|Matrix PPM|Matrix VU");
+  k_ > 0 ? ( m81_load_preset(k_); pr_cur = k_; );
+  // MODE: the two lit model keys (VFD = the Japanese module, MATRIX = the European one)
+  pg_key(570, 15, 46, 24, "VFD", pgv_th == 1, 1) ? ( slider14 = 1; ui_auto(14); );
+  pg_key(620, 15, 66, 24, "MATRIX", pgv_th == 2, 1) ? ( slider14 = 2; ui_auto(14); );
+  ui_size_picker(694 * sc, 18 * sc);
+
+  // =====================================================================
+  // Meters (well: x 12..548, y 62..270)
+  // =====================================================================
+  pgv_wx = 12; pgv_wy = 62; pgv_ww = 536; pgv_wh = 208;
+  // click a meter (or the readout) to clear the holds
+  pressed && drag_id == 0 && mouse_x >= pgv_wx * sc && mouse_x < (pgv_wx + pgv_ww) * sc && mouse_y >= pgv_wy * sc &&
+    mouse_y < (pgv_wy + pgv_wh) * sc ? ( pg_req += 1; drag_id = -1; );
+
+  strcpy(#pgv_sn, pgv_sc == 0 ? "PPM" : pgv_sc == 1 ? "VU" : pgv_de ? "SPITZE" : "PEAK");
+  pgv_sc == 0 ? sprintf(#pgv_ds, "0 dB = %d dBFS", pga_ref) :
+  pgv_sc == 1 ? sprintf(#pgv_ds, "0 VU = %d dBFS", pga_ref) : strcpy(#pgv_ds, pgv_de ? "SKALA dBFS" : "SCALE dBFS");
+  pgv_th == 2 ? (                                       // MATRIX: its own (DIN) ballistics, in English
+    pgv_sc == 0 ? strcpy(#pgv_bl, "INTEGR. 10 ms   FALL 20 dB / 1.5 s") :
+    pgv_sc == 1 ? strcpy(#pgv_bl, "RISE 300 ms   FALL 300 ms") : strcpy(#pgv_bl, "SAMPLE PEAK   FALL 20 dB / 1.7 s");
+  ) : (
+    pgv_sc == 0 ? strcpy(#pgv_bl, "INTEGR. 1 ms   FALL 20 dB / 2.5 s") :
+    pgv_sc == 1 ? strcpy(#pgv_bl, "RISE 300 ms   RETURN 300 ms") : strcpy(#pgv_bl, "SAMPLE PEAK   RETURN 20 dB / 1.7 s");
+  );
+
+  // tick label text
+
+
+  // ---------- theme 0: needle meter ----------
+  pgv_span = 0.74;                                        // half the needle swing (rad)
+
+
+  // ---------- themes 1 and 2: horizontal bargraph ----------
+
+
+
+
+  pgv_th == 0 ? (
+    pg_needle_meter(pgv_wx, pgv_wy, 262, pgv_wh, pgv_q0, pg_pos(pga_h0, pgv_sc), "L");
+    pg_needle_meter(pgv_wx + 274, pgv_wy, 262, pgv_wh, pgv_q1, pg_pos(pga_h1, pgv_sc), "R");
+  ) : (
+    ui_col(pgv_th == 1 ? 0x2E3235 : 0x0B0C0D); pg_r(pgv_wx, pgv_wy, pgv_ww, pgv_wh);
+    ui_col(PGF); pg_r(pgv_wx + 1, pgv_wy + 1, pgv_ww - 2, pgv_wh - 2);
+    pgv_bx = 56; pgv_bw = 476;
+    // caption row
+    gfx_setfont(11); ui_col(PGI); pg_txt(26, 70, pgv_de ? "PEGEL" : "LEVEL"); ui_col(PGI2); pg_txt(78, 70, pgv_sc == 1 ? "VU" : "dB");
+    ui_col(PGI2); pg_rtxt(pgv_bx + pgv_bw, 77, #pgv_ds);
+    pgv_sc != 1 ? ( ui_col(PGI); pg_txt(116, 70, #pgv_sn); );
+    // bars and scale
+    gfx_setfont(14); ui_col(PGI); pg_ctxt(34, 112, "L"); pg_ctxt(34, 203, "R");
+    pg_bar(pgv_bx, 88, pgv_bw, 48, pgv_q0, pg_pos(pga_h0, pgv_sc));
+    pg_scaleband(pgv_bx, 140, pgv_bw, 36);
+    pg_bar(pgv_bx, 180, pgv_bw, 48, pgv_q1, pg_pos(pga_h1, pgv_sc));
+    // footer: the ballistics in print
+    ui_col(pgv_th == 1 ? 0x1E2224 : 0x2C302E); pg_r(pgv_wx + 1, 240, pgv_ww - 2, 1);
+    gfx_setfont(11); ui_col(PGI2); pg_txt(26, 249, #pgv_bl);
+    ui_col(PGI2); pg_rtxt(pgv_bx + pgv_bw, 256, pgv_de ? "KLICK = HALTEN LÖSCHEN" : "CLICK = HOLD RESET");
+  );
+
+  // =====================================================================
+  // Correlation (x 12..548, y 278..332)
+  // =====================================================================
+  pgv_cy = 278; pgv_chh = 54; pgv_cbx = 112; pgv_cbw = 420;
+  pgv_th == 0 ? ( ui_col(PGI); pg_r(12, pgv_cy, 536, pgv_chh); ui_col(PGF); pg_r(13.5, pgv_cy + 1.5, 533, pgv_chh - 3); )
+              : ( ui_col(pgv_th == 1 ? 0x2E3235 : 0x0B0C0D); pg_r(12, pgv_cy, 536, pgv_chh); ui_col(PGF); pg_r(13, pgv_cy + 1, 534, pgv_chh - 2); );
+  gfx_setfont(11); ui_col(PGI); pg_txt(24, pgv_cy + 12, pgv_de ? "KORREL." : "CORREL.");
+  ui_col(PGI2); pg_txt(24, pgv_cy + 28, "PHASE");
+  // scale: -1 .. +1
+  gfx_setfont(11);
+  pgv_i = 0;
+  loop(9,
+    pgv_v = -1 + pgv_i * 0.25; pgv_x = pgv_cbx + (pgv_v + 1) * 0.5 * pgv_cbw;
+    ui_col(pgv_v < 0 ? (pgv_th == 0 ? 0xB24A00 : PGA) : PGI2);
+    pg_r(pgv_x - 0.5, pgv_cy + 22, 1, pgv_i % 2 == 0 ? 6 : 3);
+    pgv_i % 4 == 0 ? ( ui_col(pgv_v < 0 ? (pgv_th == 0 ? 0xB24A00 : PGA) : PGI);
+                       pg_ctxt(pgv_x, pgv_cy + 13, pgv_v < 0 ? "-1" : pgv_v > 0 ? "+1" : "0"); );
+    pgv_i += 1;
+  );
+  pgv_cv = min(max(pgv_cr, -1), 1);
+  pgv_th == 0 ? (
+    ui_col(PGI); pg_r(pgv_cbx, pgv_cy + 30, pgv_cbw, 1.5);
+    ui_col(PGA); pg_r(pgv_cbx, pgv_cy + 33, pgv_cbw * 0.5, 2);
+    pgv_x = pgv_cbx + (pgv_cv + 1) * 0.5 * pgv_cbw;
+    ui_cola(0x000000, 0.12); pg_r(pgv_x - 1 + 2, pgv_cy + 25 + 2, 4, 22);
+    ui_col(PGN); pg_r(pgv_x - 2, pgv_cy + 25, 4, 22);
+  ) : (
+    pgv_n = pgv_th == 1 ? 60 : 30; pgv_sw = pgv_cbw / pgv_n;
+    pgv_i = 0;
+    loop(pgv_n,
+      pgv_x = pgv_cbx + pgv_i * pgv_sw; pgv_v = -1 + (pgv_i + 0.5) / pgv_n * 2;
+      pgv_lit = pgv_cv >= 0 ? (pgv_v > 0 && pgv_v <= pgv_cv + 1 / pgv_n) : (pgv_v < 0 && pgv_v >= pgv_cv - 1 / pgv_n);
+      abs(pgv_v) < 1.01 / pgv_n ? pgv_lit = 1;             // the centre segments always show where 0 is
+      pgv_c = pgv_th == 1 ? (pgv_v < 0 ? PGA : PGI) : (abs(pgv_v) < 1.01 / pgv_n ? PGL2 : pgv_v < 0 ? PGL3 : PGL1);
+      pgv_lit ? (
+        ui_cola(pgv_c, 0.2); pg_r(pgv_x - 0.5, pgv_cy + 29, pgv_sw, 20);
+        ui_col(pgv_c); pg_r(pgv_x + 0.5, pgv_cy + 30, pgv_sw - (pgv_th == 1 ? 2 : 3), 18);
+        ui_cola(0xFFFFFF, 0.22); pg_r(pgv_x + 0.5, pgv_cy + 30, pgv_sw - (pgv_th == 1 ? 2 : 3), 1.5);
+      ) : (
+        ui_col(PGG); pg_r(pgv_x + 0.5, pgv_cy + 30, pgv_sw - (pgv_th == 1 ? 2 : 3), 18);
+      );
+      pgv_i += 1;
+    );
+  );
+
+  // =====================================================================
+  // Right column: readout, SCALE, REF, HOLD, THEME (x 558..748)
+  // =====================================================================
+  pgv_rx = 558; pgv_rw = 190;
+  // ---------- PEAK HOLD readout window ----------
+  pgv_th == 0 ? ( ui_col(PGI); pg_r(pgv_rx, 62, pgv_rw, 64); ui_col(0x141414); pg_r(pgv_rx + 3, 65, pgv_rw - 6, 58); pgv_dc = PGA; )
+  : pgv_th == 1 ? ( ui_col(0x2E3235); pg_r(pgv_rx, 62, pgv_rw, 64); ui_col(PGF); pg_r(pgv_rx + 1, 63, pgv_rw - 2, 62); pgv_dc = PGI; )
+  : ( ui_col(0x0B0C0D); pg_r(pgv_rx, 62, pgv_rw, 64); ui_col(0x0E0F10); pg_r(pgv_rx + 1, 63, pgv_rw - 2, 62); pgv_dc = PGL2; );
+  pressed && drag_id == 0 && mouse_x >= pgv_rx * sc && mouse_x < (pgv_rx + pgv_rw) * sc && mouse_y >= 62 * sc && mouse_y < 126 * sc ?
+    ( pg_req += 1; drag_id = -1; );
+  gfx_setfont(11); ui_cola(pgv_dc, 0.7); pg_txt(pgv_rx + 10, 69, pgv_de ? "SPITZE  dBFS" : "PEAK  dBFS");
+  // OVER lamps
+  pgv_i = 0;
+  loop(2,
+    pgv_on = pgv_i ? pga_ov1 : pga_ov0;
+    pgv_x = pgv_rx + pgv_rw - 46 + pgv_i * 20;
+    pgv_on ? ( ui_cola(0xFF3A1A, 0.3); pg_r(pgv_x - 2, 67, 18, 13); ui_col(0xFF3A1A); ) : ui_col(0x2A1410);
+    pg_r(pgv_x, 69, 14, 9);
+    pgv_i += 1;
+  );
+  gfx_setfont(11); ui_cola(pgv_dc, 0.55); pg_rtxt(pgv_rx + pgv_rw - 52, 74, pgv_de ? "ÜBER" : "OVER");
+  // the numbers
+  pgv_i = 0;
+  loop(2,
+    pgv_v = pgv_i ? pga_r1 : pga_r0;
+    pgv_v < -99.9 ? strcpy(#pgv_num, " ---") : pgv_v > 0.05 ? sprintf(#pgv_num, "%+5.1f", pgv_v) : sprintf(#pgv_num, "%5.1f", pgv_v);
+    pgv_x = pgv_rx + 10 + pgv_i * 92;
+    gfx_setfont(11); ui_cola(pgv_dc, 0.7); pg_txt(pgv_x, 98, pgv_i ? "R" : "L");
+    gfx_setfont(13); ui_col(pgv_dc); pg_txt(pgv_x + 12, 88, #pgv_num);
+    pgv_i += 1;
+  );
+
+  // ---------- SCALE ----------
+  pg_lbl(pgv_rx, 133, pgv_de ? "SKALA" : "SCALE");
+  pg_key(pgv_rx,       148, 60, 24, "PPM",  pgv_sc == 0, 1) ? ( slider10 = 0; ui_auto(10); );
+  pg_key(pgv_rx + 65,  148, 60, 24, "VU",   pgv_sc == 1, 1) ? ( slider10 = 1; ui_auto(10); );
+  pg_key(pgv_rx + 130, 148, 60, 24, pgv_de ? "SPITZE" : "PEAK", pgv_sc == 2, 1) ? ( slider10 = 2; ui_auto(10); );
+  // ---------- REF (the active scale's own alignment) ----------
+  pgv_rs = pgv_sc == 1 ? 12 : 11; pgv_rv = slider(pgv_rs);
+  pg_lbl(pgv_rx, 179, pgv_de ? (pgv_sc == 1 ? "BEZUG  (dBFS = 0 VU)" : pgv_sc == 0 ? "BEZUG  (dBFS = 0 dB)" : "BEZUG  (SPITZE: dBFS)")
+                      : (pgv_sc == 1 ? "REF LEVEL  (dBFS = 0 VU)" : pgv_sc == 0 ? "REF LEVEL  (dBFS = 0 dB)" : "REF LEVEL  (PEAK: dBFS)"));
+  pgv_i = 0;
+  loop(6,
+    sprintf(#pgv_k, "%d", pg_refdb(pgv_i));
+    pg_key(pgv_rx + (pgv_i % 3) * 65, 194 + floor(pgv_i / 3) * 27, 60, 22, #pgv_k, pgv_sc < 2 && pgv_rv == pgv_i, pgv_sc < 2) ?
+      ( slider(pgv_rs) = pgv_i; ui_auto(pgv_rs); );
+    pgv_i += 1;
+  );
+  // ---------- HOLD ----------
+  pg_lbl(pgv_rx, 249, pgv_de ? "HALTEN" : "HOLD");
+  pgv_i = 0;
+  loop(4,
+    pg_key(pgv_rx + pgv_i * 49, 264, 45, 24, pgv_i == 0 ? (pgv_de ? "AUS" : "OFF") : pgv_i == 1 ? "2 S" : pgv_i == 2 ? "5 S" : (pgv_de ? "FEST" : "INF"), slider13 == pgv_i, 1) ?
+      ( slider13 = pgv_i; ui_auto(13); );
+    pgv_i += 1;
+  );
+  // ---------- the mode's PPM ballistics, in print ----------
+  pg_lbl(pgv_rx, 294, pgv_de ? "PPM-BALLISTIK" : "PPM BALLISTICS");
+  ui_col(pgv_th == 1 ? 0x2E3235 : 0x0B0C0D); pg_r(pgv_rx, 308, pgv_rw, 24);
+  ui_col(PGF); pg_r(pgv_rx + 1, 309, pgv_rw - 2, 22);
+  gfx_setfont(12); ui_col(pgv_th == 1 ? PGI : PGL2);
+  pg_ctxt(pgv_rx + pgv_rw * 0.5, 320.5, pgv_th == 2 ? "DIN 45406 QUASI-PEAK" : "FAST PEAK PROGRAMME");
+
+  mm_strip(760, 340, 0x181A1B, 0x7FD8D8); mm_keys81(760 - 176, 340 + 6);
+  pk_end();
+  ui_end();
+  m81_pr = pr_cur;
+) : (
+  pr_cur = m92_pr;
+  ui_begin(960, 396 + 34);
+  s92_pal(slider15);
+  s92_fonts();
+  s92_face(960, 396);
+  gt_dg = slider15 >= 0.5;
+
+  // ---------- the header ----------
+  k_ = s92_header(960, "METER92", "SERIES 92", "METER BRIDGE", #m9_pm, 15);
+  k_ > 0 ? m92_load_preset(k_);
+  gt_ref = slider16 < 0.5 ? -18 : slider16 < 1.5 ? -14 : -12;
+
+  !gt_dg ? (
+    // ---------- ANALOG: the backlit VU meters ----------
+    s92_mod(20, 62, 620, 322, "VU METERS");
+    gt_rl = 10 ^ (gt_ref / 20);
+    m9_vum(34, 94, 292, 280, m9_vxL / gt_rl * m9_vpos(0), m9pL.led > 0, "L", gt_ref);
+    m9_vum(334, 94, 292, 280, m9_vxR / gt_rl * m9_vpos(0), m9pR.led > 0, "R", gt_ref);
+  ) : (
+    // ---------- DIGITAL: the plasma bars ----------
+    s92_mod(20, 62, 620, 136, "PEAK · RMS · DBFS");
+    m9_bar(32, 94, 596, 34, "L", m9pL.pd, sqrt(max(m9_mqL, 0)), m9_hm ? m9pL.ph : 0, m9pL.mx, m9oL.lamp > 0);
+    m9_bar(32, 154, 596, 34, "R", m9pR.pd, sqrt(max(m9_mqR, 0)), m9_hm ? m9pR.ph : 0, m9pR.mx, m9oR.lamp > 0);
+    gfx_setfont(13); ui_col(S92_DIM);
+    gi_ = 0;
+    loop(11,
+      gt_d = gi_ == 0 ? -60 : gi_ == 1 ? -50 : gi_ == 2 ? -40 : gi_ == 3 ? -30 : gi_ == 4 ? -24 : gi_ == 5 ? -18 : gi_ == 6 ? -12 : gi_ == 7 ? -9 : gi_ == 8 ? -6 : gi_ == 9 ? -3 : 0;
+      gt_x = 58 + 442 * m9_bpos(gt_d) - 442 / 128;
+      sprintf(#gt_e, "%d", gt_d); s92_tc(gt_x, 141, #gt_e);
+      gi_ += 1;
+    );
+    s92_tc(585, 141, "MAX");
+
+    // ---------- DIGITAL: overs and the bits in use ----------
+    s92_mod(20, 206, 300, 178, "OVERS · BITS");
+    s92_small(32, 236, "OVERS  L");
+    s92_small(128, 236, "R");
+    sprintf(#gt_a, "%03d", min(m9oL.n, 999)); s92_lcd(32, 252, 84, 28, #gt_a);
+    sprintf(#gt_b, "%03d", min(m9oR.n, 999)); s92_lcd(128, 252, 84, 28, #gt_b);
+    s92_key(228, 254, 80, 26, 0, "RESET") ? m9_rq = 1;
+    s92_small(32, 296, "BITS IN USE");
+    gt_w = m9_bor; gt_f = m9_bfl;
+    gt_t = 0; gi_ = 0; loop(23, gt_t == 0 && (gt_w & (2 ^ gi_)) ? gt_t = 23 - gi_; gi_ += 1; );   // the lowest bit in use
+    gt_f ? strcpy(#gt_c, "FLOAT") : gt_w == 0 ? strcpy(#gt_c, "--") : sprintf(#gt_c, "%d BIT", gt_t + 1);
+    s92_lcd(228, 288, 80, 26, #gt_c);
+    gi_ = 0;
+    loop(25,
+      gt_on = gi_ == 0 ? gt_w > 0 : gi_ == 24 ? gt_f : (gt_w & (2 ^ (23 - gi_))) > 0;
+      gt_c2 = gi_ == 24 ? S92_RED : gi_ == 15 || gi_ == 19 || gi_ == 23 ? S92_YEL : S92_LAMP;
+      ui_col(gt_on ? gt_c2 : ui_mix(gt_c2, 0x000000, 0.82)); s92_r(32 + gi_ * 11.12, 326, 8.6, 14);
+      gt_on ? ( ui_cola(gt_c2, 0.18); s92_r(31 + gi_ * 11.12, 324, 10.6, 18); );
+      gi_ += 1;
+    );
+    gfx_setfont(13); ui_col(S92_DIM);
+    s92_tc(36.3, 352, "S"); s92_tc(36.3 + 7 * 11.12, 352, "8"); s92_tc(36.3 + 15 * 11.12, 352, "16"); s92_tc(36.3 + 19 * 11.12, 352, "20");
+    s92_tc(36.3 + 23 * 11.12, 352, "24"); s92_tc(36.3 + 24 * 11.12, 352, "F");
+    s92_smallc(170, 372, "SIGN  ·  MSB TO LSB  ·  FLT = FINER");
+
+    // ---------- DIGITAL: the goniometer, correlation and loudness ----------
+    s92_mod(332, 206, 308, 178, "PHASE · LOUDNESS");
+    gt_gx = 344; gt_gy = 238; gt_gs = 136;
+    ui_col(0x050506); s92_rr(gt_gx - 3, gt_gy - 3, gt_gs + 6, gt_gs + 6, 3);
+    ui_col(S92_LCDB); s92_r(gt_gx, gt_gy, gt_gs, gt_gs);
+    ui_cola(S92_LCDT, 0.22);
+    s92_ln(gt_gx + gt_gs * 0.5, gt_gy + 4, gt_gx + gt_gs * 0.5, gt_gy + gt_gs - 4, 0.6);
+    s92_ln(gt_gx + 4, gt_gy + gt_gs * 0.5, gt_gx + gt_gs - 4, gt_gy + gt_gs * 0.5, 0.6);
+    s92_ln(gt_gx + 14, gt_gy + 14, gt_gx + gt_gs - 14, gt_gy + gt_gs - 14, 0.6);
+    s92_ln(gt_gx + gt_gs - 14, gt_gy + 14, gt_gx + 14, gt_gy + gt_gs - 14, 0.6);
+    gfx_setfont(13); ui_cola(S92_LCDT, 0.6);
+    s92_tc(gt_gx + 9, gt_gy + 9, "L"); s92_tc(gt_gx + gt_gs - 9, gt_gy + 9, "R"); s92_tc(gt_gx + gt_gs * 0.5 + 9, gt_gy + 9, "M");
+    // the trace: the last 1536 samples, auto-ranged
+    gt_p = m9_gw; gt_mx = 0.00001; gi_ = 0;
+    loop(1536, gt_p = (gt_p - 1) & 2047; gt_mx = max(gt_mx, max(abs(m9_GB[gt_p]), abs(m9_GB[2048 + gt_p]))); gi_ += 1; );
+    gt_tg = min(max(0.9 / gt_mx, 1), 24);
+    m9g_gn = gt_tg < m9g_gn ? gt_tg : m9g_gn + (gt_tg - m9g_gn) * 0.08;
+    gt_k = gt_gs * 0.5 * m9g_gn; gt_cx = gt_gx + gt_gs * 0.5; gt_cy = gt_gy + gt_gs * 0.5;
+    ui_cola(S92_LCDT, 0.55);
+    gt_p = m9_gw; gi_ = 0;
+    loop(1536, gt_p = (gt_p - 1) & 2047;
+      gt_x = min(max(gt_cx + m9_GB[2048 + gt_p] * gt_k, gt_gx + 1), gt_gx + gt_gs - 2);
+      gt_y = min(max(gt_cy - m9_GB[gt_p] * gt_k, gt_gy + 1), gt_gy + gt_gs - 2);
+      gfx_rect(gt_x * sc, gt_y * sc, max(1, 1.2 * sc), max(1, 1.2 * sc));
+      gi_ += 1; );
+    // the loudness LCD: short-term, the momentary beside it
+    s92_small(492, 236, "SHORT-TERM  ·  LUFS");
+    m9_ls > -70 ? sprintf(#gt_d, "%.1f", m9_ls) : strcpy(#gt_d, "---");
+    s92_lcd(492, 252, 136, 30, #gt_d);
+    m9_lm > -70 ? sprintf(#gt_m, "MOMENTARY  %.1f", m9_lm) : strcpy(#gt_m, "MOMENTARY  ---");
+    s92_small(492, 290, #gt_m);
+    // the correlation bar
+    gt_co = m9_cLR / sqrt(max(m9_cLL * m9_cRR, 0.000000000001)); gt_co = min(max(gt_co, -1), 1);
+    (m9_cLL + m9_cRR) < 0.0000001 ? gt_co = 1;
+    m9g_co += (gt_co - m9g_co) * 0.25;
+    sprintf(#gt_n, "CORRELATION  %+.2f", m9g_co); s92_small(492, 310, #gt_n);
+    ui_col(0x050506); s92_rr(492, 326, 136, 16, 2);
+    gi_ = 0; loop(17, ui_col(gi_ < 8 ? ui_mix(S92_RED, 0x000000, 0.8) : ui_mix(S92_LAMP, 0x000000, 0.82)); s92_r(495 + gi_ * 7.7, 329, 6, 10); gi_ += 1; );
+    gt_x = floor((m9g_co + 1) * 8 + 0.5); gt_x = min(max(gt_x, 0), 16);
+    gi_ = min(gt_x, 8); loop(abs(gt_x - 8) + 1, ui_col(gi_ < 8 ? S92_RED : S92_LAMP); s92_r(495 + gi_ * 7.7, 329, 6, 10); gi_ += 1; );
+    s92_smallc(497, 352, "-1"); s92_smallc(560, 352, "0"); s92_smallc(623, 352, "+1");
+    sprintf(#gt_r, "RMS  L %.1f  ·  R %.1f", max(10 * log10(max(m9_mqL, 0.00000000000001)), -99), max(10 * log10(max(m9_mqR, 0.00000000000001)), -99));
+    s92_small(492, 364, #gt_r);
+  );
+
+  // ---------- METER BRIDGE: the VU reference and peak LEDs (ANALOG), the hold and the overs (DIGITAL) ----------
+  s92_mod(652, 62, 288, 322, "CALIBRATION");
+  s92_smallc(796, 94, "VU REFERENCE  ·  0 VU =");
+  gi_ = 0; loop(3, s92_key(668 + gi_ * 88, 104, 80, 26, slider16 == gi_, gi_ == 0 ? "-18" : gi_ == 1 ? "-14" : "-12") && !gt_dg ? s92_set(16, gi_); gi_ += 1; );
+  s92_smallc(796, 142, "DBFS  ·  SINE PEAK");
+  s92_smallc(796, 166, "PEAK LED");
+  gi_ = 0; loop(3, s92_key(668 + gi_ * 88, 176, 80, 26, slider17 == gi_, gi_ == 0 ? "-6" : gi_ == 1 ? "-3" : "-1") && !gt_dg ? s92_set(17, gi_); gi_ += 1; );
+  s92_smallc(796, 214, "DBFS  ·  SAMPLE PEAK");
+  gt_dg ? ( ui_cola(S92_PANEL, 0.72); s92_r(660, 86, 272, 136); s92_smallc(796, 228, "VU SETTINGS  ·  ANALOG ONLY"); );
+  s92_smallc(796, 250, "PEAK HOLD");
+  gi_ = 0; loop(3, s92_key(668 + gi_ * 88, 260, 80, 26, slider18 == gi_, gi_ == 0 ? "OFF" : gi_ == 1 ? "3 S" : "HOLD") && gt_dg ? s92_set(18, gi_); gi_ += 1; );
+  s92_smallc(796, 300, "OVER  =  RUN OF N FULL-SCALE");
+  gi_ = 0; loop(4, s92_key(668 + gi_ * 66, 310, 58, 26, slider19 == gi_, gi_ == 0 ? "1" : gi_ == 1 ? "2" : gi_ == 2 ? "3" : "4") && gt_dg ? s92_set(19, gi_); gi_ += 1; );
+  !gt_dg ? ( ui_cola(S92_PANEL, 0.72); s92_r(660, 240, 272, 102); s92_smallc(796, 346, "DIGITAL ONLY"); ) : s92_smallc(796, 346, "SAMPLES  ·  ONE COUNT PER RUN");
+  s92_smallc(796, 368, "BIT-EXACT PASS-THROUGH  ·  LATENCY 0");
+
+  mm_strip(960, 396, 0x1A1B1D, 0xB8B8B8); mm_keys92(960 - 176, 396 + 6);
+  pk_end();
+  ui_end();
+  m92_pr = pr_cur;
+);

@@ -1,0 +1,955 @@
+desc:GFX G PCM 12 [PCM drum machine]
+//tags: instrument drum machine pcm 12-bit digital 80s rhythm
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-clip, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-drum (.jsfx-inc) in the same folder.
+//
+// 12-bit PCM drum machine in the spirit of the big mid-80s digital rhythm programmers.
+// SOUND ROM: 24 drum sounds, synthesized once when the plugin loads and stored as 12-bit PCM at 40 kHz
+//   (no sample files: punchy and gated kicks and snares, rim, clap, four toms, hats, ride, crash, cowbell,
+//   shaker, tambourine, conga, timbale, an electronic tom and a finger snap).
+// 12 PAD CHANNELS, each playing one ROM sound (one at a time - a new hit pulls the channel's VCA down in 1.2 ms, then
+//   restarts it, as the hardware did), with the
+//   classic voice edit: PITCH, LEVEL, PAN, EG (ATTACK, DECAY 1, DECAY POINT, DECAY 2 - shaping the stored
+//   sound), BEND (the pitch sweeps up or down while the sound plays), REVERSE (the sound runs backwards)
+//   and the MIDI NOTE that plays it. A closed or pedal hat chokes an open hat.
+// Click a pad to hear it and select it; the EDIT knobs and the LCD follow the selected pad.
+// PLAYBACK HARDWARE: each channel is tuned by its own playback clock and holds each ROM value until the next tick (no
+//   interpolation), so the converter images move with the pitch; drawn band-limited (B-spline BLEP) so 44.1 / 48 / 96 kHz
+//   match. Level and EG are an analogue VCA after the converter; velocity in 10 steps, the top one the ACCENT (harder
+//   attack, longer decay, a faster clock). Summing bus with faint crosstalk, the 4-pole output filter (DAC FILTER) and an
+//   analogue output stage (soft above 1.0, ADAA). DAC era drop-down: 12-bit linear or 8-bit companded (mu-law); a tiny
+//   DAC non-linearity is baked into the stored values. Hidden Drift (%): channel clock spread, master clock drift, hit
+//   level variation (50 standard, 0 = exact).
+// KITS (TIGHT FUNK, ELECTRO, GATED 80S, LATIN, HIP HOP, HOUSE) sets all 12 pads (sounds and voice edits). The pad set is saved with the project.
+// PATTERN SEQUENCER (always on the panel: the steps in the voice matrix, PATTERN below): 8 patterns (A-H) x 12 rows (one per pad) x 16 steps,
+//   click a step for off / hit / accent; plays in time with Reaper's transport, SWING; a new pattern starts at
+//   the next bar (its key flashes until then); COPY / CLEAR; factory patterns for the TIGHT FUNK kit. EXPORT MIDI hands the pattern (with each
+//   pad's note) to the companion ReaScript "GFX G-PCM 12 - export MIDI.lua", which drops it at the edit cursor.
+// IN / OUT: the strip along the bottom holds SAT and STEREO (MONO, WIDTH).
+
+options:gmem=GFX_GPCM12
+
+import gfx-drift.jsfx-inc
+import gfx-clip.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-drum.jsfx-inc
+
+slider1:0<-24,12,0.1>-Volume (dB)
+slider2:0<0,16,1>-MIDI channel (0 = omni)
+slider3:60<0,100,1>-Velocity (%)
+slider4:14000<4000,20000,10>-DAC filter (Hz)
+slider5:0<0,100,1>-Band sat (%)
+slider6:30<0,100,1>-Bias (%)
+slider7:120<40,400,1>-Sat low band (Hz)
+slider8:6000<2000,16000,10>-Sat high band (Hz)
+slider9:-0.3<-24,0,0.1>-Ceiling (dB)
+slider10:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider11:20<20,500,1>-Mono below (Hz, 20 = off)
+slider12:0<0,100,1>-Stereo width (%)
+// EDIT: the selected pad's voice (the panel loads and stores these per pad)
+slider13:0<0,23,1>-Edit: sound
+slider14:0<-24,24,0.1>-Edit: pitch (st)
+slider15:80<0,100,1>-Edit: level (%)
+slider16:0<-100,100,1>-Edit: pan (%)
+slider17:0<0,200,0.1>-Edit: attack (ms)
+slider18:4000<10,4000,1>-Edit: decay 1 (ms)
+slider19:100<0,100,1>-Edit: decay point (%)
+slider20:4000<10,4000,1>-Edit: decay 2 (ms)
+slider21:0<-100,100,1>-Edit: bend
+slider22:0<0,1,1{Off,On}>-Edit: reverse
+slider23:36<24,96,1>-Edit: MIDI note
+// PATTERN SEQUENCER
+slider24:0<0,1,1{Off,On}>-Sequencer play (with transport)
+slider25:0<0,75,1>-Sequencer swing (%)
+slider26:0<0,7,1{A,B,C,D,E,F,G,H}>-Pattern
+slider27:0<0,3,1{1 bar,2 bars,4 bars,8 bars}>-Export length
+// THE CONVERTERS and the machine's spread / drift
+slider28:0<0,1,1{12-bit linear,8-bit companded}>-DAC era
+slider29:50<0,100,1>-Drift (%)
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-pcm12";                                  // the ? pop-up links to this manual
+
+NCH = 12; NSND = 24;
+RS = 40000;                            // the ROM's sample rate
+ROM = 200000;                          // the 12-bit sound ROM (about 17 s of sound)
+ROFF = 1000; RLEN = 1040;              // each sound's start and length in the ROM
+CHP = 2000;                            // pad channel settings: ch * 16 (sound, pitch, level, pan, att, d1, point, d2, bend, rev, note)
+NMAP = 2600;                           // MIDI note -> channel (128)
+MQO = 2800; MQN = 3100; MQV = 3400;    // this block's note-ons
+PAT = 4000;                            // patterns: pat * 192 + row * 16 + step (0 off, 1 hit, 2 accent)
+ost_init(150000); ostL.ost_ch_init(); ostR.ost_ch_init();
+
+// ---------------------------------------------------------------------------------------------------------
+// SOUND ROM: each sound is synthesized into the ROM at RS, peak-normalised, then quantised to 12 bits
+// ---------------------------------------------------------------------------------------------------------
+function snd_name(s) (
+  s == 0 ? "BD 1" : s == 1 ? "BD 2" : s == 2 ? "BD GATED" : s == 3 ? "SD 1" : s == 4 ? "SD GATED" : s == 5 ? "SD TIGHT" :
+  s == 6 ? "RIM" : s == 7 ? "CLAP" : s == 8 ? "TOM 1" : s == 9 ? "TOM 2" : s == 10 ? "TOM 3" : s == 11 ? "TOM 4" :
+  s == 12 ? "HH CLOSED" : s == 13 ? "HH OPEN" : s == 14 ? "HH PEDAL" : s == 15 ? "RIDE" : s == 16 ? "CRASH" : s == 17 ? "COWBELL" :
+  s == 18 ? "SHAKER" : s == 19 ? "TAMBOURINE" : s == 20 ? "CONGA" : s == 21 ? "TIMBALE" : s == 22 ? "ELEC TOM" : "SNAP";
+);
+// offline helpers (time t in seconds, at RS)
+function oe(t, tau) ( exp(-t / tau); );
+function sqw(ph) ( ph - floor(ph) < 0.5 ? 1 : -1; );
+// state-variable filter for building sounds: returns lp / bp / hp in its instance
+function bset(f, q) instance(g, k, a1, a2, a3) (
+  g = tan($pi * min(f, RS * 0.45) / RS); k = 1 / q; a1 = 1 / (1 + g * (g + k)); a2 = g * a1; a3 = g * a2;
+);
+function brun(x) instance(a1, a2, a3, k, ic1, ic2, lp, bp, hp) local(v1, v2, v3) (
+  v3 = x - ic2; v1 = a1 * ic1 + a2 * v3; v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2; lp = v2; bp = v1; hp = x - k * v1 - v2;
+  bp;
+);
+function breset() instance(ic1, ic2) ( ic1 = ic2 = 0; );
+// metal: six squares at inharmonic ratios (r scales them)
+function metal(t, r) (
+  (sqw(t * 205.3 * r) + sqw(t * 304.4 * r) + sqw(t * 369.6 * r) + sqw(t * 522.7 * r) + sqw(t * 540 * r) + sqw(t * 800 * r)) / 6;
+);
+// kick: sine with an exponential pitch drop; gate > 0 holds the level then cuts hard (gated)
+function mk_kick(b, n, f0, f1, tp, ta, click, drive, gate) local(i, t, ph, y, a, g) (
+  ph = 0; i = 0;
+  loop(n,
+    t = i / RS;
+    ph += (f0 + f1 * oe(t, tp)) / RS;
+    a = gate > 0 ? (t < gate ? 1 - 0.3 * t / gate : max(0, 0.7 - (t - gate) * 60)) : oe(t, ta);
+    y = sin(2 * $pi * ph);
+    drive > 0 ? ( g = 1 + drive; y = (y * g) / (1 + abs(y * g)) * (1 + 1 / g); );
+    y = y * a + (rand(2) - 1) * click * oe(t, 0.0015);
+    b[i] = y; i += 1;
+  );
+);
+// snare: two tone modes + filtered noise; gate > 0 holds the noise (gated reverb), room adds a short tail
+function mk_snare(b, n, f, tt, nt, nlo, nhi, tone, gate) local(i, t, y, nz, a, an) (
+  sN1.bset(nhi, 0.7); sN2.bset(nlo, 0.7); sN1.breset(); sN2.breset(); i = 0;
+  loop(n,
+    t = i / RS;
+    nz = rand(2) - 1; sN1.brun(nz); sN2.brun(sN1.lp); nz = sN2.hp;
+    an = gate > 0 ? (t < 0.004 ? 1.4 : t < gate ? 0.75 - 0.25 * t / gate : max(0, 0.5 - (t - gate) * 40)) : oe(t, nt);
+    a = oe(t, tt);
+    y = (sin(2 * $pi * f * t * (1 + 0.25 * oe(t, 0.01))) * 0.7 + sin(2 * $pi * f * 1.84 * t) * 0.35) * a * tone + nz * an;
+    b[i] = y; i += 1;
+  );
+);
+// tom: sine with a pitch fall and a second mode, a little stick noise
+function mk_tom(b, n, f, ta, fall) local(i, t, ph, ph2, y) (
+  ph = ph2 = 0; i = 0;
+  loop(n,
+    t = i / RS;
+    ph += f * (1 + fall * oe(t, 0.08)) / RS; ph2 += f * 1.52 * (1 + fall * oe(t, 0.05)) / RS;
+    y = (sin(2 * $pi * ph) + 0.25 * sin(2 * $pi * ph2) * oe(t, ta * 0.4)) * oe(t, ta) + (rand(2) - 1) * 0.3 * oe(t, 0.004);
+    b[i] = y; i += 1;
+  );
+);
+// hats and cymbals: metal + noise through band-pass / high-pass
+function mk_cym(b, n, r, nzm, fc, q, ta, att, bell) local(i, t, x, y, e) (
+  cF.bset(fc, q); cF.breset(); i = 0;
+  loop(n,
+    t = i / RS;
+    x = metal(t, r) * (1 - nzm) + (rand(2) - 1) * nzm;
+    cF.brun(x);
+    e = oe(t, ta) * (att > 0 ? min(t / att, 1) : 1);
+    y = (cF.bp + 0.7 * cF.hp) * e;
+    bell > 0 ? y += bell * (sin(2 * $pi * 2350 * t) + 0.6 * sin(2 * $pi * 3520 * t)) * oe(t, ta * 0.6);
+    b[i] = y; i += 1;
+  );
+);
+
+// ---------- acoustic models (cymbals, toms, kicks) ----------
+function tanh_(x) ( x = min(max(x, -12), 12); x = exp(2 * x); (x - 1) / (x + 1); );
+// a repeatable random generator, so the ROM is the same every time it is built
+function lcg() ( seed = (seed * 16807) % 2147483647; seed / 2147483647; );
+SCR = 1500000; MOD = 1400000;                  // scratch for the room, partial tables
+// a short room baked into a sound (the originals were recorded in a studio): a few early reflections,
+// darkened, mixed in at amt
+function add_room(b, n, amt) local(i, t, d, g, k, y, lp) (
+  memset(SCR, 0, n);
+  k = 0;
+  loop(7,
+    d = floor(RS * 0.001 * (k == 0 ? 6.3 : k == 1 ? 9.7 : k == 2 ? 13.1 : k == 3 ? 17.9 : k == 4 ? 23.5 : k == 5 ? 29.4 : 37.0));
+    g = (k == 0 ? 0.42 : k == 1 ? -0.33 : k == 2 ? 0.28 : k == 3 ? -0.22 : k == 4 ? 0.17 : k == 5 ? -0.12 : 0.08);
+    i = d; loop(n - d, SCR[i] += b[i - d] * g; i += 1; );
+    k += 1;
+  );
+  lp = 0; i = 0;
+  loop(n, lp += (SCR[i] - lp) * 0.35; b[i] += lp * amt; i += 1; );
+);
+// MODAL CYMBAL: np inharmonic partials between flo and fhi (log-spread, random), each a decaying sinusoid
+// (a two-pole resonator, so it costs two multiplies a sample); high partials decay toward thi, low ones
+// toward tlo. A noise "wash" (band-passed around nzf) and the stick's click sit on top; att swells it in.
+function mk_mcym(b, n, np, flo, fhi, tlo, thi, nzamt, nzf, att, click, sd) local(k, f, a, tau, r, w, c1, c2, y0, y1, y2, i, m, u, t, e) (
+  memset(b, 0, n); seed = sd;
+  k = 0;
+  loop(np,
+    u = lcg(); f = flo * (fhi / flo) ^ u;
+    f < RS * 0.45 ? (
+      a = (0.4 + 0.6 * lcg()) * (0.5 + 0.5 * u);
+      tau = tlo * (thi / tlo) ^ u * (0.6 + 0.8 * lcg());
+      r = exp(-1 / (tau * RS)); w = 2 * $pi * f / RS;
+      c1 = 2 * r * cos(w); c2 = -r * r;
+      y1 = 0; y2 = -a * sin(w) / r;                   // starts at zero, rises as a * r^n * sin(w n)
+      m = min(n, floor(tau * 7 * RS)); i = 0;
+      loop(m, y0 = c1 * y1 + c2 * y2; b[i] += y1; y2 = y1; y1 = y0; i += 1; );
+    );
+    k += 1;
+  );
+  // scale the partials to about unit level, add wash and click, apply the swell
+  cF.bset(nzf, 0.8); cF.breset(); i = 0;
+  loop(n,
+    t = i / RS; u = lcg() * 2 - 1;
+    cF.brun(u);
+    e = att > 0 ? 1 - exp(-t / att) : 1;
+    b[i] = (b[i] / sqrt(np) * 1.6 + (cF.bp + 0.6 * cF.hp) * nzamt * exp(-t / (tlo * 0.5 + thi * 0.5))) * e
+           + (lcg() * 2 - 1) * click * exp(-t / 0.0012);
+    i += 1;
+  );
+);
+// thin: a 12 dB/oct high-pass over a whole sound (takes the body out of the cymbals)
+function thin(b, n, fc) local(i) (
+  cF.bset(fc, 0.707); cF.breset(); i = 0; loop(n, cF.brun(b[i]); b[i] = cF.hp; i += 1; );
+);
+// TOM: the struck circular head's modes (1, 1.59, 2.14, 2.30, 2.65, 2.92), higher ones dying faster; the
+// pitch starts a little sharp and settles as the head relaxes; a stick attack and a little room
+function mk_tom2(b, n, f, ta, rm) local(i, t, k, g, p0, p1, p2, p3, p4, p5, y) (
+  p0 = p1 = p2 = p3 = p4 = p5 = 0; cF.bset(3800, 1.2); cF.breset(); seed = floor(f * 13); i = 0;
+  loop(n,
+    t = i / RS; g = 1 + 0.07 * exp(-t / 0.07);
+    p0 += f * g / RS; p1 += f * 1.594 * g / RS; p2 += f * 2.136 * g / RS; p3 += f * 2.296 * g / RS; p4 += f * 2.653 * g / RS; p5 += f * 2.918 * g / RS;
+    y = sin(2 * $pi * p0) * exp(-t / ta) + 0.5 * sin(2 * $pi * p1) * exp(-t / (ta * 0.55)) + 0.32 * sin(2 * $pi * p2) * exp(-t / (ta * 0.4))
+      + 0.22 * sin(2 * $pi * p3) * exp(-t / (ta * 0.35)) + 0.15 * sin(2 * $pi * p4) * exp(-t / (ta * 0.3)) + 0.1 * sin(2 * $pi * p5) * exp(-t / (ta * 0.25));
+    y += cF.brun(lcg() * 2 - 1) * 0.9 * exp(-t / 0.004);           // the stick
+    b[i] = y; i += 1;
+  );
+  add_room(b, n, rm);
+);
+// GATED REVERB: a small dense room (4 damped combs into 2 all-passes) of the sound itself, held for 'hold'
+// seconds then cut in 20 ms - the 80s gate - mixed in at mix
+RVB = 1410000;
+function rev_gate(b, n, hold, mix) local(i, k, x, y, t, e, c0, c1, c2, c3, f0, f1, f2, f3, i0, i1, i2, i3, a0, a1, j0, j1, l0, l1, l2, l3, m0, m1, w) (
+  memset(RVB, 0, 8192);
+  l0 = 1116 * 0.8; l1 = 1188 * 0.8; l2 = 1277 * 0.8; l3 = 1356 * 0.8; m0 = 556; m1 = 441;
+  c0 = RVB; c1 = RVB + 1200; c2 = RVB + 2400; c3 = RVB + 3600; a0 = RVB + 4800; a1 = RVB + 5600;
+  f0 = f1 = f2 = f3 = 0; i0 = i1 = i2 = i3 = j0 = j1 = 0;
+  i = 0;
+  loop(n,
+    t = i / RS; x = b[i] * 0.3;
+    y = c0[i0]; f0 = y * 0.6 + f0 * 0.4; c0[i0] = x + f0 * 0.86; i0 += 1; i0 >= l0 ? i0 = 0; w = y;
+    y = c1[i1]; f1 = y * 0.6 + f1 * 0.4; c1[i1] = x + f1 * 0.86; i1 += 1; i1 >= l1 ? i1 = 0; w += y;
+    y = c2[i2]; f2 = y * 0.6 + f2 * 0.4; c2[i2] = x + f2 * 0.86; i2 += 1; i2 >= l2 ? i2 = 0; w += y;
+    y = c3[i3]; f3 = y * 0.6 + f3 * 0.4; c3[i3] = x + f3 * 0.86; i3 += 1; i3 >= l3 ? i3 = 0; w += y;
+    y = a0[j0]; a0[j0] = w + y * 0.5; w = y - w; j0 += 1; j0 >= m0 ? j0 = 0;
+    y = a1[j1]; a1[j1] = w + y * 0.5; w = y - w; j1 += 1; j1 >= m1 ? j1 = 0;
+    e = t < hold ? 1 : max(0, 1 - (t - hold) * 50);
+    SCR[i] = w * e;
+    i += 1;
+  );
+  i = 0; loop(n, b[i] += SCR[i] * mix; i += 1; );
+);
+// KICK: a felt beater on a big head - fundamental with a short pitch fall, one shell mode, the beater's
+// soft click; light saturation only (drv); gated > 0 adds a gated reverb tail (dense, dark, held, then cut)
+function mk_kick2(b, n, f0, drop, ta, drv, gated, gl) local(i, t, p0, p1, y, e, g) (
+  p0 = p1 = 0; cF.bset(2600, 0.7); cF.breset(); sN1.bset(2400, 0.7); sN1.breset(); sN2.bset(160, 0.7); sN2.breset(); seed = 4711; i = 0;
+  loop(n,
+    t = i / RS;
+    p0 += f0 * (1 + drop * exp(-t / 0.014)) / RS; p1 += f0 * 1.59 * (1 + drop * exp(-t / 0.01)) / RS;
+    y = sin(2 * $pi * p0) * exp(-t / ta) + 0.25 * sin(2 * $pi * p1) * exp(-t / 0.035);
+    cF.brun(lcg() * 2 - 1); y += cF.lp * 0.7 * exp(-t / 0.003);    // the beater
+    drv > 0 ? ( g = 1 + drv * 3; y = tanh_(y * g) / tanh_(g) ; );
+    b[i] = y; i += 1;
+  );
+  add_room(b, n, 0.12);
+  gated > 0 ? rev_gate(b, n, gated, gl);
+);
+
+function build_rom() local(s, o, n, b, i, t, y, pk, ph, x, k) (
+  o = 0; s = 0;
+  loop(NSND,
+    n = floor(RS * (s == 0 ? 0.5 : s == 1 ? 0.9 : s == 2 ? 0.4 : s == 3 ? 0.5 : s == 4 ? 0.6 : s == 5 ? 0.35 : s == 6 ? 0.15 : s == 7 ? 0.5 :
+                   s == 8 ? 0.6 : s == 9 ? 0.7 : s == 10 ? 0.8 : s == 11 ? 1.0 : s == 12 ? 0.15 : s == 13 ? 0.9 : s == 14 ? 0.2 : s == 15 ? 2.5 :
+                   s == 16 ? 3.0 : s == 17 ? 0.5 : s == 18 ? 0.25 : s == 19 ? 0.6 : s == 20 ? 0.45 : s == 21 ? 0.7 : s == 22 ? 1.0 : 0.25));
+    b = ROM + o; ROFF[s] = o; RLEN[s] = n;
+    s == 0 ? mk_kick2(b, n, 56, 0.45, 0.16, 0.25, 0, 0) :                 // BD 1: punchy studio kick
+    s == 1 ? mk_kick2(b, n, 46, 0.35, 0.32, 0.1, 0, 0) :                  // BD 2: deep and long
+    s == 2 ? mk_kick2(b, n, 60, 0.5, 0.11, 0.3, 0.24, 1.6) :            // BD GATED: tight kick + gated reverb
+    s == 3 ? mk_snare(b, n, 185, 0.05, 0.11, 1800, 9000, 0.8, 0) :        // SD 1: studio snare
+    s == 4 ? mk_snare(b, n, 170, 0.06, 0, 900, 8000, 0.7, 0.32) :         // SD GATED: the 80s gated-reverb snare
+    s == 5 ? mk_snare(b, n, 240, 0.03, 0.06, 2500, 11000, 0.6, 0) :       // SD TIGHT
+    s == 6 ? (                                                              // RIM
+      i = 0; loop(n, t = i / RS;
+        b[i] = sin(2 * $pi * 1700 * t) * 0.7 * oe(t, 0.012) + sin(2 * $pi * 460 * t) * 0.5 * oe(t, 0.01) + (rand(2) - 1) * 0.5 * oe(t, 0.0008);
+        i += 1; );
+    ) : s == 7 ? (                                                          // CLAP: four strikes, then a tail
+      cF.bset(1250, 1.4); cF.breset(); i = 0;
+      loop(n, t = i / RS; x = rand(2) - 1; cF.brun(x);
+        k = t < 0.009 ? oe(t, 0.003) : t < 0.018 ? oe(t - 0.009, 0.003) : t < 0.028 ? oe(t - 0.018, 0.003) : oe(t - 0.028, 0.12);
+        b[i] = cF.bp * k * 2; i += 1; );
+    ) :
+    s == 8 ? mk_tom2(b, n, 210, 0.2, 0.25) : s == 9 ? mk_tom2(b, n, 160, 0.26, 0.25) :
+    s == 10 ? mk_tom2(b, n, 120, 0.32, 0.25) : s == 11 ? mk_tom2(b, n, 88, 0.42, 0.25) :
+    s == 12 ? ( mk_mcym(b, n, 70, 3000, 16000, 0.12, 0.07, 1.1, 9000, 0, 0.5, 101);                 // HH CLOSED: a choked pair
+                i = 0; loop(n, b[i] *= exp(-i / RS / 0.05); i += 1; ); ) :
+    s == 13 ? mk_mcym(b, n, 100, 2800, 16000, 0.9, 0.5, 1.0, 8500, 0, 0.4, 202) :                    // HH OPEN
+    s == 14 ? ( mk_mcym(b, n, 60, 2200, 11000, 0.15, 0.1, 1.1, 6000, 0.003, 0, 303);                // HH PEDAL: the "chick"
+                i = 0; loop(n, b[i] *= exp(-i / RS / 0.06); i += 1; ); ) :
+    s == 15 ? ( mk_mcym(b, n, 110, 1800, 15000, 2.6, 1.6, 0.35, 8000, 0, 0.5, 404);                  // RIDE: thin and pingy, a light bell
+                i = 0; loop(n, t = i / RS;
+                  b[i] += 0.12 * (sin(2 * $pi * 2360 * t) + 0.6 * sin(2 * $pi * 3540 * t)) * exp(-t / 0.7);
+                  i += 1; );
+                thin(b, n, 1200); ) :
+    s == 16 ? ( mk_mcym(b, n, 150, 2000, 16000, 1.8, 1.2, 1.1, 7500, 0.008, 0.3, 505);              // CRASH: thin, bright, swelling
+                thin(b, n, 1500); ) :
+    s == 17 ? (                                                              // COWBELL
+      cF.bset(2600, 2.2); cF.breset(); i = 0;
+      loop(n, t = i / RS; cF.brun(sqw(t * 562) + sqw(t * 845));
+        b[i] = cF.bp * (0.6 * oe(t, 0.01) + 0.4 * oe(t, 0.12)); i += 1; );
+    ) : s == 18 ? (                                                          // SHAKER
+      cF.bset(7000, 0.8); cF.breset(); i = 0;
+      loop(n, t = i / RS; cF.brun(rand(2) - 1); b[i] = cF.hp * min(t / 0.012, 1) * oe(t, 0.045); i += 1; );
+    ) : s == 19 ? (                                                          // TAMBOURINE: jingle resonators + shake
+      i = 0; ph = 0;
+      loop(n, t = i / RS;
+        x = (rand(2) - 1) * (t < 0.003 ? 1 : (t >= 0.009 && t < 0.012) ? 0.7 : (t >= 0.02 && t < 0.023) ? 0.5 : 0);
+        b[i] = x; i += 1; );
+      // (the jingles ring through a resonant band-pass bank)
+      jA.bset(5200, 30); jB.bset(7000, 30); jC.bset(8700, 30); jD.bset(11200, 25); jE.bset(9000, 1);
+      jA.breset(); jB.breset(); jC.breset(); jD.breset(); jE.breset(); i = 0;
+      loop(n, t = i / RS; x = b[i];
+        b[i] = (jA.brun(x) + jB.brun(x) * 0.8 + jC.brun(x) * 0.7 + jD.brun(x) * 0.5 + jE.brun(x) * 0.3) * oe(t, 0.25); i += 1; );
+    ) : s == 20 ? (                                                          // CONGA
+      ph = 0; i = 0;
+      loop(n, t = i / RS; ph += 340 * (1 + 0.1 * oe(t, 0.02)) / RS;
+        b[i] = sin(2 * $pi * ph) * oe(t, 0.12) + (rand(2) - 1) * 0.25 * oe(t, 0.003); i += 1; );
+    ) : s == 21 ? (                                                          // TIMBALE: a ringing shell
+      ph = 0; i = 0;
+      loop(n, t = i / RS; ph += 460 / RS;
+        b[i] = (sin(2 * $pi * ph) + 0.5 * sin(2 * $pi * ph * 1.58) + 0.3 * sin(2 * $pi * ph * 2.45)) * oe(t, 0.18) + (rand(2) - 1) * 0.4 * oe(t, 0.002);
+        i += 1; );
+    ) : s == 22 ? (                                                          // ELEC TOM: the big downward sweep
+      ph = 0; i = 0;
+      loop(n, t = i / RS; ph += (110 + 260 * oe(t, 0.12)) / RS;
+        b[i] = (sin(2 * $pi * ph) * 0.8 + sqw(ph) * 0.2) * oe(t, 0.3); i += 1; );
+    ) : (                                                                    // SNAP
+      cF.bset(2200, 2); cF.breset(); i = 0;
+      loop(n, t = i / RS; cF.brun(rand(2) - 1); b[i] = cF.bp * 2.5 * oe(t, 0.018) + (rand(2) - 1) * oe(t, 0.0006); i += 1; );
+    );
+    // normalise and quantise to 12 bits (a little headroom; the last 15% fades out, so no sound ends with a click)
+    pk = 0; i = 0; loop(n, pk = max(pk, abs(b[i])); i += 1; );
+    pk > 0 ? ( i = 0; loop(n, y = b[i] * 0.9 / pk * min((n - i) / (n * 0.15), 1); b[i] = floor(y * 2047 + 0.5) / 2047; i += 1; ); );
+    o += n + 16; s += 1;
+  );
+  ROMN = o;
+  rom_ok = 1;
+);
+// THE CONVERTERS, baked into the ROM once (they are static curves on the stored values, so they cost nothing to play):
+// ROM8: the early 8-bit COMPANDED machines - each value re-coded as an 8-bit mu-law word (sign, 3-bit chord, 4-bit
+//   step: steps grow with the level, so the quantisation noise rides about 38 dB under the sound all the way down a
+//   tail - the gritty, grainy tails) and decoded by a chord DAC whose eight chord gains are a few tenths of a percent off.
+// ROM: the 12-bit linear DAC - a tiny bow (-0.15 % cubic at full scale) and a third of an LSB of mid-scale (major carry)
+//   error, so quiet passages pick up a faint crossover grain.
+ROM8 = 1700000;
+function build_dac() local(i, x, m, sg, s, q, y) (
+  i = 0;
+  loop(ROMN,
+    x = ROM[i]; sg = x < 0 ? -1 : 1;
+    m = floor(abs(x) * 8158 + 0.5) + 33; m = min(m, 8191);
+    s = min(max(floor(log(m) / log(2) + 0.0000001) - 5, 0), 7);
+    q = floor(m / 2 ^ (s + 1)) - 16;
+    y = ((2 * q + 33) * 2 ^ s - 33) / 8158;
+    y *= 1 + (s == 0 ? 0.003 : s == 1 ? -0.002 : s == 2 ? 0.0015 : s == 3 ? -0.0025 : s == 4 ? 0.002 : s == 5 ? -0.001 : s == 6 ? 0.0025 : -0.0015);
+    ROM8[i] = sg * y;
+    ROM[i] = x - 0.0015 * x * x * x + (x > 0 ? 0.00008 : x < 0 ? -0.00008 : 0);
+    i += 1;
+  );
+  dac_ok = 1;
+);
+!rom_ok ? build_rom();
+!dac_ok ? build_dac();
+
+// ---------- pad channels ----------
+function chset(c, snd, pitch, lvl, pan, note) local(b) (
+  b = CHP + c * 16;
+  b[0] = snd; b[1] = pitch; b[2] = lvl; b[3] = pan; b[4] = 0; b[5] = 4000; b[6] = 100; b[7] = 4000; b[8] = 0; b[9] = 0; b[10] = note;
+);
+function cheg(c, att, d1, pt, d2, bend, rev) local(b) (
+  b = CHP + c * 16; b[4] = att; b[5] = d1; b[6] = pt; b[7] = d2; b[8] = bend; b[9] = rev;
+);
+function kit_name(k) ( k == 1 ? "ELECTRO" : k == 2 ? "GATED 80S" : k == 3 ? "LATIN" : k == 4 ? "HIP HOP" : k == 5 ? "HOUSE" : "TIGHT FUNK"; );
+// a kit sets all 12 pads; MIDI notes follow General MIDI where they can
+NKIT = 6;
+function load_kit(k) local(c) (
+  k == 2 ? (                                   // GATED 80S: gated kick and snare, big toms falling a little, a crash on 12
+    chset(0, 2, 0, 92, 0, 36); chset(1, 4, 0, 85, 0, 38); chset(2, 3, -1, 75, 0, 40); chset(3, 6, 0, 60, -15, 37);
+    chset(4, 7, -1, 70, 10, 39); chset(5, 8, -1, 78, 35, 50); chset(6, 9, -2, 78, 0, 47); chset(7, 10, -3, 78, -35, 45);
+    chset(8, 12, 0, 58, 25, 42); chset(9, 13, 0, 52, 25, 46); chset(10, 14, 0, 52, 25, 44); chset(11, 16, 0, 60, -20, 49);
+    cheg(5, 0, 4000, 100, 4000, -8, 0); cheg(6, 0, 4000, 100, 4000, -8, 0); cheg(7, 0, 4000, 100, 4000, -8, 0);
+  ) : k == 3 ? (                               // LATIN: congas and timbales high and low, cowbell, shaker, tambourine
+    chset(0, 1, -2, 85, 0, 36); chset(1, 5, 1, 70, 0, 38); chset(2, 6, 2, 65, -10, 37); chset(3, 17, 0, 60, 20, 56);
+    chset(4, 7, 0, 65, 10, 39); chset(5, 20, 3, 75, 30, 62); chset(6, 20, -3, 75, 10, 64); chset(7, 21, 2, 70, -25, 65);
+    chset(8, 12, 0, 55, 25, 42); chset(9, 18, 0, 55, -30, 70); chset(10, 19, 0, 55, 35, 54); chset(11, 21, -3, 70, -40, 66);
+    cheg(8, 0, 120, 60, 80, 0, 0);
+  ) : k == 4 ? (                               // HIP HOP: everything tuned down, a booming kick, a snap, a reversed crash
+    chset(0, 0, -4, 95, 0, 36); chset(1, 3, -3, 80, 0, 38); chset(2, 23, 0, 70, 10, 40); chset(3, 6, -2, 60, -20, 37);
+    chset(4, 7, -3, 75, 0, 39); chset(5, 8, -5, 70, 30, 50); chset(6, 9, -5, 70, 0, 47); chset(7, 16, -2, 55, -25, 49);
+    chset(8, 12, -3, 60, 20, 42); chset(9, 13, -3, 52, 20, 46); chset(10, 18, -2, 50, -30, 70); chset(11, 20, -4, 60, 25, 63);
+    cheg(0, 0, 4000, 100, 4000, -15, 0); cheg(7, 0, 4000, 100, 4000, 0, 1); cheg(1, 0, 260, 50, 200, 0, 0);
+  ) : k == 5 ? (                               // HOUSE: a round kick, a tight snare and clap, short open hat, ride, percussion
+    chset(0, 1, 0, 92, 0, 36); chset(1, 5, 2, 70, 0, 38); chset(2, 3, 0, 65, 0, 40); chset(3, 6, 0, 55, -20, 37);
+    chset(4, 7, 0, 75, 0, 39); chset(5, 22, 5, 65, 30, 50); chset(6, 20, 0, 60, -25, 63); chset(7, 15, 0, 55, -20, 51);
+    chset(8, 12, 1, 60, 20, 42); chset(9, 13, 1, 55, 20, 46); chset(10, 19, 0, 55, 30, 54); chset(11, 18, 0, 50, -30, 70);
+    cheg(0, 0, 400, 50, 300, 0, 0); cheg(9, 0, 300, 40, 150, 0, 0); cheg(5, 0, 300, 0, 4000, -10, 0);
+  ) : k == 1 ? (                                   // ELECTRO: electronic toms (raised, shorter, gentle bend), short sounds
+    chset(0, 0, -3, 90, 0, 36); chset(1, 5, 2, 80, 0, 38); chset(2, 7, 0, 75, 10, 39); chset(3, 23, 0, 65, -20, 37);
+    chset(4, 22, 7, 75, 30, 50); chset(5, 22, 3, 75, 0, 47); chset(6, 22, -1, 75, -30, 45); chset(7, 17, 0, 60, 25, 56);
+    chset(8, 12, 2, 55, 20, 42); chset(9, 13, 2, 50, 20, 46); chset(10, 18, 0, 55, -25, 70); chset(11, 2, -5, 85, 0, 35);
+    cheg(0, 0, 160, 0, 4000, -20, 0);
+    cheg(4, 0, 380, 0, 4000, -10, 0); cheg(5, 0, 420, 0, 4000, -10, 0); cheg(6, 0, 480, 0, 4000, -10, 0);
+  ) : (                                        // TIGHT FUNK: short, dry, snappy
+    chset(0, 0, 1, 90, 0, 36); chset(1, 5, 0, 80, 0, 38); chset(2, 3, 3, 70, 0, 40); chset(3, 6, 0, 65, -20, 37);
+    chset(4, 7, 2, 65, 15, 39); chset(5, 8, 2, 70, 40, 50); chset(6, 9, 2, 70, 10, 47); chset(7, 10, 2, 70, -20, 45);
+    chset(8, 12, 0, 60, 30, 42); chset(9, 13, 0, 55, 30, 46); chset(10, 14, 0, 55, 30, 44); chset(11, 17, 0, 55, -30, 56);
+    cheg(0, 0, 220, 30, 120, 0, 0); cheg(1, 0, 150, 40, 90, 0, 0); cheg(9, 0, 200, 40, 160, 0, 0);
+  );
+  cur_kit = k; ed_load = 1;
+);
+
+// ---------- the playback hardware (self-contained: ch_* functions, the a?? step buffers, dac_* and the trims) ----------
+// CLOCK-TUNED PLAYBACK: each channel reads its sound with its own playback clock (RS x the pitch ratio) and HOLDS each
+// ROM value until the next clock tick (zero-order hold): there is no interpolation, so the converter's images follow
+// the clock - tuned down, the images fall into the audio band (darker, grainier); tuned up, they climb out of it.
+// Each held step is drawn band-limited at the host rate with a 4-point cubic B-spline BLEP (residuals added round the
+// step in a(L/R)0..3, two samples of latency), and a 3-tap FIR undoes the kernel's gentle top roll-off, so the host
+// rate adds (almost) no aliasing of its own and 44.1 / 48 / 96 kHz sound the same.
+// The level (pad LEVEL x the velocity step) and the EG are an analogue VCA after the converter: soft hits keep the
+// full 12-bit resolution. MIDI velocity is read in 10 steps; the top step is the ACCENT (sequencer accents): a harder
+// VCA attack (a short overshoot), a little longer decay and a slightly faster clock.
+// One voice per channel: a new hit while the channel still sounds pulls its VCA down in 1.2 ms, then starts the sound.
+// Spread / drift: each channel's clock is a few cents off (fixed), the master clock wanders very slightly and every
+// hit is a hair louder or softer - all scaled by the hidden drift slider (50 % standard, 0 = exact).
+EGP = 3800; EG2 = 3820; lt = 3840;      // (EGP / EG2: no longer used) pad light
+RMD_MS = 1.2;                           // the retrigger ramp
+ACC_OV = 0.15; ACD_MS = 4; ACC_LV = 0.97;                 // accent: VCA overshoot depth, its time constant, the level that pays for it
+ACC_CT = 6; ACC_DK = 1.12;              // accent: clock nudge (cents) and decay stretch
+LTRIM = 0.975;                             // the playback level trim (keeps the kits at their old level)
+SPRD = 3860;                            // per-channel clock tolerance (cents at the standard drift)
+SPRD[0] = 2.1; SPRD[1] = -1.4; SPRD[2] = 0.6; SPRD[3] = -2.8; SPRD[4] = 1.7; SPRD[5] = -0.5;
+SPRD[6] = 3.0; SPRD[7] = -2.2; SPRD[8] = 0.9; SPRD[9] = -1.1; SPRD[10] = 2.5; SPRD[11] = -3.2;
+dr_c = 0; dr_r = 1;
+mdrift.drift_init(0.9);
+function dcoef(ms) ( exp(-4.6 / (max(ms, 1) * 0.001 * srate)); );     // ms = time to fall 40 dB
+function ch_choke() instance(act, snd, chk) ( act && snd == 13 ? chk = 1; );
+function chokeall() (
+  c0.ch_choke(); c1.ch_choke(); c2.ch_choke(); c3.ch_choke(); c4.ch_choke(); c5.ch_choke();
+  c6.ch_choke(); c7.ch_choke(); c8.ch_choke(); c9.ch_choke(); c10.ch_choke(); c11.ch_choke();
+);
+// start the sound on this channel (velocity pvel)
+function ch_go() instance(ci, act, ph, inc, iinc, bm, ibm, pos, dir, len, bas, held, eg, st, att, pt, d1, d2, chk, lv, pl, pr,
+                          acx, acd, rm, pnd, pvel, snd, fin) local(b, s, vq, acc, dk) (
+  b = CHP + ci * 16; s = b[0]; snd = s;
+  s == 12 || s == 14 ? chokeall();                                     // a closed or pedal hat chokes a ringing open hat
+  vq = max(1, floor(pvel * 10 + 0.5)) / 10; acc = vq >= 1;             // the velocity steps; the top one is the accent
+  len = RLEN[s]; bas = (era ? ROM8 : ROM) + ROFF[s];
+  dir = b[9] ? -1 : 1; pos = b[9] ? len : -1;                           // (the first clock tick reads the first value)
+  ph = 0.5; held = 0; fin = 0;
+  inc = 2 ^ ((b[1] + (SPRD[ci] * dm_a + dr_c + acc * ACC_CT) * 0.01) / 12) * RS / srate; iinc = 1 / inc;
+  bm = 2 ^ (b[8] / 25 / srate); ibm = 1 / bm;                          // bend: the clock sweeps (octaves per second)
+  lv = (1 - velsens + velsens * vq) * sqr(b[2] / 100) * (1 + (rand(2) - 1) * 0.012 * dm_a) * LTRIM * (acc ? ACC_LV : 1);
+  pl = sqrt(1 - b[3] / 100); pr = sqrt(1 + b[3] / 100);
+  b[4] > 0 ? ( att = 1 / (b[4] * 0.001 * srate); st = 1; eg = 0; ) : ( st = 2; eg = 1; );
+  dk = acc ? ACC_DK : 1;
+  d1 = b[5] >= 4000 ? 1 : dcoef(b[5] * dk); pt = b[6] / 100; d2 = b[7] >= 4000 ? 1 : dcoef(b[7] * dk);
+  acx = acc ? ACC_OV : 0; acd = exp(-1 / (ACD_MS * 0.001 * srate));
+  chk = 0; pnd = 0; rm = 1; act = 1;
+  lt[ci] = 1;
+);
+// a hit: a sounding channel ramps down first (pnd), a quiet one starts at once
+function ch_trig(vel) instance(act, eg, lv, pnd, pvel, rm, rmd) (
+  pvel = vel;
+  !pnd ? (
+    act && eg * lv > 0.0005 ? ( pnd = 1; rm = 1; rmd = 1 / (RMD_MS * 0.001 * srate); ) : this.ch_go();
+  );
+);
+function ch_drift(r) instance(act, inc, iinc) ( act ? ( inc *= r; iinc /= r; ); );
+// one sample of a channel: the clock, the held value, the BLEP residuals of its steps, the VCA (EG x level)
+function ch_run() instance(act, ph, inc, iinc, bm, ibm, pos, dir, len, bas, held, eg, st, att, pt, d1, d2, chk, lv, pl, pr,
+                           acx, acd, rm, rmd, pnd, fin, g, gl, gr, nv, dd, u, v, u2, v2, w, dl, dr) (
+  act ? (
+    bm != 1 ? ( inc *= bm; iinc *= ibm; inc > 6 || inc < 0.004 ? ( inc < 0.004 ? chk = 1; bm = 1; ibm = 1; ); );   // (a clock bent to a crawl fades out)
+    chk ? eg *= chk_c :                                                // choked: a 1 ms fade
+    st == 1 ? ( eg += att; eg >= 1 ? ( eg = 1; st = 2; ); ) :
+    st == 2 ? ( eg = pt + (eg - pt) * d1; abs(eg - pt) < 0.002 ? st = 3; ) :
+    eg *= d2;
+    g = eg * lv;
+    acx > 0.00001 ? ( g *= 1 + acx; acx *= acd; );
+    pnd ? ( rm -= rmd; rm > 0 ? g *= rm : ( this.ch_go(); g = eg * lv * (1 + acx); ); );
+    gl = g * pl; gr = g * pr;
+    ph += inc;
+    while (ph >= 1) (
+      pos += dir;
+      pos >= 0 && pos < len ? nv = bas[pos] : ( nv = 0; fin = 1; );
+      dd = nv - held;
+      dd != 0 ? (
+        held = nv;
+        u = (ph - 1) * iinc; v = 1 - u; u2 = u * u; v2 = v * v;
+        dl = dd * gl; dr = dd * gr;
+        w = u2 * u2 * 0.041666667;                                     // the sample two before this one
+        aL0 += dl * w; aR0 += dr * w;
+        w = 0.5 - v * 0.66666667 + v2 * v * 0.33333333 - v2 * v2 * 0.125; // one before
+        aL1 += dl * w; aR1 += dr * w;
+        w = u * 0.66666667 - 0.5 - u2 * u * 0.33333333 + u2 * u2 * 0.125; // this one
+        aL2 += dl * w; aR2 += dr * w;
+        w = v2 * v2 * -0.041666667;                                    // the next one
+        aL3 += dl * w; aR3 += dr * w;
+      );
+      ph -= 1;
+      fin ? ph = 0;
+    );
+    oL += held * gl; oR += held * gr;
+    fin || (eg < 0.0001 && st != 1) ? ( held = 0; fin = 0; pnd ? this.ch_go() : act = 0; );
+  );
+);
+function ch_reset(c) instance(ci, act, held, pnd, fin) ( ci = c; act = 0; held = 0; pnd = 0; fin = 0; );
+c0.ch_reset(0); c1.ch_reset(1); c2.ch_reset(2); c3.ch_reset(3); c4.ch_reset(4); c5.ch_reset(5);
+c6.ch_reset(6); c7.ch_reset(7); c8.ch_reset(8); c9.ch_reset(9); c10.ch_reset(10); c11.ch_reset(11);
+aL0 = aL1 = aL2 = aL3 = aR0 = aR1 = aR2 = aR3 = 0; fzL1 = fzL2 = fzR1 = fzR2 = 0;
+function trig(c, vel) (
+  c < 6 ? (
+    c == 0 ? c0.ch_trig(vel) : c == 1 ? c1.ch_trig(vel) : c == 2 ? c2.ch_trig(vel) :
+    c == 3 ? c3.ch_trig(vel) : c == 4 ? c4.ch_trig(vel) : c5.ch_trig(vel);
+  ) : (
+    c == 6 ? c6.ch_trig(vel) : c == 7 ? c7.ch_trig(vel) : c == 8 ? c8.ch_trig(vel) :
+    c == 9 ? c9.ch_trig(vel) : c == 10 ? c10.ch_trig(vel) : c11.ch_trig(vel);
+  );
+);
+
+// ---------- parameters ----------
+function update() (
+  vol_t = 10 ^ (slider1 / 20); chan = slider2; velsens = slider3 / 100;
+  // the output (anti-image) filter: 4 poles in two sections (Q 0.54 and 1.35, at 0.9 x DAC FILTER: about -3 dB there) -
+  // a slight lift an octave under the corner, then the droop and 24 dB/oct
+  dac_g = tan($pi * min(slider4 * 0.9, srate * 0.45) / srate);
+  dac_a1 = 1 / (1 + dac_g * (dac_g + 1 / 0.54)); dac_a2 = dac_g * dac_a1; dac_a3 = dac_g * dac_a2;
+  dac_b1 = 1 / (1 + dac_g * (dac_g + 1 / 1.35)); dac_b2 = dac_g * dac_b1; dac_b3 = dac_g * dac_b2;
+  // the BLEP kernel's top roll-off (sinc^4 at the host rate) undone by a 3-tap FIR, exact at 10 kHz
+  fc_x = 10000 / srate; fc_k = (sin($pi * fc_x) / ($pi * fc_x)) ^ 4;
+  fca = (1 / fc_k - 1) / (2 * (1 - cos(2 * $pi * fc_x))); fcc = 1 + 2 * fca;
+  era = slider28; drift_macro(slider29);
+  chk_c = exp(-1 / (0.001 * srate));
+  sq_play = slider24; sq_swing = slider25 / 100 * 0.5;
+  ins_output_setup(5); ins_stereo_setup(11);   // output stage: CLIP, always on
+);
+// the EDIT sliders <-> the selected pad (the panel calls these)
+function ed_to_sliders() local(b) (
+  b = CHP + sel * 16;
+  slider13 = b[0]; slider14 = b[1]; slider15 = b[2]; slider16 = b[3]; slider17 = b[4]; slider18 = b[5];
+  slider19 = b[6]; slider20 = b[7]; slider21 = b[8]; slider22 = b[9]; slider23 = b[10];
+);
+function sliders_to_ed() local(b) (
+  b = CHP + sel * 16;
+  b[0] = slider13; b[1] = slider14; b[2] = slider15; b[3] = slider16; b[4] = slider17; b[5] = slider18;
+  b[6] = slider19; b[7] = slider20; b[8] = slider21; b[9] = slider22; b[10] = slider23;
+);
+
+// ---------- factory patterns (rows follow the TIGHT FUNK kit: BD, SD TIGHT, SD 1, RIM, CLAP, TOM 1-3, HH C, HH O,
+// HH PEDAL, COWBELL; X accent, x hit, . rest) ----------
+function prow(p, r, str) local(i, c) (
+  i = 0; loop(16, c = str_getchar(str, i); PAT[p * 192 + r * 16 + i] = c == 'X' ? 2 : c == 'x' ? 1 : 0; i += 1; );
+);
+function factory_patterns() (
+  memset(PAT, 0, 8 * 192);
+  // A  80s ROCK
+  prow(0, 0, "X.......X.x....."); prow(0, 2, "....X.......X..."); prow(0, 8, "x.x.x.x.x.x.x.x."); prow(0, 10, "X...............");
+  // B  FUNK
+  prow(1, 0, "X..x..x...X..x.."); prow(1, 1, "....X..x.x..X..."); prow(1, 8, "xxXxxxXxxxXxxxXx"); prow(1, 9, "..............x.");
+  // C  ELECTRO
+  prow(2, 0, "X.....X...X....."); prow(2, 4, "....X.......X..."); prow(2, 8, "x.x.x.x.x.x.x.x."); prow(2, 11, "..x..x....x..x..");
+  // D  DISCO
+  prow(3, 0, "X...X...X...X..."); prow(3, 1, "....X.......X..."); prow(3, 8, "x...x...x...x..."); prow(3, 9, "..X...X...X...X.");
+  // E  GATED BALLAD
+  prow(4, 0, "X.......x.X....."); prow(4, 2, "....X.......X..."); prow(4, 8, "x.x.x.x.x.x.x.x."); prow(4, 3, "..............x.");
+  // F  TOM FILL
+  prow(5, 0, "X..............."); prow(5, 5, "X.x.x..........."); prow(5, 6, "......X.x.x....."); prow(5, 7, "............X.XX"); prow(5, 10, "X...............");
+  // G  CLAPS + COWBELL
+  prow(6, 0, "X...X...X...X..."); prow(6, 4, "....X.......X..x"); prow(6, 11, "x.xx.x.xx.xx.x.x"); prow(6, 8, "..x...x...x...x.");
+  // H  (empty)
+);
+function pat_name(p) (
+  p == 0 ? "80S ROCK" : p == 1 ? "FUNK" : p == 2 ? "ELECTRO" : p == 3 ? "DISCO" : p == 4 ? "GATED BALLAD" : p == 5 ? "TOM FILL" : p == 6 ? "CLAPS + BELL" : "USER";
+);
+// export: gmem[1] bars, [2] steps (16), [3] swing, [4] pending, [5] rows (12), [10 + row * 16 + step] steps,
+// [300 + row] each pad's MIDI note
+function export_midi() local(i) (
+  i = 0; loop(192, gmem[10 + i] = PAT[cur_pat * 192 + i]; i += 1; );
+  i = 0; loop(NCH, gmem[300 + i] = CHP[i * 16 + 10]; i += 1; );
+  gmem[1] = slider27 == 0 ? 1 : slider27 == 1 ? 2 : slider27 == 2 ? 4 : 8;
+  gmem[2] = 16; gmem[3] = sq_swing; gmem[5] = NCH; gmem[0] += 1; gmem[4] = 1;
+  exp_t = time_precise();
+);
+!init_done ? ( load_kit(0); sel = 0; factory_patterns(); init_done = 1; );
+lastkey = -1; cur_step = -1; cur_pat = slider26;
+sm = 1 - exp(-1 / (0.03 * srate));
+pkL = pkR = 0; dz1L = dz2L = dz1R = dz2R = 0; dw1L = dw2L = dw1R = dw2R = 0; xpL = xpR = 0;
+clL.clp_set(2, 1.6, 1.6, 0); clL.clp_knee(0.6); clR.clp_set(2, 1.6, 1.6, 0); clR.clp_knee(0.6);
+!ui_dflt ? ui_thm = 5; !ui_dflt ? ui_hw = 1; !ui_dflt ? ui_kstyle = 0;
+BLK = 0x16171A; SILK = 0xE6E8EC; CYAN = 0x5CC8E0; AMBR = 0xFFB040; REDL = 0xFF4A3A;
+SH1 = 0x1E2024; SH2 = 0x1B1D21;
+function mgroup(x, y, w, h, sec, title, shade) (
+  pk_inset(x * sc, y * sc, w * sc, h * sc, shade);
+  pk_box(x * sc, y * sc, w * sc, h * sc, ui_mix(CYAN, SILK, 0.35), title);
+  ui_section(sec == 0 ? 2 : sec); C_INK = SILK;
+);
+update();
+vol_s = vol_t;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update();
+
+@block
+update();
+// MIDI note -> pad (the first pad set to that note)
+gi_b = 0; loop(128, NMAP[gi_b] = -1; gi_b += 1; );
+gi_b = NCH - 1; loop(NCH, NMAP[CHP[gi_b * 16 + 10]] = gi_b; gi_b -= 1; );
+m_cnt = 0;
+while (midirecv(mofs, m1, m2, m3)) (
+  (m1 & 0xF0) == 0x90 && m3 > 0 && ins_chan_ok(m1, chan) && m_cnt < 256 ? (
+    MQO[m_cnt] = mofs; MQN[m_cnt] = m2; MQV[m_cnt] = m3 / 127; m_cnt += 1; ins_midi_hit();
+  );
+  midisend(mofs, m1, m2, m3);
+);
+m_idx = 0; spos = 0;
+// the master clock wanders very slightly (+-1.5 cents at the standard drift); sounding channels follow at once
+dr_n = 1.5 * dm_a * mdrift.drift_tick(samplesblock / srate / 25 * dm_s);
+dr_n != dr_c ? (
+  dr_r = 2 ^ ((dr_n - dr_c) / 1200); dr_c = dr_n;
+  c0.ch_drift(dr_r); c1.ch_drift(dr_r); c2.ch_drift(dr_r); c3.ch_drift(dr_r); c4.ch_drift(dr_r); c5.ch_drift(dr_r);
+  c6.ch_drift(dr_r); c7.ch_drift(dr_r); c8.ch_drift(dr_r); c9.ch_drift(dr_r); c10.ch_drift(dr_r); c11.ch_drift(dr_r);
+);
+// denormal housekeeping on the converter filters and the output stage
+abs(dz1L) < 0.0000000001 && abs(dz2L) < 0.0000000001 && abs(dw1L) < 0.0000000001 && abs(dw2L) < 0.0000000001 ? dz1L = dz2L = dw1L = dw2L = 0;
+abs(dz1R) < 0.0000000001 && abs(dz2R) < 0.0000000001 && abs(dw1R) < 0.0000000001 && abs(dw2R) < 0.0000000001 ? dz1R = dz2R = dw1R = dw2R = 0;
+aud > 0 ? ( trig(aud - 1, aud_vel); aud = 0; );                       // a pad clicked on the panel
+playing = (play_state & 1) && sq_play;
+bp0 = beat_position; bps = tempo / 60 / srate;
+!playing ? ( lastkey = -1; cur_step = -1; cur_pat = slider26; );        // stopped: a new pattern applies at once
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, cur_kit);
+file_var(0, sel);
+file_mem(0, CHP, NCH * 16);
+// (show_seq: the old fold-out flag, kept so saved projects still load)
+file_var(0, show_seq);
+file_mem(0, PAT, 8 * 192);
+ed_load = 1;
+
+@sample
+while (m_idx < m_cnt && (MQO[m_idx] <= spos || spos >= samplesblock - 1)) (   // (an event stamped at / past the block end: handled at its last sample)
+  NMAP[MQN[m_idx]] >= 0 ? trig(NMAP[MQN[m_idx]], MQV[m_idx]);
+  m_idx += 1;
+);
+// pattern sequencer, locked to the project's beat position (a new pattern takes over at the next bar)
+playing ? (
+  q_b = bp0 + spos * bps;
+  q_b >= 0 ? (
+    q_bar = floor(q_b / 4); q_s = (q_b - q_bar * 4) * 4; q_st = floor(q_s); q_fr = q_s - q_st;
+    q_eff = (q_st & 1) && q_fr < sq_swing ? q_st - 1 : q_st;
+    q_key = q_bar * 32 + q_eff;
+    q_key != lastkey ? (
+      q_eff == 0 ? cur_pat = slider26;
+      lastkey = q_key; cur_step = q_eff;
+      q_r = 0;
+      loop(NCH, q_v = PAT[cur_pat * 192 + q_r * 16 + q_eff]; q_v ? trig(q_r, q_v == 2 ? 1 : 0.7); q_r += 1; );
+    );
+  );
+);
+spos += 1;
+
+oL = 0; oR = 0;
+c0.ch_run(); c1.ch_run(); c2.ch_run(); c3.ch_run(); c4.ch_run(); c5.ch_run();
+c6.ch_run(); c7.ch_run(); c8.ch_run(); c9.ch_run(); c10.ch_run(); c11.ch_run();
+// the step buffers: emit the sample two back, add this sample's held values, move on
+dxL = aL0; aL0 = aL1; aL1 = aL2 + oL; aL2 = aL3; aL3 = 0;
+dxR = aR0; aR0 = aR1; aR1 = aR2 + oR; aR2 = aR3; aR3 = 0;
+// the kernel's roll-off undone (3-tap FIR), then the summing bus (a faint left / right crosstalk, -52 dB)
+oL = fcc * fzL1 - fca * (dxL + fzL2); fzL2 = fzL1; fzL1 = dxL;
+oR = fcc * fzR1 - fca * (dxR + fzR2); fzR2 = fzR1; fzR1 = dxR;
+dxL = oL + 0.0025 * oR; oR += 0.0025 * oL; oL = dxL;
+// the converter's 4-pole output filter
+dv3 = oL - dz2L; dv1 = dac_a1 * dz1L + dac_a2 * dv3; dv2 = dz2L + dac_a2 * dz1L + dac_a3 * dv3; dz1L = 2 * dv1 - dz1L; dz2L = 2 * dv2 - dz2L;
+dv3 = dv2 - dw2L; dv1 = dac_b1 * dw1L + dac_b2 * dv3; dv2 = dw2L + dac_b2 * dw1L + dac_b3 * dv3; dw1L = 2 * dv1 - dw1L; dw2L = 2 * dv2 - dw2L; oL = dv2;
+dv3 = oR - dz2R; dv1 = dac_a1 * dz1R + dac_a2 * dv3; dv2 = dz2R + dac_a2 * dz1R + dac_a3 * dv3; dz1R = 2 * dv1 - dz1R; dz2R = 2 * dv2 - dz2R;
+dv3 = dv2 - dw2R; dv1 = dac_b1 * dw1R + dac_b2 * dv3; dv2 = dw2R + dac_b2 * dw1R + dac_b3 * dv3; dw1R = 2 * dv1 - dw1R; dw2R = 2 * dv2 - dw2R; oR = dv2;
+// the analogue output stage: straight below 1.0, a soft knee above (ADAA on the clipped part only, house clipper)
+abs(oL) > 1 || abs(xpL) > 1 ? ( clL.x1 = xpL; clL.ad1 = clL.clp_ad(xpL); dxL = oL + clL.clp_run(oL) - 0.5 * (oL + xpL); xpL = oL; oL = dxL; ) : xpL = oL;
+abs(oR) > 1 || abs(xpR) > 1 ? ( clR.x1 = xpR; clR.ad1 = clR.clp_ad(xpR); dxR = oR + clR.clp_run(oR) - 0.5 * (oR + xpR); xpR = oR; oR = dxR; ) : xpR = oR;
+vol_s += (vol_t - vol_s) * sm;
+oL = ostL.ost_band(oL * 0.7) * vol_s;
+oR = ostR.ost_band(oR * 0.7) * vol_s;
+ins_stereo(oL, oR); ost_out(ins_sl, ins_sr);
+spl0 = ost_l;
+spl1 = ost_r;
+pkL = max(pkL, abs(spl0)); pkR = max(pkR, abs(spl1));
+
+@gfx 1180 588
+// ---------------------------------------------------------------------------------------------------------
+// PCM 12 panel: a mid-80s digital rhythm programmer. A silver plate under a black header band with a red stripe;
+// 12 square rubber pads (click to hear and select, the corner arrow picks the sound), a bank of 12 channel LEVEL
+// faders, VOICE EDIT for the selected pad, and below: PATTERN, the 16 STEP keys for the selected pad (with an LED
+// overview of all 12 rows above them) and MASTER. Its own look - not the Pulse family's voice matrix.
+// ---------------------------------------------------------------------------------------------------------
+fh = 582;
+ui_thm = 5; ui_hw = 1;
+ui_begin(1180, fh + 6);
+C_ACC = REDL; C_S0 = 0xE0603A; C_S2 = 0xF2B08A; C_KC = 0xF0F2F4;
+ed_load ? ( ed_to_sliders(); ed_load = 0; );
+gfx_setfont(4, "Trebuchet MS", 12 * sc, 'b');                   // the house small lettering, larger here
+gfx_setfont(2, "Trebuchet MS", 14 * sc, 'b');                   // the knobs' names, larger here
+gfx_setfont(11, "Trebuchet MS", 13 * sc, 'b');                  // the panel's lettering
+gfx_setfont(12, "Trebuchet MS", 14 * sc, 'b');                  // the section titles
+gfx_setfont(13, "Trebuchet MS", 14 * sc, 'b');                  // the keys
+PL1 = 0xC4C6C8; PL2 = 0x96999D; PINK = 0x141518; PDIM = 0x3E4146; RUB = 0x2B2C30; RUBH = 0x3A3B40; LEDR = 0xFF3B2A; LEDO = 0x3A1210;
+
+function pc_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function pc_txt(x, y, s, col) ( ui_col(col); gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function pc_ctxt(cx, y, s, col) local(tw, th) ( ui_col(col); gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = y * sc; gfx_drawstr(s); );
+function pc_led(cx, cy, r, on) (
+  ui_col(0x101112); gfx_circle(cx * sc, cy * sc, (r + 1.2) * sc, 1, 1);
+  ui_col(on ? LEDR : LEDO); gfx_circle(cx * sc, cy * sc, r * sc, 1, 1);
+  on ? ( ui_cola(LEDR, 0.25); gfx_circle(cx * sc, cy * sc, (r + 3) * sc, 1, 1); ui_cola(0xFFFFFF, 0.5); gfx_circle((cx - r * 0.3) * sc, (cy - r * 0.3) * sc, r * 0.35 * sc, 1, 1); );
+);
+// a membrane key: light grey, a coloured stripe; returns 1 on click
+function pc_key(x, y, w, h, lbl, on, stripe) local(hov, hit) (
+  hov = pc_in(x, y, w, h); hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  ui_cola(0x000000, 0.35); gfx_rect((x + 1) * sc, (y + 2) * sc, w * sc, h * sc);
+  ui_col(0x2A2B2E); gfx_rect(x * sc, y * sc, w * sc, h * sc);
+  ui_col(mdown && hov ? 0xBFC1C4 : hov ? 0xE4E6E8 : 0xD8DADD); gfx_rect((x + 1) * sc, (y + 1) * sc, (w - 2) * sc, (h - 2) * sc);
+  ui_col(stripe); gfx_rect((x + 1) * sc, (y + h - 5) * sc, (w - 2) * sc, 4 * sc);
+  gfx_setfont(13); pc_ctxt(x + w * 0.5, y + (h - 5) * 0.5 - 7, lbl, PINK);
+  on >= 0 ? pc_led(x + w - 7, y + 7, 2.6, on);
+  hit;
+);
+// a channel fader: 0 .. 100 at p; returns 1 when moved
+function pc_fader(x, y, h, p, did) local(v, n, ch, cy, hov) (
+  v = p[0]; ch = 0;
+  ui_col(0x16171A); gfx_rect((x + 9) * sc, y * sc, 4 * sc, h * sc);
+  ui_cola(0xFFFFFF, 0.25); gfx_rect((x + 13) * sc, y * sc, 1 * sc, h * sc);
+  n = 0; loop(11, ui_col(PDIM); gfx_rect((x + 1) * sc, (y + n / 10 * h) * sc, (n % 5 == 0 ? 6 : 4) * sc, 1 * sc); n += 1; );
+  cy = y + (1 - v / 100) * h;
+  hov = pc_in(x, cy - 9, 22, 18);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - pcf_lt < 0.35 && pcf_lid == did ? ( p[0] = 80; ch = 1; drag_id = -1; pcf_lt = 0; ) :
+    ( drag_id = did; pcf_y = mouse_y; pcf_v = v; pcf_lt = time_precise(); pcf_lid = did; );
+  );
+  drag_id == did ? ( p[0] = min(max(pcf_v + (pcf_y - mouse_y) / (h * sc) * 100 * ((mouse_cap & 8) ? 0.2 : 1), 0), 100); ch = 1; );
+  cy = y + (1 - p[0] / 100) * h;
+  ui_cola(0x000000, 0.4); gfx_rect((x + 1) * sc, (cy - 7) * sc, 22 * sc, 16 * sc);
+  ui_col(0x1A1B1E); gfx_rect(x * sc, (cy - 8) * sc, 22 * sc, 16 * sc);
+  ui_col(hov || drag_id == did ? 0x4A4C51 : 0x3A3C40); gfx_rect((x + 1) * sc, (cy - 7) * sc, 20 * sc, 14 * sc);
+  ui_col(0xE8EAEC); gfx_rect((x + 2) * sc, cy * sc, 18 * sc, 1.5 * sc);
+  ch;
+);
+
+// ---------- the plate and the header band ----------
+ui_col(0x090A0B); gfx_rect(0, 0, gfx_w, gfx_h);
+pk_chassis(8 * sc, 8 * sc, 1164 * sc, fh * sc, PL2);
+gfx_gradrect(10 * sc, 76 * sc, 1160 * sc, (fh - 70) * sc, 0.68, 0.69, 0.70, 1, 0, 0, 0, 0, -0.14 / ((fh - 70) * sc), -0.14 / ((fh - 70) * sc), -0.13 / ((fh - 70) * sc), 0);
+gi = 0; loop(90, ui_cola(gi % 2 ? 0xFFFFFF : 0x000000, 0.025); gfx_rect(10 * sc, (78 + gi * 5.6) * sc, 1160 * sc, 1 * sc); gi += 1; );   // brushed
+ui_col(0x18191C); gfx_rect(10 * sc, 10 * sc, 1160 * sc, 64 * sc);
+ui_col(LEDR); gfx_rect(10 * sc, 74 * sc, 1160 * sc, 3 * sc);
+ui_col(0xE8EAEC); gfx_circle(40 * sc, 40 * sc, 14 * sc, 1, 1);
+gfx_setfont(4); ui_col(0x18191C); ui_text(40 * sc, 35 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 30 * sc, 'bi'); ui_col(0xF2F3F4); gfx_x = 64 * sc; gfx_y = 22 * sc; gfx_drawstr("PCM 12");
+gfx_measurestr("PCM 12", gtw, gth);
+gfx_setfont(4); ui_col(0xA8ABAF); gfx_x = 64 * sc + gtw + 12 * sc; gfx_y = 27 * sc; gfx_drawstr("DIGITAL RHYTHM PROGRAMMER");
+ui_col(LEDR); gfx_x = 64 * sc + gtw + 12 * sc; gfx_y = 41 * sc; gfx_drawstr("12-BIT PCM  -  24 SOUNDS");
+
+// LCD (cool backlight): the selected pad and the pattern
+ui_col(0x0A0B0C); ui_rrect(420 * sc, 16 * sc, 330 * sc, 48 * sc, 4 * sc);
+gfx_gradrect(425 * sc, 20 * sc, 320 * sc, 40 * sc, 0.50, 0.80, 0.78, 1, 0, 0, 0, 0, -0.12 / (40 * sc), -0.14 / (40 * sc), -0.14 / (40 * sc), 0);
+gb = CHP + sel * 16;
+pk_lcdfont(7, 13 * sc); ui_col(0x0C2228);
+sprintf(#l1, "PAD %02d %-10s KIT %s", sel + 1, snd_name(gb[0]), kit_name(cur_kit)); gfx_x = 432 * sc; gfx_y = 23 * sc; gfx_drawstr(#l1);
+pk_lcdfont(8, 10 * sc);
+gpl = slider26;
+sprintf(#l2, "PAT %s %-12s %s", gpl == 0 ? "A" : gpl == 1 ? "B" : gpl == 2 ? "C" : gpl == 3 ? "D" : gpl == 4 ? "E" : gpl == 5 ? "F" : gpl == 6 ? "G" : "H", pat_name(gpl),
+  playing ? "PLAYING" : slider24 ? "WAITING FOR PLAY" : "SEQ OFF");
+cur_step >= 0 && playing ? sprintf(#l2, "PAT %s  STEP %02d  BAR -  %.1f BPM", gpl == 0 ? "A" : gpl == 1 ? "B" : gpl == 2 ? "C" : gpl == 3 ? "D" : gpl == 4 ? "E" : gpl == 5 ? "F" : gpl == 6 ? "G" : "H", cur_step + 1, tempo);
+gfx_x = 432 * sc; gfx_y = 43 * sc; gfx_drawstr(#l2);
+function kit_menu(x, y) local(i, k) (
+  #km = ""; i = 0; loop(NKIT, cur_kit == i ? strcat(#km, "!"); strcat(#km, kit_name(i)); i < NKIT - 1 ? strcat(#km, "|"); i += 1; );
+  gfx_x = x; gfx_y = y; k = gfx_showmenu(#km); k > 0 ? load_kit(k - 1);
+);
+pc_key(766, 24, 92, 32, "KITS", -1, LEDR) ? kit_menu(766 * sc, 56 * sc);
+pc_key(1030, 24, 112, 32, slider28 ? "8-BIT COMP" : "12-BIT LIN", -1, 0x5A5D62) ? (
+  gfx_x = 1030 * sc; gfx_y = 56 * sc;
+  gsel = gfx_showmenu(slider28 ? "DAC: 12-bit linear|!DAC: 8-bit companded" : "!DAC: 12-bit linear|DAC: 8-bit companded");
+  gsel > 0 ? ( slider28 = gsel - 1; slider_automate(2 ^ 27); );
+);
+pc_led(882, 40, 3.2, ins_midi_lit());
+gfx_setfont(4); ui_col(0xC8CACC); gfx_x = 890 * sc; gfx_y = 35 * sc; gfx_drawstr("MIDI");
+ui_size_picker(960 * sc, 30 * sc);
+
+// ---------- PADS: 4 x 3 rubber pads ----------
+function pc_panel(x, y, w, h, title) (
+  ui_cola(0x000000, 0.18); gfx_rect((x + 1) * sc, (y + 2) * sc, w * sc, h * sc);
+  ui_col(0x74777B); gfx_rect(x * sc, y * sc, w * sc, h * sc);
+  ui_col(0xA6A9AD); gfx_rect((x + 1) * sc, (y + 1) * sc, (w - 2) * sc, (h - 2) * sc);
+  gfx_setfont(12); pc_txt(x + 10, y + 5, title, PINK);
+  ui_col(LEDR); gfx_rect((x + 10) * sc, (y + 22) * sc, 28 * sc, 2 * sc);
+);
+pc_panel(24, 88, 404, 320, "PADS");
+gr = 0;
+loop(NCH,
+  gx = 34 + (gr % 4) * 98; gy = 112 + floor(gr / 4) * 93; gb = CHP + gr * 16;
+  ghv = pc_in(gx, gy, 88, 86);
+  // the arrow (the sound) in the pad's top right corner
+  garr = pc_in(gx + 64, gy, 24, 20);
+  ui_cola(0x000000, 0.45); gfx_rect((gx + 2) * sc, (gy + 3) * sc, 88 * sc, 86 * sc);
+  ui_col(0x141517); ui_rrect(gx * sc, gy * sc, 88 * sc, 86 * sc, 6 * sc);
+  ui_col(ghv && !garr ? (mdown ? 0x26272B : RUBH) : RUB); ui_rrect((gx + 2) * sc, (gy + 2) * sc, 84 * sc, 82 * sc, 5 * sc);
+  ui_cola(0xFFFFFF, 0.05); ui_rrect((gx + 4) * sc, (gy + 4) * sc, 80 * sc, 36 * sc, 4 * sc);
+  lt[gr] > 0.05 ? ( ui_cola(LEDR, 0.35 * lt[gr]); ui_rrect((gx + 2) * sc, (gy + 2) * sc, 84 * sc, 82 * sc, 5 * sc); );
+  sel == gr ? ( ui_col(LEDR); gfx_rect((gx + 2) * sc, (gy + 82) * sc, 84 * sc, 2 * sc); );
+  gfx_setfont(6, "Trebuchet MS", 22 * sc, 'b'); sprintf(#pn, "%d", gr + 1); pc_txt(gx + 9, gy + 6, #pn, 0xE8EAEC);
+  gfx_setfont(11); pc_txt(gx + 9, gy + 50, snd_name(gb[0]), 0xE8EAEC);
+  sprintf(#ps, "NOTE %d", gb[10]); pc_txt(gx + 9, gy + 66, #ps, 0x9A9DA2);
+  ui_col(garr ? 0x55585E : 0x3E4045); gfx_rect((gx + 66) * sc, (gy + 6) * sc, 16 * sc, 12 * sc);
+  ui_col(0xE8EAEC); gfx_triangle((gx + 70) * sc, (gy + 10) * sc, (gx + 78) * sc, (gy + 10) * sc, (gx + 74) * sc, (gy + 15) * sc);
+  pc_led(gx + 76, gy + 38, 3, sel == gr || lt[gr] > 0.3);
+  pressed && drag_id == 0 && garr ? (
+    drag_id = -1; #sm = ""; gi = 0; loop(NSND, gb[0] == gi ? strcat(#sm, "!"); strcat(#sm, snd_name(gi)); gi < NSND - 1 ? strcat(#sm, "|"); gi += 1; );
+    gfx_x = (gx + 66) * sc; gfx_y = (gy + 18) * sc; gsel = gfx_showmenu(#sm);
+    gsel > 0 ? ( gb[0] = gsel - 1; gr == sel ? ed_load = 1; aud = gr + 1; aud_vel = 0.9; );
+  ) : pressed && drag_id == 0 && ghv ? (
+    drag_id = -1; aud = gr + 1; aud_vel = 0.9; sel != gr ? ( sel = gr; ed_load = 1; );
+  );
+  lt[gr] *= 0.85;
+  gr += 1;
+);
+gfx_setfont(11); pc_ctxt(226, 391, "CLICK: HEAR AND EDIT   -   ARROW: THE SOUND", PDIM);
+
+// ---------- LEVEL: 12 channel faders ----------
+pc_panel(436, 88, 316, 320, "LEVEL");
+gr = 0;
+loop(NCH,
+  gx = 446 + gr * 25.5; gb = CHP + gr * 16;
+  gfx_setfont(11); sprintf(#pn, "%d", gr + 1); pc_ctxt(gx + 11, 118, #pn, sel == gr ? LEDR : PINK);
+  pc_fader(gx, 140, 210, gb + 2, 950 + gr) ? ( gr == sel ? ed_load = 1; );
+  sprintf(#pn, "%.0f", gb[2]); pc_ctxt(gx + 11, 360, #pn, PDIM);
+  pc_in(gx, 112, 22, 18) && pressed && drag_id == 0 ? ( drag_id = -1; sel != gr ? ( sel = gr; ed_load = 1; ); );
+  gr += 1;
+);
+gfx_setfont(11); pc_ctxt(594, 380, "DOUBLE-CLICK A CAP FOR 80", PDIM);
+
+// ---------- VOICE EDIT: the selected pad ----------
+sprintf(#vt, "VOICE EDIT  -  PAD %d", sel + 1);
+pc_panel(760, 88, 396, 320, #vt);
+C_INK = PINK;
+pc_key(776, 118, 170, 34, snd_name(slider13), -1, LEDR) ? (
+  #sm = ""; gi = 0; loop(NSND, slider13 == gi ? strcat(#sm, "!"); strcat(#sm, snd_name(gi)); gi < NSND - 1 ? strcat(#sm, "|"); gi += 1; );
+  gfx_x = 776 * sc; gfx_y = 152 * sc; gsel = gfx_showmenu(#sm);
+  gsel > 0 ? ( slider13 = gsel - 1; slider_automate(2 ^ 12); sliders_to_ed(); aud = sel + 1; aud_vel = 0.9; );
+);
+gfx_setfont(11); pc_txt(778, 156, "SOUND", PDIM);
+pc_key(1056, 118, 88, 34, "REVERSE", slider22 >= 0.5, 0x5A5D62) ? ( slider22 = 1 - slider22; slider_automate(2 ^ 21); );
+ui_section(3); C_INK = PINK; knob_step = 1; ui_kmini = 0;
+ui_knob(1000 * sc, 136 * sc, 23, 24, 96, 36, 0, "NOTE", "%.0f"); knob_step = 0;
+ui_section(1); C_INK = PINK;
+ui_knob(806 * sc, 230 * sc, 14, -24, 24, 0, 0, "PITCH", "%+.1f st");
+ui_knob(898 * sc, 230 * sc, 16, -100, 100, 0, 0, "PAN", "%+.0f");
+ui_knob(990 * sc, 230 * sc, 21, -100, 100, 0, 0, "BEND", slider21 == 0 ? "OFF" : slider21 < 0 ? "DOWN %.0f" : "UP %.0f");
+ui_knob(1082 * sc, 230 * sc, 15, 0, 100, 80, 0, "LEVEL", "%.0f");
+ui_section(2); C_INK = PINK;
+ui_knob(806 * sc, 330 * sc, 17, 0, 200, 0, 0, "ATTACK", "%.1f ms");
+ui_knob(898 * sc, 330 * sc, 18, 10, 4000, 4000, 1, "DECAY 1", slider18 >= 4000 ? "FULL" : "%.0f ms");
+ui_knob(990 * sc, 330 * sc, 19, 0, 100, 100, 0, "D.POINT", "%.0f%%");
+ui_knob(1082 * sc, 330 * sc, 20, 10, 4000, 4000, 1, "DECAY 2", slider20 >= 4000 ? "FULL" : "%.0f ms");
+gfx_setfont(11); pc_ctxt(944, 284, "ENVELOPE", PDIM); ui_col(PDIM); gfx_rect(776 * sc, 289 * sc, 132 * sc, 1 * sc); gfx_rect(980 * sc, 289 * sc, 164 * sc, 1 * sc);
+!ed_load ? sliders_to_ed();
+
+// ---------- PATTERN ----------
+pc_panel(24, 418, 286, 158, "PATTERN");
+pc_key(36, 438, 58, 74, "PLAY", slider24 >= 0.5, LEDR) ? ( slider24 = 1 - slider24; slider_automate(2 ^ 23); );
+gi = 0;
+loop(8,
+  // the pattern playing is lit; the next one (chosen while playing) flashes until it takes over at the bar
+  gq = playing && slider26 == gi && cur_pat != gi; gblink = (time_precise() * 4 % 2) < 1;
+  pc_key(104 + (gi % 4) * 50, 438 + floor(gi / 4) * 40, 44, 34, gi == 0 ? "A" : gi == 1 ? "B" : gi == 2 ? "C" : gi == 3 ? "D" : gi == 4 ? "E" : gi == 5 ? "F" : gi == 6 ? "G" : "H",
+    gq ? gblink : (playing ? cur_pat == gi : slider26 == gi), 0x5A5D62) ? ( slider26 = gi; slider_automate(2 ^ 25); );
+  gi += 1;
+);
+ui_section(1); C_INK = PINK;
+ui_kmini = 1; ui_knob(104 * sc, 529 * sc, 25, 0, 75, 0, 0, "", "%.0f%%"); ui_kmini = 0;
+gfx_setfont(11); pc_txt(36, 522, "SWING", PINK); pc_txt(134, 522, "BARS", PINK);
+pc_key(36, 546, 82, 26, "COPY TO", -1, 0x5A5D62) ? (
+  gfx_x = 36 * sc; gfx_y = 568 * sc; gsel = gfx_showmenu("A|B|C|D|E|F|G|H");
+  gsel > 0 ? ( gi = 0; loop(192, PAT[(gsel - 1) * 192 + gi] = PAT[slider26 * 192 + gi]; gi += 1; ); );
+);
+pc_key(122, 546, 70, 26, "CLEAR", -1, 0x5A5D62) ? memset(PAT + slider26 * 192, 0, 192);
+gi = 0;
+loop(4,
+  pc_key(176 + gi * 32, 516, 28, 24, gi == 0 ? "1" : gi == 1 ? "2" : gi == 2 ? "4" : "8", -1, slider27 == gi ? LEDR : 0x9A9DA1) ? ( slider27 = gi; slider_automate(2 ^ 26); );
+  gi += 1;
+);
+pc_key(196, 546, 108, 26, gmem[4] && time_precise() - exp_t > 1.5 && exp_t > 0 ? "RUN SCRIPT" : "EXPORT", time_precise() - exp_t < 0.6, LEDR) ? export_midi();
+
+// ---------- STEPS: the selected pad's 16 steps, the 12-row overview above ----------
+sprintf(#vt, "STEPS  -  PAD %d  %s", sel + 1, snd_name(slider13));
+pc_panel(318, 418, 640, 158, #vt);
+gpp = slider26 * 192;
+function pc_sx(s) ( 330 + s * 38.6 + floor(s / 4) * 3; );
+// overview: 12 rows x 16 LEDs (click a row to select its pad; the selected pad's row highlighted)
+ui_col(0x16171A); gfx_rect(328 * sc, 442 * sc, 622 * sc, 62 * sc);
+gr = 0;
+loop(NCH,
+  gy = 445 + gr * 4.9;
+  sel == gr ? ( ui_cola(LEDR, 0.25); gfx_rect(329 * sc, (gy - 0.5) * sc, 620 * sc, 4.9 * sc); );
+  gs = 0;
+  loop(16,
+    gv = PAT[gpp + gr * 16 + gs]; gx = pc_sx(gs);
+    ui_col(gv == 2 ? 0xFFD0C0 : gv == 1 ? LEDR : (cur_step == gs && playing ? 0x3A3C40 : 0x242528)); gfx_rect((gx + 2) * sc, gy * sc, 32 * sc, 3.6 * sc);
+    pressed && drag_id == 0 && mouse_x >= gx * sc && mouse_x < (gx + 36) * sc && mouse_y >= (gy - 0.5) * sc && mouse_y < (gy + 4.4) * sc ? (
+      drag_id = -1; sel != gr ? ( sel = gr; ed_load = 1; ); );
+    gs += 1;
+  );
+  gr += 1;
+);
+// the 16 step keys (click: off > hit > accent); the running light under them
+gs = 0;
+loop(16,
+  gx = pc_sx(gs); gv = PAT[gpp + sel * 16 + gs];
+  gsx = pc_key(gx, 516, 35, 34, "", -1, floor(gs / 4) % 2 ? 0x9A9DA1 : 0x6C6F74);
+  gsx ? PAT[gpp + sel * 16 + gs] = (gv + 1) % 3;
+  pc_led(gx + 11, 528, 3.4, gv >= 1); pc_led(gx + 24, 528, 3.4, gv == 2);
+  ui_col(cur_step == gs && cur_pat == slider26 && playing ? 0x6CFF6C : 0x2A3A2A); gfx_rect((gx + 4) * sc, 556 * sc, 27 * sc, 3 * sc);
+  gfx_setfont(11); sprintf(#sn, "%d", gs + 1); pc_ctxt(gx + 17, 560, #sn, gs % 4 == 0 ? PINK : PDIM);
+  gs += 1;
+);
+
+// ---------- MASTER ----------
+pc_panel(966, 418, 190, 158, "MASTER");
+ui_section(2); C_INK = PINK;
+ui_kmini = 1;
+ui_knob(996 * sc, 466 * sc, 1, -24, 12, 0, 0, "VOLUME", "%.1f dB");
+ui_knob(1048 * sc, 466 * sc, 3, 0, 100, 60, 0, "VELO", "%.0f%%");
+ui_section(1); C_INK = PINK;
+ui_knob(996 * sc, 528 * sc, 4, 4000, 20000, 14000, 1, "DAC", "%.0f Hz");
+ui_section(3); C_INK = PINK; knob_step = 1;
+ui_knob(1048 * sc, 528 * sc, 2, 0, 16, 0, 0, "CH", slider2 == 0 ? "OMNI" : "CH %.0f"); knob_step = 0;
+ui_kmini = 0;
+gfx_setfont(11); pc_ctxt(996, 486, "VOL", PINK); pc_ctxt(1048, 486, "VELO", PINK); pc_ctxt(996, 546, "DAC", PINK); pc_ctxt(1048, 546, "CH", PINK);
+ui_col(0x16171A); gfx_rect(1084 * sc, 444 * sc, 62 * sc, 122 * sc);
+mL.ui_ledm(1092 * sc, 450 * sc, 20 * sc, 108 * sc, pkL);
+mR.ui_ledm(1118 * sc, 450 * sc, 20 * sc, 108 * sc, pkR);
+pkL *= 0.85; pkR *= 0.85;
+
+pk_end();
+ui_end();

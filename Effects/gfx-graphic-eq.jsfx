@@ -1,0 +1,376 @@
+desc:GFX Graphic EQ [31-band EQ]
+//tags: equalizer eq graphic 31-band third-octave analyser
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-dyn (.jsfx-inc) in the same folder.
+//
+// A 31-band third-octave graphic equaliser in the spirit of the classic studio and live-sound rack graphics
+// (personal use; the sound is designed from scratch), with a real-time analyser behind the faders.
+//   FADERS   - one per ISO third-octave band, 20 Hz - 20 kHz. Drag a fader cap to move it; click or drag anywhere
+//              else in the fader area to draw a curve across the bands. Double-click a cap to centre it; the mouse
+//              wheel nudges the band under the pointer.
+//   RANGE    - +-6 dB (fine) or +-12 dB across the fader travel.
+//   Q        - PROP (proportional: the bands are broad for small moves and tighten as you push them, smooth for
+//              tone shaping) or CONST (constant: every band keeps its third-octave width, precise for notching).
+//   LOW CUT / HIGH CUT - 18 dB/oct high-pass and 12 dB/oct low-pass (fully left / right = off).
+//   The bands are matched: their overlap is corrected, so the response follows the faders.
+//   Theme picker and HW / flat switch in the header.
+//   OUTPUT   - level after the EQ. FLAT centres every fader. IN switches the EQ (and filters) in or out.
+// The analyser shows the output level of each band; the yellow line is the EQ's response.
+// PRESETS, and IN / OUT (bottom row): TRIM with the GUARD key and SAT.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:0<-12,12,0.1>-20 Hz
+slider2:0<-12,12,0.1>-25 Hz
+slider3:0<-12,12,0.1>-31.5 Hz
+slider4:0<-12,12,0.1>-40 Hz
+slider5:0<-12,12,0.1>-50 Hz
+slider6:0<-12,12,0.1>-63 Hz
+slider7:0<-12,12,0.1>-80 Hz
+slider8:0<-12,12,0.1>-100 Hz
+slider9:0<-12,12,0.1>-125 Hz
+slider10:0<-12,12,0.1>-160 Hz
+slider11:0<-12,12,0.1>-200 Hz
+slider12:0<-12,12,0.1>-250 Hz
+slider13:0<-12,12,0.1>-315 Hz
+slider14:0<-12,12,0.1>-400 Hz
+slider15:0<-12,12,0.1>-500 Hz
+slider16:0<-12,12,0.1>-630 Hz
+slider17:0<-12,12,0.1>-800 Hz
+slider18:0<-12,12,0.1>-1 kHz
+slider19:0<-12,12,0.1>-1.25 kHz
+slider20:0<-12,12,0.1>-1.6 kHz
+slider21:0<-12,12,0.1>-2 kHz
+slider22:0<-12,12,0.1>-2.5 kHz
+slider23:0<-12,12,0.1>-3.15 kHz
+slider24:0<-12,12,0.1>-4 kHz
+slider25:0<-12,12,0.1>-5 kHz
+slider26:0<-12,12,0.1>-6.3 kHz
+slider27:0<-12,12,0.1>-8 kHz
+slider28:0<-12,12,0.1>-10 kHz
+slider29:0<-12,12,0.1>-12.5 kHz
+slider30:0<-12,12,0.1>-16 kHz
+slider31:0<-12,12,0.1>-20 kHz
+slider32:1<0,1,1{+-6 dB,+-12 dB}>-Range
+slider33:0<0,1,1{Proportional,Constant}>-Q
+slider34:20<20,250,1>-Low cut (Hz, 20 = off)
+slider35:22000<3000,22000,10>-High cut (Hz, 22000 = off)
+slider36:0<-12,12,0.1>-Output (dB)
+slider37:1<0,1,1{Out,In}>-EQ in
+slider38:0<-24,12,0.1>-Input trim (dB)
+slider39:1<0,1,1{Off,On}>-Input guard
+slider40:0<0,100,1>-Band sat (%)
+slider41:30<0,100,1>-Bias (%)
+slider42:120<40,400,1>-Sat low band (Hz)
+slider43:6000<2000,16000,10>-Sat high band (Hz)
+slider44:-0.3<-24,0,0.1>-(unused, was output ceiling)
+slider45:1<0,1,1{Off,Clip}>-(unused, was output stage)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-graphic-eq";                               // the ? pop-up links to this manual
+
+NB = 31;
+FQ = 1000; CO = 1100; STL = 1300; STR = 1500; ACT = 1700; RSP = 1800; TG = 2100; GE = 2200; RS = 2300;
+SP_N = 4096; SP_RING = 40000; SP_FFT = 50000; SP_WIN = 60000; SP_B = 70000;   // analyser
+memset(1000, 0, 1400); last_cs = -1; NIT = 12; STP = 0.3;
+bi_ = 0; loop(NB, FQ[bi_] = 20 * 2 ^ (bi_ / 3); bi_ += 1; );                  // the band centres (nominal ISO labels below)
+bi_ = 0; loop(SP_N, SP_WIN[bi_] = 0.5 - 0.5 * cos(2 * $pi * bi_ / (SP_N - 1)); bi_ += 1; );
+memset(SP_B, -100, NB);
+sp_w = 0;
+
+// a peaking band's coefficients into CO[b * 5]
+function band_set(b, f, q, gdb) local(w0, cw, sw, al, A, n, c) (
+  w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); sw = sin(w0); al = sw / (2 * q); A = 10 ^ (gdb / 40);
+  n = 1 + al / A; c = CO + b * 5;
+  c[0] = (1 + al * A) / n; c[1] = -2 * cw / n; c[2] = (1 - al * A) / n; c[3] = c[1]; c[4] = (1 - al / A) / n;
+);
+function band_db(b, f) local(c, w, c1, c2, nu, de) (
+  c = CO + b * 5; w = 2 * $pi * f / srate; c1 = cos(w); c2 = cos(2 * w);
+  nu = c[0] * c[0] + c[1] * c[1] + c[2] * c[2] + 2 * (c[0] * c[1] + c[1] * c[2]) * c1 + 2 * c[0] * c[2] * c2;
+  de = 1 + c[3] * c[3] + c[4] * c[4] + 2 * (c[3] + c[3] * c[4]) * c1 + 2 * c[4] * c2;
+  10 * log10(max(nu, 0.000000000001) / max(de, 0.000000000001));
+);
+// the active bands, in series
+function bands(x, st) local(i, b, c, s, y) (
+  i = 0;
+  loop(nact,
+    b = ACT[i]; c = CO + b * 5; s = st + b * 4;
+    y = c[0] * x + c[1] * s[0] + c[2] * s[1] - c[3] * s[2] - c[4] * s[3];
+    s[1] = s[0]; s[0] = x; s[3] = s[2]; s[2] = y; x = y;
+    i += 1;
+  );
+  x;
+);
+function hp1(x) instance(x1, y1) ( y1 = hp1_a * (x - x1) + hp1_b * y1; x1 = x; y1; );
+
+// the bands overlap, so their responses add up; a few correction passes set each band's real gain so that the
+// response at every band centre matches its fader (the curve follows the faders)
+function solve() local(b, j, it, r, q) (
+  b = 0; loop(NB, TG[b] = slider(b + 1) * rng; GE[b] = TG[b]; b += 1; );
+  it = 0;
+  loop(NIT + 1,
+    b = 0; loop(NB, q = cq ? 4.32 : 1.1 + min(abs(TG[b]), 12) / 12 * 3.2; band_set(b, FQ[b], q, GE[b]); b += 1; );
+    it < NIT ? (
+      b = 0; loop(NB, r = 0; j = 0; loop(NB, r += band_db(j, FQ[b]); j += 1; ); RS[b] = r; b += 1; );
+      b = 0; loop(NB, GE[b] = min(max(GE[b] + (TG[b] - RS[b]) * STP, -24), 24); b += 1; );
+    );
+    it += 1;
+  );
+  nact = 0; b = 0;
+  loop(NB, abs(GE[b]) > 0.02 ? ( ACT[nact] = b; nact += 1; ) : ( memset(STL + b * 4, 0, 4); memset(STR + b * 4, 0, 4); ); b += 1; );
+);
+function update() local(b, k, cs) (
+  rng = slider32 ? 1 : 0.5; cq = slider33;
+  cs = 0; b = 1; loop(37, cs += slider(b) * (b * 7.31 + 1); b += 1; );
+  cs != last_cs ? ( last_cs = cs; solve(); redraw = 1; );
+  lc_on = slider34 > 20.5; hc_on = slider35 < 21990;
+  lc_on ? ( LC2L.bq_set(1, slider34, 1, 0); LC2R.bq_set(1, slider34, 1, 0);
+            k = tan($pi * min(slider34, srate * 0.45) / srate); hp1_a = 1 / (1 + k); hp1_b = (1 - k) / (1 + k); );
+  HCL.bq_set(0, ge_hcf, 0.707, 0); HCR.bq_set(0, ge_hcf, 0.707, 0);   // ge_hcf: glided in @sample
+  og = 10 ^ (slider36 / 20); eq_on = slider37;
+  in_setup(slider38, slider39);
+  ins_output_straight(40);   // output stage: straight through
+);
+
+// ---------- presets: curves drawn from simple shapes (leave INPUT and OUTPUT alone) ----------
+function shlo(b, f, g) ( g / (1 + (FQ[b] / f) ^ 2) );            // a gentle low shelf shape
+function shhi(b, f, g) ( g / (1 + (f / FQ[b]) ^ 2) );            // a gentle high shelf shape
+function bell(b, f, w, g) ( g * exp(-sqr(log(FQ[b] / f) / log(2) / w)) );   // w = width in octaves
+function load_preset(p) local(b, g) (
+  b = 0;
+  loop(NB,
+    g = p == 1 ? shlo(b, 90, 5) + shhi(b, 9000, 4) + bell(b, 500, 1.2, -1.5) :            // Smile
+        p == 2 ? bell(b, 3500, 0.9, 4) + bell(b, 250, 0.8, -2) + shhi(b, 12000, 2) :    // Vocal Presence
+        p == 3 ? bell(b, 300, 0.8, -5) + bell(b, 150, 0.6, -1) :                      // De-mud
+        p == 4 ? shhi(b, 10000, 6) :                                                    // Air
+        p == 5 ? (FQ[b] < 300 || FQ[b] > 3500 ? -12 : bell(b, 1300, 1, 4)) :          // Telephone
+        p == 6 ? shlo(b, 80, 7) + bell(b, 250, 0.6, -1.5) :                             // Bass Boost
+        p == 7 ? shlo(b, 60, 8) + shhi(b, 12000, 5) :                                     // Hi-Fi Loudness
+        p == 8 ? bell(b, 800, 1.6, -4) :                                              // Mid Scoop
+        p == 9 ? shlo(b, 120, 2) + bell(b, 2800, 1, -2.5) + shhi(b, 14000, -2) :          // Warm & Smooth
+        p == 10 ? bell(b, 2500, 0.5, -3) + bell(b, 4000, 0.4, -3) + bell(b, 250, 0.4, -2) : // Live Feedback Notches
+        0;
+    slider(b + 1) = min(max(floor(g * 10 + 0.5) / 10, -12), 12);
+    b += 1;
+  );
+  p >= 1 && p <= 11 ? (
+    slider32 = 1; slider33 = p == 10 ? 1 : 0; slider34 = p == 5 ? 250 : 20; slider35 = 22000; slider36 = 0; slider37 = 1;
+    slider_automate(137438953471);                   // sliders 1-37
+  );
+  p == 11 ? (                                        // Reset all to defaults
+    slider38 = 0; slider39 = 1; slider40 = 0; slider41 = 30; slider42 = 120; slider43 = 6000; slider44 = -0.3; slider45 = 1;
+    slider_automate(35184372088831);                 // sliders 1-45
+  );
+);
+
+in_init();
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+!ui_dflt ? ui_thm = 16; !ui_dflt ? ui_hw = 0;                            // new instances: Honey, flat (saved projects keep their own)
+PNL = 0x1B1C1F; PRT = 0xD9D6CC; ORNG = 0xFF8A2A; YLW = 0xF6D25A; SCRN = 0x0A0B0C;
+ge_hcf = min(slider35, srate * 0.45); ge_hck = 1 - exp(-16 / (0.02 * srate)); ge_hcn = 0;   // high cut glide (~20 ms)
+update();
+ge_hcw = hc_on; ge_hcxs = 1 / (0.02 * srate);   // high cut on / off fade: 20 ms
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update();
+
+@block
+update();
+
+@serialize
+file_var(0, ui_thm);
+file_var(0, ui_sz);
+file_var(0, ui_hw);
+file_avail(0) != 0 ? file_var(0, pr_cur);    // the preset in use (older projects end before it)
+
+@sample
+in_process(spl0, spl1);
+ge_hcw = hc_on ? min(ge_hcw + ge_hcxs, 1) : max(ge_hcw - ge_hcxs, 0);
+ge_hct = min(slider35, srate * 0.45);
+ge_hcf != ge_hct ? ( (ge_hcn += 1) >= 16 ? ( ge_hcn = 0; ge_hcf *= (ge_hct / ge_hcf) ^ ge_hck; abs(ge_hcf - ge_hct) < 0.0005 * ge_hct ? ge_hcf = ge_hct;
+  HCL.bq_set(0, ge_hcf, 0.707, 0); HCR.bq_set(0, ge_hcf, 0.707, 0); ); );
+xl = in_l; xr = in_r;
+eq_on ? (
+  lc_on ? ( xl = LCL.hp1(LC2L.bq_run(xl)); xr = LCR.hp1(LC2R.bq_run(xr)); );
+  nact > 0 ? ( xl = bands(xl, STL); xr = bands(xr, STR); );
+  ge_al = HCL.bq_run(xl); ge_ar = HCR.bq_run(xr);   // the high cut always runs (primed) and is faded in / out, never switched
+  ge_hcw >= 1 ? ( xl = ge_al; xr = ge_ar; ) : ge_hcw > 0 ? ( xl += (ge_al - xl) * ge_hcw; xr += (ge_ar - xr) * ge_hcw; );
+);
+xl *= og; xr *= og;
+oL = ostL.ost_band(xl * in_comp); oR = ostR.ost_band(xr * in_comp);
+ost_out(oL, oR);
+spl0 = ost_l; spl1 = ost_r;
+SP_RING[sp_w] = (spl0 + spl1) * 0.5; sp_w = (sp_w + 1) & (SP_N - 1);
+
+@gfx 1000 452
+ui_begin(1000, 452);
+// palette: Graphite keeps the house look; any other theme takes its colours (faceplate colours on the HW panel)
+ui_theme(ui_thm);
+ui_thm == 5 ? ( PNL = ui_hw ? 0x1B1C1F : 0x1E1F22; PRT = 0xD9D6CC; ORNG = 0xFF8A2A; YLW = 0xF6D25A; SCRN = 0x0A0B0C; C_ACC = ORNG; ) : (
+  PNL = ui_hw ? F_BG : C_BG; PRT = ui_hw ? F_INK : C_LABEL; ORNG = C_ACC; YLW = C_VA; SCRN = ui_hw ? 0x0A0B0C : C_HDR; );
+SLOT = ui_mix(PNL, 0x000000, 0.7);
+dy_ink = PRT; dy_bg = PNL; dy_kst = ui_hw ? 1 : 34; dy_nov = 1;
+// LED button on the HW panel, a theme button on the flat one
+function gbtn(x, y, on, led, s) local(h) (
+  ui_hw ? dy_btn(x, y, on, led, s) : (
+    h = ui_button(x * sc, (y + 2) * sc, 44 * sc, 22 * sc, s, on, 1); h; );
+);
+
+FX0 = 64; FW = 28.4; FY0 = 186; FY1 = 322;           // fader area: column centres FX0 + b * FW, travel FY0 .. FY1
+function bx(b) ( FX0 + b * FW );
+function fy(g) ( (FY0 + FY1) * 0.5 - g / 12 * (FY1 - FY0) * 0.5 );
+function txt(x, y, s, a) ( gfx_setfont(4); ui_cola(PRT, a); ui_text(x * sc, y * sc, s); );
+function flab(b) local(f) (
+  f = b == 2 ? 31.5 : b == 5 ? 63 : b == 12 ? 315 : b == 15 ? 630 : b == 18 ? 1250 : b == 22 ? 3150 : b == 25 ? 6300 : b == 28 ? 12500 : FQ[b];
+  b == 7 ? f = 100; b == 17 ? f = 1000; b == 27 ? f = 10000; b == 30 ? f = 20000; b == 10 ? f = 200; b == 20 ? f = 2000;
+  b == 1 ? f = 25; b == 3 ? f = 40; b == 4 ? f = 50; b == 6 ? f = 80; b == 8 ? f = 125; b == 9 ? f = 160; b == 11 ? f = 250;
+  b == 13 ? f = 400; b == 14 ? f = 500; b == 16 ? f = 800; b == 19 ? f = 1600; b == 21 ? f = 2500; b == 23 ? f = 4000; b == 24 ? f = 5000;
+  b == 26 ? f = 8000; b == 29 ? f = 16000; b == 0 ? f = 20;
+  f >= 1000 ? sprintf(#fl, "%gk", f / 1000) : sprintf(#fl, "%g", f);
+);
+function total(f) local(d, b, w) (
+  d = 0;
+  eq_on ? (
+    b = 0; loop(nact, d += band_db(ACT[b], f); b += 1; );
+    lc_on ? ( w = f / slider34; d += LC2L.bq_db(f) + 10 * log10(w * w / (1 + w * w)); );
+    hc_on ? d += HCL.bq_db(f);
+  );
+  d + slider36;
+);
+
+// ---------- panel ----------
+fh = 444;
+ui_col(0x0B0B0C); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_hw ? pk_chassis(8 * sc, 4 * sc, 984 * sc, fh * sc, PNL) : ( ui_col(PNL); gfx_rect(0, 0, gfx_w, gfx_h); );
+ui_col(ORNG); gfx_circle(38 * sc, 32 * sc, 13 * sc, 1, 1);
+gfx_setfont(4); ui_col(PNL); ui_text(38 * sc, 27 * sc, "GFX");
+gfx_setfont(6, "Arial", 24 * sc, 'b'); ui_col(PRT); gfx_x = 60 * sc; gfx_y = 18 * sc; gfx_drawstr("GRAPHIC EQ");
+gfx_setfont(4); ui_col(ORNG); gfx_x = 262 * sc; gfx_y = 28 * sc; gfx_drawstr("31-BAND  1/3 OCTAVE");
+pk_pextra = "Reset all to defaults";   // the house preset display: PRESETS, prev / next, LCD (click it for the list)
+k_ = pk_preset(636 * sc, 12 * sc, 296 * sc, 36 * sc, pr_cur, "Smile|Vocal Presence|De-mud|Air|Telephone|Bass Boost|Hi-Fi Loudness|Mid Scoop|Warm & Smooth|Live Feedback Notches");
+k_ > 0 ? ( load_preset(k_); pr_cur = k_ > 10 ? 0 : k_; );
+ui_theme_picker(566 * sc, 22 * sc);
+ui_hw_toggle(594 * sc, 23 * sc);
+ui_size_picker(940 * sc, 22 * sc);
+
+// ---------- analyser + response ----------
+ui_hw ? ( ui_col(0x050506); gfx_rect(18 * sc, 62 * sc, 964 * sc, 108 * sc); );
+ui_col(SCRN); gfx_rect(20 * sc, 64 * sc, 960 * sc, 104 * sc);
+gi = 0; gj = sp_w;
+loop(SP_N, SP_FFT[2 * gi] = SP_RING[gj] * SP_WIN[gi]; SP_FFT[2 * gi + 1] = 0; gj = (gj + 1) & (SP_N - 1); gi += 1; );
+fft(SP_FFT, SP_N); fft_permute(SP_FFT, SP_N);
+gb = 0;
+loop(NB,
+  ga_ = max(floor(FQ[gb] * 0.891 / srate * SP_N), 1); gc_ = max(floor(FQ[gb] * 1.122 / srate * SP_N), ga_);
+  gp_ = 0; gi = ga_; loop(gc_ - ga_ + 1, gp_ += sqr(SP_FFT[2 * gi]) + sqr(SP_FFT[2 * gi + 1]); gi += 1; );
+  gv_ = 10 * log10(max(gp_, 0.0000000000001)) + 20 * log10(4 / SP_N);
+  SP_B[gb] = max(gv_, SP_B[gb] - 1.5);
+  // LED column: 16 segments, -72 .. 0 dB
+  gi = 0; loop(16,
+    gd_ = -72 + gi * 4.5; gcol = gi >= 14 ? 0xFF3A2A : gi >= 11 ? 0xFFB030 : 0x58D46A;
+    ui_col(SP_B[gb] >= gd_ ? gcol : ui_mix(gcol, SCRN, 0.88));
+    gfx_rect((bx(gb) - 9) * sc, (162 - gi * 6) * sc, 18 * sc, 4.5 * sc);
+    gi += 1; );
+  gb += 1;
+);
+redraw ? ( gi = 0; loop(241, RSP[gi] = total(20 * 1000 ^ (gi / 240)); gi += 1; ); redraw = 0; );
+ui_cola(0xFFFFFF, 0.2); gfx_rect(20 * sc, 116 * sc, 960 * sc, 1 * sc);
+gi = 1; loop(240,
+  gxa = bx(0) + (gi - 1) / 240 * (bx(30) - bx(0)); gxb = bx(0) + gi / 240 * (bx(30) - bx(0));
+  gya = 116 - min(max(RSP[gi - 1], -15), 15) / 15 * 48; gyb = 116 - min(max(RSP[gi], -15), 15) / 15 * 48;
+  ui_cola(0x000000, 0.6); gfx_line(gxa * sc, (gya + 1.5) * sc, gxb * sc, (gyb + 1.5) * sc, 1);
+  ui_col(YLW); gfx_line(gxa * sc, gya * sc, gxb * sc, gyb * sc, 1); gfx_line(gxa * sc, (gya - 0.7) * sc, gxb * sc, (gyb - 0.7) * sc, 1);
+  gi += 1; );
+
+// ---------- faders ----------
+ui_cola(0x000000, ui_hw ? 0.35 : 0.12); gfx_rect(18 * sc, 174 * sc, 964 * sc, 172 * sc);
+// scale: left and right
+gi = 0; loop(5, gg_ = 12 - gi * 6; gyy = fy(gg_);
+  ui_cola(PRT, gg_ == 0 ? 0.45 : 0.18); gfx_rect(44 * sc, gyy * sc, 920 * sc, 1 * sc);
+  sprintf(#gl, gg_ > 0 ? "+%d" : "%d", gg_ * rng); txt(32, gyy - 5, #gl, 0.75); txt(972, gyy - 5, #gl, 0.75);
+  gi += 1; );
+// mouse: cap drag (relative), or draw across the bands
+gmx = mouse_x / sc; gmy = mouse_y / sc;
+ghb = floor((gmx - FX0) / FW + 0.5);
+gin = ghb >= 0 && ghb < NB && gmy > FY0 - 12 && gmy < FY1 + 12 && gmx > FX0 - FW * 0.5 && gmx < bx(30) + FW * 0.5;
+pressed && gin && drag_id == 0 ? (
+  abs(gmy - fy(slider(ghb + 1))) < 8 ? (
+    time_precise() - glt < 0.35 && glb == ghb ? ( slider(ghb + 1) = 0; ui_auto(ghb + 1); drag_id = -1; ) : (
+      drag_id = 2001; gdb = ghb; gy0 = gmy; gv0 = slider(ghb + 1); );
+    glt = time_precise(); glb = ghb;
+  ) : ( drag_id = 2002; glast = ghb; glasty = gmy; );
+);
+drag_id == 2001 ? (
+  gv_ = min(max(gv0 - (gmy - gy0) / ((FY1 - FY0) * 0.5) * 12 * ((mouse_cap & 8) ? 0.2 : 1), -12), 12);
+  gv_ = floor(gv_ * 10 + 0.5) / 10;
+  slider(gdb + 1) != gv_ ? ( slider(gdb + 1) = gv_; ui_auto(gdb + 1); );
+);
+drag_id == 2002 ? (
+  ghb = min(max(ghb, 0), NB - 1);
+  gs_ = ghb >= glast ? 1 : -1; gi = glast;
+  loop(abs(ghb - glast) + 1,
+    gt_ = ghb == glast ? 1 : (gi - glast) / (ghb - glast);
+    gv_ = ((FY0 + FY1) * 0.5 - (glasty + (gmy - glasty) * gt_)) / ((FY1 - FY0) * 0.5) * 12;
+    gv_ = floor(min(max(gv_, -12), 12) * 10 + 0.5) / 10;
+    slider(gi + 1) != gv_ ? ( slider(gi + 1) = gv_; ui_auto(gi + 1); );
+    gi += gs_; );
+  glast = ghb; glasty = gmy;
+);
+gin && mouse_wheel != 0 && drag_id == 0 ? (
+  slider(ghb + 1) = min(max(slider(ghb + 1) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.1 : 0.5), -12), 12);
+  ui_auto(ghb + 1); mouse_wheel = 0;
+);
+gb = 0;
+loop(NB,
+  gxx = bx(gb);
+  ui_col(SLOT); gfx_rect((gxx - 2) * sc, (FY0 - 4) * sc, 4 * sc, (FY1 - FY0 + 8) * sc);
+  gyy = fy(slider(gb + 1));
+  ui_hw ? (
+    ui_cola(0xFFFFFF, 0.08); gfx_rect((gxx + 2) * sc, (FY0 - 4) * sc, 1 * sc, (FY1 - FY0 + 8) * sc);
+    ui_cola(0x000000, 0.5); gfx_rect((gxx - 9) * sc, (gyy - 6) * sc, 20 * sc, 14 * sc);
+    ui_col(0x9A9DA2); gfx_rect((gxx - 10) * sc, (gyy - 7) * sc, 20 * sc, 14 * sc);
+    ui_col(0xD8DBDF); gfx_rect((gxx - 10) * sc, (gyy - 7) * sc, 20 * sc, 6 * sc);
+    ui_col(0x6E7176); gfx_rect((gxx - 10) * sc, (gyy + 3) * sc, 20 * sc, 4 * sc);
+    ui_col(abs(slider(gb + 1)) > 0.04 ? ORNG : 0x2A2B2E); gfx_rect((gxx - 10) * sc, (gyy - 1) * sc, 20 * sc, 2 * sc);
+  ) : (
+    ui_col(abs(slider(gb + 1)) > 0.04 ? ORNG : C_BTN); gfx_rect((gxx - 10) * sc, (gyy - 6) * sc, 20 * sc, 12 * sc);
+    ui_col(abs(slider(gb + 1)) > 0.04 ? ui_ink(ORNG) : C_BTNT); gfx_rect((gxx - 10) * sc, (gyy - 0.5) * sc, 20 * sc, 1 * sc);
+  );
+  flab(gb); gfx_setfont(7, "Arial", 9 * sc); gfx_measurestr(#fl, gtw, gth); ui_cola(PRT, 0.8);
+  gfx_x = gxx * sc - gtw * 0.5; gfx_y = (FY1 + 12) * sc; gfx_drawstr(#fl);
+  gb += 1;
+);
+gin && drag_id == 0 || drag_id == 2001 ? (
+  gk_ = drag_id == 2001 ? gdb : ghb; sprintf(#v, "%+.1f dB", slider(gk_ + 1) * rng);
+  ui_col(0x000000); gfx_rect((bx(gk_) - 24) * sc, (FY0 - 14) * sc, 48 * sc, 12 * sc); gfx_setfont(4); ui_col(0xFFFFFF); ui_text(bx(gk_) * sc, (FY0 - 13) * sc, #v);
+);
+
+// ---------- controls ----------
+gbtn(30, 370, slider32, ORNG, slider32 ? "+-12 dB" : "+-6 dB") ? ( slider32 = 1 - slider32; ui_auto(32); );
+gbtn(84, 370, slider33, ORNG, slider33 ? "CONST Q" : "PROP Q") ? ( slider33 = 1 - slider33; ui_auto(33); );
+slider34 <= 20.5 ? strcpy(#v, "OFF") : sprintf(#v, "%.0f Hz", slider34); dy_kf = 1; dy_knob(190, 386, 12, 34, 20, 250, 20, 1, ORNG, "LOW CUT", #v);
+slider35 >= 21990 ? strcpy(#v, "OFF") : sprintf(#v, "%.1f kHz", slider35 / 1000); dy_kf = 2; dy_knob(256, 386, 12, 35, 3000, 22000, 22000, 1, ORNG, "HIGH CUT", #v);
+sprintf(#v, "%+.1f dB", slider36); dy_knob(322, 386, 12, 36, -12, 12, 0, 0, ORNG, "OUTPUT", #v);
+gfx_setfont(4); ui_cola(PRT, 0.7); ui_text(452 * sc, 381 * sc, "IN / OUT");
+dy_nov = 1; rd_iok = ui_hw ? 20 : 34; rd_ioc1 = 0x2A2A2E; rd_ioc2 = ORNG; rd_ioc3 = 0xC8402A;
+rd_io(500, 364, 38, 39, 40, 45);
+dy_nov = 0;
+gbtn(870, 370, 0, ORNG, "FLAT") ? ( gb = 0; loop(NB, slider(gb + 1) = 0; gb += 1; ); slider_automate(2147483647); );
+gbtn(924, 370, slider37, dy_grn, "EQ IN") ? ( slider37 = 1 - slider37; ui_auto(37); );
+
+pk_end();
+ui_end();

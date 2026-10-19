@@ -1,0 +1,310 @@
+desc:GFX TransEQ [program EQ]
+//tags: equaliser eq passive program transformer hybrid
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-headsmooth (.jsfx-inc)
+// in the same folder.
+//
+// TransEQ - a hybrid program equaliser (personal use; the sound is designed from scratch). Passive-style
+// curves at the two ends, more versatile bells in between, and transformer-coupled input and output.
+// Named in tribute to the trans community; blue and pink section accents and a soft rainbow hairline.
+//   LOW     - FREQ 20 / 30 / 60 / 100 / 150 Hz. BOOST (up to +14 dB) and ATTEN (up to -13 dB) are separate:
+//             the boost is a slightly resonant shelf, the cut a much broader one, so using both lifts the
+//             lowest lows with a dip above them (at 60 Hz, both full: about +7 dB at 30 Hz, -6 dB at 100 Hz).
+//   LO MID  - bell, 150 Hz - 1.5 kHz, +/-12 dB. HI MID - bell, 1 - 10 kHz, +/-12 dB. Proportional Q (it
+//             narrows as the gain goes up); WIDE / NARROW sets the base width.
+//   HIGH    - BOOST: a bell at 3 - 16 kHz with BANDWIDTH (sharp - broad). ATTEN: a shelf at 5 / 10 / 20 kHz.
+//   HPF / LPF - 12 dB / octave.
+//   IRON IN / IRON OUT - input and output transformers in the spirit of a Lundahl: the core saturates on
+//             magnetic flux (the integral of the signal), so the low end thickens first with mostly
+//             low-order harmonics while the mids and highs stay clean. Below saturation they are transparent.
+//   EQ IN   - switches the EQ curves out (the transformers stay in).
+// DRIFT: the band frequencies and gains wander very slightly, like component tolerances warming up.
+// The oxblood strip below holds DRIFT (one dial) and IN / OUT (TRIM + GUARD, SAT); formerly the fold-out with INPUT, DRIFT and the GFX output stage on an oxblood panel below.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-headsmooth.jsfx-inc
+
+slider1:2<0,4,1{20 Hz,30 Hz,60 Hz,100 Hz,150 Hz}>-Low frequency
+slider2:0<0,10,0.1>-Low boost
+slider3:0<0,10,0.1>-Low atten
+slider4:3<0,6,1{150 Hz,220 Hz,330 Hz,470 Hz,680 Hz,1 kHz,1.5 kHz}>-Lo mid frequency
+slider5:0<-12,12,0.1>-Lo mid gain (dB)
+slider6:0<0,1,1{Wide,Narrow}>-Lo mid Q
+slider7:3<0,6,1{1 kHz,1.5 kHz,2.2 kHz,3.3 kHz,4.7 kHz,6.8 kHz,10 kHz}>-Hi mid frequency
+slider8:0<-12,12,0.1>-Hi mid gain (dB)
+slider9:0<0,1,1{Wide,Narrow}>-Hi mid Q
+slider10:4<0,6,1{3 kHz,4 kHz,5 kHz,8 kHz,10 kHz,12 kHz,16 kHz}>-High boost frequency
+slider11:0<0,10,0.1>-High boost
+slider12:5<0,10,0.1>-High bandwidth
+slider13:1<0,2,1{5 kHz,10 kHz,20 kHz}>-High atten frequency
+slider14:0<0,10,0.1>-High atten
+slider15:20<20,500,1>-HPF (Hz, 20 = off)
+slider16:20000<2000,20000,10>-LPF (Hz, 20000 = off)
+slider17:3<0,10,0.1>-Iron in
+slider18:3<0,10,0.1>-Iron out
+slider19:0<-12,12,0.1>-Output (dB)
+slider20:1<0,1,1{Out,In}>-EQ in
+slider21:0<-24,12,0.1>-Input trim (dB)
+slider22:1<0,1,1{Off,On}>-Input guard
+slider23:25<0,100,1>-Drift amount (%)
+slider24:0.25<0.02,2,0.01>-Drift speed (Hz)
+slider25:0<0,100,1>-Band sat (%)
+slider26:30<0,100,1>-Bias (%)
+slider27:120<40,400,1>-Sat low band (Hz)
+slider28:6000<2000,16000,10>-Sat high band (Hz)
+slider29:-0.3<-24,0,0.1>-(unused, was output ceiling)
+slider30:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider31:50<0,100,1>-Drift (%)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-transeq";                                  // the ? pop-up links to this manual
+
+// ---------- biquads (RBJ) ----------
+// type: 0 low-pass, 1 high-pass, 2 peak, 3 high shelf, 4 low shelf
+function bq_set(type, f, q, gdb) instance(b0, b1, b2, a1, a2) local(w0, cw, sw, al, amp, sa, n) (
+  w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); sw = sin(w0); al = sw / (2 * q);
+  amp = 10 ^ (gdb / 40);
+  type == 0 ? (
+    n = 1 + al; b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 1 ? (
+    n = 1 + al; b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 2 ? (
+    n = 1 + al / amp; b0 = (1 + al * amp) / n; b1 = -2 * cw / n; b2 = (1 - al * amp) / n; a1 = b1; a2 = (1 - al / amp) / n;
+  ) : type == 3 ? (
+    sa = 2 * sqrt(amp) * al;
+    n = (amp + 1) - (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) + (amp - 1) * cw + sa) / n; b1 = -2 * amp * ((amp - 1) + (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) + (amp - 1) * cw - sa) / n; a1 = 2 * ((amp - 1) - (amp + 1) * cw) / n;
+    a2 = ((amp + 1) - (amp - 1) * cw - sa) / n;
+  ) : (
+    sa = 2 * sqrt(amp) * al;
+    n = (amp + 1) + (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) - (amp - 1) * cw + sa) / n; b1 = 2 * amp * ((amp - 1) - (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) - (amp - 1) * cw - sa) / n; a1 = -2 * ((amp - 1) + (amp + 1) * cw) / n;
+    a2 = ((amp + 1) + (amp - 1) * cw - sa) / n;
+  );
+);
+function bq_thru() instance(b0, b1, b2, a1, a2) ( b0 = 1; b1 = 0; b2 = 0; a1 = 0; a2 = 0; );
+function bq_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+
+// ---------- transformer ----------
+// The core saturates on flux: integrate the signal (leaky, ~5 Hz), saturate the flux, differentiate back.
+// While the curve is linear the output is the input exactly; flux grows as frequency falls, so the lows
+// saturate first. Normalised so a 40 Hz sine's flux equals its amplitude; k = core drive.
+function xf_init() instance(ph, sp) ( ph = 0; sp = 0; );
+
+function xf_run(x, k) instance(ph, sp) local(s, y) (
+  // 1. Hard-limit signal entering flux integration to prevent blown-out square waves
+  x = min(max(x, -1.2), 1.2);
+
+  ph = ph * xf_lk + x * xf_c;
+
+  // 2. Clamp flux memory state to prevent exponential windup on extreme low frequencies
+  ph = min(max(ph, -4.0), 4.0);
+
+  s = ost_tanh(ph * k) / k;
+  y = (s - sp * xf_lk) / xf_c;
+  sp = s;
+
+  y;
+);
+
+// ---------- one channel of EQ ----------
+function eq_set(fm, gm) instance(hp, lp, lb, la, m1, m2, hb, ha) (
+  slider15 <= 20.5 ? hp.bq_thru() : hp.bq_set(1, slider15, 0.7071, 0);     // OFF = out of circuit
+  slider16 >= 19990 ? lp.bq_thru() : lp.bq_set(0, slider16, 0.7071, 0);
+  lb.bq_set(4, low_f * fm, 1.1, eq_on * low_b * gm);   // boost: a resonant shelf (a little overshoot above it)
+  la.bq_set(4, low_f * fm, 0.3, -eq_on * low_a * gm);  // cut: a very broad, gentle shelf, so with both the
+                                                       // lowest lows still lift while a dip forms above
+  m1.bq_set(2, lm_f * fm, lm_q * (1 + abs(lm_g) / 8), eq_on * lm_g * gm);
+  m2.bq_set(2, hm_f * fm, hm_q * (1 + abs(hm_g) / 8), eq_on * hm_g * gm);
+  hb.bq_set(2, hb_f * fm, hb_q, eq_on * hb_g * gm);
+  ha.bq_set(3, ha_f * fm, 0.6, -eq_on * ha_g * gm);
+);
+function eq_run(x) instance(hp, lp, lb, la, m1, m2, hb, ha) (
+  ha.bq_run(hb.bq_run(m2.bq_run(m1.bq_run(la.bq_run(lb.bq_run(lp.bq_run(hp.bq_run(x))))))));
+);
+
+function update() (
+  low_f = slider1 == 0 ? 20 : slider1 == 1 ? 30 : slider1 == 2 ? 60 : slider1 == 3 ? 100 : 150;
+  lm_f = slider4 == 0 ? 150 : slider4 == 1 ? 220 : slider4 == 2 ? 330 : slider4 == 3 ? 470 : slider4 == 4 ? 680 : slider4 == 5 ? 1000 : 1500;
+  hm_f = slider7 == 0 ? 1000 : slider7 == 1 ? 1500 : slider7 == 2 ? 2200 : slider7 == 3 ? 3300 : slider7 == 4 ? 4700 : slider7 == 5 ? 6800 : 10000;
+  hb_f = slider10 == 0 ? 3000 : slider10 == 1 ? 4000 : slider10 == 2 ? 5000 : slider10 == 3 ? 8000 : slider10 == 4 ? 10000 : slider10 == 5 ? 12000 : 16000;
+  ha_f = slider13 == 0 ? 5000 : slider13 == 1 ? 10000 : 20000;
+  lm_q = slider6 ? 1.6 : 0.6; hm_q = slider9 ? 1.6 : 0.6;
+  hb_q = 2.5 * 0.16 ^ (slider12 / 10);             // BANDWIDTH 0 = sharp (Q 2.5) ... 10 = broad (Q 0.4)
+  k_in  = 0.25 * 10 ^ (slider17 / 10);              // core drive: 0 = all but clean ... 10 = heavy
+  k_out = 0.25 * 10 ^ (slider18 / 10);
+  out_t = 10 ^ (slider19 / 20);
+  drift_macro(slider31);                 // DRIFT dial: 50% = the drift settings, 100% = twice, 0 = none
+  drift = slider23 / 100 * dm_a; dspd = slider24 * dm_s;
+  in_setup(slider21, slider22);
+  ins_output_straight(25);   // output stage: straight through
+);
+
+xf_c = 2 * $pi * 40 / srate; xf_lk = 1 - 2 * $pi * 5 / srate;
+xiL.xf_init(); xiR.xf_init(); xoL.xf_init(); xoR.xf_init();
+dFL.drift_init(0.8 + rand(0.5)); dFR.drift_init(0.8 + rand(0.5));
+dGL.drift_init(0.8 + rand(0.5)); dGR.drift_init(0.8 + rand(0.5));
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+sm = 1 - exp(-1 / (0.03 * srate));
+mpk = 0;
+!ui_dflt ? ui_hw = 1; !ui_dflt ? ui_kstyle = 0;
+TQ_PNL = 0x26272B; TQ_INK = 0xEDE3C8; TQ_BLU = 0x5BCEFA; TQ_PNK = 0xF5A9B8; TQ_WHT = 0xFFFFFF;
+update();
+// block-smoothed gains (the curves glide rather than jump)
+low_b = slider2 * 1.4; low_a = slider3 * 1.3; lm_g = slider5; hm_g = slider8; hb_g = slider11 * 1.6; ha_g = slider14 * 1.6;
+eq_on = slider20; out_s = out_t;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update();
+
+@block
+update();
+bs = 1 - exp(-samplesblock / (0.03 * srate));
+low_b += (slider2 * 1.4 - low_b) * bs; low_a += (slider3 * 1.3 - low_a) * bs;
+lm_g += (slider5 - lm_g) * bs; hm_g += (slider8 - hm_g) * bs;
+hb_g += (slider11 * 1.6 - hb_g) * bs; ha_g += (slider14 * 1.6 - ha_g) * bs;
+eq_on += (slider20 - eq_on) * bs;
+dinc = dspd * samplesblock / srate;
+vfL = dFL.drift_tick(dinc); vfR = dFR.drift_tick(dinc);
+vgL = dGL.drift_tick(dinc); vgR = dGR.drift_tick(dinc);
+eL.eq_set(1 + 0.015 * drift * vfL, 1 + 0.03 * drift * vgL);
+eR.eq_set(1 + 0.015 * drift * vfR, 1 + 0.03 * drift * vgR);
+
+@serialize
+file_var(0, ui_sz);
+
+@sample
+in_process(spl0, spl1);
+// Input clamp before input transformer
+in_l = min(max(in_l, -1.2), 1.2);
+in_r = min(max(in_r, -1.2), 1.2);
+
+oL = xiL.xf_run(in_l, k_in); oR = xiR.xf_run(in_r, k_in);
+oL = eL.eq_run(oL); oR = eR.eq_run(oR);
+out_s += (out_t - out_s) * sm;
+
+// Clamp before output transformer
+oL_out = min(max(oL * out_s, -1.5), 1.5);
+oR_out = min(max(oR * out_s, -1.5), 1.5);
+
+oL = xoL.xf_run(oL_out, k_out); oR = xoR.xf_run(oR_out, k_out);
+
+// Post-transformer stability guard
+oL = min(max(oL, -2.0), 2.0);
+oR = min(max(oR, -2.0), 2.0);
+
+oL = ostL.ost_band(oL); oR = ostR.ost_band(oR);
+ost_out(oL, oR);
+spl0 = ost_l;
+spl1 = ost_r;
+mpk = max(mpk, max(abs(spl0), abs(spl1)));
+
+@gfx 780 330
+ui_begin(780, 330);
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+
+// pride accents: the six rainbow colours as a soft hairline under the bands
+function tq_rb(i) ( i == 0 ? 0xE8453C : i == 1 ? 0xF08A2C : i == 2 ? 0xEAD34A : i == 3 ? 0x3FA45B : i == 4 ? 0x4A73C9 : 0x9A5BC0; );
+function tq_vdiv(x, y, h) ( ui_cola(TQ_INK, 0.16); gfx_rect(x * sc, y * sc, 1 * sc, h * sc); );
+// ---------- the unit ----------
+T = 8; TH = 312;
+ui_theme(5);
+hs_unit(T, TH, TQ_PNL);
+gfx_gradrect(10 * sc, (T + 2) * sc, 760 * sc, (TH - 4) * sc, 1, 1, 1, 0.04, 0, 0, 0, -0.04 / (760 * sc), 0, 0, 0, 0);
+hs_badge(40, T + 8, "TRANSEQ", "HYBRID EQUALISER", 0x1C1D20);
+ui_size_picker(560 * sc, (T + 11) * sc);
+ui_keycap(622 * sc, (T + 8) * sc, 50 * sc, 24 * sc, "EQ IN", slider20, 1) ? ( slider20 = 1 - slider20; slider_automate(2 ^ 19); );
+pk_ink = TQ_INK; pk_bg = TQ_PNL; pk_bkfs = 12; pk_nonum = 1;   // dials: min / centre / max ticks only - use your ears
+
+// section titles with pinlines in the flag colours: blue at the ends, pink for the mids
+function tq_sec(x0, x1, y, title, col) local(tw, th, cx) (
+  cx = (x0 + x1) * 0.5;
+  gfx_setfont(4); gfx_measurestr(title, tw, th);
+  ui_cola(col, 0.8);
+  gfx_rect((x0 + 8) * sc, (y + 5) * sc, (cx - x0 - 8) * sc - tw * 0.5 - 6 * sc, 1 * sc);
+  gfx_rect(cx * sc + tw * 0.5 + 6 * sc, (y + 5) * sc, (x1 - cx - 8) * sc - tw * 0.5 - 6 * sc, 1 * sc);
+  ui_col(col); ui_text(cx * sc, y * sc, title);
+);
+tq_sec(20, 230, T + 42, "LOW", TQ_BLU);
+tq_sec(230, 350, T + 42, "LO MID", TQ_PNK);
+tq_sec(350, 470, T + 42, "HI MID", TQ_PNK);
+tq_sec(470, 760, T + 42, "HIGH", TQ_BLU);
+tq_vdiv(230, T + 62, 172); tq_vdiv(350, T + 62, 172); tq_vdiv(470, T + 62, 172);
+
+// LOW
+pk_step(125, T + 94, 1, 5, "20|30|60|100|150", "FREQ");
+pk_bigknob(72 * sc, (T + 180) * sc, 21 * sc, 2, 0, 10, 0, 3, 0, 1, "BOOST", "%.1f");
+pk_bigknob(178 * sc, (T + 180) * sc, 21 * sc, 3, 0, 10, 0, 3, 0, 1, "ATTEN", "%.1f");
+// LO MID / HI MID: FREQ, WIDE / NARROW, GAIN
+pk_step(290, T + 94, 4, 7, "150|220|330|470|680|1k|1.5k", "");
+ui_keycap(264 * sc, (T + 122) * sc, 52 * sc, 18 * sc, slider6 ? "NARROW" : "WIDE", 0, 0) ? ( slider6 = 1 - slider6; slider_automate(2 ^ 5); );
+pk_bigknob(290 * sc, (T + 180) * sc, 21 * sc, 5, -12, 12, 0, 3, -12, 3, "GAIN", "%+.1f dB");
+pk_step(410, T + 94, 7, 7, "1k|1.5k|2.2k|3.3k|4.7k|6.8k|10k", "");
+ui_keycap(384 * sc, (T + 122) * sc, 52 * sc, 18 * sc, slider9 ? "NARROW" : "WIDE", 0, 0) ? ( slider9 = 1 - slider9; slider_automate(2 ^ 8); );
+pk_bigknob(410 * sc, (T + 180) * sc, 21 * sc, 8, -12, 12, 0, 3, -12, 3, "GAIN", "%+.1f dB");
+// HIGH
+pk_step(568, T + 94, 10, 7, "3k|4k|5k|8k|10k|12k|16k", "BOOST FREQ");
+pk_step(700, T + 94, 13, 3, "5k|10k|20k", "ATTEN FREQ");
+pk_bigknob(520 * sc, (T + 180) * sc, 21 * sc, 11, 0, 10, 0, 3, 0, 1, "BOOST", "%.1f");
+pk_bigknob(615 * sc, (T + 180) * sc, 21 * sc, 12, 0, 10, 5, 3, 0, 1, "BANDWIDTH", "%.1f");
+pk_bigknob(710 * sc, (T + 180) * sc, 21 * sc, 14, 0, 10, 0, 3, 0, 1, "ATTEN", "%.1f");
+!slider20 ? ( ui_cola(0x000000, 0.3); gfx_rect(20 * sc, (T + 62) * sc, 740 * sc, 178 * sc); );
+
+// bottom strip: HPF LPF | IRON: IN, OUT | OUTPUT, meter - labels beside the knobs (the value shows
+// under a knob while it is touched)
+gi = 0; loop(6, ui_cola(tq_rb(gi), 0.55); gfx_rect((20 + gi * 740 / 6) * sc, (T + 244) * sc, (740 / 6) * sc + 1, 1 * sc); gi += 1; );
+function tq_side(x, y, txt) ( gfx_setfont(6, "Trebuchet MS", 12 * sc, 'b'); ui_col(TQ_INK); gfx_x = x * sc; gfx_y = (y - 6) * sc; gfx_drawstr(txt); );
+ui_section(2); C_INK = TQ_INK;
+ry = T + 276;
+ui_kfilter = 1; strcpy(#kf_lo, "20"); strcpy(#kf_hi, "500");
+ui_knob(60 * sc, ry * sc, 15, 20, 500, 20, 1, "", slider15 <= 20.5 ? "OFF" : "%.0f Hz");
+tq_side(86, ry, "HPF");
+ui_kfilter = 2; strcpy(#kf_lo, "2k"); strcpy(#kf_hi, "20k");
+ui_knob(160 * sc, ry * sc, 16, 2000, 20000, 20000, 1, "", slider16 >= 19990 ? "OFF" : "%.0f Hz");
+tq_side(186, ry, "LPF");
+tq_vdiv(232, T + 254, 46);
+ui_knonum = 2;                                   // these dials: min and max ticks only
+tq_side(250, ry, "IRON");
+gfx_setfont(4); ui_cola(TQ_INK, 0.75); gfx_x = 300 * sc; gfx_y = (ry - 4) * sc; gfx_drawstr("IN");
+ui_knob(336 * sc, ry * sc, 17, 0, 10, 3, 0, "", "%.1f");
+gfx_setfont(4); ui_cola(TQ_INK, 0.75); gfx_x = 370 * sc; gfx_y = (ry - 4) * sc; gfx_drawstr("OUT");
+ui_knob(414 * sc, ry * sc, 18, 0, 10, 3, 0, "", "%.1f");
+tq_vdiv(460, T + 254, 46);
+ui_knob(500 * sc, ry * sc, 19, -12, 12, 0, 0, "", "%+.1f dB");
+tq_side(528, ry, "OUTPUT");
+ui_knonum = 0;
+tq_lv = max(mpk, tq_lv * 0.8); mpk = 0;
+hs_leds(690, ry - 4, tq_lv, TQ_INK);
+
+// // ---------- DRIFT | IN / OUT: the slim oxblood strip under the unit ----------
+// FT = T + TH + 8;
+// ui_theme(6); hs_unit(FT, 104, HS_OXB);
+// dy_ink = HS_CRM; dy_bg = HS_OXB; rd_iok = 20;
+// pk_inset(220 * sc, (FT + 12) * sc, 92 * sc, 82 * sc, HS_OXS); pk_box(220 * sc, (FT + 12) * sc, 92 * sc, 82 * sc, HS_CRM, "DRIFT");
+// pk_inset(324 * sc, (FT + 12) * sc, 236 * sc, 82 * sc, HS_OXS); pk_box(324 * sc, (FT + 12) * sc, 236 * sc, 82 * sc, HS_CRM, "IN / OUT");
+// dy_kst = 20; sprintf(#dv, "%.0f%%", slider31); dy_knob(266, FT + 38, 15, 31, 0, 100, 50, 0, HS_SLV, "DRIFT", #dv); dy_kst = 7;
+// rd_io(335, FT + 16, 21, 22, 25, 30);
+
+pk_end();
+ui_end();

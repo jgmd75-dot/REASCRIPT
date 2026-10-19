@@ -1,0 +1,499 @@
+desc:GFX G Byte 6 [lo-fi drum machine]
+//tags: instrument drum machine 12-bit 8-bit digital fm lo-fi 80s rhythm
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-dyn (.jsfx-inc) in the same folder.
+//
+// Six-voice lo-fi digital drum machine in the spirit of the gritty mid-80s Japanese 12-bit rhythm boxes
+// (the PCM / FM era). No samples: every hit is synthesised live and then pushed through a vintage converter.
+//   VOICES    - KICK (sine with a fast pitch drop and an FM "thump" that dies away), SNARE (two-operator FM
+//               tone + band-passed noise), CLOSED / OPEN HAT (a cluster of six inharmonic squares + noise,
+//               high-passed), CLAP (four noise bursts and a tail), RIM / PERC (an FM ping with a wooden body).
+//               Each voice: TUNE, DECAY, LEVEL, PAN. The closed (and pedal) hat chokes the open hat.
+//   CONVERTER - every voice has its own DAC: the sound is sampled and held at the converter RATE (22 / 26 / 32 /
+//               44 kHz, no anti-alias filter, so the folded-back "grain" is part of the sound) and quantised to
+//               BITS (8 / 10 / 12). As on the originals, TUNE moves the voice's converter clock, so a lower-tuned
+//               voice is also grainier. Each DAC is followed by a 4-pole output low-pass (FILTER, a percentage of
+//               the converter's Nyquist) - the band-limited outputs of the period.
+//   MIDI      - General MIDI drum notes: 36 (35) kick, 38 / 40 snare, 42 / 44 closed hat, 46 open hat, 39 clap,
+//               37 rim. Velocity sets the level (VELOCITY = how much). Click a pad to hear it.
+//   DRIFT     - a digital box, so it stays very subtle: each hit is retuned at random by up to +/-12 cents at
+//               100 % (the default 15 % is under 2 cents). Nothing wanders between hits.
+//   IN / OUT  - the house output section: SAT, MONO and WIDTH (the output soft clip is always on).
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-dyn.jsfx-inc
+
+slider1:0<-24,12,0.1>-Volume (dB)
+slider2:2<0,2,1{8 bit,10 bit,12 bit}>-Bits
+slider3:2<0,3,1{22 kHz,26 kHz,32 kHz,44 kHz}>-Converter rate
+slider4:80<20,100,1>-Output filter (% of Nyquist)
+slider5:80<0,100,1>-Velocity (%)
+slider6:15<0,100,1>-Drift (%)
+slider7:0<0,16,1>-MIDI channel (0 = omni)
+slider8:0<0,100,1>-Band sat (%)
+slider9:30<0,100,1>-Bias (%)
+slider10:120<40,400,1>-Sat low band (Hz)
+slider11:6000<2000,16000,10>-Sat high band (Hz)
+slider12:-0.3<-24,0,0.1>-Ceiling (dB)
+slider13:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider14:20<20,500,1>-Mono below (Hz, 20 = off)
+slider15:0<0,100,1>-Stereo width (%)
+slider16:0<-12,12,0.1>-Kick tune (st)
+slider17:100<25,400,1>-Kick decay (%)
+slider18:85<0,100,1>-Kick level (%)
+slider19:0<-100,100,1>-Kick pan
+slider20:0<-12,12,0.1>-Snare tune (st)
+slider21:100<25,400,1>-Snare decay (%)
+slider22:75<0,100,1>-Snare level (%)
+slider23:0<-100,100,1>-Snare pan
+slider24:0<-12,12,0.1>-Closed hat tune (st)
+slider25:100<25,400,1>-Closed hat decay (%)
+slider26:60<0,100,1>-Closed hat level (%)
+slider27:25<-100,100,1>-Closed hat pan
+slider28:0<-12,12,0.1>-Open hat tune (st)
+slider29:100<25,400,1>-Open hat decay (%)
+slider30:55<0,100,1>-Open hat level (%)
+slider31:25<-100,100,1>-Open hat pan
+slider32:0<-12,12,0.1>-Clap tune (st)
+slider33:100<25,400,1>-Clap decay (%)
+slider34:70<0,100,1>-Clap level (%)
+slider35:-15<-100,100,1>-Clap pan
+slider36:0<-12,12,0.1>-Rim tune (st)
+slider37:100<25,400,1>-Rim decay (%)
+slider38:60<0,100,1>-Rim level (%)
+slider39:-30<-100,100,1>-Rim pan
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-byte-6";                                  // the ? pop-up links to this manual
+ext_noinit = 1;                                            // keep ringing voices when playback starts
+
+// ---------- memory map ----------
+B6EVQ = 1000;          // this block's note-ons: offset, voice, velocity (3 x 512)
+B6NMAP = 2600;         // MIDI note -> voice (128)
+B6LT = 2800;           // pad lights (6), set on every hit, faded by the panel
+B6PRE = 2810;          // per voice: gain into the converter (the voice's raw peak -> about full scale)
+B6TRIM = 2820;         // per voice: gain after the converter (balances the kit)
+G6FMAP = 2900;         // LCD font: character code -> glyph (128)
+G6GLY = 3100;          // LCD font: 7 rows of 5 dots per glyph
+ostL.ost_ch_init(); ostR.ost_ch_init();          // the output stage itself: b6_srinit() below
+
+memset(B6NMAP, -1, 128);
+B6NMAP[35] = B6NMAP[36] = 0; B6NMAP[38] = B6NMAP[40] = 1; B6NMAP[42] = B6NMAP[44] = 2;
+B6NMAP[46] = 3; B6NMAP[39] = 4; B6NMAP[37] = 5;
+
+// level calibration (measured offline): PRE brings each voice to about full scale at the converter, TRIM sets
+// the kit balance after it (kick about -3 dBFS, snare -3.5, clap -4, hats and rim -5 at default levels, full velocity)
+B6PRE[0] = 0.89; B6PRE[1] = 0.66; B6PRE[2] = 1.28; B6PRE[3] = 1.16; B6PRE[4] = 1.22; B6PRE[5] = 0.62;
+B6TRIM[0] = 1.075; B6TRIM[1] = 1.39; B6TRIM[2] = 1.48; B6TRIM[3] = 2.11; B6TRIM[4] = 1.25; B6TRIM[5] = 1.44;
+
+function b6_dc(t) ( exp(-6.9 / (max(t, 0.0005) * srate)); );     // per-sample multiplier: -60 dB after t seconds
+
+// ---------- one voice ----------
+// ty: 0 kick, 1 snare, 2 closed hat, 3 open hat, 4 clap, 5 rim / perc
+function b6_trig(k, vel) instance(ty, act, n, ae, aec, pe, pec, f0, mi, mic, ne, nec, be, bec, bn, ce, cec,
+                                  p1, p2, p3, p4, p5, p6, fk, fa1, fa2, fa3, dph, dinc, gl, gr, amp, pre, ck)
+                         local(b, tm, dm, lv, pn, g, fc, fq) (
+  ty = k; b = 16 + k * 4;
+  tm = 2 ^ (slider(b) / 12) * 2 ^ ((rand(2) - 1) * b6_drift * 0.12 / 12);      // DRIFT: a tiny random retune per hit
+  dm = slider(b + 1) / 100; lv = slider(b + 2) / 100; pn = slider(b + 3) / 100;
+  n = 0; act = 1; ck = 0;
+  ae = 1; pe = 1; mi = 1; ne = 1; be = 1; ce = 1;
+  p1 = 0; p2 = 0; p3 = 0; p4 = 0.13; p5 = 0.37; p6 = 0.71;
+  fc = 1000; fq = 0.7;
+  k == 0 ? (                                                   // KICK
+    f0 = 48 * tm; pec = b6_dc(0.09 * sqrt(dm)); aec = b6_dc(0.62 * dm); mic = b6_dc(0.035); cec = b6_dc(0.004);
+  ) : k == 1 ? (                                               // SNARE
+    f0 = 182 * tm; pec = b6_dc(0.04); aec = b6_dc(0.2 * dm); mic = b6_dc(0.05); nec = b6_dc(0.36 * dm);
+    fc = 4600 * tm; fq = 0.8;
+  ) : k == 2 || k == 3 ? (                                     // HATS
+    f0 = tm; aec = b6_dc((k == 2 ? 0.1 : 0.95) * dm);
+    fc = 7000 * tm; fq = 0.9;
+  ) : k == 4 ? (                                               // CLAP
+    bn = floor(0.0105 * srate); bec = b6_dc(0.016); nec = b6_dc(0.4 * dm);
+    fc = 1150 * tm; fq = 1.5;
+  ) : (                                                        // RIM / PERC
+    f0 = 790 * tm; aec = b6_dc(0.15 * dm); mic = b6_dc(0.02); bec = b6_dc(0.07 * dm); cec = b6_dc(0.0015);
+  );
+  g = tan($pi * min(fc, srate * 0.45) / srate); fk = 1 / fq;
+  fa1 = 1 / (1 + g * (g + fk)); fa2 = g * fa1; fa3 = g * fa2;
+  // the converter clock follows the tuning (as when a sample is pitched by its playback clock)
+  dinc = min(b6_rate * tm / srate, 1); dph = 1;
+  amp = lv * lv * (1 - b6_vs + b6_vs * vel) * B6TRIM[k]; pre = B6PRE[k];
+  gl = sqrt(1 - pn); gr = sqrt(1 + pn);
+  B6LT[k] = 1; b6_last = k; b6_lvel = vel; b6_hitn += 1;
+);
+
+function b6_run() instance(ty, act, n, ae, aec, pe, pec, f0, mi, mic, ne, nec, be, bec, bn, ce, cec,
+                           p1, p2, p3, p4, p5, p6, fk, fa1, fa2, fa3, ic1, ic2, dph, dinc, dh, z1, z2, z3, z4,
+                           amp, pre, ck, rpk)
+                  local(x, nz, s, v1, v2, v3, bp, hp, y, f) (
+  act ? (
+    nz = rand(2) - 1;
+    ty == 0 ? (
+      // KICK: pitch-dropping sine, self-FM thump at the start, a short beater click
+      f = f0 * (1 + 3.2 * pe); pe *= pec;
+      p1 += f / srate; p1 -= floor(p1);
+      x = sin(2 * $pi * p1 + 1.5 * mi * sin(2 * $pi * p1)) * ae + nz * 0.25 * ce;
+      mi *= mic; ae *= aec; ce *= cec; s = ae;
+    ) : ty == 1 ? (
+      // SNARE: two-operator FM tone (falls a little in pitch) + band-passed noise
+      f = f0 * (1 + 0.6 * pe); pe *= pec;
+      p1 += f / srate; p1 -= floor(p1); p2 += f * 1.47 / srate; p2 -= floor(p2);
+      v3 = nz - ic2; v1 = fa1 * ic1 + fa2 * v3; v2 = ic2 + fa2 * ic1 + fa3 * v3;
+      ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2; bp = v1; hp = nz - fk * v1 - v2;
+      x = sin(2 * $pi * p1 + 2 * mi * sin(2 * $pi * p2)) * ae * 0.65 + (bp * 1.3 + hp * 0.45) * ne;
+      mi *= mic; ae *= aec; ne *= nec; s = max(ae, ne);
+    ) : ty <= 3 ? (
+      // HATS: six inharmonic squares + noise, high-passed
+      p1 += 302 * f0 / srate; p1 -= floor(p1); p2 += 437 * f0 / srate; p2 -= floor(p2);
+      p3 += 521 * f0 / srate; p3 -= floor(p3); p4 += 589 * f0 / srate; p4 -= floor(p4);
+      p5 += 744 * f0 / srate; p5 -= floor(p5); p6 += 981 * f0 / srate; p6 -= floor(p6);
+      x = ((p1 < 0.5) + (p2 < 0.5) + (p3 < 0.5) + (p4 < 0.5) + (p5 < 0.5) + (p6 < 0.5) - 3) / 3 * 0.7 + nz * 0.55;
+      v3 = x - ic2; v1 = fa1 * ic1 + fa2 * v3; v2 = ic2 + fa2 * ic1 + fa3 * v3;
+      ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2; hp = x - fk * v1 - v2;
+      x = (hp + 0.4 * v1) * ae;
+      ae *= aec; ck ? ae *= b6_chk; s = ae;
+    ) : ty == 4 ? (
+      // CLAP: three quick bursts, then the fourth rings on as the tail
+      n < 3 * bn ? ( (n % bn) == 0 ? be = 1; y = be; be *= bec; s = 1; ) : ( y = ne; ne *= nec; s = ne; );
+      v3 = nz - ic2; v1 = fa1 * ic1 + fa2 * v3; v2 = ic2 + fa2 * ic1 + fa3 * v3;
+      ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2; hp = nz - fk * v1 - v2;
+      x = (v1 * 1.6 + hp * 0.12) * y;
+    ) : (
+      // RIM / PERC: an FM ping (inharmonic modulator, fast index decay), a wooden body, a click
+      p1 += f0 / srate; p1 -= floor(p1); p2 += f0 * 2.31 / srate; p2 -= floor(p2); p3 += f0 * 0.545 / srate; p3 -= floor(p3);
+      x = sin(2 * $pi * p1 + 3.2 * mi * sin(2 * $pi * p2)) * ae + 0.6 * sin(2 * $pi * p3) * be + nz * 0.35 * ce;
+      mi *= mic; ae *= aec; be *= bec; ce *= cec; s = max(ae, be);
+    );
+    // the voice's converter: sample and hold at the converter clock, quantise to BITS
+    rpk = max(rpk, abs(x * pre));
+    dph += dinc;
+    dph >= 1 ? ( dph -= 1; x = min(max(x * pre, -1), 1); dh = floor(x * b6_q + 0.5) / b6_q; );
+    // 4-pole output low-pass (two 2-pole stages)
+    v3 = dh - z2; v1 = b6_a1 * z1 + b6_a2 * v3; v2 = z2 + b6_a2 * z1 + b6_a3 * v3; z1 = 2 * v1 - z1; z2 = 2 * v2 - z2; y = v2;
+    v3 = y - z4; v1 = b6_b1 * z3 + b6_b2 * v3; v2 = z4 + b6_b2 * z3 + b6_b3 * v3; z3 = 2 * v1 - z3; z4 = 2 * v2 - z4; y = v2;
+    n += 1;
+    s < 0.0002 && dh == 0 && abs(y) < 0.00002 ? ( act = 0; z1 = z2 = z3 = z4 = 0; ic1 = ic2 = 0; );
+    y * amp;
+  ) : 0;
+);
+function b6_hit(k, vel) (
+  k == 0 ? b6v0.b6_trig(0, vel) : k == 1 ? b6v1.b6_trig(1, vel) :
+  k == 2 ? ( b6v2.b6_trig(2, vel); b6v3.ck = 1; ) :                    // the closed hat chokes the open hat
+  k == 3 ? b6v3.b6_trig(3, vel) : k == 4 ? b6v4.b6_trig(4, vel) : b6v5.b6_trig(5, vel);
+);
+
+// ---------- parameters ----------
+function b6_update() local(fc, g) (
+  b6_vol = 10 ^ (slider1 / 20);
+  b6_q = slider2 < 0.5 ? 128 : slider2 < 1.5 ? 512 : 2048;
+  b6_rate = slider3 < 0.5 ? 22050 : slider3 < 1.5 ? 26040 : slider3 < 2.5 ? 31250 : 44100;
+  b6_vs = slider5 / 100; b6_drift = slider6 / 100; b6_chan = floor(slider7 + 0.5);
+  fc = min(b6_rate * 0.5 * slider4 / 100, srate * 0.45);
+  g = tan($pi * fc / srate);
+  b6_a1 = 1 / (1 + g * (g + 0.7654)); b6_a2 = g * b6_a1; b6_a3 = g * b6_a2;     // Butterworth 4-pole: k = 0.765, 1.848
+  b6_b1 = 1 / (1 + g * (g + 1.8478)); b6_b2 = g * b6_b1; b6_b3 = g * b6_b2;
+  b6_fc = fc;
+  ins_output_setup(8); ins_stereo_setup(14);   // output stage: CLIP, always on
+);
+
+// ---------- presets (BITS, RATE, FILTER and the six voices; volume, velocity, drift, MIDI and IN / OUT stay) ----------
+function b6_pv(k, tu, de, lv, pn) local(b) ( b = 16 + k * 4; slider(b) = tu; slider(b + 1) = de; slider(b + 2) = lv; slider(b + 3) = pn; );
+function b6_pg(bt, rt, ft) ( slider2 = bt; slider3 = rt; slider4 = ft; );
+function load_preset(p) local(i) (
+  p == 1 || p == 11 ? (                                       // Init
+    b6_pg(2, 2, 80);
+    b6_pv(0, 0, 100, 85, 0); b6_pv(1, 0, 100, 75, 0); b6_pv(2, 0, 100, 60, 25);
+    b6_pv(3, 0, 100, 55, 25); b6_pv(4, 0, 100, 70, -15); b6_pv(5, 0, 100, 60, -30);
+  ) : p == 2 ? (                                               // Classic 80s Pop
+    b6_pg(2, 2, 72);
+    b6_pv(0, -1, 120, 86, 0); b6_pv(1, 1, 150, 80, 0); b6_pv(2, 0, 80, 58, 30);
+    b6_pv(3, 0, 110, 52, 30); b6_pv(4, 1, 130, 66, -20); b6_pv(5, 0, 100, 55, -35);
+  ) : p == 3 ? (                                               // Dirty 8-Bit
+    b6_pg(0, 0, 62);
+    b6_pv(0, -2, 140, 90, 0); b6_pv(1, -1, 120, 80, 0); b6_pv(2, -2, 90, 60, 20);
+    b6_pv(3, -2, 120, 54, 20); b6_pv(4, -1, 130, 72, -15); b6_pv(5, -3, 120, 60, -25);
+  ) : p == 4 ? (                                               // Crunchy Hip-Hop
+    b6_pg(1, 1, 52);
+    b6_pv(0, -4, 190, 92, 0); b6_pv(1, -3, 110, 82, 0); b6_pv(2, -3, 70, 54, 20);
+    b6_pv(3, -3, 90, 48, 20); b6_pv(4, -2, 140, 72, -10); b6_pv(5, -5, 90, 58, -30);
+  ) : p == 5 ? (                                               // Synth Pop
+    b6_pg(2, 3, 95);
+    b6_pv(0, 1, 90, 85, 0); b6_pv(1, 2, 160, 78, 0); b6_pv(2, 2, 70, 62, 35);
+    b6_pv(3, 2, 130, 55, 35); b6_pv(4, 2, 160, 70, -25); b6_pv(5, 3, 110, 60, -40);
+  ) : p == 6 ? (                                               // Electro Funk
+    b6_pg(2, 2, 85);
+    b6_pv(0, -3, 270, 92, 0); b6_pv(1, 3, 70, 78, 0); b6_pv(2, 1, 55, 62, 25);
+    b6_pv(3, 1, 80, 52, 25); b6_pv(4, 0, 100, 76, -15); b6_pv(5, 5, 90, 62, -40);
+  ) : p == 7 ? (                                               // Lo-Fi Tape Kit
+    b6_pg(1, 0, 42);
+    b6_pv(0, -2, 130, 88, 0); b6_pv(1, -2, 130, 80, 0); b6_pv(2, -1, 110, 58, 15);
+    b6_pv(3, -1, 140, 50, 15); b6_pv(4, -1, 150, 68, -10); b6_pv(5, -2, 130, 55, -20);
+  ) : p == 8 ? (                                               // Bright 12-Bit
+    b6_pg(2, 3, 100);
+    b6_pv(0, 2, 85, 82, 0); b6_pv(1, 4, 100, 78, 0); b6_pv(2, 4, 90, 64, 30);
+    b6_pv(3, 4, 120, 58, 30); b6_pv(4, 3, 90, 70, -20); b6_pv(5, 5, 80, 60, -35);
+  ) : p == 9 ? (                                               // Deep Boom Kit
+    b6_pg(2, 1, 64);
+    b6_pv(0, -6, 360, 95, 0); b6_pv(1, -5, 160, 78, 0); b6_pv(2, -4, 90, 55, 20);
+    b6_pv(3, -4, 140, 50, 20); b6_pv(4, -4, 160, 70, -15); b6_pv(5, -7, 120, 58, -30);
+  ) : p == 10 ? (                                              // Tight & Snappy
+    b6_pg(2, 2, 90);
+    b6_pv(0, 2, 55, 85, 0); b6_pv(1, 3, 55, 80, 0); b6_pv(2, 2, 45, 60, 25);
+    b6_pv(3, 2, 60, 52, 25); b6_pv(4, 2, 60, 72, -15); b6_pv(5, 2, 60, 60, -30);
+  );
+  p == 11 ? (                                                  // Reset all to defaults
+    slider1 = 0; slider5 = 80; slider6 = 15; slider7 = 0;
+    slider8 = 0; slider9 = 30; slider10 = 120; slider11 = 6000; slider12 = -0.3; slider13 = 1; slider14 = 20; slider15 = 0;
+  );
+  p >= 1 && p <= 11 ? ( i = 1; loop(39, ui_auto(i); i += 1; ); );
+);
+
+// ---------- the LCD's 5 x 7 dot-matrix font ----------
+#b6cs = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 %+-./:>";
+#b6fnt = ">AAAOAANAANAAN>A@@@A>LBAAABLO@@N@@OO@@N@@@>A@GAA?AAAOAAA>44444>72222B<ABDHDBA@@@@@@OAKEEAAAAAIECAA>AAAAA>NAAN@@@>AAAEB=NAANDBA?@@>11NO444444AAAAAA>AAAAA:4AAAEEE:AA:4:AAAAA:444O1248@O>ACEIA>4<4444>>A1248OO2421A>26:BO22O@N11A>68@NAA>O124888>AA>AA>>AA?12<0000000HI248C3044O440000O00000000<<01248@00<<0<<08421248";
+memset(G6FMAP, -1, 128);
+gi = 0; loop(strlen(#b6cs), G6FMAP[str_getchar(#b6cs, gi)] = gi; gi += 1; );
+gi = 0; loop(strlen(#b6fnt), G6GLY[gi] = str_getchar(#b6fnt, gi) - 48; gi += 1; );
+
+// ---------- state, panel colours ----------
+b6_vs_s = 1; b6_pkL = b6_pkR = 0;
+// everything that depends on the sample rate (run again from @block if the rate changes: ext_noinit keeps @init
+// from running then)
+function b6_srinit() (
+  b6_sr = srate;
+  ost_init(20000);
+  b6_chk = exp(-1 / (0.004 * srate));                        // the open-hat choke: a 4 ms fade
+  sm6 = 1 - exp(-1 / (0.03 * srate));
+);
+b6_srinit();
+!ui_dflt ? ui_thm = 5; !ui_dflt ? ui_hw = 1; !ui_dflt ? ui_kstyle = 0;
+!ui_dflt ? ( ui_sz = 2; pr_cur = 1; b6_last = 0; b6_lvel = -1; );      // a new instance opens Large, on Init
+G6BODY = 0xDCD8D0; G6INK = 0x2A2A2E; G6STRIP = 0x2B2C30; G6SILK = 0xE8E4DA;
+G6VT = 0xD2CDC4; G6MT = 0xCCC7BD; G6PT = 0xC3BEB4; G6IO = 0xC8C3B9;
+G6ORG = 0xD8542A; G6BLU = 0x3A6EA8; G6LED = 0xFF3A2A;
+function g6_vcol(v) ( v == 0 ? 0xD8542A : v == 1 ? 0xE0A030 : v == 2 ? 0x8DB33A : v == 3 ? 0x3AA39A : v == 4 ? 0x3A6EA8 : 0x8A5BB0; );
+function g6_vname(v) ( v == 0 ? "KICK" : v == 1 ? "SNARE" : v == 2 ? "CL HAT" : v == 3 ? "OP HAT" : v == 4 ? "CLAP" : "RIM"; );
+function g6_vnote(v) ( v == 0 ? "36" : v == 1 ? "38 40" : v == 2 ? "42 44" : v == 3 ? "46" : v == 4 ? "39" : "37"; );
+b6_update();
+b6_vol_s = b6_vol;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+b6_update();
+
+@block
+srate != b6_sr ? ( b6_sr = srate; b6_srinit(); );
+b6_update();                                       // knobs moved on the panel do not run @slider, so read them here
+b6_en = 0;
+while (midirecv(b6_mo, b6_m1, b6_m2, b6_m3)) (
+  (b6_m1 & 0xF0) == 0x90 && b6_m3 > 0 && ins_chan_ok(b6_m1, b6_chan) && b6_en < 512 && B6NMAP[b6_m2] >= 0 ? (
+    B6EVQ[b6_en * 3] = b6_mo; B6EVQ[b6_en * 3 + 1] = B6NMAP[b6_m2]; B6EVQ[b6_en * 3 + 2] = b6_m3 / 127; b6_en += 1;
+  );
+  midisend(b6_mo, b6_m1, b6_m2, b6_m3);
+);
+b6_ei = 0; b6_sp = 0;
+b6_aud > 0 ? ( b6_hit(b6_aud - 1, 1); b6_aud = 0; );     // a pad clicked on the panel
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@sample
+while (b6_ei < b6_en && (B6EVQ[b6_ei * 3] <= b6_sp || b6_sp >= samplesblock - 1)) (   // (an event stamped at / past the block end: handled at its last sample)
+  b6_hit(B6EVQ[b6_ei * 3 + 1], B6EVQ[b6_ei * 3 + 2]); ins_midi_hit();
+  b6_ei += 1;
+);
+b6_sp += 1;
+
+b6_y = b6v0.b6_run(); b6_l = b6_y * b6v0.gl; b6_r = b6_y * b6v0.gr;
+b6_y = b6v1.b6_run(); b6_l += b6_y * b6v1.gl; b6_r += b6_y * b6v1.gr;
+b6_y = b6v2.b6_run(); b6_l += b6_y * b6v2.gl; b6_r += b6_y * b6v2.gr;
+b6_y = b6v3.b6_run(); b6_l += b6_y * b6v3.gl; b6_r += b6_y * b6v3.gr;
+b6_y = b6v4.b6_run(); b6_l += b6_y * b6v4.gl; b6_r += b6_y * b6v4.gr;
+b6_y = b6v5.b6_run(); b6_l += b6_y * b6v5.gl; b6_r += b6_y * b6v5.gr;
+
+b6_vol_s += (b6_vol - b6_vol_s) * sm6;
+b6_l = ostL.ost_band(b6_l) * b6_vol_s;
+b6_r = ostR.ost_band(b6_r) * b6_vol_s;
+ins_stereo(b6_l, b6_r); ost_out(ins_sl, ins_sr);         // mono-maker / widener, then the output stage
+spl0 = ost_l;
+spl1 = ost_r;
+b6_pkL = max(b6_pkL, abs(spl0)); b6_pkR = max(b6_pkR, abs(spl1));
+
+@gfx 900 460
+// ---------------------------------------------------------------------------------------------------------
+// A mid-80s digital rhythm box: light grey plastic case, a dark function strip with the green dot-matrix LCD
+// and the CONVERTER keys, six voice columns, MASTER, and the six trigger pads with their LEDs.
+// ---------------------------------------------------------------------------------------------------------
+ui_begin(900, 460);
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+pk_chassis(8 * sc, 8 * sc, 884 * sc, 444 * sc, G6BODY);
+C_INK = G6INK; dy_ink = G6INK; dy_kst = 1; dy_ntick = 11;
+
+// ---------- header: badge, name, preset bar, size picker ----------
+ui_col(G6INK); gfx_circle(40 * sc, 36 * sc, 14 * sc, 1, 1);
+gfx_setfont(4); ui_col(G6BODY); ui_text(40 * sc, 31 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 24 * sc, 'b'); ui_col(G6INK); gfx_x = 62 * sc; gfx_y = 22 * sc; gfx_drawstr("BYTE 6");
+gfx_measurestr("BYTE 6", g6_tw, g6_th);
+gfx_setfont(4); ui_cola(G6INK, 0.7); gfx_x = 62 * sc + g6_tw + 10 * sc; gfx_y = 32 * sc; gfx_drawstr("12-BIT DIGITAL DRUM MACHINE");
+pk_pextra = "Reset all to defaults";
+g6_ps = pk_preset(420 * sc, 19 * sc, 344 * sc, 32 * sc, pr_cur,
+  "Init|Classic 80s Pop|Dirty 8-Bit|Crunchy Hip-Hop|Synth Pop|Electro Funk|Lo-Fi Tape Kit|Bright 12-Bit|Deep Boom Kit|Tight & Snappy");
+g6_ps > 0 ? ( load_preset(g6_ps); pr_cur = g6_ps > 10 ? 1 : g6_ps; );
+ui_size_picker(822 * sc, 26 * sc);
+ui_col(G6ORG); gfx_rect(14 * sc, 59 * sc, 872 * sc, 3 * sc);
+ui_col(G6BLU); gfx_rect(14 * sc, 63 * sc, 872 * sc, 2 * sc);
+
+// ---------- the dark function strip ----------
+ui_cola(0x000000, 0.35); ui_rrect(15 * sc, 72 * sc, 872 * sc, 108 * sc, 4 * sc);
+ui_col(G6STRIP); ui_rrect(14 * sc, 70 * sc, 872 * sc, 108 * sc, 4 * sc);
+gfx_gradrect(15 * sc, 71 * sc, 870 * sc, 40 * sc, 1, 1, 1, 0.07, 0, 0, 0, 0, 0, 0, 0, -0.07 / (40 * sc));
+ui_cola(0xFFFFFF, 0.14); gfx_line(18 * sc, 70 * sc, 882 * sc, 70 * sc);
+
+// LCD: a 20 x 2 dot-matrix character display, backlit green
+function g6_lcdline(x, y, s, p) local(i, len, c, ix, r, bits, cc, ds) (
+  ds = max(1, floor(p * 0.8 + 0.5)); len = strlen(s);
+  i = 0;
+  loop(20,
+    c = i < len ? str_getchar(s, i) : 32;
+    c >= 97 && c <= 122 ? c -= 32;
+    ix = c > 0 && c < 128 ? G6FMAP[c] : -1; ix < 0 ? ix = G6FMAP[32];
+    r = 0;
+    loop(7,
+      bits = G6GLY[ix * 7 + r]; cc = 0;
+      loop(5,
+        gfx_a = (bits & (16 >> cc)) ? 0.9 : 0.07;
+        gfx_rect(floor(x + (i * 6 + cc) * p), floor(y + r * p), ds, ds);
+        cc += 1;
+      );
+      r += 1;
+    );
+    i += 1;
+  );
+);
+ui_col(0x0A0A0B); ui_rrect(22 * sc, 80 * sc, 384 * sc, 90 * sc, 5 * sc);
+ui_col(0x3A3B40); gfx_rect(24 * sc, 81 * sc, 380 * sc, 1 * sc);
+gfx_gradrect(30 * sc, 88 * sc, 368 * sc, 74 * sc, 0.56, 0.74, 0.20, 1, 0, 0, 0, 0, -0.10 / (74 * sc), -0.11 / (74 * sc), -0.04 / (74 * sc), 0);
+ui_cola(0xFFFFFF, 0.10); gfx_rect(30 * sc, 88 * sc, 368 * sc, 2 * sc);
+b6_hitn != g6_hn ? ( g6_hn = b6_hitn; g6_cur = b6_last; );     // the LCD follows the last hit (or the knob being turned)
+g6_v = min(max(floor(g6_cur + 0.5), 0), 5); g6_b = 16 + g6_v * 4;
+sprintf(#g6l1, "%-6s T%+5.1f D%3.0f%%", g6_vname(g6_v), slider(g6_b), slider(g6_b + 1));
+g6_bits = slider2 < 0.5 ? 8 : slider2 < 1.5 ? 10 : 12;
+#g6rt = slider3 < 0.5 ? "22K" : slider3 < 1.5 ? "26K" : slider3 < 2.5 ? "32K" : "44K";
+b6_lvel >= 0 ? sprintf(#g6l2, "%2dBIT %s F%2.0fK V%3.0f", g6_bits, #g6rt, b6_fc / 1000, b6_lvel * 127)
+             : sprintf(#g6l2, "%2dBIT %s F%2.0fK V---", g6_bits, #g6rt, b6_fc / 1000);
+ui_col(0x132408);
+g6_lcdline(36 * sc, 100 * sc, #g6l1, 3 * sc);
+g6_lcdline(36 * sc, 130 * sc, #g6l2, 3 * sc);
+
+// CONVERTER: BITS and RATE keys, the output FILTER
+gfx_setfont(4); ui_cola(G6SILK, 0.8);
+ui_text(480 * sc, 80 * sc, "BITS"); ui_text(692 * sc, 80 * sc, "CONVERTER RATE");
+gi = 0;
+loop(3,
+  pk_ledbtn((436 + gi * 46) * sc, 94 * sc, 40 * sc, 32 * sc, slider2 == gi, G6LED) ? ( slider2 = gi; ui_auto(2); );
+  gfx_setfont(2); ui_col(G6SILK); ui_text((456 + gi * 46) * sc, 131 * sc, gi == 0 ? "8" : gi == 1 ? "10" : "12");
+  gi += 1;
+);
+gi = 0;
+loop(4,
+  pk_ledbtn((602 + gi * 46) * sc, 94 * sc, 40 * sc, 32 * sc, slider3 == gi, G6LED) ? ( slider3 = gi; ui_auto(3); );
+  gfx_setfont(2); ui_col(G6SILK); ui_text((622 + gi * 46) * sc, 131 * sc, gi == 0 ? "22K" : gi == 1 ? "26K" : gi == 2 ? "32K" : "44K");
+  gi += 1;
+);
+pk_line(436 * sc, 157 * sc, 556 * sc, 157 * sc, G6SILK, 0.35);
+pk_line(602 * sc, 157 * sc, 782 * sc, 157 * sc, G6SILK, 0.35);
+gfx_setfont(4); ui_cola(G6SILK, 0.6);
+ui_text(496 * sc, 151 * sc, " DEPTH ");
+ui_text(692 * sc, 151 * sc, " SAMPLE CLOCK ");
+dy_ink = G6SILK; dy_kf = 2;
+sprintf(#g6v, "%.1f kHz", b6_fc / 1000);
+dy_knob(838, 112, 18, 4, 20, 100, 80, 0, 0, "FILTER", #g6v);
+dy_ink = G6INK;
+
+// ---------- the six voice columns ----------
+pk_inset(24 * sc, 196 * sc, 624 * sc, 172 * sc, G6VT);
+function g6_pan(v) ( v == 0 ? strcpy(#g6v, "C") : v < 0 ? sprintf(#g6v, "L%.0f", -v) : sprintf(#g6v, "R%.0f", v); );
+gv = 0;
+loop(6,
+  gx0 = 24 + gv * 104; gcx = gx0 + 52; gb = 16 + gv * 4; gc = g6_vcol(gv);
+  gv > 0 ? pk_line(gx0 * sc, 202 * sc, gx0 * sc, 362 * sc, G6INK, 0.18);
+  // header: colour key, name, MIDI notes
+  ui_col(gc); ui_rrect((gx0 + 7) * sc, 203 * sc, 6 * sc, 15 * sc, 1.5 * sc);
+  gfx_setfont(2); ui_col(G6INK); gfx_x = (gx0 + 18) * sc; gfx_y = 203 * sc; gfx_drawstr(g6_vname(gv));
+  gfx_setfont(4); ui_cola(G6INK, 0.62); gfx_measurestr(g6_vnote(gv), g6_tw, g6_th);
+  gfx_x = (gx0 + 98) * sc - g6_tw; gfx_y = 206 * sc; gfx_drawstr(g6_vnote(gv));
+  // knobs: TUNE DECAY / LEVEL PAN
+  sprintf(#g6v, "%+.1f st", slider(gb));
+  dy_knob(gcx - 25, 242, 15, gb, -12, 12, 0, 0, 0, "TUNE", #g6v);
+  dy_act && mdown ? g6_cur = gv;
+  sprintf(#g6v, "%.0f%%", slider(gb + 1));
+  dy_knob(gcx + 25, 242, 15, gb + 1, 25, 400, 100, 1, 0, "DECAY", #g6v);
+  dy_act && mdown ? g6_cur = gv;
+  sprintf(#g6v, "%.0f", slider(gb + 2));
+  dy_knob(gcx - 25, 316, 15, gb + 2, 0, 100, gv == 0 ? 85 : gv == 1 ? 75 : gv == 2 ? 60 : gv == 3 ? 55 : gv == 4 ? 70 : 60, 0, 0, "LEVEL", #g6v);
+  g6_pan(slider(gb + 3));
+  dy_knob(gcx + 25, 316, 15, gb + 3, -100, 100, gv == 2 || gv == 3 ? 25 : gv == 4 ? -15 : gv == 5 ? -30 : 0, 0, 0, "PAN", #g6v);
+  gv += 1;
+);
+
+// ---------- the pads: an LED over each, a recessed key bed ----------
+pk_inset(24 * sc, 392 * sc, 624 * sc, 50 * sc, G6PT);
+gv = 0;
+loop(6,
+  gx0 = 24 + gv * 104; gcx = gx0 + 52; gc = g6_vcol(gv);
+  pk_led(gcx * sc, 380 * sc, 3.6 * sc, B6LT[gv] > 0.25, G6LED);
+  B6LT[gv] *= 0.8;
+  gpx = (gx0 + 9) * sc; gpy = 397 * sc; gpw = 86 * sc; gph = 40 * sc;
+  ginb = mouse_x >= gpx && mouse_x < gpx + gpw && mouse_y >= gpy && mouse_y < gpy + gph;
+  pressed && drag_id == 0 && ginb ? ( drag_id = 5000 + gv; b6_aud = gv + 1; );
+  gdn = drag_id == 5000 + gv && mdown ? 1.5 * sc : 0;
+  ui_keyshadow(gpx, gpy, gpw, gph, 4 * sc);
+  ui_col(0x55524C); ui_rrs(gpx, gpy, gpw, gph, 4 * sc);
+  ui_col(0x8E8A82); ui_rrs(gpx + 1, gpy + 1, gpw - 2, gph - 2, 4 * sc);
+  ui_col(ginb && !mdown ? 0x4A4B50 : 0x3E3F44); ui_rrs(gpx + 3 * sc, gpy + 2 * sc + gdn, gpw - 6 * sc, gph - 7 * sc, 3 * sc);
+  gfx_gradrect(gpx + 4 * sc, gpy + 3 * sc + gdn, gpw - 8 * sc, 12 * sc, 1, 1, 1, 0.10, 0, 0, 0, 0, 0, 0, 0, -0.10 / (12 * sc));
+  B6LT[gv] > 0.05 ? ( ui_cola(gc, B6LT[gv] * 0.45); ui_rrs(gpx + 3 * sc, gpy + 2 * sc + gdn, gpw - 6 * sc, gph - 7 * sc, 3 * sc); );
+  ui_col(gc); gfx_rect(gpx + 8 * sc, gpy + 6 * sc + gdn, gpw - 16 * sc, 2 * sc);
+  gfx_setfont(2); ui_col(0xEDE8DC); ui_text(gpx + gpw * 0.5, gpy + 14 * sc + gdn, g6_vname(gv));
+  gv += 1;
+);
+
+// ---------- MASTER ----------
+pk_inset(664 * sc, 196 * sc, 216 * sc, 172 * sc, G6MT);
+gfx_setfont(2); ui_col(G6INK); gfx_x = 674 * sc; gfx_y = 203 * sc; gfx_drawstr("MASTER");
+sprintf(#g6v, "%+.1f dB", slider1);
+dy_knob(706, 252, 20, 1, -24, 12, 0, 0, 0, "VOLUME", #g6v);
+sprintf(#g6v, "%.0f%%", slider5);
+dy_knob(774, 252, 16, 5, 0, 100, 80, 0, 0, "VELOCITY", #g6v);
+dy_kst = 20;
+sprintf(#g6v, "%.0f%%", slider6);
+dy_knob(706, 324, 12, 6, 0, 100, 15, 0, 0x9DA2A8, "DRIFT", #g6v);
+slider7 == 0 ? strcpy(#g6v, "OMNI") : sprintf(#g6v, "CH %.0f", slider7);
+dy_step = 17; dy_steps = "||||||||||||||||";
+dy_knob(774, 324, 12, 7, 0, 16, 0, 0, 0x9DA2A8, "CHANNEL", #g6v);
+dy_kst = 1;
+pk_led(806 * sc, 302 * sc, 3 * sc, ins_midi_lit(), G6LED);
+gfx_setfont(4); ui_col(G6INK); ui_text(806 * sc, 310 * sc, "MIDI");
+g6mL.ui_ledm(836 * sc, 208 * sc, 11 * sc, 140 * sc, b6_pkL);
+g6mR.ui_ledm(854 * sc, 208 * sc, 11 * sc, 140 * sc, b6_pkR);
+b6_pkL *= 0.85; b6_pkR *= 0.85;
+gfx_setfont(4); ui_col(G6INK); ui_text(851 * sc, 354 * sc, "OUT");
+
+// ---------- IN / OUT: SAT, MONO, WIDTH ----------
+pk_inset(664 * sc, 392 * sc, 216 * sc, 50 * sc, G6IO);
+ins_io(672, 398, 8, G6INK);
+ins_stereo_mini(778, 398, 14, G6INK);
+
+pk_end();
+ui_end();

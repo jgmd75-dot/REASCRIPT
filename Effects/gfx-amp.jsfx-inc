@@ -1,0 +1,192 @@
+// gfx-amp.jsfx-inc - shared amp engine for the GFX amp heads (JGWizrad / Garden FX)
+// Requires gfx-ui and gfx-panel imported first (for the tuner display and faceplate helpers).
+//
+//   biquads:   am.am_bq(type, f, q, gdb, fs)  /  am.am_run(x)   (0 LP 1 HP 2 peak 3 high shelf 4 low shelf)
+//   2x oversampling: up.am_aa(); dn.am_aa();  per sample:
+//              z = up.am_aa_run(x * 2); core(z) -> dn.am_aa_run(..); z = up.am_aa_run(0); y = dn.am_aa_run(core(z))
+//   valve:     v1.am_tube(x, bias)  - asymmetric tanh, unity small-signal gain (one instance per stage: the bias term
+//              is cached)
+//   gate:      g.am_gate(x, thr_db) returns the gain (0..1) to apply
+//   cabinet:   cab.am_cab_set(type, mic)  /  cab.am_cab_run(x)   type 1 = 8x10 bass, 2 = 2x12 open, 3 = 4x12, 4 = 1x8 open
+//   spring:    rv.am_spring_init(mem, fs) / rv.am_spring_run(x, dwell)   (fs = the rate it runs at)
+//   tuner:     am_tun_push(x) per sample (decimates), am_tun_draw(x, y, w, h) in @gfx
+
+@init
+
+function am_bq(type, f, q, gdb, fs) instance(b0, b1, b2, a1, a2) local(w0, cw, sw, al, amp, sa, n) (
+  f = min(max(f, 5), fs * 0.45);
+  w0 = 2 * $pi * f / fs; cw = cos(w0); sw = sin(w0); al = sw / (2 * q);
+  amp = 10 ^ (gdb / 40);
+  type == 0 ? (
+    n = 1 + al; b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 1 ? (
+    n = 1 + al; b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 2 ? (
+    n = 1 + al / amp; b0 = (1 + al * amp) / n; b1 = -2 * cw / n; b2 = (1 - al * amp) / n; a1 = b1; a2 = (1 - al / amp) / n;
+  ) : type == 3 ? (
+    sa = 2 * sqrt(amp) * al;
+    n = (amp + 1) - (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) + (amp - 1) * cw + sa) / n; b1 = -2 * amp * ((amp - 1) + (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) + (amp - 1) * cw - sa) / n; a1 = 2 * ((amp - 1) - (amp + 1) * cw) / n;
+    a2 = ((amp + 1) - (amp - 1) * cw - sa) / n;
+  ) : (
+    sa = 2 * sqrt(amp) * al;
+    n = (amp + 1) + (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) - (amp - 1) * cw + sa) / n; b1 = 2 * amp * ((amp - 1) - (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) - (amp - 1) * cw - sa) / n; a1 = -2 * ((amp - 1) + (amp + 1) * cw) / n;
+    a2 = ((amp + 1) + (amp - 1) * cw - sa) / n;
+  );
+);
+function am_thru() instance(b0, b1, b2, a1, a2) ( b0 = 1; b1 = 0; b2 = 0; a1 = 0; a2 = 0; );
+function am_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+
+// ---------- 2x oversampling: 8th-order Butterworth either side ----------
+function am_aa() instance(f1, f2, f3, f4) local(fc, fs2) (
+  fs2 = 2 * srate; fc = min(0.42 * srate, 20000);
+  f1.am_bq(0, fc, 0.5098, 0, fs2); f2.am_bq(0, fc, 0.6013, 0, fs2);
+  f3.am_bq(0, fc, 0.9000, 0, fs2); f4.am_bq(0, fc, 2.5629, 0, fs2);
+);
+function am_aa_run(x) instance(f1, f2, f3, f4) ( f4.am_run(f3.am_run(f2.am_run(f1.am_run(x)))); );
+
+// ---------- valve stage: asymmetric tanh, unity gain for small signals ----------
+function am_tanh(x) local(e) ( x = min(max(x, -20), 20); e = exp(2 * x); (e - 1) / (e + 1); );
+// (an instance: give each stage its own name, v1.am_tube(x, b), so the bias term tanh(b) is only worked out again
+// when b changes - the same result to the bit; a bare am_tube(x, b) still works, it just recomputes more often)
+function am_tube(x, b) instance(tbb, tbt, tbn) (
+  tbn && b === tbb ? 0 : ( tbb = b; tbt = am_tanh(b); tbn = 1 - tbt * tbt; );
+  (am_tanh(x + b) - tbt) / tbn;
+);
+
+// ---------- noise gate (expander), returns the gain ----------
+function am_gate(x, thr) instance(env, hold, g) local(t, a) (
+  a = abs(x);
+  env += (a - env) * (a > env ? am_g_att : am_g_rel);
+  thr <= -79.5 ? g = 1 : (
+    t = 10 ^ (thr / 20);
+    env > t ? ( hold = am_g_hold; t = 1; ) : ( hold > 0 ? ( hold -= 1; t = 1; ) : t = (env / t) ^ 3; );
+    g += (t - g) * (t > g ? am_g_open : am_g_close);
+  );
+  g;
+);
+am_g_att = 1 - exp(-1 / (0.0005 * srate)); am_g_rel = 1 - exp(-1 / (0.03 * srate));
+am_g_hold = floor(0.05 * srate); am_g_open = 1 - exp(-1 / (0.0008 * srate)); am_g_close = 1 - exp(-1 / (0.08 * srate));
+
+// ---------- cabinets (filter models), mic 0 = on axis ... 10 = off axis ----------
+function am_cab_set(type, mic) instance(c1, c2, c3, c4, c5, c6, c7) local(m, lp) (
+  m = mic / 10;
+  type == 1 ? (                                    // 8x10 sealed bass cab
+    c1.am_bq(1, 52, 0.9, 0, srate);                // low end: sealed-box roll-off
+    c2.am_bq(2, 85, 1.1, 3, srate);                // box resonance
+    c3.am_bq(2, 480, 1.0, -3, srate);              // cone dip
+    c4.am_bq(2, 2400, 1.8, 3.5 * (1 - m), srate);  // cone breakup (on axis)
+    lp = 5200 - 1900 * m;
+    c5.am_bq(0, lp, 0.5412, 0, srate); c6.am_bq(0, lp, 1.3066, 0, srate);
+    c7.am_bq(2, 6500, 3, -8 * m, srate);           // off axis: a deeper notch above the roll-off
+  ) : type == 2 ? (                                // 2x12 open back
+    c1.am_bq(1, 75, 0.7, 0, srate);
+    c2.am_bq(2, 120, 1.0, 1.5, srate);
+    c3.am_bq(2, 600, 1.2, -2, srate);
+    c4.am_bq(2, 2200, 1.4, 4 * (1 - m * 0.7), srate);
+    lp = 6200 - 2200 * m;
+    c5.am_bq(0, lp, 0.5412, 0, srate); c6.am_bq(0, lp, 1.3066, 0, srate);
+    c7.am_bq(2, 7500, 3, -9 * m, srate);
+  ) : type == 3 ? (                                // 4x12 closed back
+    c1.am_bq(1, 82, 1.1, 0, srate);
+    c2.am_bq(2, 110, 1.3, 4, srate);
+    c3.am_bq(2, 420, 1.0, -3, srate);
+    c4.am_bq(2, 2900, 1.5, 5 * (1 - m * 0.7), srate);
+    lp = 5600 - 2000 * m;
+    c5.am_bq(0, lp, 0.5412, 0, srate); c6.am_bq(0, lp, 1.3066, 0, srate);
+    c7.am_bq(2, 7000, 3, -9 * m, srate);
+  ) : type == 4 ? (                                // 1x8 open back (small combo)
+    c1.am_bq(1, 115, 0.8, 0, srate);               // little cone, open back: thin low end
+    c2.am_bq(2, 160, 1.4, 2.5, srate);
+    c3.am_bq(2, 1300, 0.9, 4, srate);              // the honk
+    c4.am_bq(2, 3000, 2.0, 3 * (1 - m * 0.8), srate);
+    lp = 4600 - 1600 * m;
+    c5.am_bq(0, lp, 0.5412, 0, srate); c6.am_bq(0, lp, 1.3066, 0, srate);
+    c7.am_bq(2, 6000, 3, -8 * m, srate);
+  ) : (
+    c1.am_thru(); c2.am_thru(); c3.am_thru(); c4.am_thru(); c5.am_thru(); c6.am_thru(); c7.am_thru();
+  );
+);
+function am_cab_run(x) instance(c1, c2, c3, c4, c5, c6, c7) (
+  c7.am_run(c6.am_run(c5.am_run(c4.am_run(c3.am_run(c2.am_run(c1.am_run(x)))))));
+);
+
+// ---------- spring reverb: chirpy dispersion, two springs, damping ----------
+function am_ap1(x, a) instance(z) local(y) ( y = -a * x + z; z = x + a * y; y; );
+function am_spring_init(mem, fs) instance(b1, b2, n1, n2, w1, w2, lp1, lp2, hp, lc) (
+  b1 = mem; n1 = floor(0.0371 * fs); b2 = mem + n1 + 8; n2 = floor(0.0433 * fs);
+  memset(mem, 0, n1 + n2 + 16); w1 = 0; w2 = 0; lp1 = 0; lp2 = 0;
+  hp.am_bq(1, 250, 0.7, 0, fs); lc = 1 - exp(-2 * $pi * 3800 / fs);
+);
+function am_spring_run(x, dwell) instance(b1, b2, n1, n2, w1, w2, lp1, lp2, hp, lc, d1, d2, d3, d4, d5, d6, e1, e2, e3, e4) local(y, s1, s2, fb) (
+  y = hp.am_run(x);
+  y = d6.am_ap1(d5.am_ap1(d4.am_ap1(d3.am_ap1(d2.am_ap1(d1.am_ap1(y, 0.62), 0.62), 0.62), 0.62), 0.62), 0.62);   // the chirp
+  fb = 0.55 + 0.35 * dwell;
+  s1 = b1[w1]; s2 = b2[w2];
+  lp1 += (s1 - lp1) * lc; lp2 += (s2 - lp2) * lc;
+  b1[w1] = y + e1.am_ap1(e2.am_ap1(lp2 * fb, 0.5), 0.5);
+  b2[w2] = y + e3.am_ap1(e4.am_ap1(lp1 * fb, 0.5), 0.5);
+  w1 = (w1 + 1) % n1; w2 = (w2 + 1) % n2;
+  (s1 + s2) * 0.5;
+);
+
+// ---------- tuner: decimated input, YIN-style period search in @gfx ----------
+AM_TN = 2048; AM_TBUF = 960000; am_tw = 0; am_tacc = 0; am_tcnt = 0; am_tf = 0; am_tcl = 0;
+function am_tun_push(x) (
+  am_tacc += x; am_tcnt += 1;
+  am_tcnt >= 4 ? ( AM_TBUF[am_tw] = am_tacc * 0.25; am_tw = (am_tw + 1) & (AM_TN - 1); am_tacc = 0; am_tcnt = 0; );
+);
+// estimate the frequency (Hz, 0 = none) from the last samples
+function am_tun_detect() local(fs, W, tmin, tmax, t, j, d, sum, cm, best, bt, i0, a, b, c, p, e) (
+  fs = srate / 4; W = 700; tmin = floor(fs / 700); tmax = floor(fs / 35);
+  i0 = (am_tw - W - tmax + AM_TN * 4) & (AM_TN - 1);
+  e = 0; j = 0; loop(W, e += sqr(AM_TBUF[(i0 + j) & (AM_TN - 1)]); j += 1; );
+  e < W * 0.0000004 ? 0 : (
+    sum = 0; best = -1; t = 1;
+    loop(tmax,
+      d = 0; j = 0;
+      loop(W, d += sqr(AM_TBUF[(i0 + j) & (AM_TN - 1)] - AM_TBUF[(i0 + j + t) & (AM_TN - 1)]); j += 1; );
+      AM_TBUF[AM_TN + t] = d; sum += d; cm = d * t / max(sum, 0.0000001);
+      AM_TBUF[AM_TN * 2 + t] = cm;
+      best < 0 && t >= tmin && cm < 0.18 ? best = t;
+      t += 1;
+    );
+    best < 0 ? 0 : (
+      while (best + 1 < tmax && AM_TBUF[AM_TN * 2 + best + 1] < AM_TBUF[AM_TN * 2 + best]) ( best += 1; );
+      a = AM_TBUF[AM_TN * 2 + best - 1]; b = AM_TBUF[AM_TN * 2 + best]; c = AM_TBUF[AM_TN * 2 + best + 1];
+      p = (a - 2 * b + c) != 0 ? 0.5 * (a - c) / (a - 2 * b + c) : 0;
+      fs / (best + p);
+    );
+  );
+);
+function am_tun_draw(x, y, w, h, ink, acc) local(f, n, cents, nn, oct, cx, px) (
+  f = am_tun_detect();
+  f > 0 ? am_tf = am_tf > 0 && abs(f / am_tf - 1) < 0.03 ? am_tf + (f - am_tf) * 0.35 : f;
+  f <= 0 ? ( am_tcl += 1; am_tcl > 20 ? am_tf = 0; ) : am_tcl = 0;
+  ui_col(0x0A0B0C); ui_rrect(x, y, w, h, 3 * sc);
+  cx = x + w * 0.5;
+  gfx_setfont(4);
+  am_tf > 0 ? (
+    n = 12 * log(am_tf / 440) / log(2) + 69; nn = floor(n + 0.5); cents = (n - nn) * 100;
+    oct = floor(nn / 12) - 1; nn = nn % 12;
+    strcpy(#am_tn, nn == 0 ? "C" : nn == 1 ? "C#" : nn == 2 ? "D" : nn == 3 ? "D#" : nn == 4 ? "E" : nn == 5 ? "F" :
+                   nn == 6 ? "F#" : nn == 7 ? "G" : nn == 8 ? "G#" : nn == 9 ? "A" : nn == 10 ? "A#" : "B");
+    sprintf(#am_to, "%s%d", #am_tn, oct);
+    gfx_setfont(6, "Trebuchet MS", 14 * sc, 'b');
+    ui_col(abs(cents) < 4 ? 0x5CF08A : acc); ui_text(cx, y + 3 * sc, #am_to);
+    gfx_setfont(4);
+    px = cx + min(max(cents / 50, -1), 1) * (w * 0.42);
+    ui_cola(ink, 0.35); gfx_line(x + w * 0.08, y + h - 7 * sc, x + w * 0.92, y + h - 7 * sc);
+    ui_col(ink); gfx_line(cx, y + h - 11 * sc, cx, y + h - 3 * sc);
+    ui_col(abs(cents) < 4 ? 0x5CF08A : acc); gfx_circle(px, y + h - 7 * sc, 3 * sc, 1, 1);
+  ) : (
+    ui_cola(ink, 0.4); ui_text(cx, y + h * 0.5 - 5 * sc, "PLAY A NOTE");
+  );
+);

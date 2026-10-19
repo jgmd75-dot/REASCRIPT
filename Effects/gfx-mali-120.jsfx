@@ -1,0 +1,548 @@
+desc:GFX Mali 120 [chorus combo amp]
+//tags: amp amplifier guitar keys solid state combo stereo chorus vibrato reverb distortion
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate, gfx-instrument and gfx-amp
+// (.jsfx-inc) in the same folder.
+//
+// Mali 120 - a stereo solid-state combo in the spirit of the famous late-70s Japanese 2x12 stereo chorus amp and its
+// smaller sibling (personal use; the sound is designed from scratch).
+//   120 / 55     - the model. 120: two channels, 2 x 60 W, two 12" speakers. 55: the smaller single-channel combo,
+//                  lower headroom, two 8" speakers, a fixed chorus (what the 55 lacks is greyed out).
+//   INPUT        - which channel the signal goes into: NORMAL, EFFECT or BOTH (the two channels jumpered).
+//   MONO IN      - sum the inputs into one amp (the classic set-up: in CHORUS, dry left / chorus right); off (default) =
+//                  L and R into two linked identical amps. The CHORUS presets switch it on for the classic split.
+//   NORMAL       - VOLUME, TREBLE, MIDDLE, BASS and BRIGHT: the clean, glassy channel.
+//   EFFECT       - the same tone controls plus DISTORTION (a fizzy op-amp clipper, oversampled), REVERB (a short,
+//                  bright spring) and the modulation: CHORUS / VIBRATO / OFF, SPEED and DEPTH for the vibrato.
+//   The stereo trick: in CHORUS the left speaker plays the dry amp and the right speaker the bucket-brigade
+//   (pitch-modulated) copy, so the chorus happens in the room between them. In VIBRATO both speakers carry the
+//   modulated signal. With MONO IN off each side mixes its own chorus, the two sweeps a quarter cycle apart.
+//   WIDTH        - speaker spread (100% = the full L / R split; lower blends the speakers for headphones).
+// The power amps are very clean solid-state stages that clip hard only at the very top; each speaker is its own
+// channel with its own power amp.
+// DRIFT: the supply wanders - the chorus clock and rate drift slightly, the rails sag a touch under load. The DRIFT
+// dial scales it (50% = standard, 100% = twice, 0 = none, and no sag).
+// IN / OUT: TRIM (click it for GUARD), SAT (the output soft clip is always on) along the bottom.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-amp.jsfx-inc
+
+slider1:0<0,1,1{120,55}>-Model
+slider2:1<0,2,1{Normal,Effect,Both}>-Input channel
+slider3:0<0,1,1{Off,On}>-Mono in
+slider4:5<0,10,0.1>-Normal volume
+slider5:5<0,10,0.1>-Normal treble
+slider6:5<0,10,0.1>-Normal middle
+slider7:5<0,10,0.1>-Normal bass
+slider8:0<0,1,1{Off,On}>-Normal bright
+slider9:5<0,10,0.1>-Effect volume
+slider10:5<0,10,0.1>-Effect treble
+slider11:5<0,10,0.1>-Effect middle
+slider12:5<0,10,0.1>-Effect bass
+slider13:0<0,1,1{Off,On}>-Effect bright
+slider14:0<0,10,0.1>-Distortion
+slider15:2<0,10,0.1>-Reverb
+slider16:0<0,2,1{Off,Chorus,Vibrato}>-Modulation
+slider17:5<0,10,0.1>-Vibrato speed
+slider18:5<0,10,0.1>-Vibrato depth
+slider19:100<0,100,1>-Width (%)
+slider20:0<-24,12,0.1>-Output (dB)
+slider21:0<-24,12,0.1>-Input trim (dB)
+slider22:0<0,1,1{Off,On}>-Input guard
+slider23:0<0,100,1>-Band sat (%)
+slider24:30<0,100,1>-Bias (%)
+slider25:120<40,400,1>-Sat low band (Hz)
+slider26:6000<2000,16000,10>-Sat high band (Hz)
+slider27:-0.3<-24,0,0.1>-Ceiling (dB)
+slider28:1<0,1,1{Off,Clip}>-(unused, was output stage)
+// DRIFT dial: supply wander - the chorus clock and rate drift, the rails sag a touch
+slider29:50<0,100,1>-Drift (%)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-mali-120";                                  // the ? pop-up links to this manual
+
+// ---------- memory (the output stage lives at 20000 .. 24096) ----------
+ml_nm = 30000;
+function ml_alloc(n) local(p) ( p = ml_nm; ml_nm += n; memset(p, 0, n); p; );
+ML_BB = 4096; ML_BM = ML_BB - 1;                           // bucket-brigade lines (power of two)
+
+// ---------- the op-amp clipper: a hard clip with first-order antiderivative anti-aliasing (run at 2x) ----------
+function ml_hcF(u) ( abs(u) <= 1 ? 0.5 * u * u : abs(u) - 0.5; );
+function ml_clip(u) instance(x1, F1, b1) local(F, y, d) (
+  u += ml_bias; F = ml_hcF(u); d = u - x1;
+  y = abs(d) > 0.00001 ? (F - F1) / d : min(max(0.5 * (u + x1), -1), 1);
+  y -= 0.5 * (ml_bias + b1);                              // the bias as averaged: a drifting bias leaves no steps
+  x1 = u; F1 = F; b1 = ml_bias;
+  y;
+);
+
+// ---------- one side's preamp: the NORMAL and EFFECT channels (results in on / oe) ----------
+function ml_pre_set() instance(nbr, nb, nm, nt, nv1, nv2, ebr, eb, em, et, ev1, ev2, ehp, dpe, dlp, dlp2, dhp, up, dn) (
+  this.nbr.am_bq(3, 2400, 0.6, ml_nbrd, srate);
+  this.nb.am_bq(4, 110, 0.7, ml_nbd, srate); this.nm.am_bq(2, ml_mf, 0.75, ml_nmd, srate); this.nt.am_bq(3, 3200, 0.7, ml_ntd, srate);
+  this.nv1.am_bq(2, 1300, 0.7, ml_vmid, srate); this.nv2.am_bq(3, 6500, 0.7, ml_vglass, srate);
+  this.ebr.am_bq(3, 2400, 0.6, ml_ebrd, srate);
+  this.eb.am_bq(4, 110, 0.7, ml_ebd, srate); this.em.am_bq(2, ml_mf, 0.75, ml_emd, srate); this.et.am_bq(3, 3200, 0.7, ml_etd, srate);
+  this.ev1.am_bq(2, 1300, 0.7, ml_vmid, srate); this.ev2.am_bq(3, 6500, 0.7, ml_vglass, srate);
+  this.ehp.am_bq(1, 110, 0.7, 0, srate);
+  this.dpe.am_bq(3, 1500, 0.7, 9, srate);                 // the fizz: treble pushed into the clipper
+  this.dlp.am_bq(0, 6200, 1.05, 0, srate);                // the op-amp's own roll-off, a slightly peaky edge
+  this.dlp2.am_bq(0, 10500, 0.6, 0, srate);
+  this.dhp.am_bq(1, 30, 0.7, 0, srate);
+);
+function ml_pre_init() instance(up, dn) ( this.up.am_aa(); this.dn.am_aa(); );
+function ml_pre(x) instance(on, oe, gn, ge, db, rw, nbr, nb, nm, nt, nv1, nv2, ebr, eb, em, et, ev1, ev2, ehp, dpe, dlp, dlp2, dhp, up, dn, ad, rv)
+  local(y, z, c, d) (
+  ml_nrm ? (
+    y = this.nbr.am_run(x);
+    y = this.nb.am_run(y); y = this.nm.am_run(y); y = this.nt.am_run(y);
+    y = this.nv1.am_run(y); y = this.nv2.am_run(y);
+    gn += (ml_gn - gn) * ml_sm; on = y * gn;
+  ) : ( gn = 0; on = 0; );
+  ml_eff ? (
+    y = this.ebr.am_run(x);
+    db += (ml_db - db) * ml_sm;
+    db > 0.0005 ? (                                       // DISTORTION: at twice the rate, then back
+      c = this.dpe.am_run(this.ehp.am_run(y)) * ml_gd;
+      z = this.up.am_aa_run(c * 2); this.dn.am_aa_run(this.ad.ml_clip(z));
+      z = this.up.am_aa_run(0);     d = this.dn.am_aa_run(this.ad.ml_clip(z));
+      d = this.dhp.am_run(this.dlp2.am_run(this.dlp.am_run(d))) * ml_cd;
+      y += (d - y) * db;
+    );
+    y = this.eb.am_run(y); y = this.em.am_run(y); y = this.et.am_run(y);
+    y = this.ev1.am_run(y); y = this.ev2.am_run(y);
+    ge += (ml_ge - ge) * ml_sm; y *= ge;
+    rw += (ml_rw - rw) * ml_sm;
+    oe = y + this.rv.am_spring_run(y, 0.7) * rw;           // the spring, before the chorus
+  ) : ( ge = 0; oe = 0; );
+);
+
+// ---------- the bucket-brigade line: anti-alias filter, delay (Hermite read), soft companding, reconstruction ----------
+function ml_bbd(x, d) instance(buf, wp, p1, p2, q) local(rp, i, f, xm1, x0, x1, x2, y) (
+  p1 += (x - p1) * ml_bc; p2 += (p1 - p2) * ml_bc;
+  buf[wp] = p2;
+  rp = wp - d; rp < 0 ? rp += ML_BB;
+  i = floor(rp); f = rp - i;
+  xm1 = buf[(i + ML_BM) & ML_BM]; x0 = buf[i & ML_BM]; x1 = buf[(i + 1) & ML_BM]; x2 = buf[(i + 2) & ML_BM];
+  wp = (wp + 1) & ML_BM;
+  y = (((0.5 * (x2 - xm1) + 1.5 * (x0 - x1)) * f + (xm1 - 2.5 * x0 + 2 * x1 - 0.5 * x2)) * f + 0.5 * (x1 - xm1)) * f + x0;
+  y = min(max(y, -3), 3); y = y * (27 + y * y) / (27 + 9 * y * y);
+  this.q.am_run(y);
+);
+// the LFO shapes: a rounded triangle (chorus) or a sine (vibrato), -1 .. 1
+function ml_shape(p, vib) local(t) (
+  p -= floor(p);
+  vib ? sin(2 * $pi * p) : ( t = 4 * abs(p - 0.5) - 1; t * (1.5 - 0.5 * t * t); );
+);
+
+// ---------- one speaker's power amp and 12" (or 8") speaker ----------
+function ml_spk_set(m) instance(s1, s2, s3, s4, s5, s6, s7) (
+  m ? (                                                   // 55: two 8" - less bass, more mid
+    this.s1.am_bq(1, 105, 0.8, 0, srate); this.s2.am_bq(2, 175, 1.2, 2, srate); this.s3.am_bq(2, 950, 1.0, 2.5, srate);
+    this.s4.am_bq(2, 2800, 1.0, 2, srate); this.s5.am_bq(2, 420, 1.4, 0, srate);
+    this.s6.am_bq(0, 6000, 0.8, 0, srate); this.s7.am_bq(0, 9000, 0.6, 0, srate);
+  ) : (                                                   // 120: two 12", closed-ish - tight, bright, a bit boxy
+    this.s1.am_bq(1, 72, 0.85, 0, srate); this.s2.am_bq(2, 120, 1.1, 2.5, srate); this.s3.am_bq(2, 460, 1.4, 1.8, srate);
+    this.s4.am_bq(2, 2600, 0.9, 3, srate); this.s5.am_bq(2, 1500, 1.2, -1.5, srate);
+    this.s6.am_bq(0, 6800, 0.8, 0, srate); this.s7.am_bq(0, 10000, 0.6, 0, srate);
+  );
+);
+function ml_pa(x) instance(env, s1, s2, s3, s4, s5, s6, s7) local(a, r, k, y) (
+  a = abs(x);
+  env += (a - env) * (a > env ? ml_satt : ml_srel);
+  r = ml_rail * (1 - ml_sag * min(env / ml_rail, 1));
+  k = 0.9 * r;
+  y = a < k ? x : ( ml_pclip = 1; sign(x) * (k + (r - k) * am_tanh((a - k) / (r - k))); );
+  y = this.s1.am_run(y); y = this.s2.am_run(y); y = this.s3.am_run(y); y = this.s4.am_run(y);
+  y = this.s5.am_run(y); y = this.s6.am_run(y); y = this.s7.am_run(y);
+  y * ml_mk;
+);
+
+function update() local(m, v, sp, cents) (
+  m = slider1 >= 0.5; ml_mdl = m;
+  ml_nrm = !m && slider2 != 1;
+  ml_eff = m || slider2 != 0;
+  ml_mono = slider3 >= 0.5;
+  ml_gn = sqr(slider4 / 10) * 4; ml_ge = sqr(slider9 / 10) * 4;              // audio-taper volumes, 5 = 0 dB
+  ml_ntd = (slider5 - 5) * 2.6; ml_nmd = (slider6 - 5) * 2.0; ml_nbd = (slider7 - 5) * 2.6;
+  ml_etd = (slider10 - 5) * 2.6; ml_emd = (slider11 - 5) * 2.0; ml_ebd = (slider12 - 5) * 2.6;
+  ml_nbrd = !m && slider8 ? 7 - 3 * slider4 / 10 : 0;     // BRIGHT: strongest at low volume
+  ml_ebrd = !m && slider13 ? 7 - 3 * slider9 / 10 : 0;
+  ml_mf = m ? 900 : 750;
+  ml_vmid = m ? 2.5 : 1.5; ml_vglass = m ? 1.5 : 2.5;     // the glassy, mid-forward voicing
+  v = m ? 0 : slider14;                                   // DISTORTION
+  ml_gd = 10 ^ ((6 + 4.4 * v) / 20); ml_cd = max(1 / ml_gd, 0.13);
+  ml_db = min(v * 2, 1);
+  ml_rw = (slider15 / 10) ^ 1.5 * 1.5;
+  ml_mod = m ? (slider16 >= 0.5 ? 1 : 0) : slider16 | 0;
+  ml_vib = ml_mod == 2;
+  ml_mod == 2 ? (                                         // VIBRATO: SPEED 0.5 .. 10 Hz, DEPTH up to 50 cents
+    ml_rate = 0.5 * 20 ^ (slider17 / 10);
+    cents = 50 * (slider18 / 10) ^ 1.3;
+    ml_dept = min((2 ^ (cents / 1200) - 1) / (2 * $pi * ml_rate) * 1000, 6);
+    ml_cent = ml_dept + 1.3;
+  ) : m ? ( ml_rate = 0.85; ml_cent = 4.0; ml_dept = 1.6; )   // the fixed choruses
+        : ( ml_rate = 0.72; ml_cent = 4.6; ml_dept = 1.9; );
+  ml_tL = ml_mod == 2 ? 1 : ml_mod == 1 ? (ml_mono ? 0 : 0.5) : 0;
+  ml_tR = ml_mod == 2 ? 1 : ml_mod == 1 ? (ml_mono ? 1 : 0.5) : 0;
+  ml_wid = slider19 / 100;
+  ml_rail0 = m ? 0.75 : 1;
+  ml_out = 10 ^ (slider20 / 20);
+  ml_m0 != m ? ( ml_m0 = m; OL.ml_spk_set(m); OR.ml_spk_set(m); );
+  PL.ml_pre_set(); PR.ml_pre_set();
+  drift_macro(slider29);
+  in_setup(slider21, slider22);
+  ins_output_setup(23);   // output stage: CLIP, always on
+);
+
+// ---------- presets (the output stage and the I/O rows are left alone) ----------
+function ml_set(md, ic, mo, nv, nt, nm, nb, nr, ev, et, em, eb, er, ds, rv, mm, sp, dp, wd) (
+  slider1 = md; slider2 = ic; slider3 = mo; slider4 = nv; slider5 = nt; slider6 = nm; slider7 = nb; slider8 = nr;
+  slider9 = ev; slider10 = et; slider11 = em; slider12 = eb; slider13 = er; slider14 = ds; slider15 = rv;
+  slider16 = mm; slider17 = sp; slider18 = dp; slider19 = wd;
+  slider_automate(524287);                                // sliders 1-19
+);
+function load_preset(p) (
+  //                     model inp mono  N: vol tre mid bas brt   E: vol tre mid bas brt  dist rev  mod spd dep  wid
+  p == 1  ? ml_set(0, 1, 0, 5, 5, 5, 5, 0, 5, 5, 5, 5, 0, 0, 2, 0, 5, 5, 100) :   // Init Clean
+  p == 2  ? ml_set(0, 1, 0, 5, 6.5, 5.5, 4.5, 1, 5, 6.5, 5.5, 4.5, 1, 0, 2.5, 0, 5, 5, 100) :   // Glass Clean
+  p == 3  ? ml_set(0, 1, 1, 5, 5, 5, 5, 0, 5, 5.5, 5, 5, 0, 0, 2, 1, 5, 5, 100) :   // Stereo Chorus
+  p == 4  ? ml_set(0, 1, 1, 5, 5, 5, 5, 0, 5, 4.5, 5, 6.5, 1, 0, 4.5, 1, 5, 5, 100) :   // Deep Chorus
+  p == 5  ? ml_set(0, 1, 0, 5, 5, 5, 5, 0, 5, 5.5, 5, 5, 0, 0, 2.5, 2, 3.8, 6, 100) :   // Vibrato Warble
+  p == 6  ? ml_set(0, 1, 1, 5, 5, 5, 5, 0, 5, 7, 4, 4.5, 1, 0, 3, 1, 5, 5, 100) :   // New Wave Clean
+  p == 7  ? ml_set(0, 0, 0, 5.5, 6.5, 6, 4, 1, 5, 5, 5, 5, 0, 0, 0.5, 0, 5, 5, 100) :   // Funk Rhythm
+  p == 8  ? ml_set(0, 1, 1, 5, 5, 5, 5, 0, 4.5, 4.5, 6.5, 5, 0, 6, 2, 1, 5, 5, 100) :   // Fizz Drive
+  p == 9  ? ml_set(0, 1, 1, 5, 5, 5, 5, 0, 4.5, 5.5, 4.5, 6, 0, 0, 2.5, 1, 5, 5, 100) :   // Keys Chorus
+  p == 10 ? ml_set(0, 1, 0, 5, 5, 5, 5, 0, 4.5, 5, 4.5, 6, 0, 0, 2, 2, 4.5, 4, 100) :   // Keys Vibrato
+  p == 11 ? ml_set(1, 1, 0, 5, 5, 5, 5, 0, 5, 5.5, 5, 5, 0, 0, 2.5, 0, 5, 5, 100) :   // 55 Clean
+  p == 12 ? ml_set(1, 1, 1, 5, 5, 5, 5, 0, 5, 5.5, 5, 5, 0, 0, 3, 1, 5, 5, 100) :   // 55 Chorus
+  p == 13 ? (                                             // Reset all to defaults
+    ml_set(0, 1, 0, 5, 5, 5, 5, 0, 5, 5, 5, 5, 0, 0, 2, 0, 5, 5, 100);
+    slider20 = 0; slider21 = 0; slider22 = 0; slider23 = 0; slider24 = 30; slider25 = 120; slider26 = 6000;
+    slider27 = -0.3; slider28 = 1; slider29 = 50;
+    slider_automate(536870911);                           // sliders 1-29
+  );
+);
+
+// ---------- state ----------
+BL.buf = ml_alloc(ML_BB); BR.buf = ml_alloc(ML_BB); BL.wp = 0; BR.wp = 0;
+ml_rvn = floor(0.09 * srate) + 64;
+PL.rv.am_spring_init(ml_alloc(ml_rvn), srate); PR.rv.am_spring_init(ml_alloc(ml_rvn), srate);
+// a shorter, brighter tank than the heads' springs (the two sides differ a little)
+PL.rv.n1 = floor(0.0291 * srate); PL.rv.n2 = floor(0.0337 * srate);
+PR.rv.n1 = floor(0.0306 * srate); PR.rv.n2 = floor(0.0352 * srate);
+PL.rv.lc = PR.rv.lc = 1 - exp(-2 * $pi * 6200 / srate);
+PL.rv.hp.am_bq(1, 300, 0.7, 0, srate); PR.rv.hp.am_bq(1, 300, 0.7, 0, srate);
+PL.ml_pre_init(); PR.ml_pre_init();
+BL.q.am_bq(0, 8500, 0.65, 0, srate); BR.q.am_bq(0, 8500, 0.65, 0, srate);
+ml_bc = 1 - exp(-2 * $pi * 11000 / srate);
+ml_sm = 1 - exp(-1 / (0.02 * srate));
+ml_sm2 = 1 - exp(-1 / (0.08 * srate));
+ml_satt = 1 - exp(-1 / (0.005 * srate)); ml_srel = 1 - exp(-1 / (0.15 * srate));
+ml_msr = srate / 1000;
+drR.drift_init(0.8 + rand(0.5)); drC.drift_init(0.8 + rand(0.5)); drS.drift_init(0.8 + rand(0.5)); drB.drift_init(0.8 + rand(0.5));
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+ml_m0 = -1; ml_mk = 0.8; ml_bias = 0.1; ml_rail = 1; ml_sag = 0; ml_ph = 0; ml_pclip = 0;
+update();
+ml_cs = ml_cent; ml_ds = ml_dept; ml_mL = ml_tL; ml_mR = ml_tR; ml_ws = ml_wid; ml_os = ml_out;
+ml_pkL = ml_pkR = 0;
+ui_thm = 5; ui_hw = 0;
+!ui_dflt ? ( ui_sz = 2; pr_cur = 1; );                    // new instances open in Large, on Init
+ui_dflt = 1;
+
+@slider
+update();
+
+@block
+update();
+// DRIFT: the supply wanders - chorus rate and BBD clock drift, the rails move and sag a touch
+ml_di = 0.25 * dm_s * samplesblock / srate;
+ml_rate_d = ml_rate * (1 + 0.05 * dm_a * drR.drift_tick(ml_di));
+ml_clk = 1 + 0.03 * dm_a * drC.drift_tick(ml_di);
+ml_rail = ml_rail0 * (1 + 0.015 * dm_a * drS.drift_tick(ml_di));
+ml_sag = 0.035 * dm_a;
+ml_bias = 0.1 + 0.03 * dm_a * drB.drift_tick(ml_di);
+ml_inc = ml_rate_d / srate;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@sample
+in_process(spl0, spl1);
+ml_mono ? (
+  PL.ml_pre((in_l + in_r) * 0.5);
+  ml_nL = ml_nR = PL.on; ml_eL = ml_eR = PL.oe;
+) : (
+  PL.ml_pre(in_l); PR.ml_pre(in_r);
+  ml_nL = PL.on; ml_nR = PR.on; ml_eL = PL.oe; ml_eR = PR.oe;
+);
+// the modulation: one clock, the right side a quarter cycle on in stereo chorus
+ml_cs += (ml_cent * ml_clk - ml_cs) * ml_sm2;
+ml_ds += (ml_dept * ml_clk - ml_ds) * ml_sm2;
+ml_mL += (ml_tL - ml_mL) * ml_sm; ml_mR += (ml_tR - ml_mR) * ml_sm;
+ml_ph += ml_inc; ml_ph >= 1 ? ml_ph -= 1;
+ml_lv = ml_shape(ml_ph, ml_vib);
+ml_wL = BL.ml_bbd(ml_eL, (ml_cs + ml_ds * ml_lv) * ml_msr);
+ml_mono ? ml_wR = ml_wL : (
+  ml_lv2 = ml_vib ? ml_lv : ml_shape(ml_ph + 0.25, 0);
+  ml_wR = BR.ml_bbd(ml_eR, (ml_cs + ml_ds * ml_lv2) * ml_msr);
+);
+// the two speakers: L dry + R wet in CHORUS (the chorus happens in the room), both wet in VIBRATO
+ml_sL = ml_nL + ml_eL + (ml_wL - ml_eL) * ml_mL;
+ml_sR = ml_nR + ml_eR + (ml_wR - ml_eR) * ml_mR;
+ml_oL = OL.ml_pa(ml_sL);
+ml_oR = OR.ml_pa(ml_sR);
+// WIDTH: the speaker spread
+ml_ws += (ml_wid - ml_ws) * ml_sm;
+ml_os += (ml_out - ml_os) * ml_sm;
+ml_a = 0.5 + 0.5 * ml_ws; ml_b = 0.5 - 0.5 * ml_ws;
+ml_yL = (ml_oL * ml_a + ml_oR * ml_b) * ml_os;
+ml_yR = (ml_oR * ml_a + ml_oL * ml_b) * ml_os;
+ost_out(ostL.ost_band(ml_yL), ostR.ost_band(ml_yR));
+spl0 = abs(ost_l) < 0.00000000000000000001 ? 0 : ost_l;
+spl1 = abs(ost_r) < 0.00000000000000000001 ? 0 : ost_r;
+ml_pkL = max(ml_pkL, abs(spl0)); ml_pkR = max(ml_pkR, abs(spl1));
+
+@gfx 1100 320
+ui_begin(1100, 320);
+
+// =====================================================================
+// A black tolex combo, a wide black control panel in an aluminium frame, white legends, black knobs with
+// satin-silver tops, a blue power lamp. The 55 keeps the panel and greys out what it lacks; the badge changes.
+// =====================================================================
+ML_TOL = 0x121315;                                         // tolex
+ML_FACE = 0x17181B;                                        // the control panel
+ML_FACE2 = 0x1D1F23;                                       // INPUT and the modulation block: a shade lighter
+ML_INK = 0xEEEFEA;                                         // chiffon-white print
+ML_DIM = 0x6A6D72;                                         // greyed-out print
+ML_ACC = 0x5CB8FF;                                         // value arcs, lit modulation keys
+ML_LAMP = 0x6CC4FF;
+ml_55 = slider1 >= 0.5;
+
+gfx_setfont(6,  "Trebuchet MS", 30 * sc, 'b');            // title
+gfx_setfont(11, "Trebuchet MS", 12.5 * sc, 'b');            // knob names
+gfx_setfont(12, "Trebuchet MS", 12.5 * sc, 'b');          // key captions, values
+gfx_setfont(13, "Trebuchet MS", 14 * sc, 'b');            // section legends
+gfx_setfont(14, "Trebuchet MS", 22 * sc, 'bi');           // the grille badge
+
+function ml_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+function ml_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function ml_ltxt(x, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = x * sc; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function ml_arcw(cx, cy, r, a1, a2, w) local(k) (          // a smooth thick arc: anti-aliased arcs every half pixel
+  ui_ssarc(cx, cy, r, a1, a2, w);   // (supersampled: an even ring)
+);
+function ml_ptr(cx, cy, a, r1, r2, w) local(ca, sa, k) (   // a straight line w pixels wide along angle a
+  ca = sin(a); sa = -cos(a); k = -w * 0.5;
+  loop(max(1, floor(w * 2) + 1), gfx_line(cx + ca * r1 - sa * k, cy + sa * r1 + ca * k, cx + ca * r2 - sa * k, cy + sa * r2 + ca * k, 1); k += 0.5; );
+);
+
+// the knob (pixels): a thin track with the value arc in the accent colour, a plain black skirt with a white index
+// line, and the house white cap on top - flat satin silver, one soft highlight on its upper-left edge, a thin dark
+// rim and a dark pointer
+function ml_cap(cx, cy, r, n, en, hov) local(rr, a0, a, w, rc) (
+  rr = r + 6 * sc; w = 3 * sc; a0 = -0.75 * $pi; a = a0 + n * 1.5 * $pi;
+  ui_col(0x34373C); ml_arcw(cx, cy, rr, a0, 0.75 * $pi, 1.3 * sc);
+  en && n > 0.004 ? (
+    ui_col(ML_ACC); ml_arcw(cx, cy, rr, a0, a, w);
+    gfx_circle(cx + sin(a0) * rr, cy - cos(a0) * rr, w * 0.5, 1, 1); gfx_circle(cx + sin(a) * rr, cy - cos(a) * rr, w * 0.5, 1, 1);
+  );
+  ui_cola(0x000000, 0.55); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+  ui_col(0x050506); gfx_circle(cx, cy, r, 1, 1);
+  ui_col(0x1D1F22); gfx_circle(cx, cy, r - 1.2 * sc, 1, 1);
+  ui_col(ML_INK); ml_ptr(cx, cy, a, r * 0.72, r - 2.4 * sc, 1.6 * sc);
+  rc = r * 0.66;
+  ui_col(0x4A5057); gfx_circle(cx, cy, rc, 1, 1);
+  ui_col(0xC4C9CF); gfx_circle(cx, cy, rc - 1.1 * sc, 1, 1);
+  ui_col(0xE4E7EA); ml_arcw(cx, cy, rc - 2.4 * sc, -0.66 * $pi, 0.06 * $pi, 1.3 * sc);
+  ui_col(0x1A1E24); ml_ptr(cx, cy, a, rc * 0.12, rc - 1.6 * sc, 2 * sc);
+  hov ? ( ui_cola(0xFFFFFF, 0.08); gfx_circle(cx, cy, r, 1, 1); );
+  !en ? ( ui_cola(ML_FACE, 0.62); gfx_circle(cx, cy, rr + 2 * sc, 1, 1); );
+);
+// a 0 .. 10 knob: name above, value below while touched; drag, SHIFT = fine, double-click = default, wheel
+function ml_knob(cx, cy, r, idx, def, label, en) local(v, n, dx, dy, hov, did, i, a) (
+  did = 1700 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = en && dx * dx + dy * dy <= sqr((r + 7) * sc);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - ml_lt < 0.35 && ml_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; ml_lt = 0; ) : (
+      drag_id = did; ml_my = mouse_y; ml_lt = time_precise(); ml_lid = idx; ml_n = v / 10;
+    );
+  );
+  drag_id == did ? (
+    ml_n = min(max(ml_n + (ml_my - mouse_y) / (((mouse_cap & 8) ? 1200 : 220) * sc), 0), 1); ml_my = mouse_y;
+    v = floor(ml_n * 100 + 0.5) / 10;
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    slider(idx) = min(max(floor(v * 10 + 0.5) / 10 + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.1 : 0.5), 0), 10);
+    ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(v / 10, 0), 1);
+  i = 0; loop(11,                                          // the printed scale: eleven dots
+    a = -0.75 * $pi + i / 10 * 1.5 * $pi;
+    ui_cola(en ? ML_INK : ML_DIM, en ? 0.8 : 0.5);
+    gfx_circle((cx + sin(a) * (r + 10.5)) * sc, (cy - cos(a) * (r + 10.5)) * sc, (i % 5 ? 1.1 : 1.7) * sc, 1, 1);
+    i += 1; );
+  ml_cap(cx * sc, cy * sc, r * sc, n, en, hov || drag_id == did);
+  gfx_setfont(11); ui_col(en ? ML_INK : ML_DIM); ml_ctxt(cx, cy - r - 21, label);
+  (hov || drag_id == did) ? ( sprintf(#mlv, "%.1f", v); gfx_setfont(12); ui_col(ML_ACC); ml_ctxt(cx, cy + r + 19, #mlv); );
+);
+// a lit key (lit = on), caption on the key; greyed and dead when en = 0. Returns 1 when clicked.
+function ml_key(x, y, w, h, on, col, s, en) local(hit, hov) (
+  hov = en && mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = pressed && hov && drag_id == 0; hit ? drag_id = -1;
+  on = on && en;
+  ui_cola(0x000000, 0.55); ml_r(x + 1, y + 2, w, h);
+  ui_col(0x08080A); ml_r(x, y, w, h);
+  on ? (
+    ui_cola(col, 0.22); ml_r(x - 2, y - 2, w + 4, h + 4);
+    ui_col(col); ml_r(x + 1.5, y + 1.5, w - 3, h - 3);
+    gfx_gradrect((x + 1.5) * sc, (y + 1.5) * sc, (w - 3) * sc, (h - 3) * sc * 0.5, 1, 1, 1, 0.3, 0, 0, 0, 0, 0, 0, 0, -0.3 / ((h - 3) * sc * 0.5));
+  ) : (
+    ui_col(ui_mix(col, 0x0E0E10, 0.86)); ml_r(x + 1.5, y + 1.5, w - 3, h - 3);
+    gfx_gradrect((x + 1.5) * sc, (y + 1.5) * sc, (w - 3) * sc, (h - 3) * sc * 0.5, 1, 1, 1, 0.07, 0, 0, 0, 0, 0, 0, 0, -0.07 / ((h - 3) * sc * 0.5));
+  );
+  hov ? ( ui_cola(0xFFFFFF, 0.08); ml_r(x, y, w, h); );
+  gfx_setfont(12);
+  ui_col(on ? ((((col & 255) + ((col >> 8) & 255) + ((col >> 16) & 255)) > 450) ? 0x141414 : 0xFFFFFF) : ui_mix(col, 0xA8ACB2, 0.7));
+  ui_keytext((x + w * 0.5) * sc, (y + h * 0.5) * sc, s);
+  !en ? ( ui_cola(ML_FACE, 0.62); ml_r(x - 2, y - 2, w + 4, h + 5); );
+  hit;
+);
+// a printed legend with its bracket line
+function ml_brk(x1, x2, y, s, en) local(tw, th, cx) (
+  gfx_setfont(13); gfx_measurestr(s, tw, th); cx = (x1 + x2) * 0.5;
+  ui_cola(en ? ML_INK : ML_DIM, en ? 0.55 : 0.5);
+  ml_r(x1, y, cx - x1 - tw / sc * 0.5 - 8, 1); ml_r(cx + tw / sc * 0.5 + 8, y, x2 - cx - tw / sc * 0.5 - 8, 1);
+  ml_r(x1, y, 1, 6); ml_r(x2 - 1, y, 1, 6);
+  ui_col(en ? ML_INK : ML_DIM); ml_ctxt(cx, y + 0.5, s);
+);
+function ml_set1(idx, v) ( slider(idx) = v; ui_auto(idx); );
+
+// ---------- the tolex ----------
+ui_col(ML_TOL); gfx_rect(0, 0, gfx_w, gfx_h);
+ml_i = 0;
+loop(1400,
+  ml_px = ((ml_i * 7919) % 997) / 997 * 1100; ml_py = ((ml_i * 104729) % 991) / 991 * 320;
+  ui_cola(ml_i % 2 ? 0xFFFFFF : 0x000000, ml_i % 2 ? 0.035 : 0.3); gfx_rect(ml_px * sc, ml_py * sc, sc + 1, sc + 1);
+  ml_i += 1;
+);
+gfx_gradrect(0, 0, gfx_w, 40 * sc, 1, 1, 1, 0.05, 0, 0, 0, 0, 0, 0, 0, -0.05 / (40 * sc));
+
+// ---------- header: badge, name, model keys, presets, size ----------
+rd_badge(30, 28, 16, ML_INK, ML_TOL);
+gfx_setfont(6); ui_cola(0x000000, 0.6); gfx_x = 57 * sc; gfx_y = 11 * sc; gfx_drawstr(ml_55 ? "MALI 55" : "MALI 120");
+ui_col(ML_INK); gfx_x = 56 * sc; gfx_y = 10 * sc; gfx_drawstr(ml_55 ? "MALI 55" : "MALI 120");
+ml_tx = gfx_x / sc + 16;
+gfx_setfont(12); ui_cola(ML_INK, 0.75); ml_ltxt(ml_tx, 19, "STEREO CHORUS");
+ml_ltxt(ml_tx, 34, ml_55 ? "SOLID STATE  ·  2 x 8\"" : "SOLID STATE  ·  2 x 12\"");
+ml_key(352, 14, 46, 26, !ml_55, 0xFFFDD0, "120", 1) ? ml_set1(1, 0);
+ml_key(402, 14, 46, 26, ml_55, 0xFFFDD0, "55", 1) ? ml_set1(1, 1);
+pk_pextra = "Reset all to defaults";                       // the house preset bar: PRESETS, prev / next, LCD
+k_ = pk_preset(470 * sc, 10 * sc, 470 * sc, 34 * sc, pr_cur,
+  "Init Clean|Glass Clean|Stereo Chorus|Deep Chorus|Vibrato Warble|New Wave Clean|Funk Rhythm|Fizz Drive|Keys Chorus|Keys Vibrato|55 Clean|55 Chorus");
+k_ > 0 ? ( load_preset(k_); pr_cur = k_ > 12 ? 1 : k_; );
+ui_size_picker(1030 * sc, 18 * sc);
+
+// ---------- the control panel: aluminium frame, black face ----------
+ui_cola(0x000000, 0.5); ml_r(9, 58, 1084, 166);
+rd_brushed(8, 56, 1084, 166, 0xA9AEB4);
+ui_cola(0xFFFFFF, 0.45); ml_r(8, 56, 1084, 1);
+ui_cola(0x000000, 0.35); ml_r(8, 221, 1084, 1);
+ui_col(0x050506); ml_r(13, 61, 1074, 156);
+ui_col(ML_FACE); ml_r(14, 62, 1072, 154);
+gfx_gradrect(14 * sc, 62 * sc, 1072 * sc, 40 * sc, 1, 1, 1, 0.035, 0, 0, 0, 0, 0, 0, 0, -0.035 / (40 * sc));
+ui_col(ML_FACE2); ml_r(15, 63, 82, 152); ml_r(853, 63, 232, 152);
+ui_cola(0x000000, 0.5); ml_r(97, 63, 1, 152); ml_r(852, 63, 1, 152); ml_r(402, 70, 1, 138);
+ui_cola(0xFFFFFF, 0.06); ml_r(98, 63, 1, 152); ml_r(853, 63, 1, 152); ml_r(403, 70, 1, 138);
+
+ML_KY = 148; ML_KR = 18;
+
+// INPUT: which channel, and MONO IN
+gfx_setfont(13); ui_col(ml_55 ? ML_DIM : ML_INK); ml_ctxt(56, 78, "INPUT");
+ml_key(20, 94, 72, 22, slider2 == 0, 0xEEEFEA, "NORMAL", !ml_55) ? ml_set1(2, 0);
+ml_key(20, 120, 72, 22, slider2 == 1 || ml_55, 0xEEEFEA, "EFFECT", !ml_55) ? ml_set1(2, 1);
+ml_key(20, 146, 72, 22, slider2 == 2, 0xEEEFEA, "BOTH", !ml_55) ? ml_set1(2, 2);
+ml_key(20, 182, 72, 24, slider3 >= 0.5, ML_ACC, "MONO IN", 1) ? ml_set1(3, slider3 >= 0.5 ? 0 : 1);
+
+// NORMAL channel
+ml_en = !ml_55;
+ml_brk(106, 396, 78, "NORMAL CHANNEL", ml_en);
+ml_key(108, ML_KY - 12, 52, 24, slider8 >= 0.5, 0xFFFDD0, "BRIGHT", ml_en) ? ml_set1(8, slider8 >= 0.5 ? 0 : 1);
+ml_knob(194, ML_KY, ML_KR, 4, 5, "VOLUME", ml_en);
+ml_knob(254, ML_KY, ML_KR, 5, 5, "TREBLE", ml_en);
+ml_knob(314, ML_KY, ML_KR, 6, 5, "MIDDLE", ml_en);
+ml_knob(372, ML_KY, ML_KR, 7, 5, "BASS", ml_en);
+
+// EFFECT channel (the 55's single channel)
+ml_brk(410, 844, 78, ml_55 ? "CHANNEL" : "EFFECT CHANNEL", 1);
+ml_key(412, ML_KY - 12, 52, 24, slider13 >= 0.5, 0xFFFDD0, "BRIGHT", ml_en) ? ml_set1(13, slider13 >= 0.5 ? 0 : 1);
+ml_knob(500, ML_KY, ML_KR, 9, 5, "VOLUME", 1);
+ml_knob(560, ML_KY, ML_KR, 10, 5, "TREBLE", 1);
+ml_knob(620, ML_KY, ML_KR, 11, 5, "MIDDLE", 1);
+ml_knob(680, ML_KY, ML_KR, 12, 5, "BASS", 1);
+ml_knob(750, ML_KY, ML_KR, 14, 0, "DISTORTION", ml_en);
+ml_knob(816, ML_KY, ML_KR, 15, 2, "REVERB", 1);
+
+// modulation: CHORUS / VIBRATO / OFF (the 55: CHORUS on / off), SPEED and DEPTH for the vibrato
+ml_brk(860, 1046, 78, ml_55 ? "CHORUS" : "CHORUS  ·  VIBRATO", 1);
+ml_key(862, 96, 60, 24, ml_55 ? slider16 >= 0.5 : slider16 == 1, ML_ACC, "CHORUS", 1) ?
+  ml_set1(16, ml_55 ? (slider16 >= 0.5 ? 0 : 1) : 1);
+ml_key(862, 126, 60, 24, slider16 == 2, ML_ACC, "VIBRATO", ml_en) ? ml_set1(16, 2);
+ml_key(862, 156, 60, 24, slider16 < 0.5, 0xE3D8D8, "OFF", 1) ? ml_set1(16, 0);
+ml_knob(960, ML_KY, ML_KR, 17, 5, "SPEED", ml_en);
+ml_knob(1018, ML_KY, ML_KR, 18, 5, "DEPTH", ml_en);
+// the power lamp
+ui_col(0x050506); gfx_circle(1066 * sc, 136 * sc, 9.5 * sc, 1, 1);
+ui_col(0x8D9298); gfx_circle(1066 * sc, 136 * sc, 8.3 * sc, 1, 1);
+rd_lamp(1066, 136, 6.2, 1, ML_LAMP);
+gfx_setfont(12); ui_cola(ML_INK, 0.9); ml_ctxt(1066, 157, "ON");
+
+// ---------- the lower strip: DRIFT | IN / OUT | WIDTH, OUTPUT, meters - and the grille with its badge ----------
+rd_plate(8, 228, 556, 88, 0x1E2024, 4);
+dy_ink = ML_INK; dy_bg = 0x1E2024; dy_kst = 20; dy_ntick = 11;
+sprintf(#mlv, "%.0f%%", slider29); dy_knob(42, 264, 15, 29, 0, 100, 50, 0, 0x9DA2A8, "DRIFT", #mlv);
+ui_cola(0xFFFFFF, 0.12); ml_r(80, 238, 1, 68); ml_r(304, 238, 1, 68);
+rd_ioc1 = 0x3A3D42; rd_ioc2 = 0xD8B040; rd_ioc3 = 0xC83A2A; rd_iok = 20;
+rd_io(88, 242, 21, 22, 23, 28);
+dy_kst = 20;
+sprintf(#mlv, "%.0f%%", slider19); dy_knob(336, 264, 15, 19, 0, 100, 100, 0, 0x9DA2A8, "WIDTH", #mlv);
+sprintf(#mlv, "%+.1f dB", slider20); dy_knob(394, 264, 15, 20, -24, 12, 0, 0, 0x9DA2A8, "OUTPUT", #mlv);
+dy_kst = 7;
+ui_hw = 1;
+mL.ui_ledm(432 * sc, 258 * sc, 120 * sc, 8 * sc, ml_pkL); mR.ui_ledm(432 * sc, 272 * sc, 120 * sc, 8 * sc, ml_pkR);
+ui_hw = 0;
+ml_pkL *= 0.85; ml_pkR *= 0.85;
+gfx_setfont(12); ui_cola(ML_INK, 0.85); ml_ctxt(492, 295, "L / R");
+
+// the grille: black and silver weave, a silver welt, the badge
+ui_col(0x050506); ml_r(572, 228, 520, 88);
+ui_col(0x16171A); ml_r(574, 230, 516, 84);
+ml_i = 0; loop(172, ui_cola(0x9AA0A8, ml_i % 2 ? 0.10 : 0.2); ml_r(575 + ml_i * 3, 230, 1, 84); ml_i += 1; );
+ml_i = 0; loop(28, ui_cola(0x9AA0A8, ml_i % 2 ? 0.07 : 0.14); ml_r(574, 231 + ml_i * 3, 516, 1); ml_i += 1; );
+gfx_gradrect(574 * sc, 230 * sc, 516 * sc, 22 * sc, 0, 0, 0, 0.35, 0, 0, 0, 0, 0, 0, 0, -0.35 / (22 * sc));
+ui_cola(0xC4C9CF, 0.5); ml_r(572, 228, 520, 1); ml_r(572, 315, 520, 1); ml_r(572, 228, 1, 88); ml_r(1091, 228, 1, 88);
+// the chrome badge
+ml_bw = ml_55 ? 128 : 150; ml_bx = 1072 - ml_bw;
+ui_cola(0x000000, 0.6); rd_rr((ml_bx + 2) * sc, 254 * sc, ml_bw * sc, 36 * sc, 6 * sc);
+ui_col(0x5A6067); rd_rr(ml_bx * sc, 251 * sc, ml_bw * sc, 36 * sc, 6 * sc);
+ui_col(0xC9CED4); rd_rr((ml_bx + 1.5) * sc, 252.5 * sc, (ml_bw - 3) * sc, 33 * sc, 5 * sc);
+gfx_gradrect((ml_bx + 3) * sc, 253 * sc, (ml_bw - 6) * sc, 14 * sc, 1, 1, 1, 0.45, 0, 0, 0, 0, 0, 0, 0, -0.45 / (14 * sc));
+ui_col(0x1A1E24); gfx_setfont(14); ml_ctxt(ml_bx + ml_bw * 0.5, 269, ml_55 ? "Mali 55" : "Mali 120");
+
+pk_end();
+ui_end();

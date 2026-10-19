@@ -1,0 +1,514 @@
+desc:GFX Wingspan [dynamic width]
+// GFX Wingspan - dynamic Mid/Side width processor
+//tags: mastering stereo width imaging mid side dynamic expander
+//author: JGWizrad / Garden FX (GFX)
+//
+// Pushes the stereo image wider (or pulls it narrower) when the music gets loud.
+//   L/R -> M/S encode (M = (L+R)/2, S = (L-R)/2) -> LOW MONO (sides high-passed, 24 dB/oct)
+//       -> detector (listens to Mid, Side or a blend: DETECT) -> dynamic Side gain -> BASE WIDTH
+//       -> M/S decode (L = M + S', R = M - S') -> MIX (parallel, against the untouched input) -> OUTPUT.
+// The Mid is never touched, so the mono sum stays exactly as it was (mono-safe by design).
+//
+// THRESHOLD   level (dB) the detector must pass before the image starts to move.
+// AMOUNT      how hard the Side is moved above the threshold: + widens, - narrows.
+//             At 100 % the Side moves 0.5 dB per dB over (6 dB soft knee), at most +12 dB wider / -18 dB narrower.
+// ATTACK      how quickly the image opens (or closes) once over the threshold.
+// RELEASE     how quickly it settles back. Gain is smoothed in the log (dB) domain, then rounded by a 3 ms stage,
+//             so the image glides rather than pumps or clicks.
+// DETECT      what the detector listens to: MID (the centre - vocals, kick, bass) through to SIDE (the width itself).
+// PEAK / RMS  instantaneous peak or an 8 ms RMS window feeding the detector.
+// BASE WIDTH  static width, 0 % (mono) .. 100 % (as is) .. 200 % (twice the Side).
+// PRE / POST  PRE: BASE WIDTH comes first, so a Side-listening detector hears the widened image.
+//             POST: the detector hears the original image; BASE WIDTH is applied after the dynamic stage.
+// LOW MONO    keeps the bass mono below 80 / 120 / 200 Hz (mastering safety for vinyl, clubs, mono playback).
+// MIX         parallel blend with the dry input.  OUTPUT  output gain.
+// No drift: like the other mastering tools, Wingspan is deliberately steady. Zero latency (except OUT = LIMIT).
+//
+// GUI: drag knobs (Shift = fine), double-click / Ctrl-click = reset. Click the LCD (or PRESETS) for the preset list.
+// S / M / L / ? = size and help.
+//
+// Requires gfx-output, gfx-ui, gfx-panel, gfx-dyn and gfx-faceplate (.jsfx-inc) in the same folder.
+
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:-20<-60,0,0.1>-Threshold (dB)
+slider2:30<-100,100,1>-Amount (%, - narrows / + widens)
+slider3:15<0.5,100,0.1>-Attack (ms)
+slider4:300<20,2000,1>-Release (ms)
+slider5:0<0,100,1>-Detect (0 = Mid .. 100 = Side)
+slider6:1<0,1,1{Peak,RMS}>-Detector
+slider7:100<0,200,1>-Base width (%)
+slider8:1<0,1,1{Pre,Post}>-Base width position
+slider9:0<0,3,1{Off,80 Hz,120 Hz,200 Hz}>-Low mono
+slider10:100<0,100,1>-Mix (%)
+slider11:0<-12,12,0.1>-Output (dB)
+slider12:0<0,1,1{Off,Clip}>-(unused, was output stage)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+#ui_man = "gfx-wingspan";                        // the ? pop-up links to this manual
+nextmem = 0;
+function alloc(n) local(p) ( p = nextmem; nextmem += n; memset(p, 0, n); p; );
+
+ost_init(alloc(4096));                           // the house output stage
+ws_gn = 1024; ws_gl = alloc(ws_gn); ws_gr = alloc(ws_gn);   // goniometer ring (output L / R)
+ws_hn = 240;  ws_hist = alloc(ws_hn);            // side-gain history, 60 points a second (4 s)
+
+// ---------- parameters (all coefficients precomputed here, never per sample) ----------
+function ws_setup() local(f) (
+  ws_thr = slider1;
+  ws_amt = slider2 / 100;
+  ws_cap = ws_amt >= 0 ? 12 : 18;               // most the Side can move: +12 dB wider, -18 dB narrower
+  ws_att = dy_ms(slider3);
+  ws_rel = dy_ms(slider4);
+  ws_dw1 = min(max(slider5 / 100, 0), 1); ws_dw0 = 1 - ws_dw1;
+  ws_rmsm = slider6 > 0.5;
+  ws_wbt = slider7 / 100;
+  ws_pre = slider8 < 0.5;
+  ws_lmi = floor(slider9 + 0.5);
+  f = ws_lmi == 1 ? 80 : ws_lmi == 2 ? 120 : 200;
+  f != ws_lmf ? ( ws_lmf = f; ws_h1.bq_set(1, f, 0.70710678, 0); ws_h2.bq_set(1, f, 0.70710678, 0); );   // LR4 high-pass on S
+  ws_lmt = ws_lmi > 0;
+  ws_mixt = slider10 / 100;
+  ws_outt = 10 ^ (slider11 / 20);
+  ost_setup(0, 0, 120, 6000, -0.3, 0);   // output stage: straight through
+);
+
+ws_lmf = -1;
+ws_sm   = 1 - exp(-1 / (0.03 * srate));          // 30 ms parameter smoothing
+ws_c2   = 1 - exp(-1 / (0.003 * srate));         // 3 ms rounding stage on the side gain
+ws_crms = 1 - exp(-1 / (0.008 * srate));         // 8 ms RMS window
+ws_cm   = 1 - exp(-1 / (0.3 * srate));           // 300 ms meters (correlation, M / S energy)
+ws_hstep = max(floor(srate / 60), 1);
+ws_ms = 0; ws_gd = 0; ws_gd2 = 0; ws_hc = 0; ws_hw = 0; ws_gw = 0; ws_gd_ = 0;
+ws_pil = ws_pir = ws_pol = ws_por = 0; ws_lvm = -150;
+ws_cLR = ws_cLL = ws_cRR = 0; ws_eM = ws_eS = 0;
+ws_h1.x1 = ws_h1.x2 = ws_h1.y1 = ws_h1.y2 = 0; ws_h2.x1 = ws_h2.x2 = ws_h2.y1 = ws_h2.y2 = 0;
+ws_setup();
+ws_wbs = ws_wbt; ws_mixs = ws_mixt; ws_outs = ws_outt; ws_lms = ws_lmt;
+
+// ---------- presets: threshold, amount, attack, release, detect, detector, base width, position, low mono, mix ----------
+function ws_p(t, a, at, rl, d, dt, bw, ps, lm, mx) (
+  slider1 = t; slider2 = a; slider3 = at; slider4 = rl; slider5 = d; slider6 = dt;
+  slider7 = bw; slider8 = ps; slider9 = lm; slider10 = mx;
+);
+function load_preset(p) (
+  p == 1  ? ( ws_p(-20,  30, 15,  300,   0, 1, 100, 1, 0, 100); slider11 = 0; slider12 = 0; ) :   // Init
+  p == 2  ? ws_p(-18,  60, 30,  600,   0, 1, 105, 1, 2, 100) :      // Wide Choruses: the image opens as the song lifts
+  p == 3  ? ws_p(-30, -50,  5,  200, 100, 0, 100, 1, 0, 100) :      // Tame Wide Peaks: listens to the Side, reins in spiky width
+  p == 4  ? ws_p(-22,  25, 40,  800,  30, 1, 110, 1, 1, 100) :      // Gentle Master Width
+  p == 5  ? ws_p(-20,  15, 25,  500,   0, 1, 115, 1, 2, 100) :      // Mono-Safe Lows: a touch wider, bass locked mono below 120 Hz
+  p == 6  ? ws_p(-16,  70,  2,  400,   0, 0, 100, 1, 2,  70) :      // Drum Room Bloom: each hit blooms the room, in parallel
+  p == 7  ? ws_p(-36,  50, 80, 1500,  50, 1, 130, 0, 3, 100) :      // Pad Spread: slow, wide, the swell spreads further
+  p == 8  ? ws_p(-14, -60, 10,  400,   0, 1, 100, 1, 2, 100) :      // Narrow Loud Bits: loud passages pull towards the centre
+  p == 9  ? ws_p(-24, -35,  8,  250,   0, 1, 105, 1, 1, 100) :      // Vocal Centre Lock: a loud centre narrows the sides around it
+  p == 10 ? ws_p(-24, -40, 20,  700,   0, 1, 125, 1, 2, 100);       // Wide When Quiet: wide verses, steadier when it gets big
+  p >= 1 && p <= 10 ? slider_automate(4095);    // sliders 1-12
+);
+
+!ui_dflt ? ( ui_sz = 2; pr_cur = 1; );           // new instances: Large, on Init
+ui_dflt = 1;
+ui_hw = 1; ui_thm = 5;                           // the house keycaps (graphite); Wingspan has one look
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, ui_szinit);
+file_var(0, pr_cur);
+
+@slider
+ws_setup();
+
+@block
+ws_setup();                                      // knobs moved on the panel do not run @slider, so read them here
+// no denormals: flush the low-mono filter states once they have decayed to nothing
+abs(ws_h1.y1) + abs(ws_h1.y2) + abs(ws_h1.x1) + abs(ws_h1.x2) < 0.000000000001 ? ( ws_h1.x1 = ws_h1.x2 = ws_h1.y1 = ws_h1.y2 = 0; );
+abs(ws_h2.y1) + abs(ws_h2.y2) + abs(ws_h2.x1) + abs(ws_h2.x2) < 0.000000000001 ? ( ws_h2.x1 = ws_h2.x2 = ws_h2.y1 = ws_h2.y2 = 0; );
+abs(ws_ms) < 0.000000000001 ? ws_ms = 0;
+abs(ws_gd) < 0.0000001 ? ws_gd = 0;
+abs(ws_gd2) < 0.0000001 ? ws_gd2 = 0;
+abs(ws_eM) < 0.000000000001 ? ws_eM = 0; abs(ws_eS) < 0.000000000001 ? ws_eS = 0;
+abs(ws_cLL) < 0.000000000001 ? ( ws_cLL = 0; ws_cLR = 0; ); abs(ws_cRR) < 0.000000000001 ? ws_cRR = 0;
+
+@sample
+// ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+ws_l = spl0; ws_r = spl1;
+ws_l != ws_l ? ws_l = 0; ws_r != ws_r ? ws_r = 0;
+ws_pil = max(ws_pil, abs(ws_l)); ws_pir = max(ws_pir, abs(ws_r));
+
+// parameter smoothing
+ws_wbs  += (ws_wbt  - ws_wbs)  * ws_sm;
+ws_mixs += (ws_mixt - ws_mixs) * ws_sm;
+ws_outs += (ws_outt - ws_outs) * ws_sm;
+ws_lms  += (ws_lmt  - ws_lms)  * ws_sm;          // LOW MONO fades in / out, no click
+
+// encode
+ws_m = (ws_l + ws_r) * 0.5;
+ws_s = (ws_l - ws_r) * 0.5;
+
+// LOW MONO: the Side high-passed (LR4), always running so switching it is seamless
+ws_sh = ws_h2.bq_run(ws_h1.bq_run(ws_s));
+ws_s += (ws_sh - ws_s) * ws_lms;
+
+// detector: weighted Mid / Side energy, peak or RMS, in dB
+ws_sd = ws_pre ? ws_s * ws_wbs : ws_s;
+ws_e = ws_dw0 * ws_m * ws_m + ws_dw1 * ws_sd * ws_sd;
+ws_rmsm ? ( ws_ms += (ws_e - ws_ms) * ws_crms; ws_e = ws_ms; );
+ws_lv = 4.342944819 * log(max(ws_e, 0.000000000001));     // 10 * log10(energy)
+ws_lvm = max(ws_lvm, ws_lv);
+
+// gain computer (soft knee) and log-domain ballistics: ATTACK moving away from 0 dB, RELEASE coming back
+ws_t = ws_amt * min(0.5 * dy_curve(ws_lv - ws_thr, 6), ws_cap);
+ws_gd += (ws_t - ws_gd) * (abs(ws_t) > abs(ws_gd) ? ws_att : ws_rel);
+ws_gd2 += (ws_gd - ws_gd2) * ws_c2;
+ws_g = exp(ws_gd2 * 0.11512925465);              // dB -> gain
+
+// side gain, decode
+ws_so = ws_s * ws_wbs * ws_g;
+ws_wl = ws_m + ws_so;
+ws_wr = ws_m - ws_so;
+
+// mix with the untouched input, output gain, output stage
+ws_ol = (ws_l + (ws_wl - ws_l) * ws_mixs) * ws_outs;
+ws_or = (ws_r + (ws_wr - ws_r) * ws_mixs) * ws_outs;
+ost_out(ws_ol, ws_or);
+spl0 = ost_l; spl1 = ost_r;
+
+// meters
+ws_pol = max(ws_pol, abs(spl0)); ws_por = max(ws_por, abs(spl1));
+ws_cLR += (spl0 * spl1 - ws_cLR) * ws_cm; ws_cLL += (spl0 * spl0 - ws_cLL) * ws_cm; ws_cRR += (spl1 * spl1 - ws_cRR) * ws_cm;
+ws_om = (spl0 + spl1) * 0.5; ws_os = (spl0 - spl1) * 0.5;
+ws_eM += (ws_om * ws_om - ws_eM) * ws_cm; ws_eS += (ws_os * ws_os - ws_eS) * ws_cm;
+(ws_gw += 1) >= 2 ? ( ws_gw = 0; ws_gl[ws_gp] = spl0; ws_gr[ws_gp] = spl1; ws_gp = (ws_gp + 1) % ws_gn; );
+abs(ws_gd2) > abs(ws_gd_) ? ws_gd_ = ws_gd2;
+(ws_hc += 1) >= ws_hstep ? ( ws_hc = 0; ws_hist[ws_hw] = ws_gd_; ws_hw = (ws_hw + 1) % ws_hn; ws_gd_ = ws_gd2; );
+
+@gfx 1000 440
+// =====================================================================
+// GUI - film-console mastering unit: graphite modules, cream print, elephant's breath caps, amber the one accent.
+// Design space 1333 x 587 drawn at qs = 0.75 * sc (1000 x 440 at size M).
+// =====================================================================
+ui_begin(1000, 440);
+qs = sc*0.75;
+
+gfx_setfont(6, "Trebuchet MS", 17*qs, 'b');                // labels / section titles
+gfx_setfont(7, "Trebuchet MS", 16*qs, 'b');                // values
+gfx_setfont(8, "Trebuchet MS", 15*qs, 'b');                // small print
+gfx_setfont(9, "Courier New", 26*qs, 'b');                 // readout values
+gfx_setfont(10, "Courier New", 15*qs, 'b');                // readout captions
+gfx_setfont(12, "Trebuchet MS", 36*qs, 'b');               // plugin name
+gfx_setfont(13, "Trebuchet MS", 16*qs, 'b');               // key captions
+
+PNL = 0x26272B; PNL2 = 0x232428; PNL3 = 0x29292D;           // graphite modules (each a shade apart)
+INK = 0xE6DFCB; INK2 = 0xA29D92; CAPU = 0xC7BEB3;           // cream print, elephant's breath caps
+CAPS = 0x9DA2A8;                                           // silver-grey small cap (output stage)
+ACC = 0xE8A33A; HDR = 0x18191C; SCR = 0x0B0B0C; SCRL = 0x1E1F22;
+
+function R(x, y, w, h) ( gfx_rect(x*qs, y*qs, max(1, w*qs), max(1, h*qs)); );
+function RR(x, y, w, h, r) ( rd_rr(x*qs, y*qs, w*qs, h*qs, r*qs); );
+function LN(x1, y1, x2, y2) ( gfx_line(x1*qs, y1*qs, x2*qs, y2*qs, 1); );
+function CIRC(x, y, rr, f) ( gfx_circle(x*qs, y*qs, rr*qs, f, 1); );
+function TX(x, y, t) ( gfx_x = x*qs; gfx_y = y*qs; gfx_drawstr(t); );
+function TC(cx, y, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = cx*qs - w*0.5; gfx_y = y*qs; gfx_drawstr(t); );
+function TR(rx, y, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = rx*qs - w; gfx_y = y*qs; gfx_drawstr(t); );
+function setmsg(n, v) ( strcpy(#lcdn, n); strcpy(#lcdv, v); lcd_t = time_precise(); );
+function setv(idx, v) ( slider(idx) = v; ui_auto(idx); );
+
+// ---- panel screw: black on graphite (900-space units) ----
+function mscrew(x, y) (
+  ui_cola(0x000000, 0.45); gfx_circle((x + 0.6)*sc, (y + 1)*sc, 4.6*sc, 1, 1);
+  ui_col(0x0E0F10); gfx_circle(x*sc, y*sc, 4.4*sc, 1, 1);
+  ui_col(0x2C2E31); gfx_circle((x - 0.6)*sc, (y - 0.7)*sc, 3.2*sc, 1, 1);
+  ui_col(0x050506); gfx_line((x - 2.8)*sc, (y - 1.2)*sc, (x + 2.8)*sc, (y + 1.2)*sc, 1);
+  ui_cola(0xFFFFFF, 0.18); gfx_circle((x - 1.4)*sc, (y - 1.6)*sc, 0.9*sc, 1, 1);
+);
+// ---- module plate ----
+function plate(x, y, w, h, col) (
+  ui_cola(0x000000, 0.55); gfx_rect((x + 2)*qs, (y + 3)*qs, w*qs, h*qs);
+  ui_col(ui_mix(col, 0x000000, 0.4)); R(x, y, w, h);
+  ui_col(col); R(x + 1, y + 1, w - 2, h - 2);
+  gfx_gradrect((x + 1)*qs, (y + 1)*qs, (w - 2)*qs, (h - 2)*qs*0.5, 1, 1, 1, 0.07, 0, 0, 0, 0, 0, 0, 0, -0.07/((h - 2)*qs*0.5));
+  gfx_gradrect((x + 1)*qs, (y + h*0.5)*qs, (w - 2)*qs, (h*0.5 - 1)*qs, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.14/((h*0.5 - 1)*qs));
+  ui_cola(0xFFFFFF, 0.16); gfx_rect((x + 1)*qs, (y + 1)*qs, (w - 2)*qs, 1*qs); gfx_rect((x + 1)*qs, (y + 1)*qs, 1*qs, (h - 2)*qs);
+  ui_cola(0x000000, 0.45); gfx_rect((x + 1)*qs, (y + h - 2)*qs, (w - 2)*qs, 1*qs); gfx_rect((x + w - 2)*qs, (y + 1)*qs, 1*qs, (h - 2)*qs);
+  mscrew((x + 10)*0.75, (y + 10)*0.75); mscrew((x + w - 10)*0.75, (y + 10)*0.75);
+  mscrew((x + 10)*0.75, (y + h - 10)*0.75); mscrew((x + w - 10)*0.75, (y + h - 10)*0.75);
+  ui_col(HDR); R(x + 1, y + 1, w - 2, 7); ui_col(ACC); R(x + 1, y + 6, w - 2, 2);
+);
+// ---- section title: cream lettering with a small amber marker ----
+function tape(x, y, t) local(tw, th) (
+  gfx_setfont(6); gfx_measurestr(t, tw, th);
+  ui_col(ACC); gfx_rect(x*qs, (y + 5)*qs, 3*qs, 13*qs);
+  ui_col(INK); gfx_x = (x + 10)*qs; gfx_y = (y + 11.5)*qs - th*0.5; gfx_drawstr(t);
+);
+// ---- recessed screen with sloped walls ----
+function screen(x, y, w, h) (
+  ui_cola(0x000000, 0.35); R(x - 4, y - 4, w + 8, h + 8);
+  ui_col(0x101113); R(x - 3, y - 3, w + 6, h + 6);
+  ui_cola(0xFFFFFF, 0.07); R(x - 3, y + h + 2, w + 6, 1); R(x + w + 2, y - 3, 1, h + 6);
+  ui_col(SCR); R(x, y, w, h);
+  gfx_gradrect(x*qs, y*qs, w*qs, 10*qs, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 0, -0.5/(10*qs));
+);
+// ---- lit square key with its caption printed on the key ----
+function mkey(x, y, w, h, t, on) local(hit, tw, th) (
+  rd_sqbg = PNL;
+  hit = rd_sq(x*0.75, y*0.75, w*0.75, h*0.75, on, ACC, "");
+  gfx_setfont(13); gfx_measurestr(t, tw, th);
+  ui_col(on ? 0x141414 : ui_mix(ACC, 0xDDDDDD, 0.45));
+  gfx_x = (x + w*0.5)*qs - tw*0.5; gfx_y = (y + h*0.5)*qs - th*0.5; gfx_drawstr(t);
+  hit;
+);
+// ---- knobs: house dy_knob (cap colour cap, style kst), name under it, value on hover / drag only ----
+function mknob(idx, cx, cy, r, lo, hi, def, lg, kst, cap, label, val) local(dx, dy, hov, did, act) (
+  did = 1600 + idx;
+  dx = mouse_x - cx*qs; dy = mouse_y - cy*qs; hov = dx*dx + dy*dy <= sqr((r + 6)*qs);
+  pressed && hov && drag_id == 0 && (mouse_cap & 4) ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; );
+  dy_kst = kst; dy_ink = 0xD8D8D2; dy_ntick = 11;
+  dy_knob(cx*0.75, cy*0.75, r*0.75, idx, lo, hi, def, lg, cap, "", "");
+  act = hov || drag_id == did;
+  gfx_setfont(6); ui_col(INK); TC(cx, cy + r + 19, label);
+  act ? ( gfx_setfont(7); ui_col(ACC); TC(cx, cy + r + 40, val); );
+);
+function fdb(v) ( abs(v) < 0.05 ? strcpy(#vt, "0.0 dB") : sprintf(#vt, "%+.1f dB", v); #vt; );
+function fms(v) ( v >= 1000 ? sprintf(#vt, "%.2f s", v/1000) : v >= 100 ? sprintf(#vt, "%d ms", floor(v + 0.5)) :
+                  v >= 10 ? sprintf(#vt, "%.1f ms", v) : sprintf(#vt, "%.2f ms", v); #vt; );
+function g2db(g) ( g > 0.0000001 ? 20*log10(g) : -140; );
+
+// vertical peak ladder, -48 .. +3 dB (n segments of sh), lit from the bottom
+function vmeter(x, y, n, sh, w, pk) local(db, k, d, c) (
+  db = g2db(pk);
+  ui_col(0x08080A); R(x - 3, y - 3, w + 6, n*sh + 6);
+  k = 0;
+  loop(n,
+    d = -48 + 51*(k + 0.5)/n;
+    c = d > 0 ? 0xFF3A2A : ACC;
+    ui_col(db >= d ? c : ui_mix(c, 0x000000, 0.86)); R(x, y + (n - k - 1)*sh + 1, w, sh - 3);
+    k += 1;
+  );
+);
+
+// =====================================================================
+// Draw
+// =====================================================================
+rd_brushed(0, 0, 1333*0.75, 587*0.75, 0x16171A);
+ui_cola(0x000000, 0.25); gfx_rect(0, 587*qs, gfx_w, gfx_h);
+
+// ---- top strip: name plate, presets, size ----
+ui_cola(0x000000, 0.25); R(0, 0, 1333, 100);
+ui_col(0x0A0A0C); R(0, 97, 1333, 3); ui_cola(ACC, 0.35); R(0, 99, 1333, 1);
+ui_cola(0x000000, 0.45); RR(20, 17, 300, 70, 4);
+ui_col(0x0E0F11); RR(18, 14, 300, 70, 4);
+ui_col(0x1A1B1E); RR(19, 15, 298, 67, 3);
+gfx_gradrect(19*qs, 15*qs, 298*qs, 34*qs, 1, 1, 1, 0.08, 0, 0, 0, 0, 0, 0, 0, -0.08/(34*qs));
+ui_col(ACC); CIRC(56, 49, 23, 1);
+ui_cola(0xFFFFFF, 0.25); CIRC(51, 43, 10, 1);
+gfx_setfont(2); ui_col(0x141414); ui_text(56*qs, 42*qs, "GFX");
+gfx_setfont(12); ui_col(0xEDEBE4); TX(92, 18, "WINGSPAN");
+gfx_setfont(8); ui_col(0xA8A9AD); TX(94, 60, "DYNAMIC M/S WIDTH");
+mscrew(30*0.75, 26*0.75); mscrew(30*0.75, 72*0.75); mscrew(306*0.75, 26*0.75); mscrew(306*0.75, 72*0.75);
+
+// the house preset bar: PRESETS, prev / next, LCD (click it for the list)
+k_ = pk_preset(346*qs, 24*qs, 610*qs, 52*qs, pr_cur,
+  "Init|Wide Choruses|Tame Wide Peaks|Gentle Master Width|Mono-Safe Lows|Drum Room Bloom|Pad Spread|Narrow Loud Bits|Vocal Centre Lock|Wide When Quiet");
+k_ > 0 ? ( load_preset(k_); pr_cur = k_; );
+
+gfx_setfont(8); ui_col(INK2); TC(1080, 30, "MODEL W2"); TC(1080, 50, "MASTERING");
+ui_size_picker(1196*qs, 34*qs);
+gfx_setfont(8); ui_col(INK2); TX(1196, 68, "SIZE");
+
+// =====================================================================
+// DYNAMICS module
+// =====================================================================
+plate(8, 110, 400, 467, PNL);
+tape(24, 122, "DYNAMICS");
+gfx_setfont(8); ui_col(INK2); TR(392, 126, "SIDECHAIN -> SIDE GAIN");
+
+sprintf(#v1, "%.1f dB", slider1);
+mknob(1, 108, 222, 40, -60, 0, -20, 0, 7, CAPU, "THRESHOLD", #v1);
+av_ = floor(slider2 + 0.5);
+av_ > 0 ? sprintf(#v2, "+%d%% WIDEN", av_) : av_ < 0 ? sprintf(#v2, "%d%% NARROW", av_) : strcpy(#v2, "OFF");
+mknob(2, 302, 222, 40, -100, 100, 30, 0, 7, CAPU, "AMOUNT", #v2);
+drag_id == 1600 + 2 && abs(slider2) < 3 && slider2 != 0 ? slider2 = 0;      // centre detent
+gfx_setfont(8); ui_col(INK2); TR(262, 252, "NARROW"); TX(342, 252, "WIDEN");
+
+mknob(3, 76, 382, 27, 0.5, 100, 15, 1, 7, CAPU, "ATTACK", fms(slider3));
+mknob(4, 205, 382, 27, 20, 2000, 300, 1, 7, CAPU, "RELEASE", fms(slider4));
+dv_ = floor(slider5 + 0.5);
+dv_ <= 0 ? strcpy(#v5, "MID") : dv_ >= 100 ? strcpy(#v5, "SIDE") : sprintf(#v5, "M %d / S %d", 100 - dv_, dv_);
+mknob(5, 334, 382, 27, 0, 100, 0, 0, 7, CAPU, "DETECT", #v5);
+gfx_setfont(8); ui_col(INK2); TR(298, 404, "M"); TX(370, 404, "S");
+
+// detector: PEAK / RMS keys, the level against the threshold, the ACTIVE lamp
+mkey(26, 470, 66, 32, "PEAK", slider6 < 0.5) ? setv(6, 0);
+mkey(98, 470, 66, 32, "RMS", slider6 >= 0.5) ? setv(6, 1);
+gfx_setfont(8); ui_col(INK2); TC(95, 510, "DETECTOR");
+// level ladder, -60 .. 0 dB (detector level, held briefly)
+wg_lv = ws_lvm; ws_lvm = -150;
+wg_lvd = max(wg_lv, wg_lvd - 1.2);
+ui_col(0x08080A); R(186, 471, 196, 22);
+wg_k = 0;
+loop(24,
+  wg_d = -60 + 60*(wg_k + 0.5)/24;
+  ui_col(wg_lvd >= wg_d ? (wg_d >= slider1 ? ACC : INK2) : ui_mix(wg_d >= slider1 ? ACC : INK2, 0x000000, 0.84));
+  R(189 + wg_k*8, 474, 6, 16);
+  wg_k += 1;
+);
+wg_tx = 189 + 192*(slider1 + 60)/60;
+ui_col(INK); R(wg_tx - 1, 466, 2, 32);
+gfx_setfont(8); ui_col(INK2); TX(186, 501, "-60"); TC(284, 501, "-30"); TR(383, 501, "0");
+wg_on = abs(ws_gd2) > 0.25;
+rd_led(392*0.75, 548*0.75, 5*0.75, wg_on, ACC);
+gfx_setfont(8); ui_col(INK2); TR(380, 541, "MOVING");
+gfx_setfont(8); ui_col(INK2); TX(26, 541, "LEVEL vs THRESHOLD");
+
+// =====================================================================
+// STEREO FIELD module: goniometer, side-gain history, correlation, readouts, gain-change bar
+// =====================================================================
+plate(416, 110, 470, 467, PNL2);
+tape(432, 122, "STEREO FIELD");
+
+// goniometer (M up, S across), with the 'wings': the current width angle from the output M / S energy
+wg_x = 434; wg_y = 156; wg_s = 226;
+screen(wg_x, wg_y, wg_s, wg_s);
+wg_cx = wg_x + wg_s*0.5; wg_cy = wg_y + wg_s*0.5; wg_r = wg_s*0.46;
+ui_col(SCRL);
+LN(wg_cx - wg_r, wg_cy, wg_cx + wg_r, wg_cy); LN(wg_cx, wg_cy - wg_r, wg_cx, wg_cy + wg_r);
+LN(wg_cx - wg_r*0.707, wg_cy - wg_r*0.707, wg_cx + wg_r*0.707, wg_cy + wg_r*0.707);
+LN(wg_cx + wg_r*0.707, wg_cy - wg_r*0.707, wg_cx - wg_r*0.707, wg_cy + wg_r*0.707);
+CIRC(wg_cx, wg_cy, wg_r, 0);
+gfx_setfont(8); ui_col(INK2);
+TC(wg_cx, wg_y + 4, "M"); TX(wg_x + 8, wg_y + 6, "L"); TR(wg_x + wg_s - 8, wg_y + 6, "R");
+TX(wg_x + 6, wg_cy - 22, "-S"); TR(wg_x + wg_s - 6, wg_cy - 22, "+S");
+// wings: angle 0 = mono (straight up), 45 deg = as wide as uncorrelated, 90 deg = all side
+wg_ang = atan2(sqrt(max(ws_eS, 0)), sqrt(max(ws_eM, 0.0000000001)));
+ws_eM + ws_eS > 0.00000001 ? (
+  ui_cola(ACC, 0.16);
+  gfx_triangle(wg_cx*qs, wg_cy*qs, (wg_cx - sin(wg_ang)*wg_r)*qs, (wg_cy - cos(wg_ang)*wg_r)*qs, wg_cx*qs, (wg_cy - wg_r)*qs);
+  gfx_triangle(wg_cx*qs, wg_cy*qs, (wg_cx + sin(wg_ang)*wg_r)*qs, (wg_cy - cos(wg_ang)*wg_r)*qs, wg_cx*qs, (wg_cy - wg_r)*qs);
+  ui_cola(ACC, 0.7);
+  LN(wg_cx, wg_cy, wg_cx - sin(wg_ang)*wg_r, wg_cy - cos(wg_ang)*wg_r);
+  LN(wg_cx, wg_cy, wg_cx + sin(wg_ang)*wg_r, wg_cy - cos(wg_ang)*wg_r);
+);
+// the trace (auto-scaled to the output level)
+wg_vk = wg_r*0.8 / max(sqrt(max(ws_cLL, ws_cRR))*2.8, 0.02);
+ui_cola(0xFFD890, 0.55);
+wg_i = 0;
+loop(ws_gn,
+  wg_l = ws_gl[wg_i]; wg_rr = ws_gr[wg_i];
+  wg_qx = (wg_rr - wg_l)*0.7071*wg_vk; wg_qy = -(wg_l + wg_rr)*0.7071*wg_vk;
+  wg_qx*wg_qx + wg_qy*wg_qy < wg_r*wg_r ? gfx_rect((wg_cx + wg_qx)*qs, (wg_cy + wg_qy)*qs, max(1, 1.4*qs), max(1, 1.4*qs));
+  wg_i += 1;
+);
+
+// side-gain history (4 s), +12 .. -18 dB, newest at the right
+wg_hx = 676; wg_hy = 156; wg_hw = 192; wg_hh = 226;
+screen(wg_hx, wg_hy, wg_hw, wg_hh);
+function hy(db) ( wg_hy + 8 + (wg_hh - 16)*(12 - min(max(db, -18), 12))/30; );
+gfx_setfont(8);
+wg_k = 0;
+loop(6,
+  wg_d = 12 - wg_k*6; wg_yy = hy(wg_d);
+  ui_col(wg_d == 0 ? 0x3A3B3F : SCRL); R(wg_hx + 30, wg_yy, wg_hw - 34, 1);
+  ui_col(INK2); wg_d > 0 ? sprintf(#hl, "+%d", wg_d) : sprintf(#hl, "%d", wg_d); TR(wg_hx + 26, wg_yy - 8, #hl);
+  wg_k += 1;
+);
+wg_y0 = hy(0); wg_n = ws_hn; wg_pw = (wg_hw - 36)/wg_n;
+wg_i = 0;
+loop(wg_n,
+  wg_v = ws_hist[(ws_hw + wg_i) % ws_hn]; wg_yy = hy(wg_v); wg_xx = wg_hx + 32 + wg_i*wg_pw;
+  ui_cola(wg_v >= 0 ? ACC : INK, 0.22); R(wg_xx, min(wg_y0, wg_yy), max(wg_pw, 1/qs), abs(wg_yy - wg_y0));
+  wg_i > 0 ? ( ui_col(wg_v >= 0 ? ACC : INK); LN(wg_xx - wg_pw, wg_py, wg_xx, wg_yy); );
+  wg_py = wg_yy;
+  wg_i += 1;
+);
+gfx_setfont(8); ui_col(INK2); TC(wg_hx + wg_hw*0.5 + 14, wg_hy + wg_hh + 8, "SIDE GAIN  4 s");
+TC(wg_cx, wg_y + wg_s + 8, "VECTORSCOPE");
+
+// correlation (output)
+wg_cor = ws_cLL > 0.0000001 && ws_cRR > 0.0000001 ? ws_cLR / sqrt(ws_cLL*ws_cRR) : 1;
+wg_bx = 434; wg_bw = 434; wg_by = 422;
+ui_col(0x08080A); R(wg_bx - 2, wg_by - 2, wg_bw + 4, 14);
+ui_col(SCRL); R(wg_bx, wg_by, wg_bw, 10);
+ui_col(wg_cor < 0 ? 0xFF3A2A : ACC);
+R(wg_bx + wg_bw*0.5 + min(wg_cor, 0)*wg_bw*0.5, wg_by, abs(wg_cor)*wg_bw*0.5, 10);
+ui_col(INK); R(wg_bx + wg_bw*0.5 - 1, wg_by - 4, 2, 18);
+gfx_setfont(8); ui_col(INK2); TX(wg_bx, wg_by + 16, "-1"); TR(wg_bx + wg_bw, wg_by + 16, "+1");
+sprintf(#crs, "CORRELATION %+.2f", wg_cor); TC(wg_bx + wg_bw*0.5, wg_by + 16, #crs);
+
+// readouts: side gain now, and the resulting image width
+function readout(x, y, w, cap, v) (
+  ui_col(0x050505); R(x, y, w, 52);
+  ui_col(0x120B04); R(x + 3, y + 3, w - 6, 46);
+  gfx_gradrect((x + 3)*qs, (y + 3)*qs, (w - 6)*qs, 23*qs, 1, 1, 1, 0.06, 0, 0, 0, 0, 0, 0, 0, -0.06/(23*qs));
+  ui_col(0xF2AE45); gfx_setfont(10); TX(x + 12, y + 7, cap); gfx_setfont(9); TR(x + w - 12, y + 20, v);
+);
+wg_gd = ws_gd2;
+sprintf(#rg, "%+.1f dB", abs(wg_gd) < 0.05 ? 0 : wg_gd);
+readout(434, 460, 212, "SIDE GAIN", #rg);
+sprintf(#rw, "%d%%", floor(slider7*10^(wg_gd/20) + 0.5));
+readout(656, 460, 212, "IMAGE WIDTH", #rw);
+
+// gain-change bar: -18 .. +12 dB from the centre detent
+wg_bx = 434; wg_bw = 434; wg_by = 530;
+ui_col(0x08080A); R(wg_bx - 3, wg_by - 3, wg_bw + 6, 18);
+wg_z = wg_bx + wg_bw*18/30;
+wg_k = 0;
+loop(30,
+  wg_d = -18 + wg_k + 0.5;
+  wg_lit = wg_d > 0 ? wg_gd >= wg_d - 0.5 : wg_gd <= wg_d + 0.5;
+  wg_c = wg_d > 0 ? ACC : INK;
+  ui_col(wg_lit ? wg_c : ui_mix(wg_c, 0x000000, 0.86)); R(wg_bx + wg_k*wg_bw/30 + 1, wg_by, wg_bw/30 - 3, 12);
+  wg_k += 1;
+);
+ui_col(INK); R(wg_z - 1.5, wg_by - 6, 2, 24);
+gfx_setfont(8); ui_col(INK2);
+TX(wg_bx, wg_by + 18, "-18  NARROWER"); TC(wg_z, wg_by + 18, "0"); TR(wg_bx + wg_bw, wg_by + 18, "WIDER  +12");
+
+// =====================================================================
+// WIDTH & OUTPUT module
+// =====================================================================
+plate(894, 110, 431, 467, PNL3);
+tape(910, 122, "WIDTH & OUTPUT");
+
+mknob(7, 976, 222, 40, 0, 200, 100, 0, 7, CAPU, "BASE WIDTH", sprintf(#v7, "%d%%", floor(slider7 + 0.5)));
+drag_id == 1600 + 7 && abs(slider7 - 100) < 3 && slider7 != 100 ? slider7 = 100;   // detent at 100 %
+gfx_setfont(8); ui_col(INK2); TR(936, 252, "0"); TX(1016, 252, "200");
+mkey(1056, 176, 72, 34, "PRE", slider8 < 0.5) ? ( setv(8, 0); );
+mkey(1136, 176, 72, 34, "POST", slider8 >= 0.5) ? ( setv(8, 1); );
+gfx_setfont(8); ui_col(INK2); TC(1132, 218, "WIDTH STAGE");
+gfx_setfont(8); ui_col(INK2); TC(1132, 244, slider8 < 0.5 ? "BEFORE DETECTOR" : "AFTER DYNAMICS");
+
+wg_k = 0;
+loop(4,
+  mkey(912 + wg_k*76, 326, 68, 34, wg_k == 0 ? "OFF" : wg_k == 1 ? "80" : wg_k == 2 ? "120" : "200", floor(slider9 + 0.5) == wg_k) ? setv(9, wg_k);
+  wg_k += 1;
+);
+gfx_setfont(8); ui_col(INK2); TC(1058, 368, "LOW MONO  (Hz)");
+
+mknob(10, 1000, 470, 30, 0, 100, 100, 0, 7, CAPU, "MIX", sprintf(#v10, "%d%%", floor(slider10 + 0.5)));
+mknob(11, 1120, 474, 24, -12, 12, 0, 0, 20, CAPS, "OUTPUT", fdb(slider11));
+gfx_setfont(8, "Trebuchet MS", ui_fs4, 'b');   // (the meter captions below use this size)
+
+// IN / OUT meters
+wg_il = ws_pil; wg_ir = ws_pir; wg_ol = ws_pol; wg_or = ws_por; ws_pil = ws_pir = ws_pol = ws_por = 0;
+wg_mil = max(wg_il, wg_mil*0.85); wg_mir = max(wg_ir, wg_mir*0.85);
+wg_mol = max(wg_ol, wg_mol*0.85); wg_mor = max(wg_or, wg_mor*0.85);
+vmeter(1232, 156, 24, 15, 11, wg_mil); vmeter(1247, 156, 24, 15, 11, wg_mir);
+vmeter(1278, 156, 24, 15, 11, wg_mol); vmeter(1293, 156, 24, 15, 11, wg_mor);
+gfx_setfont(8); ui_col(INK2);
+TC(1252, 528, "IN"); TC(1298, 528, "OUT");
+TR(1228, 156 + 15*24*3/51 - 8, "0"); TR(1228, 156 + 15*24*21/51 - 8, "-18"); TR(1228, 156 + 15*24 - 14, "-48");
+
+pk_end();
+ui_end();

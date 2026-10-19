@@ -1,0 +1,72 @@
+desc:GFX Input stage (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// Gain-staging before any processing, so hot sources (e.g. loud soft synths)
+// never overdrive the effect's drive, feedback, saturation or clipping stages.
+//   - DC blocker (always on, ~5 Hz).
+//   - TRIM: plain input level, -24..+12 dB.
+//   - GUARD (on by default):
+//       1. eases hot sources down towards about -18 dBFS average (~1 s); never boosts quiet ones
+//       2. catches fast peaks above -6 dBFS (8:1, soft knee, ~2 ms attack, ~100 ms release)
+//     The level is NOT restored afterwards: hot sources come out tamer.
+//
+// Usage in a plugin:
+//   import gfx-input.jsfx-inc
+//   @init    in_init();
+//   @block   in_setup(trim_db, guard 0/1);
+//   @sample  in_process(spl0, spl1); l = in_l; r = in_r;
+//            ... effect ...
+//            (in_comp is kept for compatibility and is always 1)
+//   Display: in_pk (post-guard peak; decay it in @gfx),
+//            in_grd (total guard reduction in dB since last read; set back to 0).
+
+@init
+
+function in_init() (
+  in_g = 1; in_ag = 1; in_ms = 0; in_pk = 0; in_comp = 1; in_grd = 0; in_env = 0;
+  in_dxL = 0; in_dyL = 0; in_dxR = 0; in_dyR = 0;
+  in_dcc = 1 - 2 * $pi * 1 / srate;          // DC blocker at 1 Hz: no audible low-end loss, even stacked
+  in_msc  = 1 - exp(-1 / (0.3 * srate));    // level detector ~300 ms
+  in_agc  = 1 - exp(-1 / (1.2 * srate));    // slow leveller ~1.2 s
+  in_gsm  = 1 - exp(-1 / (0.03 * srate));   // trim smoothing
+  in_catt = 1 - exp(-1 / (0.002 * srate));  // peak catcher attack ~2 ms
+  in_crel = 1 - exp(-1 / (0.1 * srate));    // peak catcher release ~100 ms
+);
+
+function in_setup(trim_db, guard) (
+  in_trim = 10 ^ (trim_db / 20); in_grdon = guard;
+);
+
+function in_process(l, r) local(x, ag_t, pk, ov, cgr) (
+  // DC blocker
+  x = l - in_dxL + in_dcc * in_dyL; in_dxL = l; in_dyL = x; l = x;
+  x = r - in_dxR + in_dcc * in_dyR; in_dxR = r; in_dyR = x; r = x;
+
+  // trim
+  in_g += (in_trim - in_g) * in_gsm;
+  l *= in_g; r *= in_g;
+
+  cgr = 0;
+  in_grdon ? (
+    // 1. slow leveller: only turns down, above -18 dBFS average
+    in_ms += (0.5 * (l * l + r * r) - in_ms) * in_msc;
+    ag_t = in_ms > 0.0159 ? 0.126 / sqrt(in_ms) : 1;
+    in_ag += (ag_t - in_ag) * in_agc;
+    l *= in_ag; r *= in_ag;
+
+    // 2. peak catcher: 8:1 above -6 dBFS, 6 dB soft knee, stereo-linked
+    pk = max(abs(l), abs(r));
+    in_env += (pk - in_env) * (pk > in_env ? in_catt : in_crel);
+    ov = 20 * log10(max(in_env, 0.000001)) + 6;
+    cgr = ov <= -3 ? 0 : ( ov >= 3 ? 0.875 * ov : 0.875 * (ov + 3) * (ov + 3) / 12 );
+    cgr > 0 ? ( x = 10 ^ (-cgr / 20); l *= x; r *= x; );
+  ) : (
+    in_ag += (1 - in_ag) * in_gsm;
+    l *= in_ag; r *= in_ag;
+  );
+
+  in_grd = max(in_grd, cgr - 20 * log10(max(in_ag, 0.0001)));
+  in_l = l; in_r = r;
+  in_comp = 1;
+  in_pk = max(in_pk, max(abs(l), abs(r)));
+);

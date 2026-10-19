@@ -1,0 +1,429 @@
+desc:GFX ADPMod [ring modulator]
+//tags: modulation ringmod distortion lfo vintage stereo
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output and gfx-ui (.jsfx-inc) in the same folder.
+//
+// ADP MOD Ring Modulator:
+// Dual-carrier audio-rate/sub-audio ring modulator with tape-style harmonic saturation,
+// custom chaos drift, filter routing, and Head-inspired drive stage.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+
+slider1:0<0,3,1{Audio,Sub,Dual,Bypass}>-Mod Mode
+slider3:220<0.5,2000,0.1>-Carrier Freq (Hz)
+slider5:0<0,4,1{Sine,Triangle,Square,Saw,Noise}>-Carrier Wave
+slider6:0<0,10,0.01>-$ Drive
+slider7:100<0,100,1>-Mod Depth (%)
+slider8:50<0,100,1>-Harmonics (%)
+slider9:1000<20,18000,10>-Tone Filter (Hz)
+slider10:50<0,100,1>-Mix (%)
+slider11:10<0,50,1>-Freq Drift (%)
+slider12:15<0,50,1>-Drive Drift (%)
+slider13:10<0,50,1>-Tone Drift (%)
+slider14:0.25<0.02,2,0.01>-Drift Speed (Hz)
+slider15:0<-24,12,0.1>-Output (dB)
+slider16:0<0,100,1>-Band Sat (%)
+slider17:30<0,100,1>-Bias (%)
+slider18:120<40,400,1>-Sat Low Band (Hz)
+slider19:6000<2000,16000,10>-Sat High Band (Hz)
+slider20:-0.3<-24,0,0.1>-(unused, was output ceiling)
+slider21:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider22:0<-24,12,0.1>-Input Trim (dB)
+slider23:1<0,1,1{Off,On}>-Input Guard
+slider24:20<20,500,1>-Wet Low Cut (Hz, 20 = off)
+slider25:50<0,100,1>-Drift (%)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-adpmod";
+
+// ---------- Head Tape Saturation Core Functions ----------
+function bq_set(type, f, q, gdb, fs) instance(b0, b1, b2, a1, a2) local(w0, cw, sw, al, amp, sa, n) (
+  w0 = 2 * $pi * min(f, fs * 0.45) / fs; cw = cos(w0); sw = sin(w0); al = sw / (2 * q);
+  amp = 10 ^ (gdb / 40);
+  type == 0 ? (
+    n = 1 + al; b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 1 ? (
+    n = 1 + al; b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 2 ? (
+    n = 1 + al / amp; b0 = (1 + al * amp) / n; b1 = -2 * cw / n; b2 = (1 - al * amp) / n; a1 = b1; a2 = (1 - al / amp) / n;
+  ) : (
+    sa = 2 * sqrt(amp) * al;
+    n = (amp + 1) - (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) + (amp - 1) * cw + sa) / n; b1 = -2 * amp * ((amp - 1) + (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) + (amp - 1) * cw - sa) / n; a1 = 2 * ((amp - 1) - (amp + 1) * cw) / n;
+    a2 = ((amp + 1) - (amp - 1) * cw - sa) / n;
+  );
+);
+
+function bq_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+
+function hd_aa() instance(u1, u2, u3, u4, d1, d2, d3, d4) local(fc, fs2) (
+  fs2 = 2 * srate; fc = min(0.42 * srate, 20000);
+  u1.bq_set(0, fc, 0.5098, 0, fs2); u2.bq_set(0, fc, 0.6013, 0, fs2);
+  u3.bq_set(0, fc, 0.9000, 0, fs2); u4.bq_set(0, fc, 2.5629, 0, fs2);
+  d1.bq_set(0, fc, 0.5098, 0, fs2); d2.bq_set(0, fc, 0.6013, 0, fs2);
+  d3.bq_set(0, fc, 0.9000, 0, fs2); d4.bq_set(0, fc, 2.5629, 0, fs2);
+);
+
+function hd_eq() instance(emp, dem, bump, gap, dcb, lop) (
+  emp.bq_set(3, 3000, 0.7, 4, srate);  dem.bq_set(3, 3000, 0.7, -4, srate);
+  bump.bq_set(2, 70, 0.9, hd_bump, srate);
+  gap.bq_set(0, 18000, 0.55, 0, srate);
+  dcb.bq_set(1, 10, 0.7, 0, srate);
+  lop.bq_set(0, 250, 0.6, 0, srate);
+);
+
+function hd_sat(x, b) local(tb, c) (
+  tb = ost_tanh(b);
+  c = 0.25 / ((ost_tanh(hd_g * 0.125 + b) - tb) - (ost_tanh(-hd_g * 0.125 + b) - tb));
+  (ost_tanh(hd_g * x + b) - tb) * c;
+);
+
+function hd_run(x, b) instance(emp, dem, bump, gap, dcb, lop, u1, u2, u3, u4, d1, d2, d3, d4) local(y, z, lo) (
+  lo = lop.bq_run(x) * hd_lb;
+  y = emp.bq_run(x - lo) * 0.5;
+  z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(y * 2))));
+  d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b)))));
+  z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(0))));
+  y = d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b))))) * 2;
+  dcb.bq_run(gap.bq_run(bump.bq_run(dem.bq_run(y)) + lo * hd_lg));
+);
+
+function ring_osc(phase, wave) local(out, p) (
+  p = phase - floor(phase);
+  wave == 0 ? out = sin(p * 2 * $pi) :
+  wave == 1 ? out = (p < 0.5 ? 4 * p - 1 : 3 - 4 * p) :
+  wave == 2 ? out = (p < 0.5 ? 1 : -1) :
+  wave == 3 ? out = 2 * p - 1 :
+  wave == 4 ? out = rand(2) - 1 : 0;
+  out;
+);
+
+function wlc(x) instance(x1, x2, y1, y2) local(y) (
+  y = wl_b0 * (x - 2 * x1 + x2) - wl_a1 * y1 - wl_a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y; y;
+);
+
+function wlc_set(f) local(w0, al, n) (
+  w0 = 2 * $pi * min(f, srate * 0.45) / srate; al = sin(w0) / (2 * 0.7071); n = 1 + al;
+  wl_b0 = (1 + cos(w0)) * 0.5 / n; wl_a1 = -2 * cos(w0) / n; wl_a2 = (1 - al) / n;
+);
+
+function lp_filter(x, f) instance(p) local(c) (
+  c = 1 - exp(-2 * $pi * min(f, srate * 0.45) / srate);
+  p += (x - p) * c;
+  p;
+);
+
+function update() (
+  wl_on = slider24 > 20.5; wl_on ? wlc_set(slider24);
+  mode = slider1;
+  cfreq = slider3;
+  cwave = floor(slider5 + 0.5);
+  
+  // Head Drive Parameters
+  hd_g = 10 ^ (slider6 * 2.2 / 20);
+  hd_b0 = 0.05;
+  hd_lb = (slider6 / 10) ^ 1.2;
+  hd_c = 0.25 / ((ost_tanh(hd_g * 0.125 + hd_b0) - ost_tanh(hd_b0)) - (ost_tanh(-hd_g * 0.125 + hd_b0) - ost_tanh(hd_b0)));
+  hd_lg = sqrt(hd_g * hd_c * (1 - ost_tanh(hd_b0) ^ 2));
+  hd_bump = 1.5 * (1 - 0.5 * slider6 / 10);
+  hL.hd_eq(); hR.hd_eq();
+
+  mdepth = slider7 / 100;
+  harmonics = slider8 / 100;
+  cut_freq = slider9;
+  mix_t = slider10 / 100;
+  
+  drift_macro(slider25);
+  fd = slider11 / 100 * dm_a;
+  dd = slider12 / 100 * dm_a;
+  td = slider13 / 100 * dm_a;
+  dspd = slider14 * dm_s;
+  
+  out_t = 10 ^ (slider15 / 20);
+  in_setup(slider22, slider23);
+  ost_setup(slider16 / 100, slider17 / 100, slider18, slider19, slider20, 0);   // output stage: straight through
+);
+
+function load_preset(p) (
+  p == 1 ? ( slider1 = 0; slider3 = 440; slider5 = 0; slider6 = 2; slider7 = 100; slider8 = 30; slider9 = 2500; slider10 = 70; ) :
+  p == 2 ? ( slider1 = 1; slider3 = 6.5; slider5 = 1; slider6 = 5; slider7 = 80; slider8 = 60; slider9 = 1500; slider10 = 50; ) :
+  p == 3 ? ( slider1 = 2; slider3 = 180; slider5 = 2; slider6 = 8; slider7 = 100; slider8 = 85; slider9 = 8000; slider10 = 85; ) :
+  p == 4 ? ( slider1 = 0; slider3 = 220; slider5 = 0; slider6 = 0; slider7 = 50; slider8 = 0; slider9 = 10000; slider10 = 40; );
+  p >= 1 && p <= 4 ? slider_automate(1023);
+);
+
+// ---------- state ----------
+sm  = 1 - exp(-1 / (0.03 * srate));
+vuc = 1 - exp(-1 / (0.01 * srate));
+
+drF.drift_init(0.8 + rand(0.5));
+drD.drift_init(0.8 + rand(0.5));
+drT.drift_init(0.8 + rand(0.5));
+
+hL.hd_aa(); hR.hd_aa();
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+pkL = 0; pkR = 0; vu_ms = 0;
+phaseL = 0; phaseR = 0;
+
+!ui_dflt ? ui_thm = 0; !ui_dflt ? ui_hw = 0;
+update();
+mix_s = mix_t; out_s = out_t;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update();
+
+@block
+update();
+
+@serialize
+file_var(0, ui_thm);
+file_var(0, ui_sz);
+file_var(0, ui_hw);
+file_avail(0) != 0 ? file_var(0, pr_cur);    // the preset in use (older projects end before it)
+
+@sample
+in_process(spl0, spl1);
+inL = in_l; inR = in_r;
+vu_ms += (0.5 * (inL * inL + inR * inR) - vu_ms) * vuc;
+
+// Drift ticks
+dinc = dspd / srate;
+vF = drF.drift_tick(dinc);
+vD = drD.drift_tick(dinc);
+vT = drT.drift_tick(dinc);
+
+mix_s += (mix_t - mix_s) * sm;
+out_s += (out_t - out_s) * sm;
+
+mode == 3 ? (
+  oL = inL; oR = inR;
+) : (
+  eff_freq = max(cfreq * (1 + fd * vF), 0.1);
+  dual_detune = mode == 2 ? 1.005 : 1;   // DUAL: second carrier runs slightly detuned for stereo width; AUDIO stays single-carrier (mono-coherent)
+  
+  phase_inc = eff_freq / srate;
+  phaseL = phaseL + phase_inc; phaseL -= floor(phaseL);
+  phaseR = phaseR + phase_inc * dual_detune; phaseR -= floor(phaseR);
+  
+  // Carrier Oscillators
+  carL = ring_osc(phaseL, cwave);
+  carR = ring_osc(phaseR, cwave);
+  
+  // Harmonic fold on carrier
+  harmonics > 0 ? (
+    carL += harmonics * ring_osc(phaseL * 2, cwave);
+    carR += harmonics * ring_osc(phaseR * 2, cwave);
+  );
+  
+  // Ring Modulation Execution
+  wL = inL * (1 - mdepth + mdepth * carL);
+  wR = inR * (1 - mdepth + mdepth * carR);
+  
+  // Head Drive Stage on Modulated Wet Signal
+  b_drift = hd_b0 + vD * dd * 0.06;
+  wL = hL.hd_run(wL, b_drift);
+  wR = hR.hd_run(wR, b_drift);
+  
+  // Tone Filter with Drift
+  eff_tone = max(cut_freq * (1 + td * 0.5 * vT), 20);
+  wL = fltL.lp_filter(wL, eff_tone);
+  wR = fltR.lp_filter(wR, eff_tone);
+  
+  oL = wl_on ? inL + mix_s * (WLL.wlc(wL) - WDL.wlc(inL)) : (1 - mix_s) * inL + mix_s * wL;
+  oR = wl_on ? inR + mix_s * (WLR.wlc(wR) - WDR.wlc(inR)) : (1 - mix_s) * inR + mix_s * wR;
+);
+
+dispP = phaseL; // Capture current carrier phase for UI animation
+
+// Output saturation & stage
+oL = ostL.ost_band(oL) * out_s;
+oR = ostR.ost_band(oR) * out_s;
+ost_out(oL, oR);
+spl0 = ost_l;
+spl1 = ost_r;
+pkL = max(pkL, abs(spl0)); pkR = max(pkR, abs(spl1));
+
+@gfx 900 340
+ui_begin(900, 340);
+
+// --- Theme Colors ---
+BG_COLOR  = 0x0A0A0A;
+GOLD      = 0xD4AF37;
+GOLD_DIM  = 0x8C7323;
+TEXT_WHITE= 0xF0F0F0;
+KEYC      = 0x1A1A1A;
+
+// Custom Knob Cap Colors
+RED       = 0xD8261C;
+BLUE      = 0x3E7CC4;
+GREEN     = 0x3BD16F;
+GREY      = 0x7E8288;
+
+function setv(idx, v) ( slider(idx) = v; ui_auto(idx); );
+// panel keys: house lamp keys (gfx-ui); legends in font slot 15 (set once per scale change)
+function ap_key(x, y, w, h, on, col, s) local(hit) (
+  sc != ap_lsc ? ( ap_lsc = sc; gfx_setfont(15, "Trebuchet MS", 9 * sc, 'b'); );
+  lk_well = 0x141518; lk_font = 15; lk_font2 = 15;
+  hit = lk_fit(x, y, w, h, on, col, s);
+  gfx_setfont(4);   // (the font the old keys left current)
+  hit;
+);
+function ap_ck(x, y, w, h, on, s) local(hit) (   // cream selector key (gfx-ui ck_key), legend in slot 15
+  sc != ap_lsc ? ( ap_lsc = sc; gfx_setfont(15, "Trebuchet MS", 9 * sc, 'b'); );
+  ck_font = 15;
+  hit = ck_key(x, y, w, h, on, s);
+  gfx_setfont(4);
+  hit;
+);
+
+// Dark outer background
+ui_col(BG_COLOR); gfx_rect(0, 0, gfx_w, gfx_h);
+
+// Main Faceplate Plate
+rd_plate(6, 4, 888, 332, BG_COLOR, 12);
+
+// --- TRANSPARENT POLKA DOTS (DIAGONAL BAND) ---
+ui_cola(0xFFFFFF, 0.22);
+row = 0;
+while (row < 5) (
+  col = 0;
+  while (col < 11) ( // Change '10' to adjust the width of the band
+    px = (col * 22 + row * 10 + 12) * sc;
+    py = (row * 12 + 10) * sc;
+    gfx_circle(px, py, 2.2 * sc, 1, 1);
+    col += 1;
+  );
+  row += 1;
+);
+
+ui_col(GOLD);
+gfx_roundrect(6 * sc, 4 * sc, 888 * sc, 332 * sc, 12 * sc);
+rd_screw(22, 20); rd_screw(878, 20); rd_screw(22, 320); rd_screw(878, 320);
+
+// ---------- Header ----------
+rd_badge(56, 36, 15, GOLD, BG_COLOR);
+rd_titlei(83, 11, "ADP MOD", 32, GOLD);
+rd_sub(84, 43, "HARMONIC RING MODULATOR", GOLD_DIM, 1);
+
+// 3D Pyramid Graphic
+px0 = 380 * sc; py0 = 16 * sc;
+ui_col(0xFFDF00);
+gfx_triangle(px0, py0, px0 - 18 * sc, py0 + 26 * sc, px0, py0 + 30 * sc);
+ui_col(0x997A00);
+gfx_triangle(px0, py0, px0 + 18 * sc, py0 + 26 * sc, px0, py0 + 30 * sc);
+ui_col(GOLD);
+gfx_line(px0, py0, px0, py0 + 30 * sc, 1);
+
+ui_cola(GOLD, 0.5); gfx_rect(40 * sc, 62 * sc, 820 * sc, 1 * sc);
+
+// Mode Selection Buttons
+rd_sqdark = 1;
+ap_ck(450, 18, 50, 26, slider1 == 0, "AUDIO") ? setv(1, 0);
+ap_ck(504, 18, 50, 26, slider1 == 1, "SUB")   ? setv(1, 1);
+ap_ck(558, 18, 50, 26, slider1 == 2, "DUAL")  ? setv(1, 2);
+ap_ck(612, 18, 50, 26, slider1 == 3, "OFF") ? setv(1, 3);
+rd_sqdark = 0;
+
+pk_pextra = "";   // the house preset display: PRESETS, prev / next, LCD (click it for the list)
+k_ = pk_preset(670 * sc, 16 * sc, 216 * sc, 28 * sc, pr_cur, "Vocal Ring (Classic)|Sub Tremolo|Metallic Chaos|Subtle Saturation Mod");
+k_ > 0 ? ( load_preset(k_); pr_cur = k_ > 4 ? 0 : k_; );
+ui_size_picker(270 * sc, 24 * sc);
+// ---------- Animated Scope Display Window ----------
+ui_col(0x000000); rd_rr(40 * sc, 74 * sc, 300 * sc, 130 * sc, 6 * sc); // Increased height from 100 to 130
+ui_col(0x111100); gfx_rect(44 * sc, 78 * sc, 292 * sc, 122 * sc, 6 * sc); // Increased height from 92 to 122
+ui_col(GOLD);
+
+sx0 = 44; sw0 = 292; sy0 = 139; sa = 38; // Shifted vertical center (sy0) down and increased amplitude (sa)
+i = 0;
+loop(100,
+  pp = i / 100;
+  qx = (sx0 + pp * sw0) * sc;
+  qy = (sy0 - ring_osc(pp * 4 + dispP, floor(slider5 + 0.5)) * sa) * sc;
+  i > 0 ? gfx_line(px, py, qx, qy, 1);
+  px = qx; py = qy;
+  i += 1;
+);
+gfx_setfont(4); ui_cola(GOLD, 0.8); gfx_x = 52 * sc; gfx_y = 84 * sc; gfx_drawstr("CARRIER WAVEFORM");
+
+// ---------- Main Controls ----------
+// WAVE SELECTOR SWITCHES
+rd_sqdark = 1;
+c_w = floor(slider5 + 0.5);
+ap_key(350, 102, 42, 20, c_w == 0, LK_YEL, "SIN") ? setv(5, 0);
+ap_key(396, 102, 42, 20, c_w == 1, LK_YEL, "TRI") ? setv(5, 1);
+ap_key(350, 126, 42, 20, c_w == 2, LK_YEL, "SQR") ? setv(5, 2);
+ap_key(396, 126, 42, 20, c_w == 3, LK_YEL, "SAW") ? setv(5, 3);
+ap_key(373, 150, 42, 20, c_w == 4, LK_YEL, "NOISE")? setv(5, 4);
+rd_sqdark = 0;
+
+// KNOB SECTION
+
+// FREQ Knob
+sqrt((mouse_x - 500 * sc)^2 + (mouse_y - 120 * sc)^2) <= 33 * sc ? 
+  sprintf(#v, "%.1f Hz", slider3) : strcpy(#v, "");
+dy_knob(500, 120, 28, 3, 0.5, 2000, 220, 1, GOLD, "FREQ", #v);
+
+// DRIVE Knob
+sqrt((mouse_x - 580 * sc)^2 + (mouse_y - 120 * sc)^2) <= 26 * sc ? 
+  sprintf(#v, "%.2f", slider6) : strcpy(#v, "");
+dy_knob(580, 120, 21, 6, 0, 10, 0, 0, RED, "$ DRIVE", #v);
+
+// DEPTH Knob
+sqrt((mouse_x - 650 * sc)^2 + (mouse_y - 120 * sc)^2) <= 26 * sc ? 
+  sprintf(#v, "%.0f%%", slider7) : strcpy(#v, "");
+dy_knob(650, 120, 21, 7, 0, 100, 100, 0, BLUE, "DEPTH", #v);
+
+// HARMONICS Knob
+sqrt((mouse_x - 730 * sc)^2 + (mouse_y - 120 * sc)^2) <= 26 * sc ? 
+  sprintf(#v, "%.0f%%", slider8) : strcpy(#v, "");
+dy_knob(730, 120, 21, 8, 0, 100, 50, 0, GREEN, "HARMONICS", #v);
+
+// TONE Knob
+sqrt((mouse_x - 810 * sc)^2 + (mouse_y - 120 * sc)^2) <= 26 * sc ? 
+  sprintf(#v, "%.0f Hz", slider9) : strcpy(#v, "");
+dy_knob(810, 120, 21, 9, 20, 18000, 1000, 1, GREY, "TONE", #v);
+// ---------- Lower Panel: DRIFT | I/O | MASTER ----------
+ui_cola(GOLD, 0.35); gfx_rect(40 * sc, 222 * sc, 820 * sc, 1 * sc);
+gfx_rect(128 * sc, 230 * sc, 1 * sc, 92 * sc); gfx_rect(400 * sc, 230 * sc, 1 * sc, 92 * sc);
+rd_lbl(84, 230, "CHAOS DRIFT", GOLD_DIM, 1); rd_lbl(264, 230, "IN / OUT $", GOLD_DIM, 1); rd_lbl(630, 230, "MASTER", GOLD_DIM, 1);
+
+dy_nov = 1;
+sprintf(#v, "%.0f%%", slider25); dy_knob(84, 272, 16, 25, 0, 100, 50, 0, GOLD, "DRIFT", #v);
+rd_ioc1 = 0x221A00; rd_ioc2 = GOLD; rd_ioc3 = 0xFF3333; rd_iok = 20;
+rd_iotx = 12; rd_io(166, 250, 22, 23, 16, 21); rd_iotx = 0;
+
+dy_nov = 0;
+sprintf(#v, "%.0f%%", slider10); dy_knob(450, 272, 18, 10, 0, 100, 50, 0, GOLD, "MIX", #v);
+slider24 <= 20.5 ? strcpy(#v, "off") : sprintf(#v, "%.0f Hz", slider24);
+dy_kf = 1; dy_knob(524, 272, 15, 24, 20, 500, 20, 1, 0, "LOW CUT", #v);
+sprintf(#v, "%+.1f dB", slider15); dy_knob(598, 272, 18, 15, -24, 12, 0, 0, GOLD, "OUTPUT", #v);
+
+mL.ui_ledm(652 * sc, 258 * sc, 196 * sc, 8 * sc, pkL); 
+mR.ui_ledm(652 * sc, 270 * sc, 196 * sc, 8 * sc, pkR);
+pkL *= 0.85; pkR *= 0.85;
+rd_lbl(750, 286, "$ LEVEL $", GOLD_DIM, 0.8);
+
+pk_end();
+ui_end();
+

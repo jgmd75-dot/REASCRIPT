@@ -1,0 +1,486 @@
+desc:GFX Contour [filter]
+//tags: filter envelope modulation lfo gate pan volume shaper
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel and gfx-instrument (.jsfx-inc) in the same folder
+// (gfx-instrument is used only for the shared OUTPUT tray and button).
+//
+// Drawn-envelope filter in the spirit of TAL-Filter-2, with four curves running at once:
+//   CURVES    - CUTOFF, RESONANCE, VOLUME and PAN each have their own drawn curve (pick one with the tabs; the
+//               others show faintly behind). Click to add a point, drag points, double-click a point to remove
+//               it. Drag a line between two points up or down to bend it; double-click the line to straighten it.
+//               Right-click for reset / flat / copy / paste.
+//   AMOUNTS   - CUTOFF (octaves, + or -), RESO, VOLUME and PAN set how far each curve moves its target
+//               (0 = that curve is off). DEPTH scales all four without changing the drawings.
+//               Cutoff: the curve's top is CUTOFF + the amount. Volume: the curve's top is full level, its
+//               bottom is the level minus the amount (draw dips to duck). Pan: the middle is centre.
+//   STEREO    - delays the right channel's place in the curve (up to half a cycle) for wide, moving filtering.
+//   TIMING    - RATE from 1/32 to 32 bars. SYNC follows the project's timeline, MIDI restarts the curve on every
+//               note, FREE runs at the project tempo even when stopped. LOOP or ONE-SHOT; TRIGGER restarts it.
+//   FILTER    - 4x oversampled state-variable filter: LP 6 / 12 / 18 / 24 dB, HP 12, BP 12, NOTCH. A diode-style
+//               soft clipper sits in the feedback loop: DRIVE pushes the input into it for analogue-style grit.
+// IN / OUT also holds SAT.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+
+slider1:1<0,6,1{LP 6,LP 12,LP 18,LP 24,HP 12,BP 12,Notch}>-Filter mode
+slider2:400<20,20000,1>-Cutoff (Hz)
+slider3:25<0,100,1>-Resonance (%)
+slider4:0<0,24,0.1>-Drive (dB)
+slider5:5<0,10,1{1/32,1/16,1/8,1/4,1/2,1 bar,2 bars,4 bars,8 bars,16 bars,32 bars}>-Rate
+slider6:0<0,2,1{Sync,MIDI,Free}>-Trigger
+slider7:0<0,1,1{Loop,One-shot}>-Playback
+slider8:0<0,50,1>-Stereo offset (%)
+slider9:100<0,100,1>-Depth (%)
+slider10:4<-8,8,0.1>-Cutoff amount (oct)
+slider11:0<-100,100,1>-Resonance amount (%)
+slider12:0<0,100,1>-Volume amount (%)
+slider13:0<0,100,1>-Pan amount (%)
+slider14:100<0,100,1>-Mix (%)
+slider15:0<-24,12,0.1>-Output (dB)
+slider16:0<0,100,1>-Band sat (%)
+slider17:30<0,100,1>-Bias (%)
+slider18:120<40,400,1>-Sat low band (Hz)
+slider19:6000<2000,16000,10>-Sat high band (Hz)
+slider20:-0.3<-24,0,0.1>-(unused, was output ceiling)
+slider21:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider22:0<-24,12,0.1>-Input trim (dB)
+slider23:0<0,1,1{Off,On}>-Input guard
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-contour";                                  // the ? pop-up links to this manual
+ext_noinit = 1;
+
+// ---------- memory ----------
+CRV = 1000; CSZ = 100; NMAX = 32;                 // 4 curves: [0] = point count, then x, y, bend per point
+CLP = 1500;                                       // curve clipboard
+EVQ = 1700;                                       // MIDI note-on offsets this block
+LUT = 5000; LSZ = 1028; LN = 1024;                // each curve rendered to 1025 points
+
+// ---------- curves ----------
+// a segment from point i to i+1, shaped by its bend t (-1 .. 1; 0 = straight)
+function shape(u, t) ( t >= 0 ? u ^ (1 + 4 * t) : 1 - (1 - u) ^ (1 - 4 * t); );
+function cv_eval(c, p) local(b, n, i, x0, x1, u) (
+  b = CRV + c * CSZ; n = b[0]; i = 0;
+  while (i < n - 2 && p > b[1 + (i + 1) * 3]) ( i += 1; );
+  x0 = b[1 + i * 3]; x1 = b[1 + (i + 1) * 3];
+  u = x1 > x0 ? min(max((p - x0) / (x1 - x0), 0), 1) : 0;
+  b[2 + i * 3] + (b[2 + (i + 1) * 3] - b[2 + i * 3]) * shape(u, b[3 + i * 3]);
+);
+// read a curve at place p (0 .. 1)
+function cv_read(c, p) local(l, x, i) ( l = LUT + c * LSZ; x = p * LN; i = floor(x); l[i] + (l[i + 1] - l[i]) * (x - i); );
+function build_lut(c) local(i, l) (
+  l = LUT + c * LSZ; i = 0;
+  loop(LN + 1, l[i] = cv_eval(c, i / LN); i += 1; );
+);
+function cv_set(c, n, x0, y0, t0, x1, y1, t1, x2, y2, t2, x3, y3, t3) local(b) (
+  b = CRV + c * CSZ; b[0] = n;
+  b[1] = x0; b[2] = y0; b[3] = t0; b[4] = x1; b[5] = y1; b[6] = t1;
+  b[7] = x2; b[8] = y2; b[9] = t2; b[10] = x3; b[11] = y3; b[12] = t3;
+  build_lut(c);
+);
+function cv_default(c) (
+  c == 0 ? cv_set(0, 2, 0, 1, -0.6, 1, 0, 0, 0, 0, 0, 0, 0, 0) :           // cutoff: a pluck
+  c == 1 ? cv_set(1, 2, 0, 0.5, 0, 1, 0.5, 0, 0, 0, 0, 0, 0, 0) :          // resonance: flat
+  c == 2 ? cv_set(2, 2, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0) :              // volume: flat (full)
+           cv_set(3, 4, 0, 0.5, 0, 0.25, 1, 0, 0.75, 0, 0, 1, 0.5, 0);     // pan: left - right
+);
+!crv_init ? ( crv_init = 1; cv_default(0); cv_default(1); cv_default(2); cv_default(3); );
+
+// ---------- presets (the sound sliders 1-14 and all four curves; OUTPUT and the I/O rows stay as they are) ----------
+function ct_set(md, ct, rs, dv, rt, st, ca, ra, va, pa) (
+  slider1 = md; slider2 = ct; slider3 = rs; slider4 = dv; slider5 = rt; slider6 = 0; slider7 = 0;
+  slider8 = st; slider9 = 100; slider10 = ca; slider11 = ra; slider12 = va; slider13 = pa; slider14 = 100;
+  cv_default(0); cv_default(1); cv_default(2); cv_default(3);
+);
+function load_preset(p) (
+  cn_dst = 1;                                      // duck the output, swap the settings at silence, fade back in
+  p == 1 ? ct_set(1, 400, 25, 0, 5, 0, 4, 0, 0, 0) :                          // Init
+  p == 2 ? ct_set(3, 120, 78, 10, 1, 0, 5.5, 0, 0, 0) :                        // Acid Pluck 1/16 (the pluck curve)
+  p == 3 ? ( ct_set(0, 20000, 0, 0, 1, 0, 0, 0, 100, 0);                       // Trance Gate 1/16
+             cv_set(2, 4, 0, 1, 0, 0.5, 1, 0, 0.505, 0, 0, 1, 0, 0); ) :
+  p == 4 ? ( ct_set(0, 20000, 0, 0, 3, 0, 0, 0, 75, 0);                        // Sidechain Pump 1/4
+             cv_set(2, 3, 0, 0, -0.5, 0.45, 1, 0, 1, 1, 0, 0, 0, 0); ) :
+  p == 5 ? ( ct_set(3, 150, 45, 4, 7, 25, 6.5, 0, 0, 0);                       // 4-Bar Sweep
+             cv_set(0, 3, 0, 0, 0, 0.5, 1, 0, 1, 0, 0, 0, 0, 0); ) :
+  p == 6 ? ( ct_set(5, 300, 65, 0, 3, 50, 3.5, 0, 0, 0);                       // Stereo Wah 1/4
+             cv_set(0, 3, 0, 0, 0, 0.5, 1, 0, 1, 0, 0, 0, 0, 0); ) :
+  p == 7 ? ( ct_set(4, 40, 30, 0, 8, 0, 7.5, 0, 0, 0);                         // HP Riser 8 Bars
+             cv_set(0, 2, 0, 0, 0.5, 1, 1, 0, 0, 0, 0, 0, 0, 0); ) :
+  p == 8 ? ( ct_set(0, 20000, 0, 0, 2, 0, 0, 0, 0, 80);                        // Ping-Pong Pan 1/8
+             cv_set(3, 4, 0, 0, 0, 0.5, 0, 0, 0.505, 1, 0, 1, 1, 0); );
+  p >= 1 && p <= 8 ? slider_automate(16383);       // sliders 1-14
+);
+lut_req = 1;
+
+// ---------- biquad (the oversampling filters) ----------
+function bq_lp(f, q, fs) instance(b0, b1, b2, a1, a2) local(w0, cw, al, n) (
+  w0 = 2 * $pi * f / fs; cw = cos(w0); al = sin(w0) / (2 * q); n = 1 + al;
+  b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+);
+function bq_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+
+// ---------- the filter (one channel, runs at 4x) ----------
+// diode-style soft clip on the integrator state inside the feedback loop (stronger as DRIVE goes up)
+function dclip(x) ( x / (1 + dck * abs(x)); );                     // dck follows DRIVE: nearly clean at 0 dB
+function flt_set(fc, res) instance(g, k, a1, a2, a3, gp, k2, b1, b2, b3) local(fs) (
+  fs = 4 * srate;
+  g = tan($pi * min(max(fc, 10), min(22000, fs * 0.2)) / fs);
+  k = 2 - 1.96 * min(max(res, 0), 1);
+  a1 = 1 / (1 + g * (g + k)); a2 = g * a1; a3 = g * a2;
+  gp = g / (1 + g);                                // one-pole (LP 6, the extra pole of LP 18)
+  k2 = 1.4142; b1 = 1 / (1 + g * (g + k2)); b2 = g * b1; b3 = g * b2;   // second stage of LP 24
+);
+function flt_run(x, m) instance(g, k, a1, a2, a3, gp, k2, b1, b2, b3, s1, s2, t1, t2, p1) local(v1, v2, v3, y, v) (
+  m == 0 ? (
+    v = (x - p1) * gp; y = v + p1; p1 = y + v;
+  ) : (
+    v3 = x - s2; v1 = a1 * s1 + a2 * v3; v2 = s2 + a2 * s1 + a3 * v3;
+    s1 = dclip(2 * v1 - s1); s2 = 2 * v2 - s2;
+    y = m == 4 ? x - k * v1 - v2 : m == 5 ? v1 * k : m == 6 ? x - k * v1 : v2;   // HP / BP / notch / LP
+    m == 2 ? ( v = (y - p1) * gp; y = v + p1; p1 = y + v; ) :
+    m == 3 ? ( v3 = y - t2; v1 = b1 * t1 + b2 * v3; v2 = t2 + b2 * t1 + b3 * v3; t1 = 2 * v1 - t1; t2 = 2 * v2 - t2; y = v2; );
+  );
+  y;
+);
+// 4x: zero-stuff, anti-image, filter, anti-alias, keep one sample in four
+function os_init() instance(u1, u2, d1, d2) (
+  u1.bq_lp(0.45 * srate, 0.5412, 4 * srate); u2.bq_lp(0.45 * srate, 1.3066, 4 * srate);
+  d1.bq_lp(0.45 * srate, 0.5412, 4 * srate); d2.bq_lp(0.45 * srate, 1.3066, 4 * srate);
+);
+function os_set(fc, res) instance(f) ( f.flt_set(fc, res); );
+function os_run(x, m) instance(u1, u2, d1, d2, f) local(j, y) (
+  j = 0;
+  loop(4,
+    y = d2.bq_run(d1.bq_run(f.flt_run(u2.bq_run(u1.bq_run(j == 0 ? x * 4 : 0)), m)));
+    j += 1;
+  );
+  y;
+);
+
+// ---------- parameters ----------
+function rate_beats(r) ( r == 0 ? 0.125 : r == 1 ? 0.25 : r == 2 ? 0.5 : r == 3 ? 1 : r == 4 ? 2 : 4 * 2 ^ (r - 5); );
+function rate_name(r) ( r == 0 ? "1/32" : r == 1 ? "1/16" : r == 2 ? "1/8" : r == 3 ? "1/4" : r == 4 ? "1/2" :
+                        r == 5 ? "1 BAR" : r == 6 ? "2 BARS" : r == 7 ? "4 BARS" : r == 8 ? "8 BARS" : r == 9 ? "16 BARS" : "32 BARS"; );
+function mode_name(m) ( m == 0 ? "LP 6" : m == 1 ? "LP 12" : m == 2 ? "LP 18" : m == 3 ? "LP 24" : m == 4 ? "HP 12" : m == 5 ? "BP 12" : "NOTCH"; );
+function update() (
+  fmode = slider1; fcut = slider2; fres = slider3 / 100;
+  drv = 10 ^ (slider4 / 20); drv_mk = 1 / sqrt(drv);
+  dck = 0.01 + 0.24 * min(slider4 / 12, 1);
+  lenb = rate_beats(slider5); trig = slider6; oneshot = slider7; stoff = slider8 / 100;
+  dep = slider9 / 100;
+  a_cut = slider10 * dep; a_res = slider11 / 100 * dep; a_vol = slider12 / 100 * dep; a_pan = slider13 / 100 * dep;
+  mix_t = slider14 / 100; out_t = 10 ^ (slider15 / 20);
+  in_setup(slider22, slider23);
+  ins_output_straight(16);   // output stage: straight through
+);
+
+// everything that depends on the sample rate (run again from @block if the rate changes: ext_noinit keeps @init
+// from running then)
+function cn_srinit() (
+  cn_sr = srate;
+  in_init();
+  ost_init(20000);
+  sm = 1 - exp(-1 / (0.03 * srate));
+  msm = 1 - exp(-1 / (0.0015 * srate));          // 1.5 ms smoothing on the modulation (no zipper, no clicks)
+  cn_dkr = 1 / (0.012 * srate);                  // preset duck: 12 ms out, 12 ms in
+);
+cn_srinit(); ostL.ost_ch_init(); ostR.ost_ch_init();
+osL.os_init(); osR.os_init();
+iph = 0; toff = 0; ended = 0; pkI = pkO = 0;
+!ui_dflt ? ui_thm = 5; !ui_dflt ? ui_hw = 1; !ui_dflt ? ui_kstyle = 0;
+PNL = 0x26272B; INKL = 0xE8E6E0; ACC = 0xE8892C; REDL = 0xFF3A2A; AMBL = 0xFFB030;
+SH1 = 0x202125; SH2 = 0x1D1E22; SH3 = 0x1A1B1F;
+function ccol(c) ( c == 0 ? 0xE8892C : c == 1 ? 0xE6C23A : c == 2 ? 0x5FBF7A : 0x4A9AD8; );
+function cname(c) ( c == 0 ? "CUTOFF" : c == 1 ? "RESONANCE" : c == 2 ? "VOLUME" : "PAN"; );
+function cgroup(x, y, w, h, title, shade) (
+  pk_inset(x * sc, y * sc, w * sc, h * sc, shade);
+  pk_box(x * sc, y * sc, w * sc, h * sc, ACC, title);
+  C_INK = INKL;
+);
+update();
+mix_s = mix_t; out_s = out_t;
+cn_dk = 1; cn_dst = 0;
+!ui_dflt ? pr_cur = 1;                            // a new instance opens on Init
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+cn_dst != 1 ? update();                            // during a preset duck the swap applies the new settings
+
+@block
+srate != cn_sr ? ( cn_sr = srate; cn_srinit(); );
+cn_dst != 1 ? update();                            // knobs moved on the panel do not run @slider, so read them here
+lut_req ? ( lut_req = 0; build_lut(0); build_lut(1); build_lut(2); build_lut(3); );
+// MIDI: every note-on restarts the curve (in MIDI mode); everything passes through
+evn = 0;
+while (midirecv(mofs, m1, m2, m3)) (
+  (m1 & 0xF0) == 0x90 && m3 > 0 && evn < 64 ? ( EVQ[evn] = mofs; evn += 1; midi_t = time_precise(); );
+  midisend(mofs, m1, m2, m3);
+);
+evi = 0; spos = 0;
+playing = play_state & 1;
+bps = tempo / 60 / srate;
+pinc = bps / lenb;
+man_req ? ( man_req = 0; iph = 0; ended = 0; toff = playing ? beat_position : 0; );   // TRIGGER button
+// SYNC: the place in the curve comes from the project's position (TRIGGER moves where the cycle starts)
+sync = trig == 0 && playing;
+sync ? ( bph = (beat_position - toff) / lenb; );
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, crv_init);
+file_var(0, ctab);
+file_mem(0, CRV, 4 * CSZ);
+file_avail(0) >= 0 ? lut_req = 1;
+file_avail(0) != 0 ? file_var(0, pr_cur) : pr_cur = 0;    // the preset in use (older projects end before it)
+
+@sample
+// preset duck-and-swap: filter mode, drive, cutoff and rate change in silence
+cn_dst == 1 ? ( cn_dk -= cn_dkr; cn_dk <= 0 ? ( cn_dk = 0; update(); cn_dst = 2; ); ) :
+cn_dst == 2 ? ( cn_dk += cn_dkr; cn_dk >= 1 ? ( cn_dk = 1; cn_dst = 0; ); );
+// where we are in the curve
+trig == 1 ? ( while (evi < evn && (EVQ[evi] <= spos || spos >= samplesblock - 1)) (  iph = 0; ended = 0; evi += 1; ); );   // (an event stamped at / past the block end: handled at its last sample)
+sync ? ( ph = bph + spos * pinc; ph -= floor(ph); ) : (
+  ph = iph; iph += pinc;
+  iph >= 1 ? ( oneshot && trig == 1 ? ( iph = 1; ended = 1; ) : iph -= floor(iph); );
+  ended ? ph = 0.99999;
+);
+spos += 1;
+phL = ph; phR = ph + stoff; phR -= floor(phR);
+
+// read the four curves at both channels' places
+mcL += (fcut * 2 ^ (a_cut * cv_read(0, phL)) - mcL) * msm;
+mcR += (fcut * 2 ^ (a_cut * cv_read(0, phR)) - mcR) * msm;
+mrL += (min(max(fres + a_res * cv_read(1, phL), 0), 1) - mrL) * msm;
+mrR += (min(max(fres + a_res * cv_read(1, phR), 0), 1) - mrR) * msm;
+mvL += ((1 - a_vol * (1 - cv_read(2, phL))) - mvL) * msm;
+mvR += ((1 - a_vol * (1 - cv_read(2, phR))) - mvR) * msm;
+mp += (a_pan * (cv_read(3, phL) * 2 - 1) - mp) * msm;
+
+// input stage, the filter (4x), mix, volume, pan
+in_process(spl0, spl1);
+dL = in_l; dR = in_r;
+pkI = max(pkI, max(abs(dL), abs(dR)));
+osL.os_set(mcL, mrL); osR.os_set(mcR, mrR);
+wL = osL.os_run(dL * drv, fmode) * drv_mk;
+wR = osR.os_run(dR * drv, fmode) * drv_mk;
+mix_s += (mix_t - mix_s) * sm; out_s += (out_t - out_s) * sm;
+yL = (dL + (wL - dL) * mix_s) * mvL;
+yR = (dR + (wR - dR) * mix_s) * mvR;
+pa = (mp + 1) * $pi * 0.25;
+yL *= min(1.4142 * cos(pa), 1); yR *= min(1.4142 * sin(pa), 1);
+cn_dst ? ( cn_dkg = cn_dk * cn_dk * (3 - 2 * cn_dk); yL *= cn_dkg; yR *= cn_dkg; );
+yL = ostL.ost_band(yL) * out_s; yR = ostR.ost_band(yR) * out_s;
+ost_out(yL, yR);
+spl0 = ost_l; spl1 = ost_r;
+pkO = max(pkO, max(abs(spl0), abs(spl1)));
+disp_L = phL; disp_R = phR;
+
+@gfx 900 576
+ui_begin(900, 576);
+
+// ---------- chassis ----------
+fh = 560;
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+pk_chassis(8 * sc, 8 * sc, 884 * sc, fh * sc, PNL);
+C_INK = INKL;
+ui_col(INKL); gfx_circle(40 * sc, 38 * sc, 14 * sc, 1, 1);
+gfx_setfont(4); ui_col(PNL); ui_text(40 * sc, 33 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 24 * sc, 'b'); ui_col(INKL); gfx_x = 62 * sc; gfx_y = 24 * sc; gfx_drawstr("CONTOUR");
+gfx_setfont(4); ui_cola(INKL, 0.6); gfx_x = 210 * sc; gfx_y = 34 * sc; gfx_drawstr("DRAWN-ENVELOPE FILTER");
+// the house preset bar: PRESETS, prev / next, LCD (click it for the list)
+k_ = pk_preset(470 * sc, 21 * sc, 330 * sc, 34 * sc, pr_cur, "Init|Acid Pluck 1/16|Trance Gate 1/16|Sidechain Pump 1/4|4-Bar Sweep|Stereo Wah 1/4|HP Riser 8 Bars|Ping-Pong Pan 1/8");
+k_ > 0 ? ( load_preset(k_); pr_cur = k_; );
+ui_size_picker(820 * sc, 29 * sc);
+ui_col(ACC); gfx_rect(14 * sc, 70 * sc, 872 * sc, 3 * sc);
+
+// ---------- curve tabs (the LED shows the curve is in use) ----------
+gi = 0;
+loop(4,
+  gx = (24 + gi * 120) * sc; gc = ccol(gi);
+  gon = gi == 0 ? slider10 != 0 : gi == 1 ? slider11 != 0 : gi == 2 ? slider12 != 0 : slider13 != 0;
+  ui_col(ctab == gi ? ui_mix(gc, PNL, 0.55) : 0x1C1D21); ui_rrect(gx, 82 * sc, 112 * sc, 24 * sc, 4 * sc);
+  ui_col(ctab == gi ? gc : ui_mix(gc, PNL, 0.5)); gfx_rect(gx, 103 * sc, 112 * sc, 3 * sc);
+  pk_led(gx + 12 * sc, 94 * sc, 3 * sc, gon, gc);
+  gfx_setfont(4); ui_col(ctab == gi ? 0xFFFFFF : INKL); ui_text(gx + 62 * sc, 88 * sc, cname(gi));
+  pressed && drag_id == 0 && mouse_x >= gx && mouse_x < gx + 112 * sc && mouse_y >= 82 * sc && mouse_y < 106 * sc ? ( drag_id = -1; ctab = gi; );
+  gi += 1;
+);
+gfx_setfont(4); ui_cola(INKL, 0.75);
+sprintf(#ti, "%s   %s   %s", rate_name(slider5), slider6 == 0 ? "SYNC" : slider6 == 1 ? "MIDI" : "FREE", slider7 ? "ONE-SHOT" : "LOOP");
+gfx_measurestr(#ti, gtw, gth); gfx_x = 876 * sc - gtw; gfx_y = 88 * sc; gfx_drawstr(#ti);
+
+// ---------- the editor ----------
+ex0 = 24 * sc; ey0 = 112 * sc; ew = 852 * sc; eh = 210 * sc;
+ui_col(0x050505); ui_rrect(ex0 - 2 * sc, ey0 - 2 * sc, ew + 4 * sc, eh + 4 * sc, 4 * sc);
+ui_col(0x131417); gfx_rect(ex0, ey0, ew, eh);
+// grid: 16 steps across the cycle, the beats / bars brighter
+gi = 0;
+loop(17,
+  ui_cola(INKL, gi % 4 == 0 ? 0.16 : 0.06); gx = ex0 + gi / 16 * ew; gfx_line(gx, ey0, gx, ey0 + eh);
+  gi += 1;
+);
+ui_cola(INKL, 0.06); gfx_line(ex0, ey0 + eh * 0.5, ex0 + ew, ey0 + eh * 0.5);
+gfx_line(ex0, ey0 + eh * 0.25, ex0 + ew, ey0 + eh * 0.25); gfx_line(ex0, ey0 + eh * 0.75, ex0 + ew, ey0 + eh * 0.75);
+// the other curves, faint, then the one being edited: filled, with its points
+gi = 0;
+loop(4,
+  gc_ = (ctab + 1 + gi) % 4;
+  gc = ccol(gc_);
+  gi < 3 ? ui_cola(gc, 0.3) : ui_col(gc);
+  gl = LUT + gc_ * LSZ; gk = 0;
+  loop(213,
+    gx = ex0 + gk / 212 * ew; gy = ey0 + (1 - gl[floor(gk / 212 * LN)]) * eh;
+    gk > 0 ? (
+      gi == 3 ? (                                   // fill under the edited curve
+        ui_cola(gc, 0.13);
+        gfx_triangle(gpx, gpy, gx, gy, gx, ey0 + eh); gfx_triangle(gpx, gpy, gx, ey0 + eh, gpx, ey0 + eh);
+        ui_col(gc);
+      );
+      gfx_line(gpx, gpy, gx, gy, 1); gi == 3 ? gfx_line(gpx, gpy + 1, gx, gy + 1, 1);
+    );
+    gpx = gx; gpy = gy; gk += 1;
+  );
+  gi += 1;
+);
+// playheads (the right channel's too when STEREO is up)
+ui_cola(0xFFFFFF, 0.8); gx = ex0 + disp_L * ew; gfx_line(gx, ey0, gx, ey0 + eh);
+slider8 > 0 ? ( ui_cola(0xFFFFFF, 0.35); gx = ex0 + disp_R * ew; gfx_line(gx, ey0, gx, ey0 + eh); );
+
+// editing: points (drag, double-click to remove), lines (drag to bend, double-click to straighten),
+// empty space (click to add a point)
+gb = CRV + ctab * CSZ; gn = gb[0];
+gin = mouse_x >= ex0 && mouse_x < ex0 + ew && mouse_y >= ey0 && mouse_y < ey0 + eh;
+gmx = min(max((mouse_x - ex0) / ew, 0), 1); gmy = min(max(1 - (mouse_y - ey0) / eh, 0), 1);
+ghit = -1; gbest = 9 * sc; gi = 0;
+loop(gn,
+  gd = sqrt((mouse_x - (ex0 + gb[1 + gi * 3] * ew)) ^ 2 + (mouse_y - (ey0 + (1 - gb[2 + gi * 3]) * eh)) ^ 2);
+  gd < gbest ? ( gbest = gd; ghit = gi; );
+  gi += 1;
+);
+gseg = 0; while (gseg < gn - 2 && gmx > gb[1 + (gseg + 1) * 3]) ( gseg += 1; );
+gnear = abs(mouse_y - (ey0 + (1 - cv_eval(ctab, gmx)) * eh)) < 9 * sc;
+pressed && drag_id == 0 && gin ? (
+  gdbl = time_precise() - g_lastc < 0.35;
+  ghit >= 0 ? (
+    gdbl && g_lastw == 100 + ghit && ghit > 0 && ghit < gn - 1 ? (
+      gi = ghit; loop(gn - ghit - 1, gb[1 + gi * 3] = gb[4 + gi * 3]; gb[2 + gi * 3] = gb[5 + gi * 3]; gb[3 + gi * 3] = gb[6 + gi * 3]; gi += 1; );
+      gb[0] = gn - 1; build_lut(ctab); drag_id = -1; g_lastw = 0;
+    ) : ( drag_id = 5000 + ghit; g_lastw = 100 + ghit; );
+  ) : gnear ? (
+    gdbl && g_lastw == 200 + gseg ? ( gb[3 + gseg * 3] = 0; build_lut(ctab); drag_id = -1; g_lastw = 0; )
+                                 : ( drag_id = 5100 + gseg; g_bend_y = mouse_y; g_lastw = 200 + gseg; );
+  ) : gn < NMAX ? (
+    // a new point, between gseg and gseg + 1, which the drag then moves
+    gi = gn; loop(gn - gseg - 1, gb[1 + gi * 3] = gb[gi * 3 - 2]; gb[2 + gi * 3] = gb[gi * 3 - 1]; gb[3 + gi * 3] = gb[gi * 3]; gi -= 1; );
+    gb[1 + (gseg + 1) * 3] = gmx; gb[2 + (gseg + 1) * 3] = gmy; gb[3 + (gseg + 1) * 3] = 0;
+    gb[0] = gn + 1; build_lut(ctab); drag_id = 5000 + gseg + 1; g_lastw = 100 + gseg + 1;
+  );
+  g_lastc = time_precise();
+);
+drag_id >= 5000 && drag_id < 5000 + NMAX ? (
+  gi = drag_id - 5000;
+  gi > 0 && gi < gb[0] - 1 ? gb[1 + gi * 3] = min(max(gmx, gb[gi * 3 - 2] + 0.002), gb[4 + gi * 3] - 0.002);   // the ends stay at the edges
+  gb[2 + gi * 3] = gmy;
+  build_lut(ctab);
+);
+drag_id >= 5100 && drag_id < 5100 + NMAX ? (
+  gi = drag_id - 5100;
+  // dragging up lifts the middle of the line, whichever way it slopes
+  gb[3 + gi * 3] = min(max(gb[3 + gi * 3] + (g_bend_y - mouse_y) / (120 * sc) * (gb[5 + gi * 3] >= gb[2 + gi * 3] ? -1 : 1), -1), 1);
+  g_bend_y = mouse_y; build_lut(ctab);
+);
+(mouse_cap & 2) && !pk_prevr && gin ? (
+  gfx_x = mouse_x; gfx_y = mouse_y;
+  gsel = gfx_showmenu("Reset this curve|Flat (top)|Flat (middle)|Flat (bottom)|Copy curve|Paste curve");
+  gsel == 1 ? cv_default(ctab) :
+  gsel >= 2 && gsel <= 4 ? ( gy = gsel == 2 ? 1 : gsel == 3 ? 0.5 : 0; cv_set(ctab, 2, 0, gy, 0, 1, gy, 0, 0, 0, 0, 0, 0, 0); ) :
+  gsel == 5 ? ( memcpy(CLP, gb, CSZ); clp_ok = 1; ) :
+  gsel == 6 && clp_ok ? ( memcpy(gb, CLP, CSZ); build_lut(ctab); );
+);
+// the points
+gc = ccol(ctab); gi = 0;
+loop(gb[0],
+  gx = ex0 + gb[1 + gi * 3] * ew; gy = ey0 + (1 - gb[2 + gi * 3]) * eh;
+  ui_col(0x000000); gfx_circle(gx, gy, 6 * sc, 1, 1);
+  ui_col(ghit == gi || drag_id == 5000 + gi ? 0xFFFFFF : gc); gfx_circle(gx, gy, 4.5 * sc, 1, 1);
+  gi += 1;
+);
+gfx_setfont(4); ui_cola(INKL, 0.45);
+ui_text(450 * sc, 326 * sc, "click: add a point  -  drag: move  -  double-click a point: remove  -  drag a line: bend  -  double-click a line: straighten  -  right-click: menu");
+
+// ---------- FILTER ----------
+cgroup(24, 346, 330, 96, "FILTER", SH1);
+ui_section(2); C_INK = INKL;
+knob_step = 1; ui_knob(66 * sc, 388 * sc, 1, 0, 6, 1, 0, "MODE", mode_name(slider1));
+ui_knob(146 * sc, 388 * sc, 2, 20, 20000, 400, 1, "CUTOFF", "%.0f Hz");
+ui_knob(226 * sc, 388 * sc, 3, 0, 100, 25, 0, "RESO", "%.0f%%");
+ui_knob(306 * sc, 388 * sc, 4, 0, 24, 0, 0, "DRIVE", "+%.1f dB");
+
+// ---------- AMOUNTS (each in its curve's colour) ----------
+cgroup(362, 346, 514, 96, "CURVE AMOUNTS", SH1);
+ui_section(3); C_INK = INKL;
+gi = 0;
+loop(4,
+  gx = (408 + gi * 78) * sc;
+  ui_col(ccol(gi)); gfx_rect(gx - 18 * sc, 358 * sc, 36 * sc, 3 * sc);
+  C_INK = INKL;
+  gi == 0 ? ui_knob(gx, 388 * sc, 10, -8, 8, 4, 0, "CUTOFF", "%+.1f oct") :
+  gi == 1 ? ui_knob(gx, 388 * sc, 11, -100, 100, 0, 0, "RESO", "%+.0f%%") :
+  gi == 2 ? ui_knob(gx, 388 * sc, 12, 0, 100, 0, 0, "VOLUME", "%.0f%%") :
+            ui_knob(gx, 388 * sc, 13, 0, 100, 0, 0, "PAN", "%.0f%%");
+  gi += 1;
+);
+ui_section(2); C_INK = INKL;
+ui_knob(732 * sc, 388 * sc, 9, 0, 100, 100, 0, "DEPTH", "%.0f%%");
+ui_knob(822 * sc, 388 * sc, 8, 0, 50, 0, 0, "STEREO", "%.0f%%");
+
+// ---------- TIMING ----------
+cgroup(24, 456, 330, 96, "TIMING", SH2);
+ui_section(2); C_INK = INKL;
+knob_step = 1; ui_knob(66 * sc, 498 * sc, 5, 0, 10, 5, 0, "RATE", rate_name(slider5));
+gi = 0;
+loop(3,
+  pk_ledbtn((108 + gi * 46) * sc, 468 * sc, 40 * sc, 30 * sc, slider6 == gi, AMBL) ? ( slider6 = gi; ui_auto(6); );
+  gfx_setfont(4); ui_col(INKL); ui_text((128 + gi * 46) * sc, 502 * sc, gi == 0 ? "SYNC" : gi == 1 ? "MIDI" : "FREE");
+  gi += 1;
+);
+pk_ledbtn(250 * sc, 468 * sc, 40 * sc, 30 * sc, slider7, AMBL) ? ( slider7 = 1 - slider7; ui_auto(7); );
+gfx_setfont(4); ui_col(INKL); ui_text(270 * sc, 502 * sc, slider7 ? "ONE-SHOT" : "LOOP");
+pk_ledbtn(300 * sc, 468 * sc, 40 * sc, 30 * sc, time_precise() - man_t < 0.15, REDL) ? ( man_req = 1; man_t = time_precise(); );
+gfx_setfont(4); ui_col(INKL); ui_text(320 * sc, 502 * sc, "TRIGGER");
+pk_led(124 * sc, 528 * sc, 2.5 * sc, time_precise() - midi_t < 0.12, 0x3ADF6A);
+ui_cola(INKL, 0.6); gfx_x = 132 * sc; gfx_y = 523 * sc; gfx_drawstr("MIDI NOTE IN");
+
+// ---------- IN / OUT ----------
+cgroup(362, 456, 514, 96, "IN / OUT", SH2);
+ui_section(3); C_INK = INKL;
+knob_push = 23;
+ui_knob(408 * sc, 498 * sc, 22, -24, 12, 0, 0, "TRIM", "%.1f dB");
+ui_guardclick(22, 23, 408, 498, 24);   // click TRIM for GUARD
+knob_push = 0;
+ui_section(2); C_INK = INKL;
+ui_knob(520 * sc, 498 * sc, 14, 0, 100, 100, 0, "MIX", "%.0f%%");
+ui_knob(600 * sc, 498 * sc, 15, -24, 12, 0, 0, "OUTPUT", "%+.1f dB");
+ins_io(652, 480, 16, INKL);                         // SAT
+mI.ui_ledm(780 * sc, 466 * sc, 12 * sc, 70 * sc, pkI);
+mO.ui_ledm(840 * sc, 466 * sc, 12 * sc, 70 * sc, pkO);
+gfx_setfont(4); ui_col(INKL); ui_text(786 * sc, 540 * sc, "IN"); ui_text(846 * sc, 540 * sc, "OUT");
+pkI *= 0.85; pkO *= 0.85;
+
+pk_end();
+ui_end();

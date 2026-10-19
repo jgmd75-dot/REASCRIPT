@@ -1,0 +1,368 @@
+desc:GFX G Arp [MIDI arp]
+//tags: midi arpeggiator arp sequencer
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-arp, gfx-panel and gfx-ui (.jsfx-inc) in the same folder.
+// Place before any synth. Tempo-locked when the project plays, free-running from the first key when stopped.
+//
+// Step row: click a step button to turn it on / off, Shift+click for an accent, right-click to tie it
+// to the step before. Drag in the display above to set each step's level (velocity in PATTERN mode).
+// FEEL adds a slowly wandering, human timing / velocity variation and a chance for steps to skip.
+// Non-note MIDI (CCs, pitch bend, etc.) passes straight through.
+// SCALES & MODES: with a scale chosen, the lowest held key is the root and the arp plays that scale (or mode) from
+// it, over OCTAVES octaves, as a PHRASE: Run, Thirds, Triads, Pedal, Fourths, Fifths or Threes. MODE sets the
+// direction (Up, Down, Up-Down, Down-Up, Random; PLAYED = Up); CHORD plays the scale's triads, one per step.
+// The keyboard shows the scale from the root (root tangerine, scale notes amber) and lights the notes as they
+// play; click a key to hold it as the root (click it again to let go), handy with or without a MIDI keyboard.
+
+import gfx-drift.jsfx-inc
+import gfx-arp.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:0<0,6,1{Up,Down,Up-Down,Down-Up,As played,Random,Chord}>-Mode
+slider2:3<0,5,1{1/4,1/8,1/8T,1/16,1/16T,1/32}>-Rate
+slider3:1<1,4,1>-Octaves
+slider4:60<10,200,1>-Gate (%)
+slider5:0<0,75,1>-Swing (%)
+slider6:16<1,16,1>-Steps
+slider7:0<0,1,1{Off,On}>-Latch
+slider8:100<0,100,1>-Chance (%)
+slider9:0<0,30,0.1>-Humanise timing (ms)
+slider10:0<0,40,1>-Humanise velocity
+slider11:0<0,2,1{As played,Fixed,Pattern}>-Velocity source
+slider12:100<1,127,1>-Fixed velocity
+slider13:20<0,60,1>-Accent
+slider14:1<0,1,1{Off,On}>-Arp on
+slider15:0<0,13,1{Off (held notes),Major (Ionian),Dorian,Phrygian,Lydian,Mixolydian,Minor (Aeolian),Locrian,Harmonic minor,Melodic minor,Major pentatonic,Minor pentatonic,Blues,Whole tone}>-Scale
+slider16:0<0,6,1{Run,Thirds,Triads,Pedal,Fourths,Fifths,Threes}>-Phrase
+
+in_pin:none
+out_pin:none
+
+@init
+#ui_man = "gfx-g-arpeggiator";                                  // the ? pop-up links to this manual
+LEV = 10000; ACC = 10020; TIE = 10040; BK = 10060;    // 16-step pattern (saved with the project)
+!pat_init ? (
+  pat_init = 1;
+  bi = 0; loop(16, LEV[bi] = 1; ACC[bi] = 0; TIE[bi] = 0; BK[bi] = 1; bi += 1; );
+);
+// @init runs again when playback starts and arp_init starts afresh: whatever the arp is sounding would never get
+// its note-off downstream (a hung note). Collect those note-offs first; @block sends them at once.
+PO = 12200; po_n = 0;
+arp_Q > 0 ? ( arp_outn = 0; arp_flush(); bi = 0; loop(min(arp_outn, 127), PO[po_n * 2] = arp_out_note[bi]; PO[po_n * 2 + 1] = arp_out_ch[bi]; po_n += 1; bi += 1; ); );
+arp_init(20000);
+arp_pattern(LEV, ACC, TIE);
+was_on = 1;
+SND = 12000;                                          // the notes the arp is sounding (for the keyboard)
+memset(SND, 0, 128); kb_req = 0; kb_held = -1;
+!ui_dflt ? ui_thm = 6; !ui_dflt ? ui_hw = 1;
+!ui_dflt ? pa_cur = 1;                                // new instances show the STRAIGHT pattern
+
+function scl_mask(s) ( s == 1 ? 2741 : s == 2 ? 1709 : s == 3 ? 1451 : s == 4 ? 2773 : s == 5 ? 1717 : s == 6 ? 1453 :
+  s == 7 ? 1387 : s == 8 ? 2477 : s == 9 ? 2733 : s == 10 ? 661 : s == 11 ? 1193 : s == 12 ? 1257 : s == 13 ? 1365 : 0; );
+function scl_name(s) ( s == 1 ? "MAJOR" : s == 2 ? "DORIAN" : s == 3 ? "PHRYGIAN" : s == 4 ? "LYDIAN" : s == 5 ? "MIXOLYDIAN" :
+  s == 6 ? "MINOR" : s == 7 ? "LOCRIAN" : s == 8 ? "HARMONIC MINOR" : s == 9 ? "MELODIC MINOR" : s == 10 ? "MAJOR PENT" :
+  s == 11 ? "MINOR PENT" : s == 12 ? "BLUES" : s == 13 ? "WHOLE TONE" : "HELD NOTES"; );
+function phr_name(p) ( p == 1 ? "THIRDS" : p == 2 ? "TRIADS" : p == 3 ? "PEDAL" : p == 4 ? "FOURTHS" : p == 5 ? "FIFTHS" :
+  p == 6 ? "THREES" : "RUN"; );
+function rate_beats(r) ( r == 0 ? 1 : r == 1 ? 0.5 : r == 2 ? 1 / 3 : r == 3 ? 0.25 : r == 4 ? 1 / 6 : 0.125; );
+function rate_name(r) ( r == 0 ? "1/4" : r == 1 ? "1/8" : r == 2 ? "1/8T" : r == 3 ? "1/16" : r == 4 ? "1/16T" : "1/32"; );
+function mode_name(m) ( m == 0 ? "UP" : m == 1 ? "DOWN" : m == 2 ? "UP-DN" : m == 3 ? "DN-UP" : m == 4 ? "PLAYED" : m == 5 ? "RANDOM" : "CHORD"; );
+function pc_name(n) ( n = n % 12;
+  n == 0 ? "C" : n == 1 ? "C#" : n == 2 ? "D" : n == 3 ? "D#" : n == 4 ? "E" : n == 5 ? "F" :
+  n == 6 ? "F#" : n == 7 ? "G" : n == 8 ? "G#" : n == 9 ? "A" : n == 10 ? "A#" : "B"; );
+
+// pattern presets (the knobs and switches stay as they are, except Reset)
+function setpat(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15) (
+  LEV[0]=a0; LEV[1]=a1; LEV[2]=a2; LEV[3]=a3; LEV[4]=a4; LEV[5]=a5; LEV[6]=a6; LEV[7]=a7;
+  LEV[8]=a8; LEV[9]=a9; LEV[10]=a10; LEV[11]=a11; LEV[12]=a12; LEV[13]=a13; LEV[14]=a14; LEV[15]=a15;
+);
+function load_pattern(p) local(k) (
+  k = 0; loop(16, ACC[k] = 0; TIE[k] = 0; k += 1; );
+  p == 1 ? ( setpat(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1); ) :
+  p == 2 ? ( setpat(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1); ACC[2] = ACC[6] = ACC[10] = ACC[14] = 1; ) :
+  p == 3 ? ( setpat(1,0,1,1,1,0,1,1,1,0,1,1,1,0,1,1); ) :
+  p == 4 ? ( setpat(1,0,1,1,0,1,1,0,1,0,1,1,0,1,0,1); ) :
+  p == 5 ? ( k = 0; loop(16, LEV[k] = 0.35 + 0.65 * k / 15; k += 1; ); ) :
+  p == 6 ? ( k = 0; loop(16, LEV[k] = rand(1) < 0.25 ? 0 : 0.4 + rand(0.6); ACC[k] = rand(1) < 0.15; k += 1; ); ) :
+  p == 7 ? ( setpat(1,1,1,0,1,1,1,0,1,1,1,0,1,1,1,0); TIE[1] = TIE[5] = TIE[9] = TIE[13] = 1; ) :
+  p == 8 ? (
+    setpat(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1);
+    slider1 = 0; slider2 = 3; slider3 = 1; slider4 = 60; slider5 = 0; slider6 = 16; slider7 = 0;
+    slider8 = 100; slider9 = 0; slider10 = 0; slider11 = 0; slider12 = 100; slider13 = 20; slider14 = 1;
+    slider15 = 0; slider16 = 0;
+    slider_automate(65535);
+  );
+  k = 0; loop(16, LEV[k] > 0 ? BK[k] = LEV[k]; k += 1; );
+);
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@block
+po_n > 0 ? ( bi = 0; loop(po_n, midisend(0, 0x80 | PO[bi * 2 + 1], PO[bi * 2], 0); bi += 1; ); po_n = 0; );   // (see @init)
+on = slider14;
+arp_params(slider1, rate_beats(slider2), slider3, slider4 / 100, slider5 / 100, slider6, slider7,
+           slider8 / 100, slider9, slider10, slider11, slider12, slider13);
+arp_scale(scl_mask(floor(slider15 + 0.5)), floor(slider16 + 0.5));
+// a key clicked on the panel keyboard (posted by the GUI): hold it as the root, click again to let go
+kb_req != 0 ? (
+  on ? (
+    kb_held >= 0 ? arp_key(kb_held, 0, arp_ch, 0);
+    kb_req > 0 && kb_req - 1 != kb_held ? ( kb_held = kb_req - 1; arp_key(kb_held, 100, arp_ch, 1); ) : kb_held = -1;
+  ) : kb_held = -1;
+  kb_req = 0;
+);
+
+while (midirecv(mofs, m1, m2, m3)) (
+  st = m1 & 0xF0;
+  on && (st == 0x90 || st == 0x80) ? (
+    arp_key(m2, m3, m1 & 0x0F, st == 0x90 && m3 > 0);
+    midi_t = time_precise();
+  ) : (
+    midisend(mofs, m1, m2, m3);
+    st == 0x90 && m3 > 0 ? midi_t = time_precise();
+    // All Notes Off / All Sound Off (passed on above): clear the held and latched keys, stop at once
+    on && st == 0xB0 && (m2 == 123 || m2 == 120) ? (
+      arp_outn = 0; arp_flush(); arp_sn = 0; arp_pn = 0; arp_step = -1; memset(SND, 0, 128); kb_held = -1;
+      bi = 0; loop(arp_outn, midisend(mofs, 0x80 | arp_out_ch[bi], arp_out_note[bi], 0); bi += 1; );
+    );
+  );
+);
+// transport stopped: a latched chord keeps only the keys still held (none, once the host has sent its note-offs)
+on && slider7 && ap_play && !(play_state & 1) ? arp_relatch = 1;
+ap_play = play_state & 1;
+
+// switching the arp off: stop what it was playing, release its note set
+!on && was_on ? (
+  arp_outn = 0; arp_flush(); arp_sn = 0; arp_pn = 0;
+  bi = 0; loop(arp_outn, midisend(0, 0x80 | arp_out_ch[bi], arp_out_note[bi], 0); bi += 1; );
+  memset(SND, 0, 128); kb_held = -1;
+);
+was_on = on;
+
+on ? (
+  arp_block(play_state & 1, beat_position, tempo, samplesblock);
+  bi = 0;
+  loop(arp_outn,
+    arp_out_on[bi] ? midisend(arp_out_ofs[bi], 0x90 | arp_out_ch[bi], arp_out_note[bi], arp_out_vel[bi])
+                   : midisend(arp_out_ofs[bi], 0x80 | arp_out_ch[bi], arp_out_note[bi], 0);
+    SND[arp_out_note[bi]] = arp_out_on[bi];
+    bi += 1;
+  );
+);
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pat_init);
+file_mem(0, LEV, 80);
+file_var(0, pa_cur);   // the pattern shown in the header display
+
+@gfx 960 780
+ui_begin(960, 780);
+// ---------- faceplate: espresso brown, tangerine section bands, cream caps, lit keys (house style) ----------
+PANEL = 0x3A2E28; SH1 = 0x45372F; SH2 = 0x40332C; SH3 = 0x362B25; INK = 0xF2E9DA; DIMI = 0xC2B3A0;
+ORG = 0xE8762B; BTX = 0xFFF6E8; CAPD = 0xF2E9DA; AMB = 0xF2C83E; SQBG = 0x221B17;
+dy_ink = INK; dy_bg = PANEL; dy_nov = 1; rd_sqbg = SQBG;
+function setv(idx, v) ( slider(idx) = v; slider_automate(2 ^ (idx - 1)); );
+function band(x, y, w, s) ( ui_col(ORG); gfx_rect(x * sc, y * sc, w * sc, 18 * sc); gfx_setfont(4); ui_col(BTX); gfx_x = (x + 8) * sc; gfx_y = (y + 3) * sc; gfx_drawstr(s); );
+function inset(x, y, w, h, col) local(b, ox, oy, ow, oh) (
+  x *= sc; y *= sc; w *= sc; h *= sc; b = 5 * sc;
+  ox = x - b; oy = y - b; ow = w + 2 * b; oh = h + 2 * b;
+  ui_col(ui_mix(col, 0x000000, 0.30)); gfx_triangle(ox, oy, ox + ow, oy, x + w, y, x, y);
+  ui_col(ui_mix(col, 0x000000, 0.18)); gfx_triangle(ox, oy, x, y, x, y + h, ox, oy + oh);
+  ui_col(ui_mix(col, 0xFFFFFF, 0.30)); gfx_triangle(ox, oy + oh, x, y + h, x + w, y + h, ox + ow, oy + oh);
+  ui_col(ui_mix(col, 0xFFFFFF, 0.12)); gfx_triangle(ox + ow, oy, ox + ow, oy + oh, x + w, y + h, x + w, y);
+  ui_col(col); gfx_rect(x, y, w, h);
+);
+function pat_name(p) ( p == 1 ? "STRAIGHT" : p == 2 ? "OFFBEAT ACCENTS" : p == 3 ? "GALLOP" : p == 4 ? "TRANCE GATE" :
+  p == 5 ? "RISE" : p == 6 ? "RANDOM" : p == 7 ? "TIED PAIRS" : "-"; );
+function pat_go(p) ( load_pattern(p); pa_cur = p == 8 ? 1 : p; );
+
+// ---------- panel ----------
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(PANEL); gfx_rect(0, 0, 960 * sc, 780 * sc);
+gfx_gradrect(0, 0, 960 * sc, 280 * sc, 1, 1, 1, 0.08, 0, 0, 0, 0, 0, 0, 0, -0.08 / (280 * sc));
+ui_col(ORG); gfx_rect(0, 64 * sc, 960 * sc, 4 * sc);
+ui_cola(0x000000, 0.25); gfx_rect(0, 776 * sc, 960 * sc, 4 * sc);
+
+// header: badge, name, patterns [PATTERNS][◄][►][LCD], MIDI, size
+rd_badge(36, 32, 16, INK, PANEL);
+rd_title(62, 14, "ARP", 28, INK);
+rd_sub(66, 46, "MIDI ARPEGGIATOR", DIMI, 1);
+pm_ = rd_sq(376, 17, 96, 32, 0, ORG, "PATTERNS");
+rd_sq(476, 17, 32, 32, 0, ORG, "◄") ? pat_go(pa_cur <= 1 ? 7 : pa_cur - 1);
+rd_sq(512, 17, 32, 32, 0, ORG, "►") ? pat_go(pa_cur >= 7 || pa_cur < 1 ? 1 : pa_cur + 1);
+pk_lcd(552 * sc, 9 * sc, 236 * sc, 48 * sc, 0);
+ui_col(pk_lcdc); strcpy(#l1, pat_name(pa_cur));
+pk_lcdfont(9, 24 * sc); gfx_measurestr(#l1, pn_w, pn_h); pk_fitstr(#l1, 564 * sc, 33 * sc - pn_h * 0.5, 24 * sc, 216 * sc);
+pm_ || (pressed && drag_id == 0 && mouse_x >= 552 * sc && mouse_x < 788 * sc && mouse_y >= 9 * sc && mouse_y < 57 * sc) ? (
+  drag_id = -1; strcpy(#pm, ""); k_ = 1;
+  loop(7, k_ == pa_cur ? strcat(#pm, "!"); strcat(#pm, pat_name(k_)); strcat(#pm, "|"); k_ += 1; );
+  strcat(#pm, "Reset all to defaults");
+  gfx_x = 376 * sc; gfx_y = 58 * sc; k_ = gfx_showmenu(#pm); k_ > 0 ? pat_go(k_);
+);
+rd_led(814, 33, 5, time_precise() - midi_t < 0.12, 0x3ADF6A); rd_lbl(814, 44, "MIDI", DIMI, 1);
+ui_size_picker(848 * sc, 24 * sc);
+
+// ---------- row 1: PLAY, MODE, DISPLAY ----------
+inset(16, 88, 168, 132, SH1); band(16, 88, 168, "PLAY");
+rd_sq(30, 122, 140, 36, slider14 >= 0.5, ORG, "ARP ON") ? setv(14, slider14 >= 0.5 ? 0 : 1);
+rd_sq(30, 168, 140, 36, slider7 >= 0.5, AMB, "LATCH") ? setv(7, slider7 >= 0.5 ? 0 : 1);
+
+inset(196, 88, 360, 132, SH2); band(196, 88, 360, "MODE");
+gi = 0; loop(7,
+  gx = 208 + (gi % 4) * 86; gy = gi < 4 ? 120 : 170;
+  rd_sq(gx, gy, 80, 36, floor(slider1 + 0.5) == gi, ORG, mode_name(gi)) ? setv(1, gi);
+  gi += 1; );
+v_ = floor(slider11 + 0.5);
+rd_sq(466, 170, 80, 36, v_ > 0, AMB, v_ == 0 ? "VEL PLAY" : v_ == 1 ? "VEL FIX" : "VEL PATT") ? setv(11, (v_ + 1) % 3);
+
+inset(568, 88, 376, 132, SH3); band(568, 88, 376, "DISPLAY");
+pk_lcd(580 * sc, 118 * sc, 352 * sc, 90 * sc, 1);
+pk_lcdfont(7, 20 * sc); ui_col(pk_lcdc);
+sprintf(#l1, "%-6s %-5s %dOCT", mode_name(slider1), rate_name(slider2), slider3);
+gfx_x = 594 * sc; gfx_y = 130 * sc; gfx_drawstr(#l1);
+pk_lcdfont(8, 15 * sc);
+!slider14 ? strcpy(#l2, "ARP OFF - THRU") :
+arp_sn == 0 ? strcpy(#l2, slider15 >= 0.5 ? (slider7 ? "LATCH  PLAY A ROOT" : "PLAY A ROOT") : (slider7 ? "LATCH  PLAY A CHORD" : "PLAY A CHORD")) :
+slider15 >= 0.5 ? sprintf(#l2, "%02d/%02d %s%d %s", arp_step + 1, slider6, pc_name(arp_root), floor(arp_root / 12) - 1, scl_name(floor(slider15 + 0.5))) : (
+  sprintf(#l2, "%02d/%02d ", arp_step + 1, slider6);
+  gi = 0;
+  loop(min(arp_sn, 5),
+    sprintf(#nn, "%s%d ", pc_name(arp_S[gi]), floor(arp_S[gi] / 12) - 1); strcat(#l2, #nn);
+    gi += 1;
+  );
+  arp_sn > 5 ? strcat(#l2, "+");
+);
+gfx_x = 594 * sc; gfx_y = 170 * sc; gfx_drawstr(#l2);
+
+// ---------- row 2: TIME, RANGE, FEEL, NOTES ----------
+inset(16, 240, 300, 120, SH2); band(16, 240, 300, "TIME");
+dy_step = 6; dy_steps = "1/4|1/8|1/8T|1/16|1/16T|1/32";
+dy_knob(70, 306, 24, 2, 0, 5, 3, 0, ORG, "RATE", rate_name(slider2));
+sprintf(#v, "%.0f%%", slider5); dy_knob(166, 306, 22, 5, 0, 75, 0, 0, CAPD, "SWING", #v);
+sprintf(#v, "%.0f%%", slider4); dy_knob(256, 306, 22, 4, 10, 200, 60, 0, CAPD, "GATE", #v);
+
+inset(328, 240, 172, 120, SH3); band(328, 240, 172, "RANGE");
+dy_step = 4; dy_steps = "1|2|3|4";
+dy_knob(372, 306, 22, 3, 1, 4, 1, 0, CAPD, "OCTAVES", "");
+dy_step = 16; dy_steps = "";
+sprintf(#v, "%.0f", slider6); dy_knob(456, 306, 22, 6, 1, 16, 16, 0, CAPD, "STEPS", #v);
+
+inset(512, 240, 252, 120, SH1); band(512, 240, 252, "FEEL");
+sprintf(#v, "%.1f ms", slider9); dy_knob(554, 306, 20, 9, 0, 30, 0, 0, CAPD, "TIMING", #v);
+sprintf(#v, "%.0f", slider10); dy_knob(638, 306, 20, 10, 0, 40, 0, 0, CAPD, "VELOCITY", #v);
+sprintf(#v, "%.0f%%", slider8); dy_knob(722, 306, 20, 8, 0, 100, 100, 0, CAPD, "CHANCE", #v);
+
+inset(776, 240, 168, 120, SH3); band(776, 240, 168, "NOTES");
+sprintf(#v, "+%.0f", slider13); dy_knob(818, 306, 20, 13, 0, 60, 20, 0, CAPD, "ACCENT", #v);
+sprintf(#v, "%.0f", slider12); dy_knob(902, 306, 20, 12, 1, 127, 100, 0, CAPD, "LEVEL", #v);
+
+// ---------- row 3: STEPS (drag the bars to set levels; shift-click accent, right-click tie) ----------
+inset(16, 380, 928, 160, SH2); band(16, 380, 928, "STEPS");
+rd_lbl(870, 384, "DRAG  ·  SHIFT = ACCENT  ·  RIGHT = TIE", BTX, 0.85);
+gsx = 28 * sc; gsw = 57.25 * sc; gbw = 50 * sc; gby = 480 * sc; gbh = 72 * sc;
+ui_col(0x16110E); gfx_rect(24 * sc, 404 * sc, 916 * sc, 80 * sc);
+gin = mouse_x >= 24 * sc && mouse_x < 940 * sc && mouse_y >= 404 * sc && mouse_y < 484 * sc;
+gstep = min(max(floor((mouse_x - gsx) / gsw), 0), 15);
+pressed && gin && drag_id == 0 && (mouse_cap & 8) ? ( ACC[gstep] = !ACC[gstep]; drag_id = -1; );
+(mouse_cap & 2) && !g_prevr && gin ? TIE[gstep] = !TIE[gstep];
+mdown && gin && (drag_id == 0 || drag_id == -7) ? (
+  drag_id = -7;
+  LEV[gstep] = min(max((gby - mouse_y) / gbh, 0), 1);
+  LEV[gstep] < 0.04 ? LEV[gstep] = 0 : BK[gstep] = LEV[gstep];
+);
+gi = 0;
+loop(16,
+  gx = gsx + gi * gsw;
+  gdim = gi >= slider6;
+  gi == arp_step && slider14 && arp_sn > 0 ? ( ui_cola(0xFFFFFF, 0.08); gfx_rect(gx - 2 * sc, 406 * sc, gbw + 4 * sc, 76 * sc); );
+  ui_cola(0xFFFFFF, 0.05); gfx_rect(gx, gby - gbh, gbw, gbh);
+  LEV[gi] > 0 ? (
+    ui_cola(CAPD, gdim ? 0.22 : 0.85); gfx_rect(gx, gby - gbh * LEV[gi], gbw, gbh * LEV[gi]);
+    ACC[gi] ? ( ui_col(gdim ? 0x5A3018 : ORG); gfx_rect(gx, gby - gbh * LEV[gi], gbw, 5 * sc); );
+  );
+  TIE[gi] ? (
+    ui_col(gdim ? 0x6A5A20 : AMB);
+    gfx_rect(gx - 9 * sc, gby - gbh * 0.5, 14 * sc, 3 * sc);
+    gfx_setfont(4); ui_text(gx + gbw * 0.5, gby - gbh * 0.5 - 14 * sc, "TIE");
+  );
+  gi += 1;
+);
+// step keys: lit = on (amber), the running step tangerine; click on / off, shift-click accent, right-click tie
+gi = 0;
+loop(16,
+  gx = 28 + gi * 57.25;
+  gcur = gi == arp_step && slider14 && arp_sn > 0;
+  sprintf(#sn, ACC[gi] ? "%d>" : "%d", gi + 1);
+  rd_sq(gx, 492, 50, 34, gcur || (LEV[gi] > 0 && gi < slider6), gcur ? ORG : AMB, #sn) ? (
+    mouse_cap & 8 ? ACC[gi] = !ACC[gi] :
+    LEV[gi] > 0 ? ( BK[gi] = LEV[gi]; LEV[gi] = 0; ) : ( LEV[gi] = BK[gi] > 0 ? BK[gi] : 1; );
+  );
+  (mouse_cap & 2) && !g_prevr && mouse_x >= gx * sc && mouse_x < (gx + 50) * sc && mouse_y >= 492 * sc && mouse_y < 526 * sc ? TIE[gi] = !TIE[gi];
+  gi += 1;
+);
+g_prevr = mouse_cap & 2;
+
+// ---------- row 4: SCALES & MODES and the keyboard ----------
+inset(16, 560, 928, 200, SH3); band(16, 560, 928, "SCALES & MODES");
+sc_ = floor(slider15 + 0.5); ph_ = floor(slider16 + 0.5);
+sc_ > 0 ? sc_last = sc_;
+rd_sq(30, 594, 96, 32, sc_ > 0, ORG, "SCALE") ? setv(15, sc_ > 0 ? 0 : (sc_last > 0 ? sc_last : 1));
+rd_sq(138, 594, 32, 32, 0, ORG, "◄") ? setv(15, sc_ <= 1 ? 13 : sc_ - 1);
+pk_lcd(176 * sc, 590 * sc, 220 * sc, 40 * sc, 0);
+ui_col(pk_lcdc); pk_lcdfont(9, 18 * sc); gfx_measurestr(scl_name(sc_), pn_w, pn_h);
+pk_fitstr(scl_name(sc_), 188 * sc, 610 * sc - pn_h * 0.5, 18 * sc, 196 * sc);
+rd_sq(402, 594, 32, 32, 0, ORG, "►") ? setv(15, sc_ >= 13 ? 1 : sc_ + 1);
+rd_lbl(575, 564, "PHRASE", BTX, 0.85);
+rd_sq(452, 594, 32, 32, 0, AMB, "◄") ? setv(16, ph_ <= 0 ? 6 : ph_ - 1);
+pk_lcd(490 * sc, 590 * sc, 170 * sc, 40 * sc, 0);
+ui_col(sc_ > 0 ? pk_lcdc : ui_mix(pk_lcdc, 0x000000, 0.6)); pk_lcdfont(9, 18 * sc); gfx_measurestr(phr_name(ph_), pn_w, pn_h);
+pk_fitstr(phr_name(ph_), 502 * sc, 610 * sc - pn_h * 0.5, 18 * sc, 146 * sc);
+rd_sq(666, 594, 32, 32, 0, AMB, "►") ? setv(16, ph_ >= 6 ? 0 : ph_ + 1);
+// the root: the lowest held key (or the last one)
+kr_ = arp_root >= 0 ? arp_root : 60;
+pk_lcd(716 * sc, 590 * sc, 216 * sc, 40 * sc, 1);
+pk_lcdfont(7, 17 * sc); ui_col(pk_lcdc);
+sc_ > 0 ? sprintf(#l3, "ROOT %s%d", pc_name(kr_), floor(kr_ / 12) - 1) : strcpy(#l3, "HELD NOTES");
+gfx_measurestr(#l3, pn_w, pn_h); gfx_x = (824 * sc) - pn_w * 0.5; gfx_y = 610 * sc - pn_h * 0.5; gfx_drawstr(#l3);
+// the keyboard: C2 - B6, the scale lit from the root over OCTAVES octaves; the notes playing glow
+kb_x = 28; kb_y = 642; kb_ww = 904 / 35; kb_wh = 104; kb_bw = kb_ww * 0.62; kb_bh = 64;
+kb_m = scl_mask(sc_); kb_top = kr_ + 12 * floor(slider3 + 0.5);
+function kb_black(n) ( n %= 12; n == 1 || n == 3 || n == 6 || n == 8 || n == 10; );
+function kb_wx(n) local(o, c) ( o = floor((n - 36) / 12); c = n % 12;
+  kb_x + (o * 7 + (c >= 5 ? (c + 1) / 2 : c / 2)) * kb_ww; );
+function kb_lit(n) local(i, f) (
+  kb_m ? ( n >= kr_ && n <= kb_top && ((kb_m >> ((n - kr_) % 12)) & 1) ) : (
+    f = 0; i = 0; loop(arp_sn, arp_S[i] == n ? f = 1; i += 1; ); f; );
+);
+function kb_key(n, x, y, w, h, blk) local(base, c) (
+  base = blk ? 0x221B17 : 0xEDE3D2;
+  c = kb_m && (n - kr_) % 12 == 0 && kb_lit(n) ? ORG : kb_lit(n) ? ui_mix(AMB, base, blk ? 0.75 : 0.55) : base;
+  ui_col(blk ? 0x0E0B09 : 0x5A4A40); gfx_rect(x * sc, y * sc, w * sc, h * sc);
+  ui_col(c); gfx_rect((x + 1) * sc, y * sc, (w - 2) * sc, (h - 1.5) * sc);
+  SND[n] ? ( ui_cola(0xFFFFFF, 0.45); gfx_rect((x + 1) * sc, y * sc, (w - 2) * sc, (h - 1.5) * sc);
+             ui_col(blk ? AMB : ORG); gfx_rect((x + 2) * sc, (y + h - 9) * sc, (w - 4) * sc, 6 * sc); );
+  n == kb_held ? ( ui_col(0x16110E); gfx_circle((x + w * 0.5) * sc, (y + h - (blk ? 16 : 20)) * sc, 3 * sc, 1, 1); );
+);
+ui_col(0x16110E); gfx_rect((kb_x - 4) * sc, (kb_y - 4) * sc, (904 + 8) * sc, (kb_wh + 8) * sc);
+kb_n = 36; loop(60, !kb_black(kb_n) ? (
+  kb_key(kb_n, kb_wx(kb_n), kb_y, kb_ww, kb_wh, 0);
+  kb_n % 12 == 0 ? ( gfx_setfont(4); ui_col(0x6A5A50); sprintf(#l3, "C%d", floor(kb_n / 12) - 1); ui_text((kb_wx(kb_n) + kb_ww * 0.5) * sc, (kb_y + kb_wh - 22) * sc, #l3); );
+); kb_n += 1; );
+kb_n = 36; loop(60, kb_black(kb_n) ? kb_key(kb_n, kb_wx(kb_n - 1) + kb_ww - kb_bw * 0.5, kb_y, kb_bw, kb_bh, 1); kb_n += 1; );
+ui_cola(0x000000, 0.35); gfx_rect(kb_x * sc, kb_y * sc, 904 * sc, 3 * sc);
+// click: hold the key as the root (the DSP picks it up next block), click it again to let go
+pressed && drag_id == 0 && mouse_x >= kb_x * sc && mouse_x < (kb_x + 904) * sc && mouse_y >= kb_y * sc && mouse_y < (kb_y + kb_wh) * sc ? (
+  drag_id = -1; kb_hit = -1;
+  mouse_y < (kb_y + kb_bh) * sc ? (
+    kb_n = 36; loop(60, kb_black(kb_n) ? ( kb_bx = kb_wx(kb_n - 1) + kb_ww - kb_bw * 0.5;
+      mouse_x >= kb_bx * sc && mouse_x < (kb_bx + kb_bw) * sc ? kb_hit = kb_n; ); kb_n += 1; );
+  );
+  kb_hit < 0 ? ( kb_n = 36; loop(60, !kb_black(kb_n) && mouse_x >= kb_wx(kb_n) * sc && mouse_x < (kb_wx(kb_n) + kb_ww) * sc ? kb_hit = kb_n; kb_n += 1; ); );
+  kb_hit >= 0 ? kb_req = kb_hit + 1;
+);
+pk_end();
+ui_end();

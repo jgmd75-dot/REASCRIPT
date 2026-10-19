@@ -1,0 +1,479 @@
+desc:GFX G Cosmos [pad synth]
+//tags: instrument synth poly pad analogue chorus delay
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-voice (.jsfx-inc) in the same folder.
+//
+// 8-voice pad synthesizer in the spirit of the classic 80s polys (with a nod to the late-80s digital layered shimmer).
+//   DCO    - SAW, PULSE (PW, PWM from the LFO), SUB (one octave down), NOISE - all from one oscillator
+//   LAYER  - a second, detuned saw (LEVEL, DETUNE, OCTAVE) for shimmer and width
+//   HPF    - 0: bass boost, 1: flat, 2 and 3: thinner
+//   VCF    - 24 dB filter: CUTOFF, RESONANCE, ENV, LFO, KEY; FILTER ENV and AMP ENV are separate ADSRs
+//   LFO    - RATE, DELAY (fades in from the first key of a phrase), SHAPE, PITCH (vibrato); to cutoff in VCF,
+//            to pulse width in DCO
+//   CHORUS - I, II, or both (I+II: the I and II sweeps run together), the classic bucket-brigade stereo chorus
+//   DELAY  - ambient stereo delay: TIME, FEEDBACK, TONE, MIX; the repeats are diffused and gently modulated
+// DRIFT (GFX): the tuning and the filter wander - for the whole instrument and for each voice on its own -
+//   and every note lands slightly differently in tune.
+// MIDI: pitch bend +/-2, CC1 vibrato, CC64 sustain, CC123 all notes off.
+// IN / OUT: the strip along the bottom holds SAT and STEREO (MONO, WIDTH).
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-voice.jsfx-inc
+
+slider1:70<0,100,1>-Saw (%)
+slider2:0<0,100,1>-Pulse (%)
+slider3:50<5,95,1>-Pulse width (%)
+slider4:0<0,100,1>-PWM by LFO (%)
+slider5:30<0,100,1>-Sub (%)
+slider6:0<0,100,1>-Noise (%)
+slider7:40<0,100,1>-Layer level (%)
+slider8:12<0,50,0.1>-Layer detune (cents)
+slider9:1<0,2,1{-1 oct,0,+1 oct}>-Layer octave
+slider10:1<0,3,1{0 Boost,1 Flat,2,3}>-HPF
+slider11:1800<20,18000,1>-Cutoff (Hz)
+slider12:15<0,100,1>-Resonance (%)
+slider13:25<-100,100,1>-Filter env amount (%)
+slider14:10<0,100,1>-LFO to cutoff (%)
+slider15:40<0,100,1>-Key track (%)
+slider16:600<1,8000,1>-Filter attack (ms)
+slider17:1500<5,10000,1>-Filter decay (ms)
+slider18:50<0,100,1>-Filter sustain (%)
+slider19:2500<5,15000,1>-Filter release (ms)
+slider20:500<1,8000,1>-Amp attack (ms)
+slider21:1000<5,10000,1>-Amp decay (ms)
+slider22:85<0,100,1>-Amp sustain (%)
+slider23:2500<5,15000,1>-Amp release (ms)
+slider24:0.4<0.05,20,0.01>-LFO rate (Hz)
+slider25:0.8<0,5,0.01>-LFO delay (s)
+slider26:0<0,3,1{Sine,Triangle,Square,Random}>-LFO shape
+slider27:0<0,100,1>-LFO to pitch (cents)
+slider28:1<0,3,1{Off,I,II,I+II}>-Chorus
+slider29:450<40,1500,1>-Delay time (ms)
+slider30:45<0,95,1>-Delay feedback (%)
+slider31:5000<500,12000,10>-Delay tone (Hz)
+slider32:20<0,100,1>-Delay mix (%)
+slider33:30<0,100,1>-Velocity (%)
+slider34:25<0,100,1>-Drift (%)
+slider35:0<-24,6,0.1>-Volume (dB)
+slider36:0<0,16,1>-MIDI channel (0 = omni)
+slider37:0<0,100,1>-Band sat (%)
+slider38:30<0,100,1>-Bias (%)
+slider39:120<40,400,1>-Sat low band (Hz)
+slider40:6000<2000,16000,10>-Sat high band (Hz)
+slider41:-0.3<-24,0,0.1>-Ceiling (dB)
+slider42:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider43:20<20,500,1>-Mono below (Hz, 20 = off)
+slider44:0<0,100,1>-Stereo width (%)
+slider45:0<0,11,1{Cosmos,Warm Poly,Strings 6,Glass Shimmer,Dark Drone,PWM Haze,Brass Pad,Choir Air,Sweep Pad,Slow Strings,Nebula,Init}>-Patch
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-cosmos";                                  // the ? pop-up links to this manual
+
+NV = 8;
+VN = 50000; VG = 50010; VT = 50020; VS = 50030;   // per voice: note (-1 free), gate, age, held by sustain
+EQO = 50300; EQT = 50600; EQN = 50900; EQV = 51200;   // note event queue (300 each)
+CHB = 60000; CHM = 4095;                          // chorus delay line
+DLB = 100000; DRB = 400000; DMSK = 262143;        // ambient delay lines
+DAL = 700000; DAR = 702048; DAM = 2047;           // its diffusers (2048 each, back to back)
+memset(CHB, 0, 4096); memset(DLB, 0, 262144); memset(DRB, 0, 262144); memset(DAL, 0, 4096);
+gi = 0; loop(NV, VN[gi] = -1; VG[gi] = 0; VT[gi] = 0; VS[gi] = 0; gi += 1; );
+
+// ---------- one voice ----------
+function vinit() instance(dtn, dct, drT, drC, nd, note) (
+  dtn = 0; dct = 0; nd = 1; note = 60;
+  drT.drift_init(0.8 + rand(0.5)); drC.drift_init(0.8 + rand(0.5));
+);
+// once a block: this voice's own drift (tuning in cents, filter in octaves)
+function vblock(inc) instance(dtn, dct, drT, drC) (
+  dtn = drT.drift_tick(inc) * drift * 6;
+  dct = drC.drift_tick(inc) * drift * 0.2;
+);
+function vstart(n, v) instance(note, vel, nd, fe, ae) (
+  note = n; vel = v / 127; nd = ins_note_detune();
+  fe.vo_adsr_gate(1, 1); ae.vo_adsr_gate(1, 1);
+);
+function vstop() instance(fe, ae) ( fe.vo_adsr_gate(0, 0); ae.vo_adsr_gate(0, 0); );
+function vrun() instance(os, op, ob, oy, flt, fe, ae, note, vel, nd, dtn, dct) local(f, inc, pwv, y, oct, vgain) (
+  ae.st == 0 ? 0 : (
+    f = 440 * 2 ^ ((note + vib_st - 69) / 12) * bend * ins_pitch * nd * 2 ^ (dtn / 1200);
+    inc = min(f / srate, 0.45);
+    pwv = min(max(pw + lfo * pwm * 0.45, 0.05), 0.95);
+    y = saw_l * os.vo_saw(inc) + pul_l * op.vo_pulse(inc, pwv) + sub_l * ob.vo_sub(inc, 2) + noi_l * (rand(2) - 1);
+    lay_l > 0 ? y += lay_l * oy.vo_saw(min(inc * lay_r * 2 ^ (ins_aux / 12), 0.45));
+    vgain = 1 - velsens + velsens * vel;
+    oct = envamt * fe.vo_adsr() * 6 + lfo * lfo_cut * 2.5 + keytr * (note - 60) / 12 + ins_cut + dct;
+    y = flt.vo_ladder(y * 0.4, min(max(cutoff * 2 ^ oct, 20), srate * 0.45), res, 0);
+    y * ae.vo_adsr() * vgain;
+  );
+);
+
+function v_start(i, n, v) (
+  i == 0 ? v0.vstart(n, v) : i == 1 ? v1.vstart(n, v) : i == 2 ? v2.vstart(n, v) : i == 3 ? v3.vstart(n, v) :
+  i == 4 ? v4.vstart(n, v) : i == 5 ? v5.vstart(n, v) : i == 6 ? v6.vstart(n, v) : v7.vstart(n, v);
+);
+function v_stop(i) (
+  i == 0 ? v0.vstop() : i == 1 ? v1.vstop() : i == 2 ? v2.vstop() : i == 3 ? v3.vstop() :
+  i == 4 ? v4.vstop() : i == 5 ? v5.vstop() : i == 6 ? v6.vstop() : v7.vstop();
+);
+function v_idle(i) (
+  i == 0 ? v0.ae.st == 0 : i == 1 ? v1.ae.st == 0 : i == 2 ? v2.ae.st == 0 : i == 3 ? v3.ae.st == 0 :
+  i == 4 ? v4.ae.st == 0 : i == 5 ? v5.ae.st == 0 : i == 6 ? v6.ae.st == 0 : v7.ae.st == 0;
+);
+
+// ---------- notes ----------
+function all_off() local(i) ( i = 0; loop(NV, VG[i] ? v_stop(i); VG[i] = 0; VS[i] = 0; VN[i] = -1; i += 1; ); );
+function note_on(n, v) local(i, best, ba, any) (
+  any = 0; i = 0; loop(NV, VG[i] ? any = 1; i += 1; );
+  !any ? lfo_fade = 0;                                 // a new phrase: the LFO fades in again
+  best = -1;
+  i = 0; loop(NV, VN[i] == n ? best = i; i += 1; );
+  best < 0 ? ( ba = -1; i = 0; loop(NV, v_idle(i) && (best < 0 || VT[i] < ba) ? ( best = i; ba = VT[i]; ); i += 1; ); );
+  best < 0 ? ( ba = -1; i = 0; loop(NV, !VG[i] && (best < 0 || VT[i] < ba) ? ( best = i; ba = VT[i]; ); i += 1; ); );
+  best < 0 ? ( ba = -1; i = 0; loop(NV, best < 0 || VT[i] < ba ? ( best = i; ba = VT[i]; ); i += 1; ); );
+  vage += 1; VT[best] = vage; VN[best] = n; VG[best] = 1; VS[best] = 0;
+  v_start(best, n, v);
+  ins_midi_hit();
+);
+function note_off(n) local(i) (
+  i = 0; loop(NV, VN[i] == n && VG[i] ? ( pedal ? VS[i] = 1 : ( v_stop(i); VG[i] = 0; ); ); i += 1; );
+);
+function pedal_up() local(i) ( i = 0; loop(NV, VS[i] ? ( v_stop(i); VG[i] = 0; VS[i] = 0; ); i += 1; ); );
+function q_push(ofs, t, n, v) local(i) (
+  qcount < 300 ? (
+    i = qcount; while (i > 0 && EQO[i - 1] > ofs) ( EQO[i] = EQO[i - 1]; EQT[i] = EQT[i - 1]; EQN[i] = EQN[i - 1]; EQV[i] = EQV[i - 1]; i -= 1; );
+    EQO[i] = ofs; EQT[i] = t; EQN[i] = n; EQV[i] = v; qcount += 1;
+  );
+);
+
+function lfo_name(s) ( s == 0 ? "SINE" : s == 1 ? "TRI" : s == 2 ? "SQUARE" : "RANDOM"; );
+function patch_name(p) (
+  p == 0 ? "COSMOS" : p == 1 ? "WARM POLY" : p == 2 ? "STRINGS 6" : p == 3 ? "GLASS SHIMMER" :
+  p == 4 ? "DARK DRONE" : p == 5 ? "PWM HAZE" : p == 6 ? "BRASS PAD" : p == 7 ? "CHOIR AIR" :
+  p == 8 ? "SWEEP PAD" : p == 9 ? "SLOW STRINGS" : p == 10 ? "NEBULA" : "INIT";
+);
+
+// ---------- parameters ----------
+function update() (
+  saw_l = slider1 / 100; pul_l = slider2 / 100; pw = slider3 / 100; pwm = slider4 / 100;
+  sub_l = slider5 / 100 * 0.8; noi_l = slider6 / 100 * 0.5;
+  lay_l = slider7 / 100; lay_r = 2 ^ (slider8 / 1200 + slider9 - 1);
+  hpf = slider10;
+  cutoff = slider11; res = slider12 / 100 * 0.95; envamt = slider13 / 100; lfo_cut = slider14 / 100; keytr = slider15 / 100;
+  lfo_rate = slider24; lfo_del = slider25; lfo_shape = slider26 == 2 ? 3 : slider26 == 3 ? 4 : slider26; vibc = slider27;
+  chmode = slider28;
+  dtime = slider29; dfb = slider30 / 100; dmix = slider32 / 100;
+  dtc = 1 - exp(-2 * $pi * slider31 / srate);
+  velsens = slider33 / 100; drift = slider34 / 100; vol_t = 10 ^ (slider35 / 20); chan = slider36;
+  ins_output_setup(37); ins_stereo_setup(43);   // output stage: CLIP, always on
+);
+function env_update() (
+  v0.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v0.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+  v1.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v1.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+  v2.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v2.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+  v3.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v3.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+  v4.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v4.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+  v5.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v5.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+  v6.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v6.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+  v7.fe.vo_adsr_set(slider16, slider17, slider18 / 100, slider19); v7.ae.vo_adsr_set(slider20, slider21, slider22 / 100, slider23);
+);
+
+// ---------- patches (drift, volume, channel and the output rows are left alone) ----------
+// Dark Drone's oscillators are kept about 5 dB down: with its bass boost, sub, layer and long release,
+// eight overlapping voices would otherwise drive the output clipper.
+function pd(a, b, c, d, e, f, g, h, i) ( slider1 = a; slider2 = b; slider3 = c; slider4 = d; slider5 = e; slider6 = f; slider7 = g; slider8 = h; slider9 = i; );
+function pf(a, b, c, d, e, f) ( slider10 = a; slider11 = b; slider12 = c; slider13 = d; slider14 = e; slider15 = f; );
+function pe(a, b, c, d, e, f, g, h) ( slider16 = a; slider17 = b; slider18 = c; slider19 = d; slider20 = e; slider21 = f; slider22 = g; slider23 = h; );
+function pl(a, b, c, d, e, f, g, h, i, j) ( slider24 = a; slider25 = b; slider26 = c; slider27 = d; slider28 = e; slider29 = f; slider30 = g; slider31 = h; slider32 = i; slider33 = j; );
+function load_patch(p) (
+  p == 0  ? ( pd(70, 0, 50, 0, 30, 0, 40, 12, 1);    pf(1, 1800, 15, 25, 10, 40); pe(600, 1500, 50, 2500, 500, 1000, 85, 2500);  pl(0.4, 0.8, 0, 0, 1, 450, 45, 5000, 20, 30); ) :
+  p == 1  ? ( pd(80, 0, 50, 0, 45, 0, 0, 0, 1);      pf(0, 1200, 20, 30, 0, 40);  pe(300, 1200, 40, 1200, 200, 800, 90, 1200);  pl(0.5, 1.0, 1, 0, 2, 380, 30, 4000, 10, 30); ) :
+  p == 2  ? ( pd(85, 0, 50, 0, 0, 0, 30, 8, 2);      pf(2, 4000, 5, 15, 0, 30);   pe(200, 1000, 70, 900, 350, 800, 90, 1100);   pl(5.5, 0.6, 1, 6, 3, 300, 25, 6000, 12, 20); ) :
+  p == 3  ? ( pd(40, 0, 50, 0, 0, 0, 70, 18, 2);     pf(2, 7000, 10, 10, 5, 50);  pe(400, 2000, 60, 3000, 600, 1500, 80, 3500); pl(0.3, 1.5, 0, 0, 2, 620, 60, 8000, 35, 20); ) :
+  p == 4  ? ( pd(44, 0, 50, 0, 33, 6, 33, 25, 0);    pf(0, 380, 35, 30, 25, 20);  pe(2000, 4000, 40, 5000, 2500, 3000, 90, 6000); pl(0.12, 2.0, 0, 0, 1, 900, 70, 2500, 35, 10); ) :
+  p == 5  ? ( pd(0, 80, 50, 60, 30, 0, 0, 0, 1);     pf(1, 2200, 15, 20, 0, 40);  pe(400, 1500, 60, 1800, 400, 1000, 85, 2000);  pl(0.7, 0.3, 1, 0, 1, 500, 40, 5000, 18, 30); ) :
+  p == 6  ? ( pd(90, 0, 50, 0, 20, 0, 30, 10, 1);    pf(1, 700, 10, 55, 0, 50);   pe(180, 900, 45, 700, 60, 600, 85, 700);      pl(5, 0.5, 0, 4, 1, 300, 20, 4000, 10, 50); ) :
+  p == 7  ? ( pd(30, 50, 35, 30, 0, 12, 40, 6, 1);   pf(2, 2600, 30, 10, 15, 40); pe(800, 2000, 70, 2500, 900, 1500, 90, 2800); pl(4.8, 1.2, 0, 4, 3, 520, 40, 6000, 25, 20); ) :
+  p == 8  ? ( pd(70, 30, 40, 20, 20, 0, 40, 12, 1);  pf(1, 300, 45, 70, 0, 30);   pe(2500, 5000, 30, 4000, 300, 1000, 85, 3000); pl(0.25, 0, 1, 0, 2, 480, 55, 5000, 25, 30); ) :
+  p == 9  ? ( pd(80, 0, 50, 0, 0, 0, 45, 10, 1);     pf(2, 3200, 5, 10, 0, 30);   pe(1200, 2000, 80, 3000, 1500, 1500, 90, 3500); pl(5, 1.5, 1, 5, 3, 400, 30, 6000, 15, 20); ) :
+  p == 10 ? ( pd(50, 40, 30, 50, 20, 8, 60, 20, 2);  pf(1, 1500, 25, 20, 30, 40); pe(3000, 4000, 60, 6000, 3000, 4000, 80, 8000); pl(0.08, 3.0, 3, 0, 3, 1100, 75, 3500, 45, 20); ) :
+            ( pd(70, 0, 50, 0, 30, 0, 40, 12, 1);    pf(1, 1800, 15, 25, 10, 40); pe(600, 1500, 50, 2500, 500, 1000, 85, 2500);  pl(0.4, 0.8, 0, 0, 1, 450, 45, 5000, 20, 30); );
+  slider45 = p; last_patch = p;
+  slider_automate(8589934591 + 17592186044416);                  // sliders 1-33 and 45
+  panic_req = 1; update(); env_update();
+);
+
+v0.vinit(); v1.vinit(); v2.vinit(); v3.vinit(); v4.vinit(); v5.vinit(); v6.vinit(); v7.vinit();
+ins_drift_init();
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+sm = 1 - exp(-1 / (0.03 * srate));
+// per-patch level trim: keeps the hottest patches out of the output clipper (measured with 8 notes at full
+// velocity, worst case held under -3 dBFS); the quieter patches are left as they are
+function patch_trim(p) (
+  p == 0 ? 0.923 :
+  p == 1 ? 0.525 :
+  p == 2 ? 0.923 :
+  p == 3 ? 1.000 :
+  p == 4 ? 1.000 :
+  p == 5 ? 0.668 :
+  p == 6 ? 0.631 :
+  p == 7 ? 1.000 :
+  p == 8 ? 0.822 :
+  p == 9 ? 0.912 :
+  p == 10 ? 0.933 :
+  0.902;
+);
+ptr_s = patch_trim(slider45);
+bend = 1; modw = 0; pedal = 0; vage = 0; qcount = 0; lfo_fade = 1; last_patch = -1;
+chw = 0; chph = 0; chph2 = 0.37; dw = 0; daw = 0; dlpL = dlpR = dhpL = dhpR = 0; dmph = 0; hpL = hpR = hpxL = hpxR = 0; lsL = lsR = 0;
+!ui_dflt ? ui_thm = 5; !ui_dflt ? ui_hw = 1;   // fixed charcoal faceplate with coloured section bars
+!ui_dflt ? ui_kstyle = 0;
+PNL = 0x2A2B2F; INKL = 0xE8E6E0; REDB = 0xD0453A; ORB = 0xE8892C; YEB = 0xE6C23A; BLB = 0x4A86D0;
+SH1 = 0x232428; SH2 = 0x202125; SH3 = 0x1C1D21;
+// section: recessed tray, a coloured bar along its top, the title in that colour
+function jgroup(x, y, w, h, sec, title, col, shade) local(tw, th) (
+  pk_inset(x * sc, y * sc, w * sc, h * sc, shade);
+  ui_col(col); gfx_rect(x * sc, y * sc, w * sc, 4 * sc);
+  gfx_setfont(4); gfx_measurestr(title, tw, th);
+  ui_col(PNL); gfx_rect((x + 8) * sc, (y - 6) * sc, tw + 12 * sc, th + 2 * sc);
+  ui_col(col); gfx_x = (x + 14) * sc; gfx_y = (y - 5) * sc; gfx_drawstr(title);
+  ui_section(sec == 0 ? 2 : sec); C_INK = INKL;
+);
+// coloured key cap with an LED above it
+function jbtn(x, y, w, h, on, col) local(hit, inb) (
+  inb = mouse_x >= x && mouse_x < x + w && mouse_y >= y - 12 * sc && mouse_y < y + h;
+  hit = pressed && drag_id == 0 && inb; hit ? drag_id = -1;
+  pk_led(x + w * 0.5, y - 6 * sc, 3 * sc, on, 0xFF3A2A);
+  ui_keyshadow(x, y, w, h, 2 * sc);
+  ui_col(ui_mix(col, 0x000000, mdown && inb ? 0.35 : 0.2)); ui_rrs(x, y, w, h, 2 * sc);
+  ui_col(col); ui_rrs(x + 1 * sc, y + 1 * sc, w - 2 * sc, h - 4 * sc, 2 * sc);
+  ui_cola(0xFFFFFF, 0.35); gfx_line(x + 2 * sc, y + 1 * sc, x + w - 3 * sc, y + 1 * sc);
+  hit;
+);
+update(); env_update();
+vol_s = vol_t;
+// @init runs again when playback starts and the note bookkeeping above starts afresh: release every voice too,
+// or a note sounding at that moment would never get its note-off (a hung note)
+i = 0; loop(NV, v_stop(i); VG[i] = 0; VS[i] = 0; VN[i] = -1; i += 1; ); hcount = 0;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+update(); env_update();
+
+@block
+update(); env_update();                       // knobs moved on the panel do not run @slider, so read them here
+// a patch chosen from Reaper's parameter list or automation loads here
+last_patch < 0 ? last_patch = slider45 : slider45 != last_patch ? ( load_patch(slider45); last_patch = slider45; );
+qcount = 0;
+while (midirecv(mofs, m1, m2, m3)) (
+  ins_chan_ok(m1, chan) ? (
+    st = m1 & 0xF0;
+    st == 0x90 || st == 0x80 ? q_push(mofs, st == 0x90 && m3 > 0, m2, m3) :
+    st == 0xE0 ? bend = ins_bend(m2, m3, 2) :
+    st == 0xB0 ? (
+      m2 == 1 ? modw = m3 / 127 :
+      m2 == 64 ? ( pedal = m3 >= 64; !pedal ? q_push(mofs, 2, 0, 0); ) :
+      m2 == 123 || m2 == 120 ? q_push(mofs, 3, 0, 0);
+    );
+  );
+);
+// transport stop: release whatever is still held (as an all-notes-off would; a safety net if the stop's note-offs go missing)
+gfx_pst = play_state == 1 || play_state == 5;
+gfx_pst_prev && !gfx_pst ? ( q_push(0, 3, 0, 0); );
+gfx_pst_prev = gfx_pst;
+panic_req ? ( all_off(); panic_req = 0; );
+eqi = 0; spos = 0;
+// drift: tuning and filter for the whole instrument, and for each voice
+ins_drift_block(drift, samplesblock);
+dvi = 0.35 * samplesblock / srate;
+v0.vblock(dvi); v1.vblock(dvi); v2.vblock(dvi); v3.vblock(dvi); v4.vblock(dvi); v5.vblock(dvi); v6.vblock(dvi); v7.vblock(dvi);
+lfo_inc = lfo_del > 0.01 ? 1 / (lfo_del * srate) : 1;
+// chorus settings (rate Hz, centre and swing of the delay in ms). I+II runs the I sweep and the II sweep
+// together on two taps, rather than one fast sweep (a 10 Hz sweep against the dry signal throbs like a tremolo)
+chmode == 2 ? ( chr = 0.863; chc = 3.4; chs = 1.9; ) : ( chr = 0.513; chc = 3.4; chs = 1.7; );
+chr2 = 0.863; chc2 = 4.2; chs2 = 1.9;
+// HPF
+hpc = 1 - exp(-2 * $pi * (hpf == 2 ? 240 : 720) / srate); lsc = 1 - exp(-2 * $pi * 120 / srate);
+
+@serialize
+file_var(0, ui_sz);
+
+@sample
+while (eqi < qcount && (EQO[eqi] <= spos || spos >= samplesblock - 1)) (   // (an event stamped at / past the block end: handled at its last sample)
+  et = EQT[eqi];
+  et == 1 ? note_on(EQN[eqi], EQV[eqi]) : et == 0 ? note_off(EQN[eqi]) : et == 2 ? pedal_up() : all_off();
+  eqi += 1;
+);
+spos += 1;
+
+lfo_fade = min(lfo_fade + lfo_inc, 1);
+lfo = lfo1.vo_lfo(lfo_rate, lfo_shape) * lfo_fade;
+vib_st = lfo * (vibc + modw * 40) / 100;
+
+x = v0.vrun() + v1.vrun() + v2.vrun() + v3.vrun() + v4.vrun() + v5.vrun() + v6.vrun() + v7.vrun();
+
+// HPF: 0 boosts the bass, 1 is flat, 2 and 3 thin it out
+hpf == 0 ? ( lsL += (x - lsL) * lsc; x += lsL * 0.6; ) :
+hpf >= 2 ? ( hpL += (x - hpL) * hpc; x -= hpL; );
+
+// chorus: a modulated delay, read with opposite swings for left and right (I+II adds a second sweep)
+chmode > 0 ? (
+  CHB[chw] = x;
+  chph += chr / srate; chph -= floor(chph);
+  ctri = 1 - 4 * abs(chph - 0.5);
+  cdl = (chc + chs * ctri) * 0.001 * srate; cdr = (chc - chs * ctri) * 0.001 * srate;
+  ci = floor(cdl); cf = cdl - ci; cwl = CHB[(chw - ci) & CHM] * (1 - cf) + CHB[(chw - ci - 1) & CHM] * cf;
+  ci = floor(cdr); cf = cdr - ci; cwr = CHB[(chw - ci) & CHM] * (1 - cf) + CHB[(chw - ci - 1) & CHM] * cf;
+  chmode == 3 ? (
+    chph2 += chr2 / srate; chph2 -= floor(chph2);
+    ctri = 1 - 4 * abs(chph2 - 0.5);
+    cdl = (chc2 - chs2 * ctri) * 0.001 * srate; cdr = (chc2 + chs2 * ctri) * 0.001 * srate;
+    ci = floor(cdl); cf = cdl - ci; cwl = 0.5 * (cwl + CHB[(chw - ci) & CHM] * (1 - cf) + CHB[(chw - ci - 1) & CHM] * cf);
+    ci = floor(cdr); cf = cdr - ci; cwr = 0.5 * (cwr + CHB[(chw - ci) & CHM] * (1 - cf) + CHB[(chw - ci - 1) & CHM] * cf);
+  );
+  chw = (chw + 1) & CHM;
+  clpL += (cwl - clpL) * 0.45; clpR += (cwr - clpR) * 0.45;   // bucket-brigade darkness
+  xL = (x + clpL) * 0.75; xR = (x + clpR) * 0.75;
+) : ( xL = x; xR = x; );
+
+// ambient delay: cross-fed (ping-pong) repeats, diffused, gently modulated, darker as they fade
+dmix > 0 || dfb > 0 ? (
+  dmph += 0.23 / srate; dmph -= floor(dmph);
+  dmod = sin(2 * $pi * dmph) * 0.0015 * srate;
+  dtl = dtime * 0.001 * srate + dmod; dtr = dtime * 0.75 * 0.001 * srate - dmod;
+  ci = floor(dtl); cf = dtl - ci; dol = DLB[(dw - ci) & DMSK] * (1 - cf) + DLB[(dw - ci - 1) & DMSK] * cf;
+  ci = floor(dtr); cf = dtr - ci; dor = DRB[(dw - ci) & DMSK] * (1 - cf) + DRB[(dw - ci - 1) & DMSK] * cf;
+  dlpL += (dol - dlpL) * dtc; dlpR += (dor - dlpR) * dtc;
+  dhpL += (dlpL - dhpL) * 0.016; dhpR += (dlpR - dhpR) * 0.016;
+  fl = dlpL - dhpL; fr = dlpR - dhpR;
+  // one diffuser each side
+  ay = DAL[(daw - 389) & DAM]; av = fl + 0.6 * ay; DAL[daw] = av; fl = ay - 0.6 * av;
+  ay = DAR[(daw - 557) & DAM]; av = fr + 0.6 * ay; DAR[daw] = av; fr = ay - 0.6 * av;
+  DLB[dw] = 0.5 * (xL + xR) * 0.7 + fr * dfb;
+  DRB[dw] = fl * dfb;
+  dw = (dw + 1) & DMSK; daw = (daw + 1) & DAM;
+  xL = xL * (1 - 0.3 * dmix) + dol * dmix;
+  xR = xR * (1 - 0.3 * dmix) + dor * dmix;
+);
+
+vol_s += (vol_t - vol_s) * sm;
+ptr_s = patch_trim(slider45);                    // follows the patch at once (a patch change is a discrete event)
+oL = ostL.ost_band((xL * 0.45) * ptr_s) * vol_s;
+oR = ostR.ost_band((xR * 0.45) * ptr_s) * vol_s;
+ins_stereo(oL, oR); ost_out(ins_sl, ins_sr);           // mono-maker / widener, then the output stage
+spl0 = ost_l;
+spl1 = ost_r;
+
+@gfx 1040 428
+ui_begin(1040, 428);
+
+// ---------- chassis ----------
+fh = 468;                                          // the panel, with the IN / OUT strip along the bottom
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+pk_chassis(8 * sc, 8 * sc, 1024 * sc, fh * sc, PNL);
+C_INK = INKL;
+
+// header
+ui_col(INKL); gfx_circle(40 * sc, 38 * sc, 14 * sc, 1, 1);
+gfx_setfont(4); ui_col(PNL); ui_text(40 * sc, 33 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 24 * sc, 'b'); ui_col(INKL); gfx_x = 62 * sc; gfx_y = 24 * sc; gfx_drawstr("COSMOS"); gfx_measurestr("COSMOS", cm_tw, cm_th);
+gfx_setfont(4); ui_cola(INKL, 0.6); gfx_x = 62 * sc + cm_tw + 10 * sc; gfx_y = 34 * sc; gfx_drawstr("POLYPHONIC PAD SYNTHESIZER");
+pk_lcd(400 * sc, 18 * sc, 250 * sc, 44 * sc, 2);
+pk_lcdfont(7, 13 * sc); ui_col(pk_lcdc);
+sprintf(#l1, "P%02d %s", slider45 + 1, patch_name(slider45)); gfx_x = 410 * sc; gfx_y = 24 * sc; gfx_drawstr(#l1);
+pk_lcdfont(8, 10 * sc);
+gn = 0; gi = 0; loop(NV, !v_idle(gi) ? gn += 1; gi += 1; );
+sprintf(#l2, "VOICES %d/8  CHORUS %s", gn, slider28 == 0 ? "OFF" : slider28 == 1 ? "I" : slider28 == 2 ? "II" : "I+II");
+gfx_x = 410 * sc; gfx_y = 44 * sc; gfx_drawstr(#l2);
+pressed && drag_id == 0 && mouse_x >= 400 * sc && mouse_x < 650 * sc && mouse_y >= 18 * sc && mouse_y < 62 * sc ? (
+  drag_id = -1; gfx_x = 400 * sc; gfx_y = 62 * sc;
+  gsel = gfx_showmenu("Cosmos|Warm Poly|Strings 6|Glass Shimmer|Dark Drone|PWM Haze|Brass Pad|Choir Air|Sweep Pad|Slow Strings|Nebula|Init");
+  gsel > 0 ? load_patch(gsel - 1);
+);
+jbtn(662 * sc, 30 * sc, 28 * sc, 26 * sc, 0, ORB) ? load_patch(slider45 <= 0 ? 11 : slider45 - 1);
+jbtn(696 * sc, 30 * sc, 28 * sc, 26 * sc, 0, ORB) ? load_patch(slider45 >= 11 ? 0 : slider45 + 1);
+gfx_setfont(4); ui_col(PNL); ui_text(676 * sc, 36 * sc, "<"); ui_text(710 * sc, 36 * sc, ">");
+pk_led(744 * sc, 40 * sc, 3 * sc, ins_midi_lit(), 0x3ADF6A);
+ui_col(INKL); gfx_x = 752 * sc; gfx_y = 35 * sc; gfx_drawstr("MIDI");
+ui_size_picker(800 * sc, 31 * sc);
+// the red stripe
+ui_col(REDB); gfx_rect(14 * sc, 70 * sc, 1012 * sc, 3 * sc);
+
+// ---------- row 1: LFO | DCO | LAYER ----------
+jgroup(32, 90, 236, 96, 0, "LFO", REDB, SH1);
+ui_knob(70 * sc,  136 * sc, 24, 0.05, 20, 0.4, 1, "RATE", "%.2f Hz");
+ui_knob(126 * sc, 136 * sc, 25, 0, 5, 0.8, 0, "DELAY", "%.2f s");
+knob_step = 1; ui_knob(182 * sc, 136 * sc, 26, 0, 3, 0, 0, "SHAPE", lfo_name(slider26));
+ui_knob(238 * sc, 136 * sc, 27, 0, 100, 0, 0, "PITCH", "%.0f c");
+jgroup(276, 90, 400, 96, 0, "DCO", REDB, SH1);
+ui_knob(314 * sc, 136 * sc, 1, 0, 100, 70, 0, "SAW", "%.0f%%");
+ui_knob(378 * sc, 136 * sc, 2, 0, 100, 0, 0, "PULSE", "%.0f%%");
+ui_knob(442 * sc, 136 * sc, 3, 5, 95, 50, 0, "PW", "%.0f%%");
+ui_knob(506 * sc, 136 * sc, 4, 0, 100, 0, 0, "PWM", "%.0f%%");
+ui_knob(570 * sc, 136 * sc, 5, 0, 100, 30, 0, "SUB", "%.0f%%");
+ui_knob(634 * sc, 136 * sc, 6, 0, 100, 0, 0, "NOISE", "%.0f%%");
+jgroup(684, 90, 324, 96, 0, "LAYER", REDB, SH1);
+ui_knob(734 * sc, 136 * sc, 7, 0, 100, 40, 0, "LEVEL", "%.0f%%");
+ui_knob(838 * sc, 136 * sc, 8, 0, 50, 12, 0, "DETUNE", "%.1f c");
+knob_step = 1; ui_knob(942 * sc, 136 * sc, 9, 0, 2, 1, 0, "OCTAVE", slider9 == 0 ? "-1" : slider9 == 1 ? "0" : "+1");
+
+// ---------- row 2: HPF | VCF | FILTER ENV ----------
+jgroup(32, 202, 176, 96, 0, "HPF", ORB, SH2);
+gi = 0;
+loop(4,
+  jbtn((46 + gi * 38) * sc, 230 * sc, 28 * sc, 24 * sc, slider10 == gi, ORB) ? ( slider10 = gi; slider_automate(512); );
+  gfx_setfont(4); ui_col(INKL); sprintf(#hp, "%d", gi); ui_text((60 + gi * 38) * sc, 260 * sc, #hp);
+  gi += 1;
+);
+ui_cola(INKL, 0.6); ui_text(120 * sc, 278 * sc, "BOOST  FLAT  THIN");
+jgroup(216, 202, 380, 96, 0, "VCF", ORB, SH2);
+ui_knob(258 * sc, 248 * sc, 11, 20, 18000, 1800, 1, "CUTOFF", "%.0f Hz");
+ui_knob(332 * sc, 248 * sc, 12, 0, 100, 15, 0, "RES", "%.0f%%");
+ui_knob(406 * sc, 248 * sc, 13, -100, 100, 25, 0, "ENV", "%+.0f%%");
+ui_knob(480 * sc, 248 * sc, 14, 0, 100, 10, 0, "LFO", "%.0f%%");
+ui_knob(554 * sc, 248 * sc, 15, 0, 100, 40, 0, "KEY", "%.0f%%");
+jgroup(604, 202, 404, 96, 0, "FILTER ENV", ORB, SH2);
+ui_knob(654 * sc, 248 * sc, 16, 1, 8000, 600, 1, "ATTACK", "%.0f ms");
+ui_knob(750 * sc, 248 * sc, 17, 5, 10000, 1500, 1, "DECAY", "%.0f ms");
+ui_knob(846 * sc, 248 * sc, 18, 0, 100, 50, 0, "SUSTAIN", "%.0f%%");
+ui_knob(942 * sc, 248 * sc, 19, 5, 15000, 2500, 1, "RELEASE", "%.0f ms");
+
+// ---------- row 3: AMP ENV | CHORUS | DELAY | PERFORMANCE ----------
+jgroup(32, 314, 300, 96, 0, "AMP ENV", YEB, SH3);
+ui_knob(70 * sc,  360 * sc, 20, 1, 8000, 500, 1, "ATTACK", "%.0f ms");
+ui_knob(142 * sc, 360 * sc, 21, 5, 10000, 1000, 1, "DECAY", "%.0f ms");
+ui_knob(214 * sc, 360 * sc, 22, 0, 100, 85, 0, "SUSTAIN", "%.0f%%");
+ui_knob(286 * sc, 360 * sc, 23, 5, 15000, 2500, 1, "RELEASE", "%.0f ms");
+jgroup(340, 314, 150, 96, 0, "CHORUS", BLB, SH3);
+jbtn(362 * sc, 344 * sc, 40 * sc, 28 * sc, slider28 == 1 || slider28 == 3, BLB) ? (
+  slider28 = slider28 == 1 ? 0 : slider28 == 3 ? 2 : slider28 == 2 ? 3 : 1; slider_automate(134217728); );
+jbtn(428 * sc, 344 * sc, 40 * sc, 28 * sc, slider28 == 2 || slider28 == 3, BLB) ? (
+  slider28 = slider28 == 2 ? 0 : slider28 == 3 ? 1 : slider28 == 1 ? 3 : 2; slider_automate(134217728); );
+gfx_setfont(4); ui_col(INKL); ui_text(382 * sc, 380 * sc, "I"); ui_text(448 * sc, 380 * sc, "II");
+jgroup(498, 314, 280, 96, 0, "DELAY", BLB, SH3);
+ui_knob(536 * sc, 360 * sc, 29, 40, 1500, 450, 1, "TIME", "%.0f ms");
+ui_knob(604 * sc, 360 * sc, 30, 0, 95, 45, 0, "FEEDBACK", "%.0f%%");
+ui_knob(672 * sc, 360 * sc, 31, 500, 12000, 5000, 1, "TONE", "%.0f Hz");
+ui_knob(740 * sc, 360 * sc, 32, 0, 100, 20, 0, "MIX", "%.0f%%");
+jgroup(786, 314, 222, 96, 0, "PERFORMANCE", BLB, SH3);
+ui_knob(816 * sc, 360 * sc, 33, 0, 100, 30, 0, "VELOCITY", "%.0f%%");
+ui_section(1); C_INK = INKL;
+ui_knob(870 * sc, 360 * sc, 34, 0, 100, 25, 0, "DRIFT", "%.0f%%");
+ui_section(2); C_INK = INKL;
+ui_knob(924 * sc, 360 * sc, 35, -24, 6, 0, 0, "VOLUME", "%.1f dB");
+ui_section(3); C_INK = INKL; knob_step = 1;
+ui_knob(978 * sc, 360 * sc, 36, 0, 16, 0, 0, "CH", slider36 == 0 ? "OMNI" : "CH %.0f");
+
+// ---------- IN / OUT strip: SAT, OUT, STEREO ----------
+// ins_strip(32, 422, 976, 37, 43, INKL, SH3);
+
+pk_end();
+ui_end();

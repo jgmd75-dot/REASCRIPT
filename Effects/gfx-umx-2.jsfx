@@ -1,0 +1,476 @@
+desc:GFX UMX-2 [mastering maximiser]
+// gfx-umx-2 - Ultra Maximiser: lookahead brickwall peak limiter, level maximiser and bit-depth reduction (IDR)
+// in the spirit of the classic two-fader mastering maximisers.
+//tags: limiter maximizer maximiser mastering brickwall dither noise-shaping
+//author: JGWizrad / Garden FX (GFX)
+//
+// CHAIN   IN -> gain (OUT CEILING - THRESHOLD) -> lookahead brickwall limiter at the ceiling -> IDR -> OUT
+// THRESHOLD   0 .. -30 dB. Lowering it pushes the programme into the limiter: louder, peaks held.
+// OUT CEILING 0 .. -20 dB. The highest peak level that leaves the unit.
+// LIMITER  Stereo-linked (LINK) or per channel. The gain computer looks 1.5 ms ahead: the needed gain is held
+//          over the lookahead window and then averaged over the same window, so the gain is fully down before
+//          the peak arrives (no overshoot, no clipping) and the attack is a smooth fade, never a step.
+// RELEASE  1 ms .. 1 s, or ARC (automatic release): the limiter watches its own gain reduction - reduction
+//          deeper than its recent average (a transient) recovers fast, reduction at its usual depth (dense,
+//          steady programme) recovers slowly, so loud material neither pumps nor distorts.
+// TRUE PEAK  The detector also reads the waveform between the samples (4x interpolation), so the ceiling
+//          holds for inter-sample peaks too (within about 0.1 dB).
+// IDR      Re-quantisation for delivery, in double precision: QUANTISE 24 / 22 / 20 / 16 / 12 / 8 bits,
+//          DITHER off / TYPE 1 (TPDF) / TYPE 2 (high-passed TPDF: the same decorrelation, its noise pushed up
+//          where the ear is least sensitive), SHAPING none / MODERATE (1st order) / NORMAL (3-tap E-weighted) /
+//          ULTRA (9-tap F-weighted psychoacoustic curve). IDR off = the full float output.
+// METERS   IN / OUT peak bars, ATTEN (gain reduction), and read-outs: PEAK OUT, ATTEN MAX, LUFS short-term
+//          (3 s, K-weighted, BS.1770) and TRUE PEAK out. Click a read-out to reset the holds.
+// LATENCY  1.5 ms lookahead + 6 samples for the interpolator, constant, reported to REAPER.
+//
+// Requires gfx-ui, gfx-panel, gfx-faceplate (.jsfx-inc) in the same folder.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+
+slider1:0<-30,0,0.1>-Threshold (dB)
+slider2:-0.3<-20,0,0.1>-Out ceiling (dB)
+slider3:100<1,1000,1>-Release (ms)
+slider4:1<0,1,1{Off,On}>-ARC (auto release)
+slider5:1<0,1,1{Off,On}>-Link
+slider6:0<0,1,1{Off,On}>-True peak
+slider7:0<0,5,1{24,22,20,16,12,8}>-Quantise (bits)
+slider8:1<0,2,1{Off,Type 1,Type 2}>-Dither
+slider9:1<0,3,1{None,Moderate,Normal,Ultra}>-Shaping
+slider10:1<0,1,1{Off,On}>-IDR
+slider11:0<0,9,1{Init,Gentle Master,Mix Bus,Loud Master,Streaming,Safety Limiter,Drum Bus,Vocal Ride,16-bit CD,8-bit Crunch}>-Preset
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+@init
+gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+#ui_man = "gfx-umx-2";
+ext_noinit = 1;
+
+nextmem = 0;
+function alloc(n) local(p) ( p = nextmem; nextmem += n; memset(p, 0, n); p; );
+function db2g(d) ( exp(d*0.11512925465); );
+function g2db(g) ( 8.68588963807*log(max(g, 0.0000000001)); );
+
+// ---- the gain computer: lookahead sliding minimum -> release -> average over the window ----
+LA = max(8, floor(0.0015*srate + 0.5));        // lookahead window (samples)
+TPD = 6;                                       // the interpolator's delay
+D = LA - 1 + TPD;                              // audio delay
+CAP = LA + 2;
+function gc_init() instance(dqv, dqi, head, tail, bx, bxp, sum, env, t) (
+  dqv = alloc(CAP); dqi = alloc(CAP); bx = alloc(LA);
+  head = tail = 0; bxp = 0; env = 1; t = 0; sum = LA;
+  memset(bx, 0, LA); i_ = 0; loop(LA, bx[i_] = 1; i_ += 1; );
+);
+function gc_run(req, rc) instance(dqv, dqi, head, tail, bx, bxp, sum, env, t) local(m, p) (
+  // push req, keeping the deque increasing (front = the window's minimum)
+  p = (tail + CAP - 1) % CAP;
+  while (tail != head && dqv[p] >= req) ( tail = p; p = (tail + CAP - 1) % CAP; );
+  dqv[tail] = req; dqi[tail] = t; tail = (tail + 1) % CAP;
+  while (dqi[head] <= t - LA) ( head = (head + 1) % CAP; );
+  m = dqv[head];
+  t += 1;
+  // release (attack is instant here; the averaging below makes it a smooth lookahead fade)
+  env = m < env ? m : env + (m - env)*rc;
+  // average over the window
+  sum += env - bx[bxp]; bx[bxp] = env; bxp = (bxp + 1) % LA;
+  t % 65536 == 0 ? ( sum = 0; p = 0; loop(LA, sum += bx[p]; p += 1; ); );
+  sum/LA;
+);
+gA.gc_init(); gB.gc_init();
+
+// ---- audio delay lines ----
+DLN = D;                                       // read before write: D samples of delay
+dlL = alloc(DLN); dlR = alloc(DLN); dlp = 0;
+
+// ---- 4x interpolator (detector and true-peak meter): windowed sinc, 12 taps per phase ----
+NT = 12;
+hph = alloc(3*NT);
+ph = 0;
+loop(3,
+  fr = (ph + 1)/4; k = 0;
+  loop(NT,
+    xx = k - (NT/2 - 1) - fr;                  // tap position relative to the interpolated point
+    sn = abs(xx) < 0.000001 ? 1 : sin($pi*xx)/($pi*xx);
+    wn = 0.42 + 0.5*cos($pi*xx/(NT/2 + 0.5)) + 0.08*cos(2*$pi*xx/(NT/2 + 0.5));   // Blackman
+    hph[ph*NT + k] = sn*wn;
+    k += 1;
+  );
+  // normalise each phase to unity DC gain
+  s_ = 0; k = 0; loop(NT, s_ += hph[ph*NT + k]; k += 1; ); k = 0; loop(NT, hph[ph*NT + k] /= s_; k += 1; );
+  ph += 1;
+);
+function tp_init() instance(h, p) ( h = alloc(NT); p = 0; );
+// push a sample; returns the largest |value| of the sample NT/2 - 1 back and the three points after it
+function tp_run(x) instance(h, p) local(k, a, b, c, i, mx) (
+  h[p] = x; p = (p + 1) % NT;
+  a = b = c = 0; k = 0;
+  loop(NT, i = h[(p + k) % NT]; a += hph[k]*i; b += hph[NT + k]*i; c += hph[2*NT + k]*i; k += 1; );
+  mx = abs(h[(p + NT/2 - 1) % NT]);
+  max(mx, max(abs(a), max(abs(b), abs(c))));
+);
+function tp_mid() instance(h, p) ( h[(p + NT/2 - 1) % NT]; );   // the centre sample (NT/2 - 1 behind the newest... read after tp_run)
+dtL.tp_init(); dtR.tp_init(); otL.tp_init(); otR.tp_init();
+
+// ---- loudness (BS.1770 K-weighting, short-term 3 s in 100 ms blocks) ----
+function kbq(c, f, g, q, t) local(A, w, cs, al, sa, a0) (   // t 0: high shelf, 1: high-pass
+  w = 2*$pi*f/srate; cs = cos(w); al = sin(w)/(2*q);
+  t == 0 ? (
+    A = 10^(g/40); sa = 2*sqrt(A)*al; a0 = (A + 1) - (A - 1)*cs + sa;
+    c[0] = A*((A + 1) + (A - 1)*cs + sa)/a0; c[1] = -2*A*((A - 1) + (A + 1)*cs)/a0; c[2] = A*((A + 1) + (A - 1)*cs - sa)/a0;
+    c[3] = 2*((A - 1) - (A + 1)*cs)/a0; c[4] = ((A + 1) - (A - 1)*cs - sa)/a0;
+  ) : (
+    a0 = 1 + al; c[0] = (1 + cs)*0.5/a0; c[1] = -(1 + cs)/a0; c[2] = c[0]; c[3] = -2*cs/a0; c[4] = (1 - al)/a0;
+  );
+);
+function bqf(x, c, s) local(y) (
+  y = c[0]*x + c[1]*s[0] + c[2]*s[1] - c[3]*s[2] - c[4]*s[3];
+  s[1] = s[0]; s[0] = x; s[3] = s[2]; s[2] = y; y;
+);
+kc1 = alloc(5); kc2 = alloc(5); ks1L = alloc(4); ks2L = alloc(4); ks1R = alloc(4); ks2R = alloc(4);
+kbq(kc1, 1681.97, 4.0, 0.7072, 0); kbq(kc2, 38.135, 0, 0.5003, 1);
+lblk = alloc(30); lbi = 0; lacc = 0; lcnt = 0; lN = floor(srate*0.1); lufs = -70;
+
+// ---- IDR ----
+function shp(m, k) (                // shaping coefficients
+  m == 1 ? (k == 0 ? 1 : 0) :
+  m == 2 ? (k == 0 ? 1.623 : k == 1 ? -0.982 : k == 2 ? 0.109 : 0) :
+  m == 3 ? (k == 0 ? 2.412 : k == 1 ? -3.370 : k == 2 ? 3.937 : k == 3 ? -4.174 : k == 4 ? 3.353 : k == 5 ? -2.205 :
+            k == 6 ? 1.281 : k == 7 ? -0.569 : k == 8 ? 0.0847 : 0) : 0;
+);
+hs = alloc(9);
+// one channel: error-feedback shaping around a TPDF-dithered rounding (instance: e = error history, pr = last random)
+function idr_init() instance(e, pr) ( e = alloc(9); pr = 0; );
+function idr_clear() instance(e) ( memset(e, 0, 9); );
+function idr(x) instance(e, pr) local(w, k, r, d, q) (
+  w = x; k = 0; loop(nsh, w -= hs[k]*e[k]; k += 1; );
+  r = rand(1);
+  d = dmode == 0 ? 0 : dmode == 1 ? (r - rand(1)) : (r - pr);     // TYPE 2: the difference of successive randoms (high-passed TPDF)
+  pr = r;
+  q = floor((w + d*qstep)/qstep + 0.5)*qstep;
+  q = max(-1, min(1 - qstep, q));
+  k = nsh - 1; loop(max(0, nsh - 1), e[k] = e[k - 1]; k -= 1; );
+  e[0] = max(-4*qstep, min(4*qstep, q - w));
+  q;
+);
+
+iL.idr_init(); iR.idr_init();
+
+// meters
+rcArc = 1 - exp(-1/(0.1*srate)); arcN = 0; grDb = 0;
+mInL = mInR = mOutL = mOutR = 0; mAtt = 0; hPk = 0; hAtt = 0; hTp = 0; arcAvg = 0;
+mfall = exp(-1/(0.35*srate));       // bar fall: about 25 dB a second
+
+pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = D;
+
+// ---- presets ----
+function setp(th, ce, rel, arc, lk, tp, q, di, sh, id) (
+  slider1 = th; slider2 = ce; slider3 = rel; slider4 = arc; slider5 = lk; slider6 = tp; slider7 = q; slider8 = di; slider9 = sh; slider10 = id;
+);
+function apply_preset(n) (
+  n == 0 ? setp(0, -0.3, 100, 1, 1, 0, 0, 1, 1, 1) :
+  n == 1 ? setp(-2, -0.3, 100, 1, 1, 0, 0, 1, 1, 1) :
+  n == 2 ? setp(-1, -0.5, 60, 1, 1, 0, 0, 0, 0, 0) :
+  n == 3 ? setp(-6, -0.1, 100, 1, 1, 0, 0, 1, 1, 1) :
+  n == 4 ? setp(-3, -1.0, 100, 1, 1, 1, 0, 1, 1, 1) :
+  n == 5 ? setp(0, -0.3, 300, 0, 1, 1, 0, 0, 0, 0) :
+  n == 6 ? setp(-8, -1.0, 30, 0, 0, 0, 0, 0, 0, 0) :
+  n == 7 ? setp(-6, -3.0, 250, 0, 1, 0, 0, 0, 0, 0) :
+  n == 8 ? setp(-4, -0.3, 100, 1, 1, 1, 3, 2, 3, 1) :
+           setp(-3, -0.5, 100, 1, 1, 0, 5, 0, 0, 1);
+);
+function pname(n) (
+  n == 0 ? "INIT" : n == 1 ? "GENTLE MASTER" : n == 2 ? "MIX BUS" : n == 3 ? "LOUD MASTER" : n == 4 ? "STREAMING -1 TP" :
+  n == 5 ? "SAFETY LIMITER" : n == 6 ? "DRUM BUS" : n == 7 ? "VOCAL RIDE" : n == 8 ? "16-BIT CD" : "8-BIT CRUNCH";
+);
+!ui_dflt ? ( ui_hw = 0; lastPreset = slider11; );
+ui_dflt = 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, ui_hw);
+file_var(0, lastPreset);
+
+@slider
+slider11 != lastPreset ? ( apply_preset(slider11); lastPreset = slider11; );
+
+@block
+gin = db2g(slider2 - slider1);
+ceil = db2g(slider2);
+link = slider5 > 0.5;
+tpOn = slider6 > 0.5;
+arcOn = slider4 > 0.5;
+relManual = 1 - exp(-1/(max(1, slider3)*0.001*srate));
+idrOn = slider10 > 0.5;
+qbits = slider7 < 0.5 ? 24 : slider7 < 1.5 ? 22 : slider7 < 2.5 ? 20 : slider7 < 3.5 ? 16 : slider7 < 4.5 ? 12 : 8;
+qstep = 2^(1 - qbits);
+dmode = floor(slider8 + 0.5);
+smode = floor(slider9 + 0.5);
+nsh = smode == 0 ? 0 : smode == 1 ? 1 : smode == 2 ? 3 : 9;
+k_ = 0; loop(9, hs[k_] = shp(smode, k_); k_ += 1; );
+smode != lastSm ? ( iL.idr_clear(); iR.idr_clear(); lastSm = smode; );
+avgC = 1 - exp(-samplesblock/(1.0*srate));
+
+@sample
+// ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+xL = spl0*gin; xR = spl1*gin;
+// input meters (before the gain)
+a_ = abs(spl0); mInL = a_ > mInL ? a_ : mInL*mfall;
+a_ = abs(spl1); mInR = a_ > mInR ? a_ : mInR*mfall;
+
+// detector: the interpolator delays it by TPD samples, the audio by the same amount below
+pL = dtL.tp_run(xL); pR = dtR.tp_run(xR);
+!tpOn ? ( pL = abs(dtL.tp_mid()); pR = abs(dtR.tp_mid()); );
+
+// ARC: recovery time from how far the reduction stands below its recent average (updated every 32 samples)
+(++arcN & 31) == 0 ? (
+  grDb = -g2db(min(gA.env, gB.env));
+  rel_ms = 40 + 760*exp(-max(grDb - arcAvg, 0)/3);
+  rcArc = 1 - exp(-1/(rel_ms*0.001*srate));
+);
+rc = arcOn ? rcArc : relManual;
+
+link ? (
+  rq = min(1, ceil/max(max(pL, pR), 0.0000001));
+  gL = gR = gA.gc_run(rq, rc);
+) : (
+  gL = gA.gc_run(min(1, ceil/max(pL, 0.0000001)), rc);
+  gR = gB.gc_run(min(1, ceil/max(pR, 0.0000001)), rc);
+);
+
+// delayed audio
+dL = dlL[dlp]; dR = dlR[dlp];
+dlL[dlp] = xL; dlR[dlp] = xR; dlp = (dlp + 1) % DLN;
+oL = dL*gL; oR = dR*gR;
+(abs(oL) > ceil*1.000001 || abs(oR) > ceil*1.000001) ? clampHits += 1;
+oL = max(-ceil, min(ceil, oL)); oR = max(-ceil, min(ceil, oR));   // the last word on sample peaks (rounding)
+
+// IDR
+idrOn ? (
+  oL = iL.idr(oL); oR = iR.idr(oR);
+);
+spl0 = oL; spl1 = oR;
+
+// meters
+att = min(gL, gR); mAtt = att < mAtt ? att : mAtt + (att - mAtt)*0.0005;
+-g2db(att) > hAtt ? hAtt = -g2db(att);
+a_ = abs(oL); mOutL = a_ > mOutL ? a_ : mOutL*mfall; a_ > hPk ? hPk = a_;
+a_ = abs(oR); mOutR = a_ > mOutR ? a_ : mOutR*mfall; a_ > hPk ? hPk = a_;
+t_ = max(otL.tp_run(oL), otR.tp_run(oR)); t_ > hTp ? hTp = t_;
+kL = bqf(bqf(oL, kc1, ks1L), kc2, ks2L); kR = bqf(bqf(oR, kc1, ks1R), kc2, ks2R);
+lacc += kL*kL + kR*kR; lcnt += 1;
+lcnt >= lN ? (
+  lblk[lbi] = lacc/lcnt; lbi = (lbi + 1) % 30; lacc = 0; lcnt = 0;
+  s_ = 0; k_ = 0; loop(30, s_ += lblk[k_]; k_ += 1; );
+  lufs = -0.691 + 10*log10(max(s_/30, 0.0000000001));
+  arcAvg += (grDb - arcAvg)*0.1;        // 100 ms steps: about a one-second average
+);
+
+@gfx 900 420
+// =====================================================================
+// GUI - drawn in a 900 x 420 space at scale sc. Flat = dark studio panel with amber accents (default);
+// HW = brushed-steel rack with screws and lit cap keys. Faders: drag, Shift = fine, double-click = default.
+// =====================================================================
+ui_begin(900, 420);
+hw = ui_hw;
+
+function mkfont(idx, size) local(fs, w, h, target) (
+  target = 6.6*size; fs = size;
+  loop(3, gfx_setfont(idx, "Arial", fs, 'b'); gfx_measurestr("THRESHOLD", w, h); fs = min(max(fs*target/max(w, 1), size*0.75), size*1.8); );
+  gfx_setfont(idx, "Arial", fs, 'b'); gfx_measurestr("THRESHOLD", w, h);
+  loop(3, w > target*1.01 ? ( fs -= 0.5; gfx_setfont(idx, "Arial", fs, 'b'); gfx_measurestr("THRESHOLD", w, h); ); );
+  fs;
+);
+sc != u_fsc ? ( u_fsc = sc; u_f6 = mkfont(6, 9*sc); u_f8 = mkfont(8, 7.5*sc); u_f12 = mkfont(12, 24*sc); u_f13 = mkfont(13, 8.5*sc); );
+gfx_setfont(6, "Arial", u_f6, 'b'); gfx_setfont(8, "Arial", u_f8, 'b'); gfx_setfont(12, "Arial", u_f12, 'b');
+gfx_setfont(13, "Arial", u_f13, 'b'); gfx_setfont(9, "Courier New", 15*sc, 'b'); gfx_setfont(10, "Courier New", 10*sc, 'b');
+gfx_setfont(11, "Courier New", 14*sc, 'b'); gfx_setfont(14, "Courier New", 11*sc, 'b');
+
+AMB = 0xFFB93A; INK = 0xCFD3D8; INK2 = 0x8B929A; INK3 = 0x4C5056;
+K_Q = 0x4AA8FF; K_D = 0x4FD07A; K_S = 0xFF5A4A;
+
+function R(x, y, w, h) ( gfx_rect(x*sc, y*sc, max(1, w*sc), max(1, h*sc)); );
+function RR(x, y, w, h, r) ( rd_rr(x*sc, y*sc, w*sc, h*sc, r*sc); );
+function CI(x, y, r) ( gfx_circle(x*sc, y*sc, r*sc, 1, 1); );
+function LN(x1, y1, x2, y2) ( gfx_line(x1*sc, y1*sc, x2*sc, y2*sc, 1); );
+function TC(cx, cy, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = cx*sc - w*0.5; gfx_y = cy*sc - h*0.5; gfx_drawstr(t); );
+function TL(x, cy, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = x*sc; gfx_y = cy*sc - h*0.5; gfx_drawstr(t); );
+function TR(x, cy, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = x*sc - w; gfx_y = cy*sc - h*0.5; gfx_drawstr(t); );
+function inbox(x, y, w, h) ( mouse_x >= x*sc && mouse_x < (x + w)*sc && mouse_y >= y*sc && mouse_y < (y + h)*sc; );
+function hitbox(x, y, w, h) local(h_) ( h_ = pressed && drag_id == 0 && inbox(x, y, w, h); h_ ? drag_id = -1; h_; );
+function bright(c) ( (c & 255) + ((c >> 8) & 255) + ((c >> 16) & 255) > 450; );
+function setv(idx, v) ( slider(idx) = v; ui_auto(idx); );
+function tog(idx) ( slider(idx) = slider(idx) < 0.5; ui_auto(idx); );
+
+// keys: flat outlined key that lights its caption and outline / HW lit cap key
+function key(x, y, w, h, t, on, c) local(hov, hit, dn) (
+  hov = inbox(x, y, w, h);
+  hit = pressed && drag_id == 0 && hov; hit ? drag_id = -1;
+  dn = hov && mdown && drag_id == -1;
+  hw ? (
+    ui_cola(0x000000, 0.5); RR(x + 1, y + 2, w, h, 3);
+    ui_col(0x0E0F10); RR(x - 1, y - 1, w + 2, h + 2, 4);
+    ui_col(on ? c : (dn ? 0x2A2C2F : 0x34373B)); RR(x, y, w, h, 3);
+    on ? ( ui_cola(0xFFFFFF, 0.25); RR(x + 2, y + 2, w - 4, h*0.42, 2); ) : ( ui_cola(0xFFFFFF, 0.06); RR(x + 1, y + 1, w - 2, h*0.45, 2); );
+    gfx_setfont(13); ui_col(on ? (bright(c) ? 0x141414 : 0xFFFFFF) : INK);
+  ) : (
+    ui_col(on ? c : (hov ? 0x5A6168 : 0x3D434A)); RR(x, y, w, h, 5);
+    ui_col(on ? ui_mix(0x23262B, c, 0.12) : (dn ? 0x24272B : 0x2B2F35)); RR(x + 1, y + 1, w - 2, h - 2, 4);
+    gfx_setfont(13); ui_col(on ? c : INK);
+  );
+  TC(x + w*0.5, y + h*0.5, t);
+  hit;
+);
+function lampkey(x, y, w, h, t, on, c) local(hit) (   // a wide toggle with a lamp at its left
+  hit = key(x, y, w, h, "", on, c);
+  ui_col(on ? (hw ? 0xFFFFFF : c) : 0x3A3E43); CI(x + 16, y + h*0.5, 3.5);
+  gfx_setfont(13); ui_col(on ? (hw ? (bright(c) ? 0x141414 : 0xFFFFFF) : c) : INK); TC(x + w*0.5 + 8, y + h*0.5, t);
+  hit;
+);
+
+// vertical fader: idx, x (slot centre), y top, h, lo .. hi (top = hi), log, default, caption, value text, colour, dim
+function fader(idx, x, y, h, lo, hi, lg, def, cap, val, col, dim) local(v, n, cy, did, hov) (
+  did = 1700 + idx;
+  v = slider(idx); n = lg ? log(v/lo)/log(hi/lo) : (v - lo)/(hi - lo); n = min(max(n, 0), 1);
+  cy = y + h*(1 - n);
+  hov = inbox(x - 20, y - 14, 40, h + 28);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - f_lt < 0.35 && f_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; f_lt = 0; ) : (
+      drag_id = did; f_y = mouse_y; f_n = n; f_lt = time_precise(); f_lid = idx;
+      !(inbox(x - 18, cy - 12, 36, 24)) ? ( f_n = min(max(1 - (mouse_y/sc - y)/h, 0), 1); );   // click on the slot: jump there
+    );
+  );
+  drag_id == did ? (
+    f_n = min(max(f_n + (f_y - mouse_y)/(h*sc*((mouse_cap & 8) ? 8 : 1)), 0), 1); f_y = mouse_y;
+    v = lg ? lo*(hi/lo)^f_n : lo + f_n*(hi - lo); v = floor(v*10 + 0.5)/10;
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    n = min(max(n + mouse_wheel/120*((mouse_cap & 8) ? 0.002 : 0.01), 0), 1);
+    v = lg ? lo*(hi/lo)^n : lo + n*(hi - lo); slider(idx) = floor(v*10 + 0.5)/10; ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = lg ? log(v/lo)/log(hi/lo) : (v - lo)/(hi - lo); n = min(max(n, 0), 1); cy = y + h*(1 - n);
+  ui_col(hw ? 0x5A5F66 : 0x5A6168); ux_gk = 0; loop(11, LN(x - 16, y + ux_gk*h/10, x - 10, y + ux_gk*h/10); LN(x + 10, y + ux_gk*h/10, x + 16, y + ux_gk*h/10); ux_gk += 1; );
+  ui_col(0x07080A); RR(x - 3, y, 6, h, 3);
+  ui_col(dim ? 0x3A3E43 : col); R(x - 1, cy, 2, y + h - cy);
+  ui_cola(0x000000, 0.5); RR(x - 15, cy - 9, 32, 22, 3);
+  ui_col(0xB9BBBE); RR(x - 16, cy - 11, 32, 22, 3);
+  ui_col(0xF4F4F2); RR(x - 15, cy - 10, 30, 9, 2);
+  ui_col(0xD8DADC); R(x - 15, cy - 1, 30, 1);
+  ui_col(0x222222); R(x - 12, cy - 1, 24, 1.6);
+  gfx_setfont(6); ui_col(INK); TC(x, y - 22, cap);
+  ui_col(0x07080A); RR(x - 30, y + h + 10, 60, 18, 3);
+  gfx_setfont(14); ui_col(dim ? INK3 : col); TC(x, y + h + 19, val);
+);
+
+// stereo bar meter: 40 segments, 1 dB each, -40 .. 0 dBFS
+function bars(x, y, h, l, r, cap) local(ch, n, i, c, yy, sh) (
+  ch = 0;
+  loop(2,
+    ui_col(0x07080A); RR(x + ch*14, y, 10, h, 2);
+    n = floor(40 + g2db(ch ? r : l) + 0.5); sh = (h - 8)/40;
+    i = 0; loop(40, yy = y + h - 4 - (i + 1)*sh; c = i < 30 ? 0x4FD07A : i < 36 ? 0xFFC23A : 0xFF4A3A;
+      ui_col(i < n ? c : 0x1D2125); R(x + ch*14 + 2, yy + 0.75, 6, sh - 1.5); i += 1; );
+    gfx_setfont(8); ui_col(INK2); TC(x + ch*14 + 5, y + h + 10, ch ? "R" : "L");
+    ch += 1;
+  );
+  gfx_setfont(6); ui_col(INK); TC(x + 12, y - 22, cap);
+);
+function panel(x, y, w, h) (
+  hw ? (
+    ui_cola(0x000000, 0.45); RR(x + 1, y + 3, w, h, 6);
+    ui_col(0x202327); RR(x, y, w, h, 6);
+    ui_col(0x2A2E33); RR(x + 1, y + 1, w - 2, h - 2, 5);
+    ui_col(0x9A9EA3); CI(x + 9, y + 9, 3.2); CI(x + w - 9, y + 9, 3.2); CI(x + 9, y + h - 9, 3.2); CI(x + w - 9, y + h - 9, 3.2);
+    ui_col(0x4A4E53); LN(x + 7, y + 8, x + 11, y + 10); LN(x + w - 11, y + 8, x + w - 7, y + 10); LN(x + 7, y + h - 10, x + 11, y + h - 8); LN(x + w - 11, y + h - 10, x + w - 7, y + h - 8);
+  ) : (
+    ui_col(0x2C3036); RR(x, y, w, h, 8);
+    ui_col(0x1C1F23); RR(x + 1, y + 1, w - 2, h - 2, 7);
+  );
+);
+function fdb(v) ( floor(v*10 + 0.5) == 0 ? strcpy(#vt, "0.0 dB") : sprintf(#vt, "%.1f dB", v); #vt; );
+function readout(x, y, cap, v, c) (
+  ui_col(0x07080A); RR(x, y, 130, 38, 4);
+  gfx_setfont(8); ui_col(0x6F767E); TL(x + 12, y + 11, cap);
+  gfx_setfont(11); ui_col(c); v < -90 ? strcpy(#ro, "-inf") : sprintf(#ro, "%.1f", v); TR(x + 118, y + 26, #ro);
+  hitbox(x, y, 130, 38);
+);
+function go_preset(n) ( slider11 = n; apply_preset(n); lastPreset = n; slider_automate(1023 + 1024); );
+
+// ---- background and header ----
+hw ? rd_brushed(0, 0, 900, 420, 0x34373B) : ( ui_col(0x1B1D21); R(0, 0, 900, 420); );
+ui_col(0x0E0F11); R(0, 0, 900, 56); ui_col(AMB); R(0, 55, 900, 1.5);
+ui_col(0xC8402A); CI(34, 28, 14); gfx_setfont(2); ui_col(0xFFFFFF); ui_text(34*sc, 23*sc, "GFX");
+gfx_setfont(12); ui_col(0xF2F2F2); TL(58, 22, "UMX-2");
+gfx_setfont(8); ui_col(AMB); TL(59, 42, "ULTRA MAXIMISER");
+ui_col(0x07080A); RR(232, 10, 250, 36, 4);
+gfx_setfont(9); ui_col(AMB); TL(246, 28, pname(slider11));
+hitbox(232, 10, 250, 36) ? (
+  strcpy(#pm, ""); k = 0; loop(10, k == slider11 ? strcat(#pm, "!"); strcat(#pm, pname(k)); k < 9 ? strcat(#pm, "|"); k += 1; );
+  gfx_x = mouse_x; gfx_y = mouse_y; ps_ = gfx_showmenu(#pm); ps_ > 0 ? go_preset(ps_ - 1);
+);
+key(492, 13, 28, 30, "<", 0, AMB) ? go_preset((slider11 + 9) % 10);
+key(526, 13, 28, 30, ">", 0, AMB) ? go_preset((slider11 + 1) % 10);
+key(712, 16, 30, 24, "S", ui_sz == 1, AMB) ? ui_sz = 1;
+key(748, 16, 30, 24, "M", ui_sz == 0, AMB) ? ui_sz = 0;
+key(784, 16, 30, 24, "L", ui_sz == 2, AMB) ? ui_sz = 2;
+key(820, 16, 30, 24, "?", ui_help_open, AMB) ? ( ui_help_open = 1; ui_help_new = 1; );
+key(856, 16, 30, 24, "HW", hw, AMB) ? ( ui_hw = 1 - ui_hw; ui_bgok = 0; );
+
+// ---- the limiter panel ----
+panel(16, 72, 868, 234);
+bars(40, 106, 166, mInL, mInR, "IN");
+fader(1, 150, 106, 166, -30, 0, 0, 0, "THRESHOLD", fdb(slider1), AMB, 0);
+fader(2, 250, 106, 166, -20, 0, 0, -0.3, "OUT CEILING", fdb(slider2), AMB, 0);
+slider4 > 0.5 ? strcpy(#rl, "ARC") : ( slider3 >= 1000 ? strcpy(#rl, "1.00 s") : sprintf(#rl, "%d ms", floor(slider3 + 0.5)); );
+fader(3, 350, 106, 166, 1, 1000, 1, 100, "RELEASE", #rl, 0x7FC8FF, slider4 > 0.5);
+// attenuation
+gfx_setfont(6); ui_col(INK); TC(443, 84, "ATTEN");
+ui_col(0x07080A); RR(430, 106, 26, 166, 2);
+gr_ = -g2db(mAtt);
+k = 0; loop(30, ui_col(gr_ >= k + 0.5 ? AMB : 0x2A2116); R(434, 110 + k*158/30, 18, 158/30 - 1.5); k += 1; );
+gfx_setfont(8); ui_col(INK2);
+k = 0; loop(11, sprintf(#av, "%d", -k*3); TL(462, 110 + k*3*158/30, #av); k += 1; );
+bars(520, 106, 166, mOutL, mOutR, "OUT");
+// read-outs (click to reset)
+readout(600, 96, "PEAK OUT", g2db(hPk), 0xFF7A4A) ? ( hPk = 0; hTp = 0; hAtt = 0; );
+readout(600, 142, "ATTEN MAX", -hAtt, AMB) ? ( hPk = 0; hTp = 0; hAtt = 0; );
+readout(600, 188, "LUFS S", lufs, 0x4FD07A);
+readout(600, 234, "TRUE PEAK", g2db(hTp), 0xFF7A4A) ? ( hPk = 0; hTp = 0; hAtt = 0; );
+lampkey(748, 100, 124, 30, "ARC", slider4 > 0.5, AMB) ? tog(4);
+lampkey(748, 146, 124, 30, "LINK", slider5 > 0.5, AMB) ? tog(5);
+lampkey(748, 192, 124, 30, "TRUE PEAK", slider6 > 0.5, AMB) ? tog(6);
+gfx_setfont(8); ui_col(INK2); TC(810, 246, "LOOKAHEAD 1.5 ms"); sprintf(#lat, "LATENCY %d SAMPLES", D); TC(810, 262, #lat);
+
+// ---- IDR ----
+panel(16, 316, 868, 92);
+gfx_setfont(8); ui_col(INK2); TL(32, 332, "IDR  -  BIT DEPTH, DITHER AND NOISE SHAPING");
+gfx_setfont(6); ui_col(INK); TL(32, 350, "QUANTISE");
+k = 0; loop(6, sprintf(#qv, "%d", k == 0 ? 24 : k == 1 ? 22 : k == 2 ? 20 : k == 3 ? 16 : k == 4 ? 12 : 8);
+  key(32 + k*44, 360, 40, 26, #qv, floor(slider7 + 0.5) == k, K_Q) ? setv(7, k); k += 1; );
+gfx_setfont(6); ui_col(INK); TL(316, 350, "DITHER");
+key(316, 360, 52, 26, "OFF", floor(slider8 + 0.5) == 0, K_D) ? setv(8, 0);
+key(372, 360, 52, 26, "TYPE 1", floor(slider8 + 0.5) == 1, K_D) ? setv(8, 1);
+key(428, 360, 52, 26, "TYPE 2", floor(slider8 + 0.5) == 2, K_D) ? setv(8, 2);
+gfx_setfont(6); ui_col(INK); TL(504, 350, "SHAPING");
+key(504, 360, 52, 26, "NONE", floor(slider9 + 0.5) == 0, K_S) ? setv(9, 0);
+key(560, 360, 52, 26, "MOD", floor(slider9 + 0.5) == 1, K_S) ? setv(9, 1);
+key(616, 360, 52, 26, "NORM", floor(slider9 + 0.5) == 2, K_S) ? setv(9, 2);
+key(672, 360, 52, 26, "ULTRA", floor(slider9 + 0.5) == 3, K_S) ? setv(9, 3);
+lampkey(748, 358, 124, 30, "IDR", slider10 > 0.5, AMB) ? tog(10);
+slider10 < 0.5 ? ( ui_cola(0x1C1F23, 0.6); R(30, 356, 700, 34); );   // IDR off: the keys sit back
+
+pk_end();
+ui_end();
