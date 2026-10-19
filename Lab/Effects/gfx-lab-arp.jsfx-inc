@@ -1,0 +1,255 @@
+desc:GFX arpeggiator engine (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// Shared arpeggiator engine for the GFX Arpeggiator and instruments with a built-in arp (Leads).
+// Tempo-locked to the project when playing, free-running from the first key when stopped.
+// Requires gfx-drift.jsfx-inc to be imported first.
+//
+// Usage:
+//   @init    arp_init(mem);                       // needs 4096 free memory slots from mem
+//            arp_pattern(lev_ptr, acc_ptr, tie_ptr);   // 16-step arrays: level 0..1 (0 = rest), accent 0/1, tie 0/1
+//   @block   arp_params(mode, step_beats, octaves, gate, swing, steps, latch, chance,
+//                       hum_ms, hum_vel, vel_src, vel_fixed, accent);
+//            for each incoming note:  arp_key(note, vel, ch, on);
+//            arp_block(playing, beat_position, tempo, samplesblock);
+//            then read the output: i = 0; loop(arp_outn, arp_out_ofs[i], arp_out_on[i], arp_out_note[i],
+//                                               arp_out_vel[i], arp_out_ch[i]; i += 1;);
+//   arp_flush() sends note-offs for everything sounding (call when bypassing).
+//
+// mode: 0 Up, 1 Down, 2 Up-Down, 3 Down-Up, 4 As played, 5 Random, 6 Chord
+// gate: 0.1..2 of a step (above 1 = legato overlap)   swing: 0..0.75   chance: 0..1
+// vel_src: 0 as played, 1 fixed, 2 from the step level
+// Read-outs: arp_step (current pattern step, -1 when idle), arp_count (notes in the arp).
+//
+// SCALES & MODES (optional): arp_scale(mask, phrase) after arp_params. mask = 0 plays the held notes (as above);
+// otherwise a 12-bit scale (bit 0 = the root, bit n = n semitones up) and the lowest held key is the root: the arp
+// plays the scale from it over OCTAVES octaves (plus the top root). phrase: 0 Run, 1 Thirds, 2 Triads, 3 Pedal,
+// 4 Fourths, 5 Fifths, 6 Threes. MODE still sets the direction (Up, Down, Up-Down, Down-Up, Random; As played =
+// Up); Chord plays the scale's own triads, one per step, the chord root walking the scale.
+// Read-outs: arp_root (the root, -1 before the first key), arp_m (notes per octave).
+
+@init
+
+function arp_init(mem) (
+  arp_P  = mem;          // physically held notes
+  arp_S  = mem + 128;    // arp note set
+  arp_SV = mem + 256;    // its velocities
+  arp_T  = mem + 384;    // sorted temp
+  arp_TV = mem + 512;
+  arp_Q  = mem + 640;    // event queue: time (beats), on, note, vel   (256 each)
+  arp_QO = mem + 896; arp_QN = mem + 1152; arp_QV = mem + 1408;
+  arp_out_ofs = mem + 1664; arp_out_on = mem + 1920; arp_out_note = mem + 2176;
+  arp_out_vel = mem + 2432; arp_out_ch  = mem + 2688;
+  memset(mem, 0, 4096);
+  arp_pn = 0; arp_sn = 0; arp_qc = 0; arp_outn = 0; arp_cnt = 0; arp_ch = 0;
+  arp_fb = 0; arp_was = 0; arp_expect = -1; arp_step = -1; arp_count = 0;
+  arp_flushreq = 0; arp_lastk = -1000000;
+  arp_X = mem + 2944;    // scale mode: the scale from the root, 6 octaves
+  arp_scl = 0; arp_phr = 0; arp_root = -1; arp_m = 0; arp_R = 1; arp_rv = 100;
+  arp_dr.drift_init(0.8 + rand(0.5));
+  arp_dv.drift_init(0.8 + rand(0.5));
+);
+
+function arp_pattern(lv, ac, ti) ( arp_lev = lv; arp_acc = ac; arp_tie = ti; );
+function arp_scale(mask, phr) ( arp_scl = mask; arp_phr = phr; );
+
+function arp_params(mode, sb, oct, gate, swing, steps, latch, chance, hms, hv, vs, vf, acc) (
+  arp_mode = mode; arp_sb = sb; arp_oct = oct; arp_gate = gate; arp_swing = swing;
+  arp_steps = steps; arp_chance = chance; arp_hms = hms; arp_hv = hv;
+  arp_vs = vs; arp_vf = vf; arp_accamt = acc;
+  // latch switched off: drop notes that are no longer held
+  arp_latch && !latch ? ( arp_relatch = 1; );
+  arp_latch = latch;
+);
+
+// ---------- note input ----------
+function arp_key(n, v, ch, on) local(i, f) (
+  arp_ch = ch;
+  on ? (
+    arp_latch && arp_pn == 0 ? arp_sn = 0;          // first key of a new latched chord replaces the old one
+    arp_sn == 0 ? ( arp_cnt = 0; arp_fb = 0; );      // fresh start (free-running clock restarts too)
+    f = 0; i = 0; loop(arp_pn, arp_P[i] == n ? f = 1; i += 1; );
+    !f && arp_pn < 127 ? ( arp_P[arp_pn] = n; arp_pn += 1; );
+    f = 0; i = 0; loop(arp_sn, arp_S[i] == n ? ( f = 1; arp_SV[i] = v; ); i += 1; );
+    !f && arp_sn < 127 ? ( arp_S[arp_sn] = n; arp_SV[arp_sn] = v; arp_sn += 1; );
+  ) : (
+    i = 0; f = -1; loop(arp_pn, arp_P[i] == n ? f = i; i += 1; );
+    f >= 0 ? ( i = f; loop(arp_pn - f - 1, arp_P[i] = arp_P[i + 1]; i += 1; ); arp_pn -= 1; );
+    !arp_latch ? (
+      i = 0; f = -1; loop(arp_sn, arp_S[i] == n ? f = i; i += 1; );
+      f >= 0 ? ( i = f; loop(arp_sn - f - 1, arp_S[i] = arp_S[i + 1]; arp_SV[i] = arp_SV[i + 1]; i += 1; ); arp_sn -= 1; );
+    );
+  );
+);
+
+// ---------- event queue ----------
+function arp_qpush(t, on, n, v) local(i) (
+  // a new note-on cuts a still-pending note-off of the same pitch so they never overlap
+  on ? ( i = 0; loop(arp_qc, !arp_QO[i] && arp_QN[i] == n && arp_Q[i] > t ? arp_Q[i] = t - 0.000001; i += 1; ); );
+  arp_qc < 255 ? ( arp_Q[arp_qc] = t; arp_QO[arp_qc] = on; arp_QN[arp_qc] = n; arp_QV[arp_qc] = v; arp_qc += 1; );
+);
+function arp_out(ofs, on, n, v) (
+  arp_outn < 255 ? (
+    arp_out_ofs[arp_outn] = ofs; arp_out_on[arp_outn] = on; arp_out_note[arp_outn] = n;
+    arp_out_vel[arp_outn] = v; arp_out_ch[arp_outn] = arp_ch; arp_outn += 1;
+  );
+);
+// emit every queued event due before beat t1 (block starts at t0, bps beats per sample), in time order
+function arp_qemit(t0, t1, bps, ns) local(i, b, bt, ofs) (
+  loop(arp_qc,
+    b = -1; bt = 0; i = 0;
+    loop(arp_qc,
+      arp_Q[i] < t1 && (b < 0 || arp_Q[i] < bt || (arp_Q[i] == bt && !arp_QO[i])) ? ( b = i; bt = arp_Q[i]; );
+      i += 1;
+    );
+    b >= 0 ? (
+      ofs = min(max(floor((bt - t0) / bps), 0), ns - 1);
+      arp_out(ofs, arp_QO[b], arp_QN[b], arp_QV[b]);
+      arp_qc -= 1;
+      arp_Q[b] = arp_Q[arp_qc]; arp_QO[b] = arp_QO[arp_qc]; arp_QN[b] = arp_QN[arp_qc]; arp_QV[b] = arp_QV[arp_qc];
+    );
+  );
+);
+// everything sounding stops now: pending note-offs go out at offset 0, pending note-ons are dropped
+function arp_flush() local(i) (
+  i = 0; loop(arp_qc, !arp_QO[i] ? arp_out(0, 0, arp_QN[i], 0); i += 1; );
+  arp_qc = 0;
+);
+
+// ---------- note selection ----------
+function arp_build() local(i, j, n, v, k, o) (
+  // copy the set, sorted by pitch unless "as played"
+  i = 0; loop(arp_sn, arp_T[i] = arp_S[i]; arp_TV[i] = arp_SV[i]; i += 1; );
+  arp_mode != 4 ? (
+    i = 1;
+    loop(max(arp_sn - 1, 0),
+      n = arp_T[i]; v = arp_TV[i]; j = i - 1;
+      while (j >= 0 && arp_T[j] > n) ( arp_T[j + 1] = arp_T[j]; arp_TV[j + 1] = arp_TV[j]; j -= 1; );
+      arp_T[j + 1] = n; arp_TV[j + 1] = v;
+      i += 1;
+    );
+  );
+  arp_N = arp_sn * arp_oct;
+  // scale mode: the lowest held key is the root
+  arp_scl && arp_sn > 0 ? (
+    arp_root = arp_T[0]; arp_rv = arp_TV[0];
+    arp_mode == 4 ? ( i = 1; loop(arp_sn - 1, arp_T[i] < arp_root ? ( arp_root = arp_T[i]; arp_rv = arp_TV[i]; ); i += 1; ); );
+    k = 0; o = 0; loop(72, (arp_scl >> (o % 12)) & 1 ? ( arp_X[k] = arp_root + o; k += 1; ); o += 1; );
+    arp_m = 0; o = 0; loop(12, (arp_scl >> o) & 1 ? arp_m += 1; o += 1; );
+    arp_R = arp_m * arp_oct + 1;                      // degrees in range: the octaves and the top root
+  );
+);
+// direction: position c of a run D long (Up / As played, Down, Up-Down, Down-Up, Random)
+function arp_pos(c, D) local(p) (
+  D < 2 ? 0 :
+  arp_mode == 1 ? D - 1 - c % D :
+  arp_mode == 2 || arp_mode == 3 ? ( p = c % (2 * D - 2); p = p < D ? p : 2 * D - 2 - p; arp_mode == 3 ? D - 1 - p : p; ) :
+  arp_mode == 5 ? floor(rand(D)) :
+  c % D;
+);
+// scale mode: the scale degree of note c of the phrase (u notes per group, the group's top reach mo degrees)
+function arp_phdeg(c) local(u, mo, bn, q, b, e) (
+  u = arp_phr == 0 ? 1 : arp_phr == 2 || arp_phr == 6 ? 3 : 2;
+  mo = arp_phr == 1 ? 2 : arp_phr == 2 ? 4 : arp_phr == 3 ? 1 : arp_phr == 4 ? 3 : arp_phr == 5 ? 4 : arp_phr == 6 ? 2 : 0;
+  bn = max(arp_R - mo, 1);
+  q = arp_pos(c, bn * u); b = floor(q / u); e = q % u;
+  arp_phr == 3 ? ( e == 0 ? 0 : b + 1 ) :            // pedal: the root between every step of the climb
+  b + (e == 0 ? 0 : arp_phr == 1 ? 2 : arp_phr == 2 ? 2 * e : arp_phr == 4 ? 3 : arp_phr == 5 ? 4 : e);
+);
+// note of sequence index k (0 .. arp_N-1), octaves stacked upwards
+function arp_seqnote(k) ( arp_T[k % arp_sn] + 12 * floor(k / arp_sn); );
+function arp_seqvel(k)  ( arp_TV[k % arp_sn]; );
+
+function arp_vel(base, lev, acc) local(v) (
+  v = arp_vs == 0 ? base : arp_vs == 1 ? arp_vf : 20 + 107 * lev;
+  acc ? v += arp_accamt;
+  v += arp_hv * (0.6 * arp_dv.drift_tick(0.15) + 0.4 * (rand(2) - 1));
+  min(max(floor(v + 0.5), 1), 127);
+);
+
+// one pattern step starting at beat tb, lasting len beats
+function arp_trig(k, tb, len) local(idx, lev, tie, acc, p, d, n, v, i, oct, dl) (
+  idx = k % arp_steps; arp_step = idx;
+  lev = arp_lev[idx]; tie = arp_tie[idx]; acc = arp_acc[idx];
+  tie ? (
+    // hold whatever is sounding to the end of this step
+    i = 0; loop(arp_qc, !arp_QO[i] && arp_Q[i] < tb + len * arp_gate ? arp_Q[i] = tb + len * arp_gate; i += 1; );
+  ) : lev > 0 && arp_sn > 0 && rand(1) <= arp_chance ? (
+    arp_build();
+    dl = arp_hms > 0 ? arp_hms * 0.001 * arp_tempo / 60 * (0.5 + 0.35 * arp_dr.drift_tick(0.15) + 0.15 * rand(1)) : 0;
+    arp_scl ? (
+      arp_mode == 6 ? (
+        p = arp_pos(arp_cnt, arp_m * arp_oct);        // the scale's own triad on each degree
+        i = 0;
+        loop(3,
+          n = arp_X[p + 2 * i];
+          n <= 127 ? ( v = arp_vel(arp_rv, lev, acc); arp_qpush(tb + dl, 1, n, v); arp_qpush(tb + dl + len * arp_gate, 0, n, 0); );
+          i += 1;
+        );
+      ) : (
+        n = arp_X[arp_phdeg(arp_cnt)];
+        n <= 127 ? ( v = arp_vel(arp_rv, lev, acc); arp_qpush(tb + dl, 1, n, v); arp_qpush(tb + dl + len * arp_gate, 0, n, 0); );
+      );
+    ) : arp_mode == 6 ? (
+      oct = arp_cnt % arp_oct;
+      i = 0;
+      loop(arp_sn,
+        n = arp_T[i] + 12 * oct;
+        n <= 127 ? ( v = arp_vel(arp_TV[i], lev, acc); arp_qpush(tb + dl, 1, n, v); arp_qpush(tb + dl + len * arp_gate, 0, n, 0); );
+        i += 1;
+      );
+    ) : (
+      d = arp_N;
+      p = arp_mode == 0 || arp_mode == 4 ? arp_cnt % d :
+          arp_mode == 1 ? d - 1 - arp_cnt % d :
+          arp_mode == 5 ? floor(rand(d)) :
+          d < 2 ? 0 : (
+            p = arp_cnt % (2 * d - 2); p = p < d ? p : 2 * d - 2 - p;
+            arp_mode == 3 ? d - 1 - p : p;
+          );
+      n = arp_seqnote(p);
+      n <= 127 ? ( v = arp_vel(arp_seqvel(p), lev, acc); arp_qpush(tb + dl, 1, n, v); arp_qpush(tb + dl + len * arp_gate, 0, n, 0); );
+    );
+    arp_cnt += 1;
+  );
+);
+
+// ---------- per block ----------
+function arp_block(playing, bpos, tempo, ns) local(bps, t0, t1, L, P, k, st, sw, ln) (
+  arp_outn = 0; arp_tempo = tempo;
+  bps = tempo / 60 / srate;
+  arp_relatch ? (                 // latch just turned off: keep only keys still held
+    arp_relatch = 0;
+    arp_sn = 0; k = 0; loop(arp_pn, arp_S[arp_sn] = arp_P[k]; arp_SV[arp_sn] = 100; arp_sn += 1; k += 1; );
+  );
+  playing ? (
+    t0 = bpos;
+    // transport started or jumped: stop what is sounding, restart the sequence
+    (!arp_was || abs(t0 - arp_expect) > 0.05) ? ( arp_flush(); arp_cnt = 0; );
+  ) : (
+    arp_was ? arp_flush();
+    t0 = arp_fb;
+  );
+  t1 = t0 + bps * ns;
+  arp_was = playing; arp_expect = t1;
+  arp_sn == 0 ? (
+    // nothing to play: when the project plays, notes finish their gate; when stopped, release now
+    playing ? arp_qemit(t0, t1, bps, ns) : arp_flush();
+    arp_step = -1; arp_fb = 0;
+  ) : (
+    L = arp_sb; P = 2 * L; sw = arp_swing;
+    k = 2 * floor(t0 / P);
+    st = floor(k / 2) * P;
+    while (st < t1) (
+      st >= t0 ? (
+        ln = k % 2 ? L * (1 - sw) : L * (1 + sw);
+        arp_trig(k, st, ln);
+      );
+      k += 1;
+      st = floor(k / 2) * P + (k % 2 ? L * (1 + sw) : 0);
+    );
+    arp_qemit(t0, t1, bps, ns);
+    !playing ? arp_fb = t1;
+  );
+  arp_count = arp_sn;
+);

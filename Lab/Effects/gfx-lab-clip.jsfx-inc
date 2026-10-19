@@ -1,0 +1,131 @@
+desc:GFX Clip kit (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// gfx-clip - the house clipper kit: every drive unit adopts it (Fuzz4 onwards). Three parts, each on its own switch.
+//
+// 1. ADAA CLIPPERS (clp_aa = 1, ON by default everywhere)
+//    First-order antiderivative anti-aliasing: y = (F(x) - F(x1)) / (x - x1), where F is the curve's antiderivative and
+//    x1 the previous input (when the two are closer than 1e-5 the curve is read at their midpoint). Costs half a sample
+//    of delay and a gentle top droop (-0.9 dB at a quarter of the running rate); folds back far less than a plain curve.
+//    Every clipper is an instance (several per unit), with a positive limit p, a negative limit n (p = n: symmetric)
+//    and a dead zone d (0 = none) round zero: nothing passes until the input is d away from zero, then the curve starts
+//    from there (the starved-bias "gate" of a fuzz).
+//    Types:  0 HARD   - clamp at +p / -n
+//            1 SOFT   - tanh-like cubic: unity slope at zero, reaches the limit with a zero slope at 1.5 x the limit
+//                       (t - 4/27 t^3), flat beyond. No transcendental functions.
+//            2 KNEE   - hard clip with a quadratic knee of half-width w (clp_knee): w = 0 is HARD
+//            3 RECT   - full-wave rectifier |x| (dead zone d, clamped at p): the octave-up of an octave fuzz
+//    Bias / asymmetry: unequal p and n make the curve asymmetric; for a biased stage run x + b through the clipper and
+//    subtract clp_crv(b) (the stage's rest value), so no DC step is added.
+// 2. DRIVE-TRACKING PRE-FILTER (clp_pf_on = 1, ON for most units)
+//    Into the clipper: a gentle 2-pole low-pass (state-variable, Q 0.6) that slides exponentially from f0 (DRIVE 0)
+//    to f1 (full DRIVE), and a first-order low shelf at fs Hz that pulls the lows down from 0 dB to sdb dB (negative)
+//    as DRIVE rises. Neither is made up afterwards: less top into the clipper (less to fold back) and less low-end
+//    flub. Glided (30 ms), coefficients updated per block. Drive81's values: f0 = 0.45 x the running rate, f1 =
+//    10 kHz, sdb = -1.5 dB. Per-unit parameters (clp_pf_cfg).
+// 3. DRIVE-TRACKING KNEE (clp_kt_on = 0: OFF for fuzz and hard distortion, ON for character units)
+//    The knee of a KNEE clipper widens from w0 (DRIVE 0) to w1 (full DRIVE): the clipper softens as it is pushed.
+//    When off the knee stays at w0. Glided (30 ms), per block.
+//
+// API (instance functions: name.clp_xxx(...); each instance keeps its own state)
+//   clp_set(type, p, n, d)        set a clipper's curve (call per block or when anything changes; cheap when nothing
+//                                 changed). The previous point is re-read under the new curve, so nothing clicks.
+//   clp_knee(w)                   the knee half-width of a KNEE clipper (0 .. the smaller limit)
+//   clp_run(x)                    one sample through the clipper (anti-aliased while clp_aa is on)
+//   clp_crv(x) / clp_ad(x)         the plain curve and its antiderivative (e.g. clp_crv(b) = a biased stage's rest value)
+//   clp_reset()                   clear the state (e.g. when a circuit is switched in)
+//   clp_tidy()                    denormal housekeeping (once per block)
+//   clp_pf_cfg(f0, f1, sdb, fs)   pre-filter: low-pass corner at DRIVE 0 / full DRIVE (Hz), shelf depth (dB) and corner
+//   clp_pf_block(drv, rate, n)    per block: DRIVE 0..1, the rate the filter runs at, the block length (samples)
+//   clp_pf_run(x)                 per sample (passes x straight through while clp_pf_on is 0)
+//   clp_pf_reset()                clear the state; the next clp_pf_block snaps to its targets
+//   clp_kt_cfg(w0, w1)            knee tracking: half-width at DRIVE 0 and at full DRIVE
+//   clp_kt_block(drv, rate, n)    per block: returns the glided knee (w0 while clp_kt_on is 0) - pass it to clp_knee
+// Globals: clp_aa (1), clp_pf_on (1), clp_kt_on (0). A unit sets them in @init after the import.
+// Changing clp_aa while running: call clp_set (or clp_reset) afterwards so the stored antiderivative is fresh.
+
+@init
+clp_aa = 1; clp_pf_on = 1; clp_kt_on = 0;
+clp_c4 = 4 / 27; clp_c1 = 1 / 27; clp_c2 = 2 / 3;                   // exact, so the pieces of each antiderivative meet
+
+// ---------- one side of each curve: v >= 0 (already past the dead zone), limit L ----------
+function clp_hc(v, L) ( min(v, L); );
+function clp_ha(v, L) ( v <= L ? 0.5 * v * v : L * v - 0.5 * L * L; );
+function clp_sc(v, L) local(t) ( t = v / L; t >= 1.5 ? L : L * t * (1 - clp_c4 * t * t); );
+function clp_sa(v, L) local(t) ( t = v / L; L * L * (t >= 1.5 ? t - 0.5625 : t * t * (0.5 - t * t * clp_c1)); );
+function clp_kc(v, L, w) (
+  w = min(w, L);
+  w < 0.000001 ? min(v, L) : v <= L - w ? v : v >= L + w ? L : v - sqr(v - L + w) / (4 * w);
+);
+function clp_ka(v, L, w) (
+  w = min(w, L);
+  w < 0.000001 ? clp_ha(v, L) : v <= L - w ? 0.5 * v * v :
+    v >= L + w ? 0.5 * sqr(L + w) - clp_c2 * w * w + L * (v - L - w) : 0.5 * v * v - (v - L + w) ^ 3 / (12 * w);
+);
+
+// ---------- the curve and its antiderivative (F(0) = 0 for every type) ----------
+function clp_crv(u) instance(ty, cp, cn, cd, cw) local(v) (
+  v = max(abs(u) - cd, 0);
+  ty == 3 ? clp_hc(v, cp) :
+  ty == 0 ? ( u >= 0 ? clp_hc(v, cp) : -clp_hc(v, cn) ) :
+  ty == 1 ? ( u >= 0 ? clp_sc(v, cp) : -clp_sc(v, cn) ) :
+            ( u >= 0 ? clp_kc(v, cp, cw) : -clp_kc(v, cn, cw) );
+);
+function clp_ad(u) instance(ty, cp, cn, cd, cw) local(v) (
+  v = max(abs(u) - cd, 0);
+  ty == 3 ? ( u >= 0 ? clp_ha(v, cp) : -clp_ha(v, cp) ) :
+  ty == 0 ? clp_ha(v, u >= 0 ? cp : cn) :
+  ty == 1 ? clp_sa(v, u >= 0 ? cp : cn) :
+            clp_ka(v, u >= 0 ? cp : cn, cw);
+);
+
+function clp_set(t, p, n, d) instance(ty, cp, cn, cd, x1, ad1) (
+  p = max(p, 0.000001); n = max(n, 0.000001); d = max(d, 0);
+  t != ty || p != cp || n != cn || d != cd ? ( ty = t; cp = p; cn = n; cd = d; ad1 = this.clp_ad(x1); );
+);
+function clp_knee(w) instance(cw, x1, ad1) (
+  w = max(w, 0);
+  w != cw ? ( cw = w; ad1 = this.clp_ad(x1); );
+);
+function clp_run(x) instance(x1, ad1) local(adx, dx, y) (
+  clp_aa ? (
+    adx = this.clp_ad(x); dx = x - x1;
+    y = abs(dx) > 0.00001 ? (adx - ad1) / dx : this.clp_crv(0.5 * (x + x1));
+    ad1 = adx;
+  ) : y = this.clp_crv(x);
+  x1 = x;
+  y;
+);
+function clp_reset() instance(x1, ad1) ( x1 = 0; ad1 = 0; );
+function clp_tidy() instance(x1, ad1) ( abs(x1) < 0.000000000001 ? ( x1 = 0; ad1 = 0; ); );
+
+// ---------- 2. the drive-tracking pre-filter ----------
+function clp_pf_cfg(f0, f1, sdb, sf) instance(pff0, pff1, pfsd, pfsf) ( pff0 = f0; pff1 = f1; pfsd = sdb; pfsf = sf; );
+function clp_pf_reset() instance(ic1, ic2, sx1, sy1, pfi) ( ic1 = ic2 = sx1 = sy1 = 0; pfi = 0; );
+function clp_pf_block(drv, fs, n) instance(pff0, pff1, pfsd, pfsf, fc, gd, a1, a2, a3, sb0, sb1, sa1, pfi, ic1, ic2, sx1, sy1)
+  local(tf, tg, gl, t, lg, kbl, a, d) (
+  drv = min(max(drv, 0), 1);
+  tf = min(pff0, 0.45 * fs); tf = tf * (min(pff1, 0.45 * fs) / tf) ^ drv; tg = pfsd * drv;
+  pfi ? ( gl = 1 - exp(-n / (0.03 * fs)); fc += (tf - fc) * gl; gd += (tg - gd) * gl; ) : ( fc = tf; gd = tg; pfi = 1; );
+  t = tan($pi * min(fc, 0.45 * fs) / fs); a1 = 1 / (1 + t * (t + 1.6666667)); a2 = t * a1; a3 = t * a2;
+  lg = 10 ^ (gd / 20); kbl = 2 * fs; a = kbl * tan($pi * min(pfsf / sqrt(lg), 0.45 * fs) / fs); d = kbl + a;
+  sb0 = (kbl + lg * a) / d; sb1 = (lg * a - kbl) / d; sa1 = (a - kbl) / d;
+  abs(ic1) < 0.000000000001 ? ic1 = 0; abs(ic2) < 0.000000000001 ? ic2 = 0;
+  abs(sx1) < 0.000000000001 ? sx1 = 0; abs(sy1) < 0.000000000001 ? sy1 = 0;
+);
+function clp_pf_run(x) instance(a1, a2, a3, sb0, sb1, sa1, ic1, ic2, sx1, sy1) local(v1, v2, v3, y) (
+  clp_pf_on ? (
+    v3 = x - ic2; v1 = a1 * ic1 + a2 * v3; v2 = ic2 + a2 * ic1 + a3 * v3;
+    ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2;
+    y = sb0 * v2 + sb1 * sx1 - sa1 * sy1; sx1 = v2; sy1 = y;
+    y;
+  ) : x;
+);
+
+// ---------- 3. the drive-tracking knee ----------
+function clp_kt_cfg(w0, w1) instance(kw0, kw1) ( kw0 = w0; kw1 = w1; );
+function clp_kt_block(drv, fs, n) instance(kw0, kw1, kw, kti) local(t) (
+  t = clp_kt_on ? kw0 + (kw1 - kw0) * min(max(drv, 0), 1) : kw0;
+  kti ? kw += (t - kw) * (1 - exp(-n / (0.03 * fs))) : ( kw = t; kti = 1; );
+  kw;
+);

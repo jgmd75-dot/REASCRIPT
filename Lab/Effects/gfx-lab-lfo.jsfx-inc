@@ -1,0 +1,100 @@
+desc:GFX LFO (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// Universal LFO object: Sine / Triangle / Square (smoothable) / Random (smooth or stepped),
+// Free, tempo Sync or tempo Flow.
+//   Sync (1): phase locks to the project timeline (repeatable; follows loop jumps).
+//   Flow (2): tempo-synced rate, but the phase runs continuously through loops and restarts.
+// Rate drift: Free mode drifts the rate; Sync mode wobbles the phase (stays locked on average).
+//
+// Usage in a plugin:
+//   import gfx-lfo.jsfx-inc
+//   @init    myLfo.lfo_init();
+//            myLfo.lfo_setup(shape, smooth);          // shape 0-3, smooth 0..1 (call on change)
+//   @block   myLfo.lfo_block(mode 0 free / 1 sync / 2 flow, div_index, free_hz);
+//   @sample  v = myLfo.lfo_tick(phase_offset, rate_drift, drift_value);   // -1..1
+//            myLfo.p = current phase 0..1, myLfo.k / myLfo.tk = square shaping (for scopes)
+//
+// Two instances with the same settings stay phase-locked; use phase_offset for stereo spread.
+// Helpers: lfo_div_q(i), lfo_div_name(i) for the 16 sync divisions (4 bars .. 1/32, D, T),
+//          lfo_shape_k(p, shape, k, tk) to draw shapes 0-2.
+
+@init
+
+function lfo_tanh(x) local(e) (
+  x = min(max(x, -20), 20); e = exp(2 * x); (e - 1) / (e + 1);
+);
+
+function lfo_shape_k(p, shp, k, tk) (
+  shp == 0 ? sin(2 * $pi * p) : (
+    shp == 1 ? ( p < 0.25 ? 4 * p : ( p < 0.75 ? 2 - 4 * p : 4 * p - 4 ) )
+             : lfo_tanh(k * sin(2 * $pi * p)) / tk;
+  );
+);
+
+// sync division length in quarter notes
+function lfo_div_q(i) local(barq) (
+  barq = ts_denom > 0 ? ts_num * 4 / ts_denom : 4;
+  i == 0 ? 4 * barq : i == 1 ? 2 * barq : i == 2 ? barq :
+  i == 3 ? 2 : i == 4 ? 3 : i == 5 ? 4 / 3 :
+  i == 6 ? 1 : i == 7 ? 1.5 : i == 8 ? 2 / 3 :
+  i == 9 ? 0.5 : i == 10 ? 0.75 : i == 11 ? 1 / 3 :
+  i == 12 ? 0.25 : i == 13 ? 0.375 : i == 14 ? 1 / 6 : 0.125;
+);
+
+// drawing-only copy (the screen runs alongside the audio, so it must not share the audio's function)
+function lfo_shape_d(p, shp, k, tk) local(x, e) (
+  shp == 0 ? sin(2 * $pi * p) : (
+    shp == 1 ? ( p < 0.25 ? 4 * p : ( p < 0.75 ? 2 - 4 * p : 4 * p - 4 ) )
+             : ( x = min(max(k * sin(2 * $pi * p), -20), 20); e = exp(2 * x); (e - 1) / (e + 1) / tk; );
+  );
+);
+
+function lfo_div_name(i) (
+  i == 0 ? "4 BARS" : i == 1 ? "2 BARS" : i == 2 ? "1 BAR" :
+  i == 3 ? "1/2" : i == 4 ? "1/2 D" : i == 5 ? "1/2 T" :
+  i == 6 ? "1/4" : i == 7 ? "1/4 D" : i == 8 ? "1/4 T" :
+  i == 9 ? "1/8" : i == 10 ? "1/8 D" : i == 11 ? "1/8 T" :
+  i == 12 ? "1/16" : i == 13 ? "1/16 D" : i == 14 ? "1/16 T" : "1/32";
+);
+
+function lfo_init() instance(ph, p, lastp, ra, rb, v) (
+  ph = 0; p = 0; lastp = 0; ra = rand(2) - 1; rb = rand(2) - 1; v = 0;
+);
+
+function lfo_setup(shp, smooth) instance(shape, sm, k, tk) (
+  shape = shp; sm = smooth;
+  k = 1 + 49 * (1 - smooth) ^ 2;
+  tk = lfo_tanh(k);
+);
+
+function lfo_block(sync, div, frate) instance(syncm, rate, inc, ph) local(lenq) (
+  syncm = sync; rate = frate;
+  sync ? (
+    lenq = lfo_div_q(div);
+    sync == 1 && (play_state & 1) ? ( ph = beat_position / lenq; ph -= floor(ph); );
+    inc = tempo / 60 / lenq / srate;
+  );
+);
+
+function lfo_tick(phoff, rd, dv)
+  instance(syncm, rate, inc, ph, p, lastp, ra, rb, shape, sm, k, tk, v) local(f) (
+  syncm ? (
+    ph += inc;
+    p = ph + phoff + rd * 0.5 * dv;
+  ) : (
+    ph += rate * (1 + rd * dv) / srate;
+    p = ph + phoff;
+  );
+  ph -= floor(ph);
+  p -= floor(p);
+  shape == 3 ? (
+    p < lastp - 0.5 ? ( ra = rb; rb = rand(2) - 1; );
+    f = sm > 0.001 ? min(p / sm, 1) : 1;
+    v = ra + (rb - ra) * (0.5 - 0.5 * cos($pi * f));
+  ) : (
+    v = lfo_shape_k(p, shape, k, tk);
+  );
+  lastp = p;
+  v;
+);

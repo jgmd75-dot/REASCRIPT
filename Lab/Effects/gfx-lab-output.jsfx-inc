@@ -1,0 +1,189 @@
+desc:GFX Output stage (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// Band-focused "loose knit" saturation + clipper.
+//   - Signal splits into low / mid / high (subtractive, so it sums back perfectly).
+//   - Only the low and high bands are saturated; mids pass clean.
+//   - Saturation is a wide, soft biased curve. The bias floats with the signal
+//     envelope (loosens as level rises), giving even harmonics that breathe.
+//   - Final stage: a soft clipper (CLIP) or straight through, zero latency. Each unit fixes its mode in code
+//     (CLIP always on, or straight through) and has no keys for it; its old mode slider is not used.
+//     CLIP: ceil_db is the ceiling the peaks are clipped at.
+//     Should the mode ever change while running, nothing steps: the clip ceiling glides (1 dB / ms) - CLIP comes
+//     in from just above the signal's level down to the ceiling, straight through lets it rise to +30 dBFS first.
+//     mode 0 or -1: straight through; 1 (or more): CLIP.
+//   - Anti-aliasing (ost_aa = 1, on by default): the highs' saturation and the clipper are anti-aliased (first-order
+//     antiderivative, as gfx-clip.jsfx-inc, with the half-sample lag made up), zero latency. While a curve is not
+//     bending the signal passes bit for bit (SAT 0, or CLIP below its knee); the clean top end is unchanged and the
+//     CLIP ceiling still holds. A unit may set ost_aa = 0 in @init (after the import) for the plain curves.
+//
+// Usage in a plugin:
+//   import gfx-output.jsfx-inc
+//   @init    ost_init(memory_offset);  ostL.ost_ch_init(); ostR.ost_ch_init();
+//            (memory_offset is no longer used: the stage needs no buffer)
+//   @block   ost_setup(sat 0..1, bias 0..1, low_hz, high_hz, ceiling_db, mode 1 = CLIP / 0 = straight);
+//   @sample  l = ostL.ost_band(l); r = ostR.ost_band(r);   // band saturation
+//            (apply output gain here)
+//            ost_out(l, r); spl0 = ost_l; spl1 = ost_r;      // clipper
+//   Display: ost_clipped (1 if the clipper engaged; reset to 0 after reading).
+//            (ost_gr stays at 1: kept for older display code.)
+
+@init
+
+function ost_tanh(x) local(e) (
+  x = min(max(x, -20), 20); e = exp(2 * x); (e - 1) / (e + 1);
+);
+
+// wide soft biased curve, unity small-signal gain, no static DC offset
+function ost_curve(x, d, b) local(tbias, s) (
+  tbias = ost_tanh(d * b);
+  s = d * (1 - tbias * tbias);
+  (ost_tanh(d * (x + b)) - tbias) / s;
+);
+
+function ost_clip(x, c) local(a, k) (
+  a = abs(x); k = 0.8 * c;
+  a < k ? x : ( ost_clipped = 1; sign(x) * (k + (c - k) * ost_tanh((a - k) / (c - k))); );
+);
+
+// ---------- anti-aliasing (ost_aa, see the top) ----------
+// First-order antiderivative anti-aliasing (the method of gfx-clip.jsfx-inc, written here for this stage's own tanh
+// curves): the curve over the step from the previous input x1 to x is read as (F(x) - F(x1)) / (x - x1), F its
+// antiderivative (the curve at the midpoint when the two are within 1e-5). That reading sits half a sample late, so
+// half the step of the plain curve, (f(x) - f(x1)) / 2, is added back: no droop, no comb against the clean bands,
+// and while the curve is straight it gives x exactly, so the clean signal passes bit for bit.
+// SAT, one band (instance: the previous input x1, and z1, lc1, th1: its curve argument, ln cosh and tanh as read last
+// sample). Returns what the curve adds (curve(x) - x). tb, s: tanh(d b) and the curve's scale, d (1 - tb^2).
+// The bias floats a little every sample, so last sample's reading is carried over to this sample's drive and bias by
+// its Taylor series (read afresh once it has moved by more than 3e-4): one exponential and one log per sample.
+// (lcz, lc1 carry ln cosh + ln 2: the constant cancels.)
+function ost_acr(x, d, b, tb, s) instance(x1, z1, lc1, th1) local(z, q, lcz, thz, w, y) (
+  z = d * (x + b); q = 1 + exp(-2 * abs(z));
+  lcz = abs(z) + log(q); thz = sign(z) * (2 / q - 1);           // ln cosh z + ln 2, tanh z
+  y = d * (x1 + b); w = y - z1;                              // x1 under this sample's drive and bias
+  abs(w) > 0.0003 ? ( q = 1 + exp(-2 * abs(y)); lc1 = abs(y) + log(q); th1 = sign(y) * (2 / q - 1); )
+                  : ( q = w * (1 - th1 * th1); lc1 += w * (th1 + 0.5 * q); th1 += q; );
+  w = z - y;
+  y = abs(w) > 0.00001 ? (lcz - lc1) / w : ost_tanh(0.5 * (z + y));
+  x1 = x; z1 = z; lc1 = lcz; y -= tb - 0.5 * (thz - th1); th1 = thz;
+  y / s - x;
+);
+function ost_acx(x) instance(x1, c1) ( x1 = x; c1 = -1; );   // SAT off / CLIP out: keep the previous input
+function ost_acz() instance(x1, z1, lc1, th1, c1) ( x1 = z1 = th1 = 0; lc1 = log(2); c1 = -1; );
+// CLIP: one point of the clipper's residual (clip(x) - x, 0 below the knee k; w = c - k): returns its antiderivative
+// and leaves the residual itself in ost_q
+function ost_cpt(x, k, w) local(u, e) (
+  u = abs(x) - k;
+  u > 0 ? (
+    u /= w; e = exp(-2 * u);
+    ost_q = sign(x) * w * ((1 - e) / (1 + e) - u);
+    w * w * (log(1 + e) - 0.69314718055994531 + u - 0.5 * u * u);
+  ) : ( ost_q = 0; 0; );
+);
+// the anti-aliased clipper, one channel (instance: the previous input x1, its antiderivative fa1 and residual q1 read
+// under the ceiling c1): x itself while both are below the knee; never past the ceiling (a step that would overshoot
+// it takes the plain curve)
+function ost_acl(x, c) instance(x1, fa1, q1, c1) local(k, w, fa, q, y) (
+  k = 0.8 * c;
+  abs(x) < k && abs(x1) < k ? ( y = x; fa = q = 0; ) : (
+    w = c - k;
+    c !== c1 ? ( fa1 = ost_cpt(x1, k, w); q1 = ost_q; );       // (the ceiling moved: x1 read under the new one)
+    fa = ost_cpt(x, k, w); q = ost_q;
+    abs(x) >= k ? ost_clipped = 1;
+    y = abs(x - x1) > 0.00001 ? (fa - fa1) / (x - x1) : ( ost_cpt(0.5 * (x + x1), k, w); ost_q; );
+    y = x + y + 0.5 * (q - q1);
+    abs(y) > c ? y = x + q;
+  );
+  x1 = x; fa1 = fa; q1 = q; c1 = c;
+  y;
+);
+ost_aa = 1;
+
+function ost_init(mem) (
+  ost_gr = 1; ost_clipped = 0;
+  ost_envc = 1 - exp(-1 / (0.15 * srate));
+  ost_lastlf = -1; ost_lasthf = -1;
+  ost_kd = 10 ^ (-1 / (20 * 0.001 * srate)); ost_ku = 1 / ost_kd;   // ceiling glide: 1 dB per ms
+  ost_xi = 0;                                                  // the first ost_setup snaps to its mode
+  ost_cl.ost_acz(); ost_cr.ost_acz();
+);
+
+function ost_setup(sat, bias, lf, hf, ceil_db, mode) local(w0, cw, alp, q0) (
+  ost_amt = sat;
+  ost_drv = 1 + 12 * sat * sqrt(sat);                // starts biting around -20 dBFS at full SAT
+  ost_wet = min(sat * 3, 1);
+  ost_bias = bias * 0.3;
+  ost_cc = 10 ^ (ceil_db / 20);                              // clipper ceiling
+  ost_ceil = ost_cc;
+  ost_mode = mode >= 0.5;                                    // 0 / -1: straight through; 1 (or more): CLIP
+  !ost_xi ? ( ost_st = ost_mode; ost_xi = 1; );             // ost_st: 0 off, 1 clip, 2 / 3 ceiling gliding down / up
+  lf != ost_lastlf ? (
+    ost_lastlf = lf;
+    w0 = 2 * $pi * min(lf, srate * 0.45) / srate; cw = cos(w0); alp = sin(w0) / (2 * 0.70710678); q0 = 1 + alp;
+    ost_lb0 = (1 - cw) * 0.5 / q0; ost_lb1 = (1 - cw) / q0; ost_lb2 = ost_lb0;
+    ost_la1 = -2 * cw / q0; ost_la2 = (1 - alp) / q0;
+  );
+  hf != ost_lasthf ? (
+    ost_lasthf = hf;
+    w0 = 2 * $pi * min(hf, srate * 0.45) / srate; cw = cos(w0); alp = sin(w0) / (2 * 0.70710678); q0 = 1 + alp;
+    ost_hb0 = (1 + cw) * 0.5 / q0; ost_hb1 = -(1 + cw) / q0; ost_hb2 = ost_hb0;
+    ost_ha1 = -2 * cw / q0; ost_ha2 = (1 - alp) / q0;
+  );
+  pdc_bot_ch = 0; pdc_top_ch = 2;
+  pdc_delay = 0;                                             // no latency in any mode
+);
+
+function ost_ch_init() instance(lz1, lz2, hz1, hz2, dcx, dcy, env) (
+  lz1 = 0; lz2 = 0; hz1 = 0; hz2 = 0; dcx = 0; dcy = 0; env = 0;
+  this.ah.ost_acz();
+);
+
+// band split + saturation of lows and highs, mids untouched
+function ost_band(x) instance(lz1, lz2, hz1, hz2, dcx, dcy, env) local(lo, rest, hi, mid, b, d, t) (
+  lo = ost_lb0 * x + lz1;
+  lz1 = ost_lb1 * x - ost_la1 * lo + lz2;
+  lz2 = ost_lb2 * x - ost_la2 * lo;
+  rest = x - lo;
+  hi = ost_hb0 * rest + hz1;
+  hz1 = ost_hb1 * rest - ost_ha1 * hi + hz2;
+  hz2 = ost_hb2 * rest - ost_ha2 * hi;
+  mid = rest - hi;
+
+  env += (abs(x) - env) * ost_envc;
+  ost_amt > 0 ? (
+    b = ost_bias * (0.4 + 1.2 * min(env, 1));          // loose knit: bias floats with level
+    b = min(b, 1.25 / ost_drv);                         // kept off the flat of the curve, where its slope (which divides the output) nears 0
+    d = ost_wet * (ost_curve(lo, ost_drv, b) - lo);    // what the saturation adds to the lows
+    ost_aa ? (                                          // the highs anti-aliased (the lows need not be: split off
+      t = ost_tanh(ost_drv * b * 0.5);                  // at 40 - 400 Hz, their fold-back measures under -90 dBc)
+      hi += ost_wet * this.ah.ost_acr(hi, ost_drv, b * 0.5, t, ost_drv * (1 - t * t));
+    ) : (
+      this.ah.ost_acx(hi);
+      hi = hi + ost_wet * (ost_curve(hi, ost_drv, b * 0.5) - hi);
+    );
+  ) : ( d = 0; this.ah.ost_acx(hi); );
+  // DC blocker on the added part only, so the clean signal still sums back exactly flat
+  dcy = d - dcx + 0.9995 * dcy; dcx = d;
+  lo + dcy + mid + hi;
+);
+
+// clipper; results in ost_l, ost_r. OFF <-> CLIP: the ceiling glides (see the top), so nothing steps.
+function ost_out(l, r) local(c) (
+  c = 0;                                                     // this sample's ceiling (0: straight through)
+  ost_mode ? (
+    ost_st == 1 ? c = ost_cc : (
+      ost_st == 0 ? ost_ct = max(1.25 * max(abs(l), abs(r)), ost_cc)   // from just above the signal: no step
+                  : ost_ct = max(ost_ct * ost_kd, ost_cc);
+      ost_st = ost_ct > ost_cc ? 2 : 1;
+      c = ost_ct;
+    );
+  ) : ost_st ? (
+    ost_ct = (ost_st == 1 ? ost_cc : ost_ct) * ost_ku;
+    ost_ct < 31.6 ? ( ost_st = 3; c = ost_ct; ) : ost_st = 0;    // until +30 dBFS, then out
+  );
+  c > 0 && ost_aa ? ( l = ost_cl.ost_acl(l, c); r = ost_cr.ost_acl(r, c); ) : (
+    ost_cl.ost_acx(l); ost_cr.ost_acx(r);
+    c > 0 ? ( l = ost_clip(l, c); r = ost_clip(r, c); );
+  );
+  ost_l = l; ost_r = r;
+);

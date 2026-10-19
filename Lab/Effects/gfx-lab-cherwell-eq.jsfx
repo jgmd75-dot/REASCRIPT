@@ -1,0 +1,691 @@
+desc: GFX Lab Cherwell EQ [eq]
+//author: JGWizrad / Garden FX (GFX)
+//
+// Cherwell series — clinical mid-90s digital console processing.
+// EQ: five fully parametric bands (LF, LMF, MF, HMF, HF) with four EQ TYPES,
+// static HPF / LPF (12 or 24 dB/oct). LF and HF switch between shelf and bell.
+// Brand names live in comments only (reference: the Oxford-style console EQ
+// and its selectable curve types).
+//
+// EQ TYPE sets how a band's width behaves as you change its gain:
+//   1  gentle proportional — wide and musical at small gains, narrowing as you push
+//   2  tighter proportional — the same idea with more focus
+//   3  constant Q — the width is exactly what Q says, at any gain
+//   4  asymmetric — boosts broad and proportional, cuts narrow and surgical
+//   Shelves get a softer (1) to slightly resonant (4) knee.
+// Gain and frequency glide over ~20 ms, band ON fades, so moves never click.
+// Latency: 0 samples. No DRIFT (clinical digital unit). Output passes straight
+// through (house rule for mix tools).
+//
+// STATUS: Lab (experimental, may change). v0.1.
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+slider1:b0_on=1<0,1,1{Off,On}>-LF On
+slider2:b0_type=0<0,1,1{Shelf,Bell}>-LF Type
+slider3:b0_f=80<20,500,1>-LF Freq (Hz)
+slider4:b0_q=1<0.3,6,0.01>-LF Q
+slider5:b0_g=0<-20,20,0.1>-LF Gain (dB)
+slider6:b1_on=1<0,1,1{Off,On}>-LMF On
+slider7:b1_type=1<0,1,1{Shelf,Bell}>-LMF Type
+slider8:b1_f=250<40,1000,1>-LMF Freq (Hz)
+slider9:b1_q=1<0.3,6,0.01>-LMF Q
+slider10:b1_g=0<-20,20,0.1>-LMF Gain (dB)
+slider11:b2_on=1<0,1,1{Off,On}>-MF On
+slider12:b2_type=1<0,1,1{Shelf,Bell}>-MF Type
+slider13:b2_f=1000<200,5000,1>-MF Freq (Hz)
+slider14:b2_q=1<0.3,6,0.01>-MF Q
+slider15:b2_g=0<-20,20,0.1>-MF Gain (dB)
+slider16:b3_on=1<0,1,1{Off,On}>-HMF On
+slider17:b3_type=1<0,1,1{Shelf,Bell}>-HMF Type
+slider18:b3_f=3500<800,12000,1>-HMF Freq (Hz)
+slider19:b3_q=1<0.3,6,0.01>-HMF Q
+slider20:b3_g=0<-20,20,0.1>-HMF Gain (dB)
+slider21:b4_on=1<0,1,1{Off,On}>-HF On
+slider22:b4_type=0<0,1,1{Shelf,Bell}>-HF Type
+slider23:b4_f=10000<2000,20000,1>-HF Freq (Hz)
+slider24:b4_q=1<0.3,6,0.01>-HF Q
+slider25:b4_g=0<-20,20,0.1>-HF Gain (dB)
+slider26:eqtype=0<0,3,1{Type 1,Type 2,Type 3,Type 4}>-EQ Type
+slider27:hpf=20<20,1000,1>-HPF (Hz, 20 = Off)
+slider28:hpf24=0<0,1,1{12 dB,24 dB}>-HPF Slope
+slider29:lpf=20000<1000,20000,1>-LPF (Hz, 20k = Off)
+slider30:lpf24=0<0,1,1{12 dB,24 dB}>-LPF Slope
+slider31:out_db=0<-12,12,0.1>-Output (dB)
+slider32:eq_on=1<0,1,1{Off,On}>-In
+
+@init
+ext_noinit = 1;
+pr_cur = 1;              // preset shown on the LCD (saved with the project)
+gfx_ext_retina = 1;
+
+// ---------- per-band memory ----------
+// band b: params at PRM + b*16, coefficients at CFB + b*8, filter state at STB + b*16
+PRM = 0;  CFB = 100;  STB = 200;
+B_ON = 0; B_TYPE = 1; B_F = 2; B_Q = 3; B_G = 4; B_KIND = 5; B_FS = 6; B_GS = 7; B_LF = 8; B_LG = 9; B_QE = 10; B_QS = 11;
+first_run = 1;
+
+// =====================================================================
+// DSP building blocks
+// =====================================================================
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function tg(f) ( tan($pi * min(f, srate * 0.45) / srate); );
+
+// the width a band really has, from Q, gain and EQ TYPE (stored for the display)
+function q_eff(q, db) local(a) (
+  a = min(abs(db), 20) / 20;
+  eqtype < 0.5 ? q * (0.45 + 0.9 * a) :
+  eqtype < 1.5 ? q * (0.7 + 1.6 * a) :
+  eqtype < 2.5 ? q :
+  db >= 0 ? q * (0.6 + 1.0 * a) : q * (1.2 + 1.2 * a);
+);
+function q_shelf() ( eqtype < 0.5 ? 0.55 : eqtype < 1.5 ? 0.65 : eqtype < 2.5 ? 0.7071 : 0.9; );
+
+// band coefficients into CFB + b*8. kind: 0 low shelf, 1 bell, 2 high shelf
+function band_coef(b, f, db) local(c, A, g, k, a1, kind, q) (
+  c = CFB + b * 8;  kind = PRM[b * 16 + B_KIND];
+  A = exp(db * 0.05756462732485115);
+  kind == 0 ? ( q = q_shelf();  g = tg(f) / sqrt(A);  k = 1 / q;
+                c[3] = 1;  c[4] = k * (A - 1);  c[5] = A * A - 1; ) :
+  kind == 2 ? ( q = q_shelf();  g = tg(f) * sqrt(A);  k = 1 / q;
+                c[3] = A * A;  c[4] = k * (1 - A) * A;  c[5] = 1 - A * A; ) :
+              ( q = q_eff(PRM[b * 16 + B_Q], db);  g = tg(f);  k = 1 / (q * A);
+                c[3] = 1;  c[4] = k * (A * A - 1);  c[5] = 0; );
+  PRM[b * 16 + B_QE] = q;
+  a1 = 1 / (1 + g * (g + k));
+  c[0] = a1;  c[1] = g * a1;  c[2] = g * g * a1;
+);
+// one SVF step with coefficients c and state at s: returns m0 x + m1 v1 + m2 v2
+function svfc(x, c, s) local(v1, v2, v3) (
+  v3 = x - s[1];
+  v1 = c[0] * s[0] + c[1] * v3;
+  v2 = s[1] + c[1] * s[0] + c[2] * v3;
+  s[0] = 2 * v1 - s[0];  s[1] = 2 * v2 - s[1];
+  c[3] * x + c[4] * v1 + c[5] * v2;
+);
+
+// plain SVF for the static filters
+function svf_set(fc, q) instance(g, k, a1, a2, a3) (
+  g = tg(fc);  k = 1 / q;  a1 = 1 / (1 + g * (g + k));  a2 = g * a1;  a3 = g * a2;
+);
+function svf_tick(x) instance(g, k, a1, a2, a3, ic1, ic2, lp, bp, hp) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;
+  lp = v2;  bp = v1;  hp = x - k * v1 - v2;
+);
+// static HPF / LPF on one channel (12 dB = one stage, 24 dB = two Butterworth stages)
+function filt(x) instance(h1, h2, l1, l2) local(y) (
+  y = x;
+  hpf_on ? ( h1.svf_tick(y);  y = h1.hp;  hpf24 ? ( h2.svf_tick(y);  y = h2.hp; ); );
+  lpf_on ? ( l1.svf_tick(y);  y = l1.lp;  lpf24 ? ( l2.svf_tick(y);  y = l2.lp; ); );
+  y;
+);
+function filt_set() instance(h1, h2, l1, l2) (
+  h1.svf_set(hpf, hpf24 ? 0.5411961 : 0.7071068);  h2.svf_set(hpf, 1.3065630);
+  l1.svf_set(lpf, lpf24 ? 0.5411961 : 0.7071068);  l2.svf_set(lpf, 1.3065630);
+);
+
+function update_params() local(b, p, i) (
+  b = 0;
+  loop(5,
+    p = b * 16;  i = 1 + b * 5;
+    PRM[p + B_ON]   = slider(i);
+    PRM[p + B_TYPE] = slider(i + 1);
+    PRM[p + B_F]    = slider(i + 2);
+    PRM[p + B_Q]    = slider(i + 3);
+    PRM[p + B_G]    = slider(i + 4);
+    PRM[p + B_KIND] = (b == 0 && PRM[p + B_TYPE] < 0.5) ? 0 : (b == 4 && PRM[p + B_TYPE] < 0.5) ? 2 : 1;
+    PRM[p + B_LF]   = -999;                          // force a coefficient refresh (Q, type or EQ TYPE may have moved)
+    first_run ? ( PRM[p + B_FS] = PRM[p + B_F];  PRM[p + B_GS] = PRM[p + B_ON] ? PRM[p + B_G] : 0; );
+    b += 1;
+  );
+  hpf_on = hpf > 20.5;  lpf_on = lpf < 19999.5;
+  chL.filt_set();  chR.filt_set();
+  out_t = db2g(out_db);
+  sm    = 1 - exp(-1 / (0.02 * srate));
+  ramp_step = 1 / (0.010 * srate);
+  first_run ? ( out_s = out_t;  on_s = eq_on;  first_run = 0; );
+);
+
+// one band, per sample: glide gain / frequency to their targets, refresh coefficients when they move
+function band_glide(b) local(p, gt, fs, gs) (
+  p = b * 16;
+  gt = PRM[p + B_ON] ? PRM[p + B_G] : 0;            // OFF fades the band to flat
+  fs = PRM[p + B_FS];  gs = PRM[p + B_GS];
+  fs += (PRM[p + B_F] - fs) * sm;  gs += (gt - gs) * sm;
+  abs(gs - gt) < 0.0005 ? gs = gt;
+  abs(fs - PRM[p + B_F]) < 0.01 ? fs = PRM[p + B_F];
+  PRM[p + B_FS] = fs;  PRM[p + B_GS] = gs;
+  (abs(fs - PRM[p + B_LF]) > fs * 0.0005 || abs(gs - PRM[p + B_LG]) > 0.002) ? (
+    band_coef(b, fs, gs);  PRM[p + B_LF] = fs;  PRM[p + B_LG] = gs;
+  );
+  gs != 0;
+);
+
+@slider
+update_params();
+
+@block
+// GUI edits arrive as a flag; parameters are only ever rebuilt on the audio thread
+prm_dirty ? ( prm_dirty = 0;  update_params(); );
+inpk_disp  = max(inpk_disp, inpk);    inpk = 0;
+outpk_disp = max(outpk_disp, outpk);  outpk = 0;
+
+@sample
+out_s += (out_t - out_s) * sm;
+on_s != eq_on ? ( on_s = eq_on > on_s ? min(1, on_s + ramp_step) : max(0, on_s - ramp_step); );
+xL = spl0;  xR = spl1;
+inpk = max(inpk, max(abs(xL), abs(xR)));
+
+on_s > 0 ? (
+  yL = chL.filt(xL);  yR = chR.filt(xR);
+  // sb / sp belong to the audio thread only
+  sb = 0;
+  loop(5,
+    sp = sb * 16;
+    band_glide(sb) ? (
+      yL = svfc(yL, CFB + sb * 8, STB + sp);
+      yR = svfc(yR, CFB + sb * 8, STB + sp + 2);
+    );
+    sb += 1;
+  );
+  yL *= out_s;  yR *= out_s;
+  on_s < 1 ? ( yL = xL + (yL - xL) * on_s;  yR = xR + (yR - xR) * on_s; );
+) : ( yL = xL;  yR = xR; );
+
+outpk = max(outpk, max(abs(yL), abs(yR)));
+spl0 = yL;  spl1 = yR;
+
+@serialize
+file_var(0, pr_cur);
+
+@gfx 1000 575
+// =====================================================================
+// GUI — Cherwell series, "Quad" scheme: viridian faceplate, pinstripe title bar
+// with the Oxford-green line, 90s bevelled display window, knurled knobs with
+// translucent caps and a glowing lime indicator, 34-series lamp keys.
+// =====================================================================
+function col(h, a) (
+  gfx_r = floor(h / 65536) / 255;  gfx_g = (floor(h / 256) % 256) / 255;  gfx_b = (h % 256) / 255;  gfx_a = a;
+);
+function shade(h, f) local(r, g, b) (
+  r = min(255, floor(floor(h / 65536) * f));  g = min(255, floor((floor(h / 256) % 256) * f));
+  b = min(255, floor((h % 256) * f));  r * 65536 + g * 256 + b;
+);
+function gdb(x) ( 8.685889638065035 * log(max(x, 0.000000001)); );   // GUI copy of g2db
+function px(v) ( ox + v * sc; );
+function py(v) ( oy + v * sc; );
+function ps(v) ( v * sc; );
+function text_c(x, y, str) local(w, h) (
+  gfx_measurestr(str, w, h);  gfx_x = x - w * 0.5;  gfx_y = y - h * 0.5;  gfx_drawstr(str);
+);
+function param_touched(idx) ( slider_automate(2 ^ (idx - 1)); gui_dirty = 1; );
+function rivet(x, y) (
+  col(0x8A9098, 1);  gfx_circle(px(x), py(y), ps(3.5), 1, 1);
+  col(0xF2F4F6, 0.6); gfx_circle(px(x) - ps(1), py(y) - ps(1), ps(1.2), 1, 1);
+);
+function pointer(x, y, sa, ca, r0, r1, hw) local(ax, ay, bx, by, dx, dy) (
+  ax = x + sa * r0;  ay = y - ca * r0;  bx = x + sa * r1;  by = y - ca * r1;  dx = ca * hw;  dy = sa * hw;
+  gfx_triangle(ax + dx, ay + dy, bx + dx, by + dy, bx - dx, by - dy, ax - dx, ay - dy);
+  gfx_line(ax + dx, ay + dy, bx + dx, by + dy, 1);  gfx_line(ax - dx, ay - dy, bx - dx, by - dy, 1);
+);
+
+// Cherwell knob (as Lift): dark knurled skirt, translucent cap (cap colour), glowing lime
+// indicator, ticks; value on hover only. klog = 1 before a call = log taper.
+// fmt: 0 dB (+), 2 dB, 3 Hz, 4 Q, 5 ms, 7 HPF Hz (OFF at min), 8 LPF Hz (OFF at max)
+function kn(cx, cy, r, idx, vmin, vmax, def, cap, lbl, fmt)
+  local(x, y, rr, v, t, hov, now, a0, a1, tv, b, j, w, h, ty, lg)
+(
+  lg = klog;  klog = 0;
+  x = px(cx);  y = py(cy);  rr = ps(r);
+  hov = sqr(mouse_x - x) + sqr(mouse_y - y) <= sqr(rr * 1.25);
+  v = slider(idx);
+  t = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  click && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : ( drag_idx = idx;  drag_y = mouse_y;  drag_t = t; );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  drag_idx == idx ? (
+    t = max(0, min(1, drag_t + (drag_y - mouse_y) / ps(220)));
+    v = lg ? vmin * exp(t * log(vmax / vmin)) : vmin + t * (vmax - vmin);
+    lg ? ( j = 10 ^ (floor(log10(v)) - 2);  v = floor(v / j + 0.5) * j; ) : v = floor(v * 10 + 0.5) / 10;
+    v = max(vmin, min(vmax, v));
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = slider(idx);
+  t = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;  tv = a0 + t * (a1 - a0);
+  col(0xE4F0EF, 0.75);  j = 0;
+  loop(11,
+    b = a0 + j / 10 * (a1 - a0);
+    gfx_line(x + sin(b) * (rr + ps(4)), y - cos(b) * (rr + ps(4)), x + sin(b) * (rr + ps(8)), y - cos(b) * (rr + ps(8)), 1);
+    j += 1;
+  );
+  col(0x000000, 0.3);   gfx_circle(x + ps(2), y + ps(3), rr, 1, 1);
+  col(0x24272C, 1);     gfx_circle(x, y, rr, 1, 1);
+  j = 0;
+  loop(40,
+    b = tv + j * $pi / 20;
+    col(j % 2 ? 0x34383E : 0x4C5158, 1);
+    gfx_line(x + sin(b) * rr * 0.62, y - cos(b) * rr * 0.62, x + sin(b) * rr * 0.95, y - cos(b) * rr * 0.95, 1);
+    j += 1;
+  );
+  col(0x1A1C20, 1);     gfx_circle(x, y, rr, 0, 1);
+  col(0x1A1C20, 1);     gfx_circle(x, y, rr * 0.6, 1, 1);
+  col(cap, 0.82);       gfx_circle(x, y, rr * 0.54, 1, 1);
+  col(0xEAF6C2, 0.5);   gfx_arc(x, y, rr * 0.46, -1.9, -0.3, 1);
+  col(shade(cap, 0.6), 0.8);  gfx_circle(x, y, rr * 0.54, 0, 1);
+  b = ps(r > 20 ? 1.5 : 1.2);
+  col(0xCDEB7A, 0.12);  pointer(x, y, sin(tv), cos(tv), rr * 0.54, rr * 1.04, b * 3.2);
+  col(0xCDEB7A, 0.25);  pointer(x, y, sin(tv), cos(tv), rr * 0.55, rr * 1.01, b * 2);
+  col(0xDDF59A, 1);     pointer(x, y, sin(tv), cos(tv), rr * 0.56, rr * 0.99, b);
+  gfx_setfont(6);  col(0xE4F0EF, 1);  text_c(x, y + rr + ps(20), lbl);
+  hov || drag_idx == idx ? (
+    fmt == 0 ? sprintf(#kv, "%+.1f dB", v) :
+    fmt == 2 ? sprintf(#kv, "%.1f dB", v) :
+    fmt == 3 ? ( v < 1000 ? sprintf(#kv, "%d Hz", v) : sprintf(#kv, "%.2f kHz", v / 1000); ) :
+    fmt == 4 ? sprintf(#kv, "Q %.2f", v) :
+    fmt == 5 ? ( v < 10 ? sprintf(#kv, "%.1f ms", v) : sprintf(#kv, "%d ms", v); ) :
+    fmt == 7 ? ( v <= vmin + 0.5 ? strcpy(#kv, "OFF") : sprintf(#kv, "%d Hz", v); ) :
+               ( v >= vmax - 0.5 ? strcpy(#kv, "OFF") : sprintf(#kv, "%.1f kHz", v / 1000); );
+    gfx_setfont(3);  gfx_measurestr(#kv, w, h);
+    ty = y - rr - ps(14) - h;
+    col(0x0E3A40, 0.95);  gfx_rect(x - w * 0.5 - ps(6), ty - ps(3), w + ps(12), h + ps(6), 1);
+    col(0xE4F0EF, 1);     text_c(x, ty + h * 0.5, #kv);
+  );
+);
+
+// ---------- house lamp keys (34-series), ported from gfx-lab-ui lk_key / lk_fit ----------
+// Coloured lens in a dark well; off = darker milky lens with vignette and dark legend,
+// lit = feathered glow and spill onto the panel. Adapted to this panel's px/py/ps layout.
+LK_AMB = 0xF2A41E;  LK_SAGE = 0xA0AF84;  LK_YEL = 0xF2C230;  LK_SKY = 0x7FB8E6;  lk_well = 0x141518;
+function ui_mix(c1, c2, t) (
+  floor(floor(c1 / 65536) * (1 - t) + floor(c2 / 65536) * t) * 65536 +
+  floor((floor(c1 / 256) % 256) * (1 - t) + (floor(c2 / 256) % 256) * t) * 256 +
+  floor((c1 % 256) * (1 - t) + (c2 % 256) * t);
+);
+function ui_rrs(x, y, w, h, r) local(i, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  i = 0;
+  loop(r,
+    d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);
+    gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);
+    i += 1;
+  );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+function lk_rr(x, y, w, h, r) ( ui_rrs(px(x), py(y), ps(w), ps(h), ps(r)); );
+function ui_keytext(cx, cy, str) local(w, h) (
+  gfx_measurestr(str, w, h); gfx_x = floor(cx - w * 0.5 + 0.5); gfx_y = floor(cy - h * 0.58 + 0.5); gfx_drawstr(str);
+);
+function lk_key(x, y, w, h, on, c, str) local(hov, hit, k, lens, dn, i, t, dx, dy) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov;
+  dn = hov && lmb ? 1 : 0;                                  // the cap sinks a pixel while held
+  k = min(w / 54, h / 40);
+  lens = shade(ui_mix(c, 0xCFC9BC, 0.5), 0.76);
+  on ? lens = c;
+  on ? (
+    col(c, 0.10); lk_rr(x - 9 * k, y - 9 * k, w + 18 * k, h + 18 * k, 10 * k);
+    col(c, 0.18); lk_rr(x - 6 * k, y - 6 * k, w + 12 * k, h + 12 * k, 8 * k);
+  );
+  col(lk_well, 1);           lk_rr(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k, 5 * k);
+  col(shade(lens, 0.55), 1); lk_rr(x, y + 1 / sc, w, h, 4 * k);
+  y += (dn - 1) / sc;
+  on ? (
+    col(lens, 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    i = 1;
+    loop(4,
+      t = 0.07 * i * (1 + 0.6 * max(1 - k, 0));
+      dx = (i == 1 ? 3 : i == 2 ? 6 : i == 3 ? 10 : 14) * k;
+      dy = (i == 1 ? 2 : i == 2 ? 4 : i == 3 ? 7 : 9) * k;
+      col(ui_mix(c, 0xFFFFFF, t), 1); lk_rr(x + dx, y + dy, w - 2 * dx, h - 1 / sc - 2 * dy, 4 * k);
+      i += 1;
+    );
+  ) : (
+    col(shade(lens, 0.62), 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    col(shade(lens, 0.78), 1); lk_rr(x + 2 * k, y + 2 * k, w - 4 * k, h - 5 * k, 4 * k);
+    col(shade(lens, 0.92), 1); lk_rr(x + 5 * k, y + 4 * k, w - 10 * k, h - 10 * k, 4 * k);
+    col(lens, 1);              lk_rr(x + 9 * k, y + 7 * k, w - 18 * k, h - 17 * k, 4 * k);
+  );
+  col(0xFFFFFF, on ? 0.45 : 0.22);  gfx_rect(px(x + 4 * k), py(y), ps(w - 8 * k), max(1, ps(1.5)));
+  hov && !dn ? ( col(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1 / sc, 4 * k); );
+  gfx_setfont(2);  col(shade(c, on ? 0.30 : 0.17), 1);
+  ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
+  hit;
+);
+function lk_fit(x, y, w, h, on, c, str) local(k) (
+  k = min(w / 62, h / 48);
+  lk_key(x + 4 * k, y + 4 * k, w - 8 * k, h - 8 * k, on, c, str);
+);
+
+// Vertical slider (output): dark knurled cap with the knobs' glowing lime line.
+// Drag up/down; Ctrl-click or double-click = default; value tag on hover only.
+function vslider(x, y0, h, idx, vmin, vmax, def, lbl) local(X, Y0, H, v, t, cy, hov, now, j, d, yy, w, th) (
+  X = px(x);  Y0 = py(y0);  H = ps(h);
+  v = slider(idx);  t = (v - vmin) / (vmax - vmin);  cy = Y0 + H * (1 - t);
+  hov = abs(mouse_x - X) < ps(16) && abs(mouse_y - cy) < ps(15);
+  click && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : (
+      drag_idx = idx;  drag_y = mouse_y;  drag_v = v;
+    );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  drag_idx == idx ? (
+    v = drag_v + (drag_y - mouse_y) * (vmax - vmin) / H;
+    v = floor(max(vmin, min(vmax, v)) * 10 + 0.5) / 10;
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = slider(idx);  t = (v - vmin) / (vmax - vmin);  cy = Y0 + H * (1 - t);
+
+  // scale: a tick and number every 3 dB
+  gfx_setfont(5);  j = 0;
+  loop(floor((vmax - vmin) / 3 + 0.5) + 1,
+    d = vmax - j * 3;
+    yy = Y0 + H * (1 - (d - vmin) / (vmax - vmin));
+    col(0xE4F0EF, 0.75);  gfx_line(X - ps(14), yy, X - ps(9), yy, 1);  gfx_line(X + ps(9), yy, X + ps(14), yy, 1);
+    d > 0 ? sprintf(#sl, "+%d", d) : sprintf(#sl, "%d", d);  col(0xE4F0EF, 1);  text_c(X - ps(26), yy, #sl);
+    j += 1;
+  );
+  // sunken slot
+  col(0x08363C, 1);  gfx_rect(X - ps(4), Y0 - ps(4), ps(8), H + ps(8), 1);
+  col(0x061E22, 1);  gfx_rect(X - ps(2), Y0 - ps(2), ps(4), H + ps(4), 1);
+  col(0x4E959E, 1);  gfx_rect(X - ps(4), Y0 + H + ps(3), ps(8), ps(1), 1);
+  // cap
+  col(0x000000, 0.35);  gfx_rect(X - ps(13), cy - ps(12), ps(28), ps(27), 1);
+  col(0x24272C, 1);     gfx_rect(X - ps(15), cy - ps(14), ps(30), ps(28), 1);
+  col(0x4C5158, 1);     j = 0;
+  loop(6, gfx_line(X - ps(12), cy - ps(11) + j * ps(4.4), X + ps(12), cy - ps(11) + j * ps(4.4), 1); j += 1; );
+  col(0x5A5F67, 1);     gfx_rect(X - ps(15), cy - ps(14), ps(30), ps(1), 1);
+  col(0xCDEB7A, 0.12);  gfx_rect(X - ps(15), cy - ps(3.5), ps(30), ps(7), 1);
+  col(0xCDEB7A, 0.25);  gfx_rect(X - ps(15), cy - ps(2), ps(30), ps(4), 1);
+  col(0xDDF59A, 1);     gfx_rect(X - ps(15), cy - ps(1), ps(30), ps(2), 1);
+  // label
+  gfx_setfont(6);  col(0xE4F0EF, 1);  text_c(X - ps(6), Y0 + H + ps(22), lbl);   // (y0 / h were overwritten: JSFX names ignore case)
+  // value on hover only (house rule)
+  hov || drag_idx == idx ? (
+    sprintf(#kv, "%+.1f dB", v);
+    gfx_setfont(3);  gfx_measurestr(#kv, w, th);
+    col(0x0E3A40, 0.95);  gfx_rect(X - ps(22) - w - ps(12), cy - th * 0.5 - ps(3), w + ps(12), th + ps(6), 1);
+    col(0xE4F0EF, 1);     text_c(X - ps(22) - w * 0.5 - ps(6), cy, #kv);
+  );
+);
+
+// Vertical LED meter, -48..+3 dB in 1.5 dB segments
+function vmeter(x, y0, h, db, lbl) local(n, sh, j, d, yy) (
+  n = 34;  sh = h / n;
+  col(0x11151B, 1);  gfx_rect(px(x - 3), py(y0 - 3), ps(22), ps(h + 6), 1);
+  j = 0;
+  loop(n,
+    d = -48 + (j + 1) * 1.5;
+    yy = y0 + h - (j + 1) * sh;
+    d > 0 ? col(0xE0503A, db >= d - 1.5 ? 1 : 0.15) :
+    d > -6 ? col(0xE8C060, db >= d - 1.5 ? 1 : 0.15) :
+             col(0xA0AF84, db >= d - 1.5 ? 1 : 0.15);
+    gfx_rect(px(x), py(yy) + 1, ps(16), ps(sh) - 1, 1);
+    j += 1;
+  );
+  gfx_setfont(5);  col(0xE4F0EF, 1);  text_c(px(x + 8), py(y0 + h + 14), lbl);
+);
+
+
+
+// GUI copies of the width rules (audio and GUI threads must not share functions)
+function gq_eff(q, db) local(a) (
+  a = min(abs(db), 20) / 20;
+  eqtype < 0.5 ? q * (0.45 + 0.9 * a) :
+  eqtype < 1.5 ? q * (0.7 + 1.6 * a) :
+  eqtype < 2.5 ? q :
+  db >= 0 ? q * (0.6 + 1.0 * a) : q * (1.2 + 1.2 * a);
+);
+function gq_shelf() ( eqtype < 0.5 ? 0.55 : eqtype < 1.5 ? 0.65 : eqtype < 2.5 ? 0.7071 : 0.9; );
+// analog-prototype magnitude (dB) of band b at frequency f with gain db (uses the band's real width)
+function band_mag(b, f, db) local(p, f0, w, A, q, nr, ni, dr, di, w2, sa) (
+  p = b * 16;  f0 = PRM[p + B_F];  w = f / f0;  w2 = w * w;  A = exp(db * 0.05756462732485115);
+  PRM[p + B_KIND] == 1 ? (
+    q = gq_eff(PRM[p + B_Q], db);
+    nr = 1 - w2;  ni = w * A / q;  dr = 1 - w2;  di = w / (A * q);
+  ) : PRM[p + B_KIND] == 0 ? (
+    sa = sqrt(A) / gq_shelf();
+    nr = A * (A - w2);  ni = A * sa * w;  dr = 1 - A * w2;  di = sa * w;
+  ) : (
+    sa = sqrt(A) / gq_shelf();
+    nr = A * (1 - A * w2);  ni = A * sa * w;  dr = A - w2;  di = sa * w;
+  );
+  10 * log10((nr * nr + ni * ni) / max(dr * dr + di * di, 0.0000000001));
+);
+function filt_mag(f) local(m, n) (
+  m = 0;
+  hpf_on ? ( n = hpf24 ? 4 : 2;  m -= 10 * log10(1 + (hpf / f) ^ (2 * n)); );
+  lpf_on ? ( n = lpf24 ? 4 : 2;  m -= 10 * log10(1 + (f / lpf) ^ (2 * n)); );
+  m;
+);
+// house band colours (LF brown, LMF blue, HMF green, HF red) + muted violet for the fifth band, MF
+function band_col(b) ( b == 0 ? 0x8A5A3A : b == 1 ? 0x3E6E9E : b == 2 ? 0x7B5EA7 : b == 3 ? 0x3F8A5A : 0xB5443A; );
+
+// band column: title bar, ON (+ SHELF on LF / HF), GAIN, FREQ, Q
+function band_ui(b, x0) local(p, i, cc, cx, fmin, fmax, fdef) (
+  p = b * 16;  i = 1 + b * 5;  cc = band_col(b);  cx = x0 + 61;
+  b == 0 ? strcpy(#bn, "LF") : b == 1 ? strcpy(#bn, "LMF") : b == 2 ? strcpy(#bn, "MF") : b == 3 ? strcpy(#bn, "HMF") : strcpy(#bn, "HF");
+  fmin = b == 0 ? 20 : b == 1 ? 40 : b == 2 ? 200 : b == 3 ? 800 : 2000;
+  fmax = b == 0 ? 500 : b == 1 ? 1000 : b == 2 ? 5000 : b == 3 ? 12000 : 20000;
+  fdef = b == 0 ? 80 : b == 1 ? 250 : b == 2 ? 1000 : b == 3 ? 3500 : 10000;
+  col(cc, 1);  gfx_rect(px(x0), py(242), ps(122), ps(20), 1);
+  col(0x000000, 0.25);  gfx_rect(px(x0), py(260), ps(122), ps(2), 1);
+  gfx_setfont(2);  col(0xF4F2EC, 1);  text_c(px(cx), py(252), #bn);
+  (b == 0 || b == 4) ? (
+    lk_fit(x0 - 2, 266, 60, 32, PRM[p + B_ON], LK_AMB, "ON") ? ( slider(i) = PRM[p + B_ON] ? 0 : 1;  param_touched(i); );
+    lk_fit(x0 + 62, 266, 62, 32, PRM[p + B_TYPE] < 0.5, LK_SAGE, "SHELF") ? ( slider(i + 1) = PRM[p + B_TYPE] < 0.5 ? 1 : 0;  param_touched(i + 1); );
+  ) : (
+    lk_fit(cx - 32, 266, 64, 32, PRM[p + B_ON], LK_AMB, "ON") ? ( slider(i) = PRM[p + B_ON] ? 0 : 1;  param_touched(i); );
+  );
+  kn(cx, 342, 21, i + 4, -20, 20, 0, cc, "GAIN", 0);
+  klog = 1;  kn(cx, 428, 17, i + 2, fmin, fmax, fdef, cc, "FREQ", 3);
+  PRM[p + B_KIND] == 1 ? (
+    klog = 1;  kn(cx, 505, 14, i + 3, 0.3, 6, 1, 0xA8B98A, "Q", 4);
+  ) : (
+    gfx_setfont(5);  col(0xE4F0EF, 0.45);  text_c(px(cx), py(505), "SHELF");
+  );
+  !PRM[p + B_ON] ? ( col(0x15616D, 0.5);  gfx_rect(px(x0), py(300), ps(122), ps(250), 1); );
+);
+
+// ---------- house preset bar (ported from gfx-panel pk_preset): [PRESETS][<][>][LCD] ----------
+// PRESETS, or a click on the LCD, opens the list; the arrows step through it. menu = "Name 1|...|Name n".
+// The list ends with "Reset all to defaults" (returns n + 1). Returns the preset to load, 0 for none.
+// Keys are this unit's lamp keys (PB_KEY lens, PB_INK arrows); the LCD is the house amber one.
+function pb_count(menu) local(k, n) ( n = 1;  k = 0;  loop(strlen(menu), str_getchar(menu, k) == 124 ? n += 1;  k += 1; );  n; );
+function pb_item(menu, i, dst) local(k, k0, n, c, len) (
+  strcpy(dst, "");  len = strlen(menu);  k = 0;  k0 = 0;  n = 1;
+  loop(len + 1,
+    c = k < len ? str_getchar(menu, k) : 124;
+    c == 124 ? ( n == i ? strcpy_substr(dst, menu, k0, k - k0);  n += 1;  k0 = k + 1; );
+    k += 1;
+  );
+  dst;
+);
+function pb_tri(cx, cy, s, dir) (
+  gfx_triangle(px(cx + dir * s), py(cy), px(cx - dir * s), py(cy - s), px(cx - dir * s), py(cy + s));
+);
+function preset_bar(x, y, h, lw, cur, menu) local(n, sel, open, lx, tw, th, i) (
+  n = pb_count(menu);  sel = 0;  open = 0;
+  lk_fit(x, y, 100, h, 0, PB_KEY, "PRESETS") ? open = 1;
+  lk_fit(x + 102, y, 46, h, 0, PB_KEY, "") ? ( sel = cur <= 1 || cur > n ? n : cur - 1; );
+  lk_fit(x + 150, y, 46, h, 0, PB_KEY, "") ? ( sel = cur >= n || cur < 1 ? 1 : cur + 1; );
+  col(PB_INK, 1);  pb_tri(x + 125, y + h * 0.5 - 0.5, 5, -1);  pb_tri(x + 173, y + h * 0.5 - 0.5, 5, 1);
+  // the LCD: black bezel, dark amber glass, the patch name only
+  lx = x + 206;
+  col(0x000000, 0.3);  gfx_rect(px(lx + 2), py(y + 5), ps(lw), ps(h - 6), 1);
+  col(0x050505, 1);    gfx_rect(px(lx), py(y + 3), ps(lw), ps(h - 6), 1);
+  gfx_gradrect(px(lx + 3), py(y + 6), ps(lw - 6), ps(h - 12), 0.17, 0.10, 0.02, 1, 0, 0, 0, 0, -0.06 / ps(h), -0.04 / ps(h), -0.01 / ps(h), 0);
+  col(0xFFFFFF, 0.06); gfx_line(px(lx + 4), py(y + 7), px(lx + lw - 5), py(y + 7), 1);
+  cur >= 1 && cur <= n ? pb_item(menu, cur, #pb_nm) : strcpy(#pb_nm, "--");
+  gfx_setfont(8);  col(0xE8A33A, 1);  gfx_measurestr(#pb_nm, tw, th);
+  gfx_x = px(lx + 10);  gfx_y = py(y + h * 0.5) - th * 0.5;  gfx_drawstr(#pb_nm);
+  click && mouse_x >= px(lx) && mouse_x < px(lx + lw) && mouse_y >= py(y) && mouse_y < py(y + h) ? open = 1;
+  open ? (
+    strcpy(#pb_m, "");  i = 1;
+    loop(n, i == cur ? strcat(#pb_m, "!");  strcat(#pb_m, pb_item(menu, i, #pb_t));  strcat(#pb_m, "|");  i += 1; );
+    strcat(#pb_m, "Reset all to defaults");
+    gfx_x = px(x);  gfx_y = py(y + h);  i = gfx_showmenu(#pb_m);  i > 0 ? sel = i;
+  );
+  sel;
+);
+
+// ---------- presets (OUTPUT evens the loudness; GUI thread only) ----------
+function load_preset(p) (
+  p == 1 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 250;  slider(9) = 1;  slider(10) = 0;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 0;  slider(26) = 0;  slider(27) = 20;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = 0;  slider(32) = 1; ) :   // Init
+  p == 2 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 300;  slider(9) = 1.2;  slider(10) = -2;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 4000;  slider(19) = 1;  slider(20) = 3;  slider(21) = 1;  slider(22) = 0;  slider(23) = 12000;  slider(24) = 1;  slider(25) = 3;  slider(26) = 0;  slider(27) = 80;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = -0.5;  slider(32) = 1; ) :   // Vocal: Presence and Air
+  p == 3 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 450;  slider(9) = 2;  slider(10) = -4;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 2;  slider(26) = 3;  slider(27) = 100;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = 0.5;  slider(32) = 1; ) :   // Vocal: De-Box
+  p == 4 ? ( slider(1) = 1;  slider(2) = 1;  slider(3) = 60;  slider(4) = 1.2;  slider(5) = 4;  slider(6) = 1;  slider(7) = 1;  slider(8) = 350;  slider(9) = 1.5;  slider(10) = -5;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1.5;  slider(20) = 4;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 0;  slider(26) = 1;  slider(27) = 20;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = -1.5;  slider(32) = 1; ) :   // Kick: Punch
+  p == 5 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 200;  slider(9) = 1.2;  slider(10) = 3;  slider(11) = 1;  slider(12) = 1;  slider(13) = 900;  slider(14) = 2;  slider(15) = -3;  slider(16) = 1;  slider(17) = 1;  slider(18) = 5000;  slider(19) = 1;  slider(20) = 4;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 0;  slider(26) = 0;  slider(27) = 80;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = -1;  slider(32) = 1; ) :   // Snare: Body and Crack
+  p == 6 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 2;  slider(6) = 1;  slider(7) = 1;  slider(8) = 250;  slider(9) = 1.5;  slider(10) = -2;  slider(11) = 1;  slider(12) = 1;  slider(13) = 800;  slider(14) = 1.5;  slider(15) = 3;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 0;  slider(26) = 0;  slider(27) = 20;  slider(28) = 0;  slider(29) = 8000;  slider(30) = 0;  slider(31) = -0.5;  slider(32) = 1; ) :   // Bass: Definition
+  p == 7 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 200;  slider(9) = 1.2;  slider(10) = -3;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 5000;  slider(19) = 0.8;  slider(20) = 2;  slider(21) = 1;  slider(22) = 0;  slider(23) = 12000;  slider(24) = 1;  slider(25) = 3;  slider(26) = 0;  slider(27) = 80;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = 0;  slider(32) = 1; ) :   // Acoustic: Sparkle
+  p == 8 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 250;  slider(9) = 1;  slider(10) = -2;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1500;  slider(14) = 1.5;  slider(15) = 3;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 8000;  slider(24) = 1;  slider(25) = -2;  slider(26) = 0;  slider(27) = 90;  slider(28) = 0;  slider(29) = 12000;  slider(30) = 0;  slider(31) = 0;  slider(32) = 1; ) :   // Electric: Bite
+  p == 9 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 100;  slider(4) = 1;  slider(5) = -1;  slider(6) = 1;  slider(7) = 1;  slider(8) = 300;  slider(9) = 1;  slider(10) = -2;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3000;  slider(19) = 0.8;  slider(20) = 2;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 2;  slider(26) = 0;  slider(27) = 20;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = -0.5;  slider(32) = 1; ) :   // Piano: Clarity
+  p == 10 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 400;  slider(9) = 1.5;  slider(10) = -3;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 3;  slider(26) = 0;  slider(27) = 120;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = 1.5;  slider(32) = 1; ) :   // Drums: Overheads
+  p == 11 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 3;  slider(6) = 1;  slider(7) = 1;  slider(8) = 250;  slider(9) = 1;  slider(10) = 0;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 0.7;  slider(15) = -2;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 3;  slider(26) = 0;  slider(27) = 20;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = 0.5;  slider(32) = 1; ) :   // Mix: Smile
+  p == 12 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 40;  slider(4) = 1;  slider(5) = 1;  slider(6) = 1;  slider(7) = 1;  slider(8) = 250;  slider(9) = 1;  slider(10) = 0;  slider(11) = 1;  slider(12) = 1;  slider(13) = 2500;  slider(14) = 0.7;  slider(15) = -0.5;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 16000;  slider(24) = 1;  slider(25) = 1.5;  slider(26) = 0;  slider(27) = 20;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = 0;  slider(32) = 1; ) :   // Mix: Gentle Master
+  p == 13 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 250;  slider(9) = 1;  slider(10) = 0;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1500;  slider(14) = 1;  slider(15) = 6;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 0;  slider(26) = 2;  slider(27) = 400;  slider(28) = 1;  slider(29) = 3500;  slider(30) = 1;  slider(31) = 12;  slider(32) = 1; ) :   // FX: Telephone
+  p == 14 ? ( slider(1) = 1;  slider(2) = 0;  slider(3) = 80;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 250;  slider(9) = 1;  slider(10) = 0;  slider(11) = 1;  slider(12) = 1;  slider(13) = 1000;  slider(14) = 1;  slider(15) = 0;  slider(16) = 1;  slider(17) = 1;  slider(18) = 3500;  slider(19) = 1;  slider(20) = 0;  slider(21) = 1;  slider(22) = 0;  slider(23) = 10000;  slider(24) = 1;  slider(25) = 0;  slider(26) = 0;  slider(27) = 20;  slider(28) = 0;  slider(29) = 20000;  slider(30) = 0;  slider(31) = 0;  slider(32) = 1; ) : 0;   // Reset all to defaults
+  slider_automate(p == 14 ? 4294967295 : 4294967295);
+  gui_dirty = 1;
+);
+PRESET_MENU = "Init|Vocal: Presence and Air|Vocal: De-Box|Kick: Punch|Snare: Body and Crack|Bass: Definition|Acoustic: Sparkle|Electric: Bite|Piano: Clarity|Drums: Overheads|Mix: Smile|Mix: Gentle Master|FX: Telephone";
+PB_KEY = 0xA0AF84;  PB_INK = 0x0E3A40;
+
+// ---------- frame setup ----------
+sc = min(gfx_w / 1000, gfx_h / 575);
+ox = (gfx_w - 1000 * sc) * 0.5;
+oy = (gfx_h - 575 * sc) * 0.5;
+lmb = mouse_cap & 1;
+click = lmb && !last_lmb;
+
+gfx_setfont(1, "Verdana", ps(26), 'b');
+gfx_setfont(2, "Century Gothic", ps(13), 'b');
+gfx_setfont(3, "Verdana", ps(12), 'b');
+gfx_setfont(4, "Verdana", ps(15), 'b');
+gfx_setfont(5, "Verdana", ps(11), 'b');
+gfx_setfont(6, "Century Gothic", ps(13), 'b');
+gfx_setfont(8, "Courier New", ps(16), 'b');
+
+in_m  = max(inpk_disp,  in_m * 0.85);   inpk_disp = 0;
+out_m = max(outpk_disp, out_m * 0.85);  outpk_disp = 0;
+
+// ---------- faceplate ----------
+col(0x15616D, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+j = 0;   // pinstripe, top bar only
+loop(12,
+  col(j % 3 == 0 ? 0xFFFFFF : 0x0E4A53, 0.10);
+  gy = py(1 + j * 4);  gfx_line(px(0), gy, px(1000), gy, 1);
+  j += 1;
+);
+col(0x3F8590, 1);  gfx_rect(px(0), py(0), ps(1000), ps(1.5), 1);
+col(0x426A5A, 1);  gfx_rect(px(0), py(46), ps(1000), ps(5), 1);          // Oxford-green line under the title
+col(0x000000, 0.18); gfx_rect(px(0), py(569), ps(1000), ps(6), 1);       // darker bottom edge
+rivet(12, 18);  rivet(988, 18);  rivet(12, 557);  rivet(988, 557);
+gfx_setfont(1);  col(0xA0AF84, 1);  gfx_x = px(40);  gfx_y = py(9);   gfx_drawstr("CHERWELL");
+gfx_setfont(4);  col(0xE4F0EF, 1);  gfx_x += ps(14);  gfx_y = py(16);  gfx_drawstr("EQ");
+gfx_setfont(4);  col(0xA0AF84, 1);  gfx_x = px(930); gfx_y = py(16);  gfx_drawstr("GFX");
+
+// ---------- preset bar, in the title bar ----------
+pb_k = preset_bar(300, 8, 30, 300, pr_cur, PRESET_MENU);
+pb_k > 0 ? ( load_preset(pb_k);  pr_cur = pb_k > 13 ? 1 : pb_k; );
+
+// ---------- display window: response curve ----------
+dx0 = 40;  dy0 = 70;  dw = 740;  dh = 140;
+col(0x0F525C, 1);  gfx_rect(px(dx0 - 10), py(dy0 - 10), ps(dw + 20), ps(dh + 20), 1);
+col(0x08363C, 1);  gfx_rect(px(dx0 - 10), py(dy0 - 10), ps(dw + 20), ps(2), 1);
+                   gfx_rect(px(dx0 - 10), py(dy0 - 8),  ps(2), ps(dh + 18), 1);
+col(0x4E959E, 1);  gfx_rect(px(dx0 - 8),  py(dy0 + dh + 8), ps(dw + 18), ps(2), 1);
+                   gfx_rect(px(dx0 + dw + 8), py(dy0 - 8), ps(2), ps(dh + 16), 1);
+col(0xA0AF84, 1);  gfx_rect(px(dx0 - 4), py(dy0 - 4), ps(dw + 8), ps(dh + 8), 1);
+col(0x0B2F35, 1);  gfx_rect(px(dx0), py(dy0), ps(dw), ps(dh), 1);
+// grid: decades and +-6 / 12 / 18 dB (span +-20)
+col(0x1F4C52, 1);
+f = 100;  loop(3, gfx_line(px(dx0 + dw * log(f / 20) / log(1000)), py(dy0), px(dx0 + dw * log(f / 20) / log(1000)), py(dy0 + dh), 1);  f *= 10; );
+j = -3;  loop(7, gfx_line(px(dx0), py(dy0 + dh * 0.5 - j * 6 * dh / 40), px(dx0 + dw), py(dy0 + dh * 0.5 - j * 6 * dh / 40), 1);  j += 1; );
+gfx_setfont(5);  col(0x8FB0A8, 1);
+gfx_x = px(dx0 + dw * log(5) / log(1000) - 12);  gfx_y = py(dy0 + dh - 16);  gfx_drawstr("100");
+gfx_x = px(dx0 + dw * log(50) / log(1000) - 8);  gfx_y = py(dy0 + dh - 16);  gfx_drawstr("1k");
+gfx_x = px(dx0 + dw * log(500) / log(1000) - 10); gfx_y = py(dy0 + dh - 16); gfx_drawstr("10k");
+// each band's own curve, faint in its colour; then the sum, bright
+gb = 0;
+loop(5,
+  PRM[gb * 16 + B_ON] && PRM[gb * 16 + B_G] != 0 ? (
+    col(band_col(gb), 0.55);  j = 0;
+    loop(121,
+      f = 20 * 1000 ^ (j / 120);
+      m = band_mag(gb, f, PRM[gb * 16 + B_G]);
+      gx = px(dx0 + dw * j / 120);  gy = py(dy0 + dh * 0.5 - dh * 0.5 * max(-1, min(1, m / 20)));
+      j == 0 ? ( gfx_x = gx;  gfx_y = gy; ) : gfx_lineto(gx, gy, 1);
+      j += 1;
+    );
+  );
+  gb += 1;
+);
+col(0xE4F0EF, 1);  j = 0;
+loop(181,
+  f = 20 * 1000 ^ (j / 180);
+  m = filt_mag(f);
+  gb = 0;
+  loop(5, PRM[gb * 16 + B_ON] ? ( m += band_mag(gb, f, PRM[gb * 16 + B_G]); );  gb += 1; );
+  gx = px(dx0 + dw * j / 180);
+  gy = py(dy0 + dh * 0.5 - dh * 0.5 * max(-1, min(1, m / 20)));
+  j == 0 ? ( gfx_x = gx;  gfx_y = gy; ) : gfx_lineto(gx, gy, 1);
+  j += 1;
+);
+// band nodes
+gb = 0;
+loop(5,
+  PRM[gb * 16 + B_ON] ? (
+    gx = px(dx0 + dw * log(PRM[gb * 16 + B_F] / 20) / log(1000));
+    gy = py(dy0 + dh * 0.5 - dh * 0.5 * max(-1, min(1, PRM[gb * 16 + B_G] / 20)));
+    col(band_col(gb), 1);  gfx_circle(gx, gy, ps(5), 1, 1);  col(0xE4F0EF, 1);  gfx_circle(gx, gy, ps(5), 0, 1);
+  );
+  gb += 1;
+);
+
+// ---------- filters column ----------
+gfx_setfont(2);  col(0xE4F0EF, 1);  text_c(px(85), py(252), "FILTERS");
+col(0xA0AF84, 0.6);  gfx_rect(px(30), py(262), ps(110), ps(1), 1);
+klog = 1;  kn(85, 312, 17, 27, 20, 1000, 20, 0xE2C84A, "HPF", 7);
+lk_fit(55, 352, 60, 30, hpf24, LK_SAGE, "24 dB") ? ( slider(28) = hpf24 ? 0 : 1;  param_touched(28); );
+klog = 1;  kn(85, 432, 17, 29, 1000, 20000, 20000, 0x2A2D33, "LPF", 8);
+lk_fit(55, 472, 60, 30, lpf24, LK_SAGE, "24 dB") ? ( slider(30) = lpf24 ? 0 : 1;  param_touched(30); );
+
+// ---------- band columns ----------
+band_ui(0, 156);  band_ui(1, 288);  band_ui(2, 420);  band_ui(3, 552);  band_ui(4, 684);
+
+// ---------- output and meters ----------
+vslider(842, 70, 190, 31, -12, 12, 0, "OUTPUT");
+vmeter(888, 70, 190, gdb(in_m),  "IN");
+vmeter(924, 70, 190, gdb(out_m), "OUT");
+
+// ---------- EQ TYPE and IN, under the meters ----------
+gfx_setfont(2);  col(0xE4F0EF, 1);  text_c(px(896), py(318), "EQ TYPE");
+col(0xA0AF84, 0.6);  gfx_rect(px(836), py(328), ps(120), ps(1), 1);
+gi = 0;
+loop(4,
+  sprintf(#tk, "%d", gi + 1);
+  lk_fit(834 + gi * 31, 338, 32, 34, eqtype == gi, LK_SAGE, #tk) ? ( slider(26) = gi;  param_touched(26); );
+  gi += 1;
+);
+gfx_setfont(5);  col(0xE4F0EF, 0.8);
+text_c(px(896), py(388), eqtype == 0 ? "GENTLE PROPORTIONAL" : eqtype == 1 ? "TIGHT PROPORTIONAL" : eqtype == 2 ? "CONSTANT Q" : "ASYMMETRIC");
+lk_fit(862, 506, 68, 38, eq_on, LK_AMB, "IN") ? ( slider(32) = eq_on ? 0 : 1;  param_touched(32); );
+
+// ---------- end of frame ----------
+!lmb ? drag_idx = 0;
+last_lmb = lmb;
+gui_dirty ? ( prm_dirty = 1;  gui_dirty = 0; );   // rebuilt in @block, never on the GUI thread

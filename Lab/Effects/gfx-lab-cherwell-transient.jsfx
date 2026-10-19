@@ -1,0 +1,532 @@
+desc: GFX Lab Cherwell Transient [transient shaper]
+//author: JGWizrad / Garden FX (GFX)
+//
+// Cherwell series — clinical mid-90s digital console processing.
+// Transient: shapes the front and the tail of every hit, whatever its level.
+// Brand names live in comments only (reference: the Oxford-style transient
+// modulator).
+//
+//   ATTACK  -100..+100 %: soften or sharpen the front of each hit (up to ~12 dB)
+//   SUSTAIN -100..+100 %: shorten or lengthen the tail
+//   SPEED   how quickly it reacts (1 slow .. 10 fast)
+//   FOCUS   a high-pass on what it listens to (20 Hz = full range), so the low end
+//           doesn't trigger it. HIGH lit: only the band above FOCUS is shaped; the
+//           lows pass untouched (complementary split, sums back exactly).
+//   MIX     dry / shaped (parallel)
+//   DELTA   hear only the change (shaped minus dry)
+//   CLIP    a soft ceiling at 0 dBFS (big attack boosts can spike)
+// Detection is level-independent: fast and slow envelope followers compared in dB
+// (onset: fast attack above slow attack; tail: slow release above fast release),
+// stereo linked. Gain glides 0.1 ms. Latency: 0. No DRIFT (clinical digital unit).
+//
+// STATUS: Lab (experimental, may change). v0.1.
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-clip.jsfx-inc
+
+slider1:ts_att=0<-100,100,1>-Attack (%)
+slider2:ts_sus=0<-100,100,1>-Sustain (%)
+slider3:ts_spd=5<1,10,0.1>-Speed
+slider4:ts_foc=20<20,2000,1>-Focus (Hz)
+slider5:ts_mix=100<0,100,1>-Mix (%)
+slider6:ts_high=0<0,1,1{Full,High}>-Band
+slider7:ts_clip=1<0,1,1{Off,On}>-Clip 0 dB
+slider8:ts_delta=0<0,1,1{Off,On}>-Delta
+slider9:out_db=0<-12,12,0.1>-Output (dB)
+slider10:ts_on=1<0,1,1{Off,On}>-In
+
+@init
+ext_noinit = 1;
+pr_cur = 1;              // preset shown on the LCD (saved with the project)
+gfx_ext_retina = 1;
+first_run = 1;
+clp_aa = 1;
+ccL.clp_set(2, 1, 1, 0);  ccR.clp_set(2, 1, 1, 0);  ccL.clp_knee(0.2);  ccR.clp_knee(0.2);
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function tg(f) ( tan($pi * min(f, srate * 0.45) / srate); );
+function svf_set(fc, q) instance(g, k, a1, a2, a3) (
+  g = tg(fc);  k = 1 / q;  a1 = 1 / (1 + g * (g + k));  a2 = g * a1;  a3 = g * a2;
+);
+function svf_tick(x) instance(g, k, a1, a2, a3, ic1, ic2, lp, bp, hp) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;
+  lp = v2;  bp = v1;  hp = x - k * v1 - v2;
+);
+function tc(ms) ( 1 - exp(-1 / (max(ms, 0.01) * 0.001 * srate)); );
+
+function update_params() local(k) (
+  k = 2 ^ ((5 - ts_spd) / 4.5);                      // SPEED: 1 = ~2.4x slower .. 10 = ~2.2x faster
+  fa_a = tc(0.25 * k);  fa_r = tc(25 * k);           // onset: fast attack follower ...
+  sa_a = tc(20 * k);    sa_r = tc(25 * k);           // ... against a slow attack follower
+  fr_a = tc(0.5 * k);   fr_r = tc(30 * k);           // tail: fast release follower ...
+  sr_a = tc(0.5 * k);   sr_r = tc(320 * k);          // ... against a slow release follower
+  g_a = tc(0.1);                                     // gain glide
+  hold_r = exp(-1 / (0.008 * srate));
+  tl_up = tc(3);
+  dtL.svf_set(ts_foc, 0.7071);
+  xoL1.svf_set(ts_foc, 0.7071);  xoL2.svf_set(ts_foc, 0.7071);  xoR1.svf_set(ts_foc, 0.7071);  xoR2.svf_set(ts_foc, 0.7071);
+  foc_on = ts_foc > 20.5;
+  att_k = ts_att / 100 * 0.7;  sus_k = ts_sus / 100 * 0.7;
+  mix_t = ts_mix / 100;  out_t = db2g(out_db);
+  sm = 1 - exp(-1 / (0.02 * srate));
+  ramp_step = 1 / (0.010 * srate);
+  first_run ? ( mix_s = mix_t;  out_s = out_t;  on_s = ts_on;  hi_s = ts_high;  dl_s = ts_delta;  clip_s = ts_clip;  first_run = 0; );
+);
+
+@slider
+update_params();
+
+@block
+prm_dirty ? ( prm_dirty = 0;  update_params(); );
+gmax_d = max(gmax_d, gmax);  gmax = -99;            // the gain moves for the display (signed)
+gmin_d = min(gmin_d, gmin);  gmin = 99;
+inpk_disp  = max(inpk_disp, inpk);    inpk = 0;
+outpk_disp = max(outpk_disp, outpk);  outpk = 0;
+
+@sample
+mix_s += (mix_t - mix_s) * sm;  out_s += (out_t - out_s) * sm;
+on_s != ts_on ? ( on_s = ts_on > on_s ? min(1, on_s + ramp_step) : max(0, on_s - ramp_step); );
+hi_s != ts_high ? ( hi_s = ts_high > hi_s ? min(1, hi_s + ramp_step) : max(0, hi_s - ramp_step); );
+dl_s != ts_delta ? ( dl_s = ts_delta > dl_s ? min(1, dl_s + ramp_step) : max(0, dl_s - ramp_step); );
+clip_s != ts_clip ? ( clip_s = ts_clip > clip_s ? min(1, clip_s + ramp_step) : max(0, clip_s - ramp_step); );
+xL = spl0;  xR = spl1;
+inpk = max(inpk, max(abs(xL), abs(xR)));
+
+on_s > 0 ? (
+  // detector: linked, FOCUS high-pass
+  dv = max(abs(xL), abs(xR));
+  foc_on ? ( dtL.svf_tick((xL + xR) * 0.5);  dv = abs(dtL.hp); );
+  lvh = dv > lvh ? dv : lvh * hold_r;                    // instant-attack peak hold (~8 ms): the waveform's ripple out
+  dv = lvh;
+  efa += (dv - efa) * (dv > efa ? fa_a : fa_r);
+  esa += (dv - esa) * (dv > esa ? sa_a : sa_r);
+  efr += (dv - efr) * (dv > efr ? fr_a : fr_r);
+  esr += (dv - esr) * (dv > esr ? sr_a : sr_r);
+  onset = efa > 0.00001 && esa > 0.00001 ? max(0, min(18, 8.685889638065035 * log(efa / esa))) : 0;
+  tail  = efr > 0.00001 && esr > 0.00001 ? max(0, min(18, 8.685889638065035 * log(esr / efr))) : 0;
+  esa < 0.00003 ? ( onset = 0;  tail = 0; );               // silence: nothing to shape
+  // the tail term: gone the moment the level rises (a new hit), building back gently (3 ms)
+  dv > efr * 1.02 ? tl = 0 : tl += (tail - tl) * (tail > tl ? tl_up : 1);
+  tail = tl;
+  gt = max(-18, min(18, att_k * onset + sus_k * tail));
+  gd += (gt - gd) * g_a;
+  gd > gmax ? gmax = gd;  gd < gmin ? gmin = gd;
+  g = db2g(gd);
+  // shape: full band, or only above FOCUS (HIGH): complementary split (2 x 2-pole low-pass), sums back exactly
+  xoL1.svf_tick(xL);  xoL2.svf_tick(xoL1.lp);  loL = xoL2.lp;
+  xoR1.svf_tick(xR);  xoR2.svf_tick(xoR1.lp);  loR = xoR2.lp;
+  hs = hi_s * foc_on;
+  sL = (xL - loL * hs) * g + loL * hs;
+  sR = (xR - loR * hs) * g + loR * hs;
+  yL = xL + (sL - xL) * mix_s;  yR = xR + (sR - xR) * mix_s;
+  dl_s > 0 ? ( yL += (yL - xL - yL) * dl_s;  yR += (yR - xR - yR) * dl_s; );
+  clip_s > 0 ? ( yL += (ccL.clp_run(yL) - yL) * clip_s;  yR += (ccR.clp_run(yR) - yR) * clip_s; );
+  yL *= out_s;  yR *= out_s;
+  on_s < 1 ? ( yL = xL + (yL - xL) * on_s;  yR = xR + (yR - xR) * on_s; );
+) : ( yL = xL;  yR = xR; );
+
+outpk = max(outpk, max(abs(yL), abs(yR)));
+spl0 = yL;  spl1 = yR;
+
+@serialize
+file_var(0, pr_cur);
+
+@gfx 1000 320
+// =====================================================================
+// GUI — Cherwell series, "Quad" scheme (as Lift, the EQs and the De-Esser)
+// =====================================================================
+function col(h, a) (
+  gfx_r = floor(h / 65536) / 255;  gfx_g = (floor(h / 256) % 256) / 255;  gfx_b = (h % 256) / 255;  gfx_a = a;
+);
+function shade(h, f) local(r, g, b) (
+  r = min(255, floor(floor(h / 65536) * f));  g = min(255, floor((floor(h / 256) % 256) * f));
+  b = min(255, floor((h % 256) * f));  r * 65536 + g * 256 + b;
+);
+function gdb(x) ( 8.685889638065035 * log(max(x, 0.000000001)); );   // GUI copy of g2db
+function px(v) ( ox + v * sc; );
+function py(v) ( oy + v * sc; );
+function ps(v) ( v * sc; );
+function text_c(x, y, str) local(w, h) (
+  gfx_measurestr(str, w, h);  gfx_x = x - w * 0.5;  gfx_y = y - h * 0.5;  gfx_drawstr(str);
+);
+function param_touched(idx) ( slider_automate(2 ^ (idx - 1)); gui_dirty = 1; );
+function rivet(x, y) (
+  col(0x8A9098, 1);  gfx_circle(px(x), py(y), ps(3.5), 1, 1);
+  col(0xF2F4F6, 0.6); gfx_circle(px(x) - ps(1), py(y) - ps(1), ps(1.2), 1, 1);
+);
+function pointer(x, y, sa, ca, r0, r1, hw) local(ax, ay, bx, by, dx, dy) (
+  ax = x + sa * r0;  ay = y - ca * r0;  bx = x + sa * r1;  by = y - ca * r1;  dx = ca * hw;  dy = sa * hw;
+  gfx_triangle(ax + dx, ay + dy, bx + dx, by + dy, bx - dx, by - dy, ax - dx, ay - dy);
+  gfx_line(ax + dx, ay + dy, bx + dx, by + dy, 1);  gfx_line(ax - dx, ay - dy, bx - dx, by - dy, 1);
+);
+
+// Cherwell knob (as Lift): dark knurled skirt, translucent cap (cap colour), glowing lime
+// indicator, ticks; value on hover only. klog = 1 before a call = log taper.
+// fmt: 0 dB (+), 2 dB, 3 Hz, 4 Q, 5 ms, 7 HPF Hz (OFF at min), 8 LPF Hz (OFF at max)
+function kn(cx, cy, r, idx, vmin, vmax, def, cap, lbl, fmt)
+  local(x, y, rr, v, t, hov, now, a0, a1, tv, b, j, w, h, ty, lg)
+(
+  lg = klog;  klog = 0;
+  x = px(cx);  y = py(cy);  rr = ps(r);
+  hov = sqr(mouse_x - x) + sqr(mouse_y - y) <= sqr(rr * 1.25);
+  v = slider(idx);
+  t = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  click && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : ( drag_idx = idx;  drag_y = mouse_y;  drag_t = t; );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  drag_idx == idx ? (
+    t = max(0, min(1, drag_t + (drag_y - mouse_y) / ps(220)));
+    v = lg ? vmin * exp(t * log(vmax / vmin)) : vmin + t * (vmax - vmin);
+    lg ? ( j = 10 ^ (floor(log10(v)) - 2);  v = floor(v / j + 0.5) * j; ) : v = floor(v * 10 + 0.5) / 10;
+    v = max(vmin, min(vmax, v));
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = slider(idx);
+  t = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;  tv = a0 + t * (a1 - a0);
+  col(0xE4F0EF, 0.75);  j = 0;
+  loop(11,
+    b = a0 + j / 10 * (a1 - a0);
+    gfx_line(x + sin(b) * (rr + ps(4)), y - cos(b) * (rr + ps(4)), x + sin(b) * (rr + ps(8)), y - cos(b) * (rr + ps(8)), 1);
+    j += 1;
+  );
+  col(0x000000, 0.3);   gfx_circle(x + ps(2), y + ps(3), rr, 1, 1);
+  col(0x24272C, 1);     gfx_circle(x, y, rr, 1, 1);
+  j = 0;
+  loop(40,
+    b = tv + j * $pi / 20;
+    col(j % 2 ? 0x34383E : 0x4C5158, 1);
+    gfx_line(x + sin(b) * rr * 0.62, y - cos(b) * rr * 0.62, x + sin(b) * rr * 0.95, y - cos(b) * rr * 0.95, 1);
+    j += 1;
+  );
+  col(0x1A1C20, 1);     gfx_circle(x, y, rr, 0, 1);
+  col(0x1A1C20, 1);     gfx_circle(x, y, rr * 0.6, 1, 1);
+  col(cap, 0.82);       gfx_circle(x, y, rr * 0.54, 1, 1);
+  col(0xEAF6C2, 0.5);   gfx_arc(x, y, rr * 0.46, -1.9, -0.3, 1);
+  col(shade(cap, 0.6), 0.8);  gfx_circle(x, y, rr * 0.54, 0, 1);
+  b = ps(r > 20 ? 1.5 : 1.2);
+  col(0xCDEB7A, 0.12);  pointer(x, y, sin(tv), cos(tv), rr * 0.54, rr * 1.04, b * 3.2);
+  col(0xCDEB7A, 0.25);  pointer(x, y, sin(tv), cos(tv), rr * 0.55, rr * 1.01, b * 2);
+  col(0xDDF59A, 1);     pointer(x, y, sin(tv), cos(tv), rr * 0.56, rr * 0.99, b);
+  gfx_setfont(6);  col(0xE4F0EF, 1);  text_c(x, y + rr + ps(20), lbl);
+  hov || drag_idx == idx ? (
+    fmt == 9 ? sprintf(#kv, "%+d%%", v) :
+    fmt == 10 ? sprintf(#kv, "%.1f", v) :
+    fmt == 11 ? sprintf(#kv, "%d%%", v) :
+    fmt == 0 ? sprintf(#kv, "%+.1f dB", v) :
+    fmt == 2 ? sprintf(#kv, "%.1f dB", v) :
+    fmt == 3 ? ( v < 1000 ? sprintf(#kv, "%d Hz", v) : sprintf(#kv, "%.2f kHz", v / 1000); ) :
+    fmt == 4 ? sprintf(#kv, "Q %.2f", v) :
+    fmt == 5 ? ( v < 10 ? sprintf(#kv, "%.1f ms", v) : sprintf(#kv, "%d ms", v); ) :
+    fmt == 7 ? ( v <= vmin + 0.5 ? strcpy(#kv, "OFF") : sprintf(#kv, "%d Hz", v); ) :
+               ( v >= vmax - 0.5 ? strcpy(#kv, "OFF") : sprintf(#kv, "%.1f kHz", v / 1000); );
+    gfx_setfont(3);  gfx_measurestr(#kv, w, h);
+    ty = y - rr - ps(14) - h;
+    col(0x0E3A40, 0.95);  gfx_rect(x - w * 0.5 - ps(6), ty - ps(3), w + ps(12), h + ps(6), 1);
+    col(0xE4F0EF, 1);     text_c(x, ty + h * 0.5, #kv);
+  );
+);
+
+// ---------- house lamp keys (34-series), ported from gfx-lab-ui lk_key / lk_fit ----------
+// Coloured lens in a dark well; off = darker milky lens with vignette and dark legend,
+// lit = feathered glow and spill onto the panel. Adapted to this panel's px/py/ps layout.
+LK_AMB = 0xF2A41E;  LK_SAGE = 0xA0AF84;  LK_YEL = 0xF2C230;  LK_SKY = 0x7FB8E6;  lk_well = 0x141518;
+function ui_mix(c1, c2, t) (
+  floor(floor(c1 / 65536) * (1 - t) + floor(c2 / 65536) * t) * 65536 +
+  floor((floor(c1 / 256) % 256) * (1 - t) + (floor(c2 / 256) % 256) * t) * 256 +
+  floor((c1 % 256) * (1 - t) + (c2 % 256) * t);
+);
+function ui_rrs(x, y, w, h, r) local(i, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  i = 0;
+  loop(r,
+    d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);
+    gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);
+    i += 1;
+  );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+function lk_rr(x, y, w, h, r) ( ui_rrs(px(x), py(y), ps(w), ps(h), ps(r)); );
+function ui_keytext(cx, cy, str) local(w, h) (
+  gfx_measurestr(str, w, h); gfx_x = floor(cx - w * 0.5 + 0.5); gfx_y = floor(cy - h * 0.58 + 0.5); gfx_drawstr(str);
+);
+function lk_key(x, y, w, h, on, c, str) local(hov, hit, k, lens, dn, i, t, dx, dy) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov;
+  dn = hov && lmb ? 1 : 0;                                  // the cap sinks a pixel while held
+  k = min(w / 54, h / 40);
+  lens = shade(ui_mix(c, 0xCFC9BC, 0.5), 0.76);
+  on ? lens = c;
+  on ? (
+    col(c, 0.10); lk_rr(x - 9 * k, y - 9 * k, w + 18 * k, h + 18 * k, 10 * k);
+    col(c, 0.18); lk_rr(x - 6 * k, y - 6 * k, w + 12 * k, h + 12 * k, 8 * k);
+  );
+  col(lk_well, 1);           lk_rr(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k, 5 * k);
+  col(shade(lens, 0.55), 1); lk_rr(x, y + 1 / sc, w, h, 4 * k);
+  y += (dn - 1) / sc;
+  on ? (
+    col(lens, 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    i = 1;
+    loop(4,
+      t = 0.07 * i * (1 + 0.6 * max(1 - k, 0));
+      dx = (i == 1 ? 3 : i == 2 ? 6 : i == 3 ? 10 : 14) * k;
+      dy = (i == 1 ? 2 : i == 2 ? 4 : i == 3 ? 7 : 9) * k;
+      col(ui_mix(c, 0xFFFFFF, t), 1); lk_rr(x + dx, y + dy, w - 2 * dx, h - 1 / sc - 2 * dy, 4 * k);
+      i += 1;
+    );
+  ) : (
+    col(shade(lens, 0.62), 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    col(shade(lens, 0.78), 1); lk_rr(x + 2 * k, y + 2 * k, w - 4 * k, h - 5 * k, 4 * k);
+    col(shade(lens, 0.92), 1); lk_rr(x + 5 * k, y + 4 * k, w - 10 * k, h - 10 * k, 4 * k);
+    col(lens, 1);              lk_rr(x + 9 * k, y + 7 * k, w - 18 * k, h - 17 * k, 4 * k);
+  );
+  col(0xFFFFFF, on ? 0.45 : 0.22);  gfx_rect(px(x + 4 * k), py(y), ps(w - 8 * k), max(1, ps(1.5)));
+  hov && !dn ? ( col(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1 / sc, 4 * k); );
+  gfx_setfont(2);  col(shade(c, on ? 0.30 : 0.17), 1);
+  ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
+  hit;
+);
+function lk_fit(x, y, w, h, on, c, str) local(k) (
+  k = min(w / 62, h / 48);
+  lk_key(x + 4 * k, y + 4 * k, w - 8 * k, h - 8 * k, on, c, str);
+);
+
+// Vertical slider (output): dark knurled cap with the knobs' glowing lime line.
+// Drag up/down; Ctrl-click or double-click = default; value tag on hover only.
+function vslider(x, y0, h, idx, vmin, vmax, def, lbl) local(X, Y0, H, v, t, cy, hov, now, j, d, yy, w, th) (
+  X = px(x);  Y0 = py(y0);  H = ps(h);
+  v = slider(idx);  t = (v - vmin) / (vmax - vmin);  cy = Y0 + H * (1 - t);
+  hov = abs(mouse_x - X) < ps(16) && abs(mouse_y - cy) < ps(15);
+  click && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : (
+      drag_idx = idx;  drag_y = mouse_y;  drag_v = v;
+    );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  drag_idx == idx ? (
+    v = drag_v + (drag_y - mouse_y) * (vmax - vmin) / H;
+    v = floor(max(vmin, min(vmax, v)) * 10 + 0.5) / 10;
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = slider(idx);  t = (v - vmin) / (vmax - vmin);  cy = Y0 + H * (1 - t);
+
+  // scale: a tick and number every 3 dB
+  gfx_setfont(5);  j = 0;
+  loop(floor((vmax - vmin) / 3 + 0.5) + 1,
+    d = vmax - j * 3;
+    yy = Y0 + H * (1 - (d - vmin) / (vmax - vmin));
+    col(0xE4F0EF, 0.75);  gfx_line(X - ps(14), yy, X - ps(9), yy, 1);  gfx_line(X + ps(9), yy, X + ps(14), yy, 1);
+    d > 0 ? sprintf(#sl, "+%d", d) : sprintf(#sl, "%d", d);  col(0xE4F0EF, 1);  text_c(X - ps(26), yy, #sl);
+    j += 1;
+  );
+  // sunken slot
+  col(0x08363C, 1);  gfx_rect(X - ps(4), Y0 - ps(4), ps(8), H + ps(8), 1);
+  col(0x061E22, 1);  gfx_rect(X - ps(2), Y0 - ps(2), ps(4), H + ps(4), 1);
+  col(0x4E959E, 1);  gfx_rect(X - ps(4), Y0 + H + ps(3), ps(8), ps(1), 1);
+  // cap
+  col(0x000000, 0.35);  gfx_rect(X - ps(13), cy - ps(12), ps(28), ps(27), 1);
+  col(0x24272C, 1);     gfx_rect(X - ps(15), cy - ps(14), ps(30), ps(28), 1);
+  col(0x4C5158, 1);     j = 0;
+  loop(6, gfx_line(X - ps(12), cy - ps(11) + j * ps(4.4), X + ps(12), cy - ps(11) + j * ps(4.4), 1); j += 1; );
+  col(0x5A5F67, 1);     gfx_rect(X - ps(15), cy - ps(14), ps(30), ps(1), 1);
+  col(0xCDEB7A, 0.12);  gfx_rect(X - ps(15), cy - ps(3.5), ps(30), ps(7), 1);
+  col(0xCDEB7A, 0.25);  gfx_rect(X - ps(15), cy - ps(2), ps(30), ps(4), 1);
+  col(0xDDF59A, 1);     gfx_rect(X - ps(15), cy - ps(1), ps(30), ps(2), 1);
+  // label
+  gfx_setfont(6);  col(0xE4F0EF, 1);  text_c(X - ps(6), Y0 + H + ps(22), lbl);   // (y0 / h were overwritten: JSFX names ignore case)
+  // value on hover only (house rule)
+  hov || drag_idx == idx ? (
+    sprintf(#kv, "%+.1f dB", v);
+    gfx_setfont(3);  gfx_measurestr(#kv, w, th);
+    col(0x0E3A40, 0.95);  gfx_rect(X - ps(22) - w - ps(12), cy - th * 0.5 - ps(3), w + ps(12), th + ps(6), 1);
+    col(0xE4F0EF, 1);     text_c(X - ps(22) - w * 0.5 - ps(6), cy, #kv);
+  );
+);
+
+// Vertical LED meter, -48..+3 dB in 1.5 dB segments
+function vmeter(x, y0, h, db, lbl) local(n, sh, j, d, yy) (
+  n = 34;  sh = h / n;
+  col(0x11151B, 1);  gfx_rect(px(x - 3), py(y0 - 3), ps(22), ps(h + 6), 1);
+  j = 0;
+  loop(n,
+    d = -48 + (j + 1) * 1.5;
+    yy = y0 + h - (j + 1) * sh;
+    d > 0 ? col(0xE0503A, db >= d - 1.5 ? 1 : 0.15) :
+    d > -6 ? col(0xE8C060, db >= d - 1.5 ? 1 : 0.15) :
+             col(0xA0AF84, db >= d - 1.5 ? 1 : 0.15);
+    gfx_rect(px(x), py(yy) + 1, ps(16), ps(sh) - 1, 1);
+    j += 1;
+  );
+  gfx_setfont(5);  col(0xE4F0EF, 1);  text_c(px(x + 8), py(y0 + h + 14), lbl);
+);
+
+
+
+// ---------- house preset bar (ported from gfx-panel pk_preset): [PRESETS][<][>][LCD] ----------
+// PRESETS, or a click on the LCD, opens the list; the arrows step through it. menu = "Name 1|...|Name n".
+// The list ends with "Reset all to defaults" (returns n + 1). Returns the preset to load, 0 for none.
+// Keys are this unit's lamp keys (PB_KEY lens, PB_INK arrows); the LCD is the house amber one.
+function pb_count(menu) local(k, n) ( n = 1;  k = 0;  loop(strlen(menu), str_getchar(menu, k) == 124 ? n += 1;  k += 1; );  n; );
+function pb_item(menu, i, dst) local(k, k0, n, c, len) (
+  strcpy(dst, "");  len = strlen(menu);  k = 0;  k0 = 0;  n = 1;
+  loop(len + 1,
+    c = k < len ? str_getchar(menu, k) : 124;
+    c == 124 ? ( n == i ? strcpy_substr(dst, menu, k0, k - k0);  n += 1;  k0 = k + 1; );
+    k += 1;
+  );
+  dst;
+);
+function pb_tri(cx, cy, s, dir) (
+  gfx_triangle(px(cx + dir * s), py(cy), px(cx - dir * s), py(cy - s), px(cx - dir * s), py(cy + s));
+);
+function preset_bar(x, y, h, lw, cur, menu) local(n, sel, open, lx, tw, th, i) (
+  n = pb_count(menu);  sel = 0;  open = 0;
+  lk_fit(x, y, 100, h, 0, PB_KEY, "PRESETS") ? open = 1;
+  lk_fit(x + 102, y, 46, h, 0, PB_KEY, "") ? ( sel = cur <= 1 || cur > n ? n : cur - 1; );
+  lk_fit(x + 150, y, 46, h, 0, PB_KEY, "") ? ( sel = cur >= n || cur < 1 ? 1 : cur + 1; );
+  col(PB_INK, 1);  pb_tri(x + 125, y + h * 0.5 - 0.5, 5, -1);  pb_tri(x + 173, y + h * 0.5 - 0.5, 5, 1);
+  // the LCD: black bezel, dark amber glass, the patch name only
+  lx = x + 206;
+  col(0x000000, 0.3);  gfx_rect(px(lx + 2), py(y + 5), ps(lw), ps(h - 6), 1);
+  col(0x050505, 1);    gfx_rect(px(lx), py(y + 3), ps(lw), ps(h - 6), 1);
+  gfx_gradrect(px(lx + 3), py(y + 6), ps(lw - 6), ps(h - 12), 0.17, 0.10, 0.02, 1, 0, 0, 0, 0, -0.06 / ps(h), -0.04 / ps(h), -0.01 / ps(h), 0);
+  col(0xFFFFFF, 0.06); gfx_line(px(lx + 4), py(y + 7), px(lx + lw - 5), py(y + 7), 1);
+  cur >= 1 && cur <= n ? pb_item(menu, cur, #pb_nm) : strcpy(#pb_nm, "--");
+  gfx_setfont(8);  col(0xE8A33A, 1);  gfx_measurestr(#pb_nm, tw, th);
+  gfx_x = px(lx + 10);  gfx_y = py(y + h * 0.5) - th * 0.5;  gfx_drawstr(#pb_nm);
+  click && mouse_x >= px(lx) && mouse_x < px(lx + lw) && mouse_y >= py(y) && mouse_y < py(y + h) ? open = 1;
+  open ? (
+    strcpy(#pb_m, "");  i = 1;
+    loop(n, i == cur ? strcat(#pb_m, "!");  strcat(#pb_m, pb_item(menu, i, #pb_t));  strcat(#pb_m, "|");  i += 1; );
+    strcat(#pb_m, "Reset all to defaults");
+    gfx_x = px(x);  gfx_y = py(y + h);  i = gfx_showmenu(#pb_m);  i > 0 ? sel = i;
+  );
+  sel;
+);
+
+// ---------- presets (OUTPUT evens the loudness; GUI thread only) ----------
+function load_preset(p) (
+  p == 1 ? ( slider(1) = 0;  slider(2) = 0;  slider(3) = 5;  slider(4) = 20;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Init
+  p == 2 ? ( slider(1) = 50;  slider(2) = -10;  slider(3) = 6;  slider(4) = 20;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Drums: Snap
+  p == 3 ? ( slider(1) = 20;  slider(2) = -60;  slider(3) = 5;  slider(4) = 20;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Drums: Tighten Room
+  p == 4 ? ( slider(1) = -10;  slider(2) = 60;  slider(3) = 4;  slider(4) = 20;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Drums: Big Room
+  p == 5 ? ( slider(1) = 60;  slider(2) = -20;  slider(3) = 6;  slider(4) = 40;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Kick: Punch
+  p == 6 ? ( slider(1) = 70;  slider(2) = 0;  slider(3) = 7;  slider(4) = 200;  slider(5) = 100;  slider(6) = 1;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Snare: Crack
+  p == 7 ? ( slider(1) = 10;  slider(2) = 50;  slider(3) = 4;  slider(4) = 20;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Snare: Fat Body
+  p == 8 ? ( slider(1) = 40;  slider(2) = -10;  slider(3) = 6;  slider(4) = 200;  slider(5) = 100;  slider(6) = 1;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Bass: Pluck Definition
+  p == 9 ? ( slider(1) = 45;  slider(2) = -5;  slider(3) = 7;  slider(4) = 300;  slider(5) = 100;  slider(6) = 1;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Guitar: Pick Attack
+  p == 10 ? ( slider(1) = -40;  slider(2) = 10;  slider(3) = 5;  slider(4) = 20;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Acoustic: Soften Strums
+  p == 11 ? ( slider(1) = 30;  slider(2) = 0;  slider(3) = 6;  slider(4) = 150;  slider(5) = 100;  slider(6) = 1;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Piano: Hammer
+  p == 12 ? ( slider(1) = 25;  slider(2) = -5;  slider(3) = 4;  slider(4) = 20;  slider(5) = 60;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) :   // Mix Bus: Gentle Punch
+  p == 13 ? ( slider(1) = 0;  slider(2) = 0;  slider(3) = 5;  slider(4) = 20;  slider(5) = 100;  slider(6) = 0;  slider(7) = 1;  slider(8) = 0;  slider(9) = 0;  slider(10) = 1; ) : 0;   // Reset all to defaults
+  slider_automate(p == 13 ? 1023 : 1023);
+  gui_dirty = 1;
+);
+PRESET_MENU = "Init|Drums: Snap|Drums: Tighten Room|Drums: Big Room|Kick: Punch|Snare: Crack|Snare: Fat Body|Bass: Pluck Definition|Guitar: Pick Attack|Acoustic: Soften Strums|Piano: Hammer|Mix Bus: Gentle Punch";
+PB_KEY = 0xA0AF84;  PB_INK = 0x0E3A40;
+
+// ---------- frame setup ----------
+sc = min(gfx_w / 1000, gfx_h / 320);
+ox = (gfx_w - 1000 * sc) * 0.5;
+oy = (gfx_h - 320 * sc) * 0.5;
+lmb = mouse_cap & 1;
+click = lmb && !last_lmb;
+
+gfx_setfont(1, "Verdana", ps(26), 'b');
+gfx_setfont(2, "Century Gothic", ps(13), 'b');
+gfx_setfont(3, "Verdana", ps(12), 'b');
+gfx_setfont(4, "Verdana", ps(15), 'b');
+gfx_setfont(5, "Verdana", ps(11), 'b');
+gfx_setfont(6, "Century Gothic", ps(15), 'b');
+gfx_setfont(8, "Courier New", ps(16), 'b');
+
+in_m  = max(inpk_disp,  in_m * 0.85);   inpk_disp = 0;
+out_m = max(outpk_disp, out_m * 0.85);  outpk_disp = 0;
+// gain-move history (one point per frame: the bigger of this frame's boost and cut)
+HB = 2000;  HN = 240;
+gmv = abs(gmax_d) > abs(gmin_d) ? gmax_d : gmin_d;  gmax_d = -99;  gmin_d = 99;
+abs(gmv) > 50 ? gmv = 0;
+HB[hpos] = gmv;  hpos = (hpos + 1) % HN;
+
+// ---------- faceplate ----------
+col(0x15616D, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+j = 0;
+loop(12,
+  col(j % 3 == 0 ? 0xFFFFFF : 0x0E4A53, 0.10);
+  gy = py(1 + j * 4);  gfx_line(px(0), gy, px(1000), gy, 1);
+  j += 1;
+);
+col(0x3F8590, 1);  gfx_rect(px(0), py(0), ps(1000), ps(1.5), 1);
+col(0x426A5A, 1);  gfx_rect(px(0), py(46), ps(1000), ps(5), 1);
+col(0x000000, 0.18); gfx_rect(px(0), py(314), ps(1000), ps(6), 1);
+rivet(12, 18);  rivet(988, 18);  rivet(12, 302);  rivet(988, 302);
+gfx_setfont(1);  col(0xA0AF84, 1);  gfx_x = px(40);  gfx_y = py(9);   gfx_drawstr("CHERWELL");
+gfx_setfont(4);  col(0xE4F0EF, 1);  gfx_x += ps(14);  gfx_y = py(16);  gfx_drawstr("TRANSIENT");
+gfx_setfont(4);  col(0xA0AF84, 1);  gfx_x = px(930); gfx_y = py(16);  gfx_drawstr("GFX");
+
+// ---------- preset bar, in the title bar ----------
+pb_k = preset_bar(330, 8, 30, 300, pr_cur, PRESET_MENU);
+pb_k > 0 ? ( load_preset(pb_k);  pr_cur = pb_k > 12 ? 1 : pb_k; );
+
+// ---------- display window: the gain moves over the last few seconds ----------
+dx0 = 40;  dy0 = 66;  dw = 250;  dh = 200;
+col(0x0F525C, 1);  gfx_rect(px(dx0 - 10), py(dy0 - 10), ps(dw + 20), ps(dh + 20), 1);
+col(0x08363C, 1);  gfx_rect(px(dx0 - 10), py(dy0 - 10), ps(dw + 20), ps(2), 1);
+                   gfx_rect(px(dx0 - 10), py(dy0 - 8),  ps(2), ps(dh + 18), 1);
+col(0x4E959E, 1);  gfx_rect(px(dx0 - 8),  py(dy0 + dh + 8), ps(dw + 18), ps(2), 1);
+                   gfx_rect(px(dx0 + dw + 8), py(dy0 - 8), ps(2), ps(dh + 16), 1);
+col(0xA0AF84, 1);  gfx_rect(px(dx0 - 4), py(dy0 - 4), ps(dw + 8), ps(dh + 8), 1);
+col(0x0B2F35, 1);  gfx_rect(px(dx0), py(dy0), ps(dw), ps(dh), 1);
+// grid: 0, +-6, +-12 dB
+col(0x1F4C52, 1);  j = -2;  loop(5, gy = py(dy0 + dh * 0.5 - j * dh / 5);  gfx_line(px(dx0), gy, px(dx0 + dw), gy, 1);  j += 1; );
+gfx_setfont(5);  col(0x8FB0A8, 1);
+gfx_x = px(dx0 + 4);  gfx_y = py(dy0 + 4);  gfx_drawstr("+12");
+gfx_x = px(dx0 + 4);  gfx_y = py(dy0 + dh - 16);  gfx_drawstr("-12");
+// the trace: boosts up (lime), cuts down (amber), oldest at the left
+gj = 0;
+loop(HN,
+  gv = HB[(hpos + gj) % HN];
+  gx = px(dx0 + dw * gj / HN);  gy0 = py(dy0 + dh * 0.5);  gy = py(dy0 + dh * 0.5 - max(-12, min(12, gv)) * dh / 25);
+  gv >= 0 ? col(0xCDEB7A, 0.85) : col(0xF2A41E, 0.85);
+  gfx_line(gx, gy0, gx, gy, 1);
+  gj += 1;
+);
+col(0xE4F0EF, 0.5);  gfx_line(px(dx0), py(dy0 + dh * 0.5), px(dx0 + dw), py(dy0 + dh * 0.5), 1);
+gfx_setfont(5);  col(0xE4F0EF, 1);  text_c(px(dx0 + dw * 0.5), py(dy0 + dh + 22), "GAIN MOVES");
+ts_delta ? ( col(0xF2C230, 1);  gfx_x = px(dx0 + dw - 46);  gfx_y = py(dy0 + 6);  gfx_drawstr("DELTA"); );
+
+// ---------- controls ----------
+kn(380, 140, 30, 1, -100, 100, 0, 0xA0AF84, "ATTACK", 9);
+kn(498, 140, 30, 2, -100, 100, 0, 0xA0AF84, "SUSTAIN", 9);
+kn(600, 140, 17, 3, 1, 10, 5, 0xA8B98A, "SPEED", 10);
+klog = 1;  kn(680, 140, 17, 4, 20, 2000, 20, 0xA8B98A, "FOCUS", 7);
+kn(760, 140, 17, 5, 0, 100, 100, 0xA8B98A, "MIX", 11);
+
+lk_fit(338, 236, 92, 40, ts_high, LK_SAGE, "HIGH") ? ( slider(6) = ts_high ? 0 : 1;  param_touched(6); );
+lk_fit(438, 236, 92, 40, ts_clip, LK_YEL, "CLIP") ? ( slider(7) = ts_clip ? 0 : 1;  param_touched(7); );
+lk_fit(538, 236, 92, 40, ts_delta, LK_SKY, "DELTA") ? ( slider(8) = ts_delta ? 0 : 1;  param_touched(8); );
+lk_fit(638, 236, 92, 40, ts_on, LK_AMB, "IN") ? ( slider(10) = ts_on ? 0 : 1;  param_touched(10); );
+
+// ---------- output and meters ----------
+vslider(842, 70, 190, 9, -12, 12, 0, "OUTPUT");
+vmeter(888, 70, 190, gdb(in_m),  "IN");
+vmeter(924, 70, 190, gdb(out_m), "OUT");
+
+// ---------- end of frame ----------
+!lmb ? drag_idx = 0;
+last_lmb = lmb;
+gui_dirty ? ( prm_dirty = 1;  gui_dirty = 0; );   // rebuilt in @block, never on the GUI thread

@@ -1,0 +1,142 @@
+desc:GFX instrument essentials (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// The universal parts shared by every GFX instrument (the effects keep gfx-input / gfx-drift / gfx-output).
+// Import after gfx-drift, gfx-output, gfx-ui and gfx-panel.
+//
+// DRIFT (GFX instrument standard)
+//   @init    ins_drift_init();
+//   @block   ins_drift_block(amount 0..1, samplesblock);   then read:
+//              ins_pitch   pitch multiplier, wanders up to +/-20 cents
+//              ins_aux     semitone offset for a second oscillator, up to +/-0.15
+//              ins_cut     filter octave offset, up to +/-0.45
+//              ins_tone    tone-control octave offset, up to +/-0.45
+//              ins_fx      -1..1 x amount, for effect wobble (chorus / vibrato rate, wah centre, delay time)
+//   at note-on: f *= ins_note_detune();               // random per-note tuning, up to +/-6 cents
+//
+// MIDI
+//   ins_chan_ok(status, chan)      chan 0 = omni, else 1..16
+//   ins_bend(lsb, msb, semis)      pitch-bend multiplier
+//   ins_midi_hit()                 call on a note-on; ins_midi_lit() is true for 120 ms (draw the LED)
+//
+// OUTPUT STAGE (six consecutive sliders from ix: sat %, bias %, low band Hz, high band Hz, ceiling dB, mode - not used)
+//   @block   ins_output_setup(ix);   (CLIP always on; ins_output_straight(ix): straight through)
+//   @gfx     ins_output_tray(x, y, ix, shade, ink, ledc);   430 x 100 tray in the faceplate style (unscaled coords)
+//            shade < 0: the plugin has drawn its own tray, only the outline and controls are drawn
+//
+// STEREO (two consecutive sliders from iw: mono-below Hz 20..500 (20 = off), width % 0..100)
+//   @block   ins_stereo_setup(iw);
+//   @sample  ins_stereo(l, r);  then read ins_sl, ins_sr   (call just before ost_out)
+//            below MONO the side signal is removed (12 dB/oct); above it WIDTH raises the side signal up to 2x
+//   @gfx     ins_stereo_box(x, y, iw, shade, ink);   170 x 100 box beside the output tray (unscaled coords)
+//
+//            ins_out_button(x, y, ink, ledc)  OUTPUT LED button (unscaled coords): toggles ins_show_out,
+//            which the plugin uses to fold the output tray out below its panel (starts folded away)
+//            ins_strip(x, y, w, ix, iw, ink, shade)  the slim IN / OUT strip along the bottom of an instrument panel
+//            (w x 44): SAT, plus MONO and WIDTH when iw > 0; shade < 0: no inset drawn
+//            ins_io(x, y, ix, ink)  the compact IN / OUT pair that replaces the fold-out: SAT
+//            as two mini knobs, 84 x 38 from x, y (unscaled); click the OUT name to step the mode
+
+@init
+
+function ins_drift_init() (
+  ins_dP.drift_init(0.8 + rand(0.5)); ins_dA.drift_init(0.8 + rand(0.5));
+  ins_dC.drift_init(0.8 + rand(0.5)); ins_dT.drift_init(0.8 + rand(0.5)); ins_dX.drift_init(0.8 + rand(0.5));
+  ins_pitch = 1; ins_aux = 0; ins_cut = 0; ins_tone = 0; ins_fx = 0; ins_amt = 0;
+);
+
+function ins_drift_block(amt, ns) local(inc) (
+  ins_amt = amt;
+  inc = 0.35 * ns / srate;
+  ins_pitch = 2 ^ (ins_dP.drift_tick(inc) * amt * 0.2 / 12);
+  ins_aux   = ins_dA.drift_tick(inc) * amt * 0.15;
+  ins_cut   = ins_dC.drift_tick(inc) * amt * 0.45;
+  ins_tone  = ins_dT.drift_tick(inc) * amt * 0.45;
+  ins_fx    = ins_dX.drift_tick(inc) * amt;
+);
+
+function ins_note_detune() ( 2 ^ ((rand(2) - 1) * ins_amt * 0.06 / 12); );
+
+function ins_chan_ok(st, chan) ( chan == 0 || (st & 0x0F) + 1 == chan; );
+function ins_bend(lsb, msb, semis) ( 2 ^ ((((msb * 128 + lsb) - 8192) / 8192) * semis / 12); );
+function ins_midi_hit() ( ins_midi_t = time_precise(); );
+function ins_midi_lit() ( time_precise() - ins_midi_t < 0.12; );
+
+// the output stage with CLIP always on (ins_output_straight: no clip); the old mode slider ix + 5 is not used
+function ins_output_setup(ix) (
+  ost_setup(slider(ix) / 100, slider(ix + 1) / 100, slider(ix + 2), slider(ix + 3), slider(ix + 4), 1);
+);
+function ins_output_straight(ix) (
+  ost_setup(slider(ix) / 100, slider(ix + 1) / 100, slider(ix + 2), slider(ix + 3), slider(ix + 4), 0);
+);
+
+function ins_stereo_setup(iw) local(g) (
+  ins_mon = slider(iw) > 20.5;
+  g = tan($pi * min(max(slider(iw), 20), srate * 0.45) / srate);
+  ins_sk = sqrt(2); ins_sa1 = 1 / (1 + g * (g + ins_sk)); ins_sa2 = g * ins_sa1; ins_sa3 = g * ins_sa2;
+  ins_wg = 1 + slider(iw + 1) / 100;
+);
+
+function ins_stereo(l, r) local(m, s, v1, v2, v3) (
+  m = 0.5 * (l + r); s = 0.5 * (l - r);
+  ins_mon ? (
+    v3 = s - ins_sc2; v1 = ins_sa1 * ins_sc1 + ins_sa2 * v3; v2 = ins_sc2 + ins_sa2 * ins_sc1 + ins_sa3 * v3;
+    ins_sc1 = 2 * v1 - ins_sc1; ins_sc2 = 2 * v2 - ins_sc2;
+    s = s - ins_sk * v1 - v2;                              // side high-passed: mono below the frequency
+  ) : ( ins_sc1 = 0; ins_sc2 = 0; );
+  s *= ins_wg;
+  ins_sl = m + s; ins_sr = m - s;
+);
+
+function ins_stereo_box(x, y, iw, shade, ink) (
+  pk_inset(x * sc, y * sc, 170 * sc, 100 * sc, shade);
+  pk_box(x * sc, y * sc, 170 * sc, 100 * sc, ink, "STEREO");
+  ui_section(4); C_INK = ink;
+  ui_knob((x + 50) * sc,  (y + 50) * sc, iw,     20, 500, 20, 1, "MONO",  slider(iw) <= 20.5 ? "OFF" : "%.0f Hz");
+  ui_knob((x + 120) * sc, (y + 50) * sc, iw + 1, 0,  100, 0,  0, "WIDTH", "+%.0f%%");
+);
+
+function ins_out_button(x, y, ink, ledc) (
+  pk_ledbtn(x * sc, y * sc, 26 * sc, 22 * sc, ins_show_out, ledc) ? ins_show_out = !ins_show_out;
+  gfx_setfont(4); ui_col(ink); gfx_x = (x + 32) * sc; gfx_y = (y + 6) * sc; gfx_drawstr("OUTPUT");
+);
+
+function ins_io(x, y, ix, ink) (
+  ui_section(4); C_INK = ink;
+  // SAT, centred where SAT and the old OUT keys sat (84 wide); the output stage has no keys
+  ui_kmini = 1; ui_knob((x + 42) * sc, (y + 13) * sc, ix, 0, 100, 0, 0, "SAT", "%.0f%%");
+  ui_kmini = 0;
+  gfx_setfont(4); ui_cola(ink, 0.9); ui_text((x + 42) * sc, (y + 28) * sc, "SAT");
+  gfx_setfont(8, "Trebuchet MS", ui_fs4 * 0.75, 'b');   // (font 8 as the old OUT keys left it)
+);
+
+// the STEREO pair as mini knobs (MONO below Hz, WIDTH), 84 x 38 from x, y (unscaled)
+function ins_stereo_mini(x, y, iw, ink) (
+  ui_section(4); C_INK = ink;
+  ui_kmini = 1; ui_knob((x + 16) * sc, (y + 13) * sc, iw, 20, 500, 20, 1, "MONO", slider(iw) <= 20.5 ? "OFF" : "%.0f Hz");
+  ui_kmini = 1; ui_knob((x + 62) * sc, (y + 13) * sc, iw + 1, 0, 100, 0, 0, "WIDTH", "+%.0f%%");
+  ui_kmini = 0;
+  gfx_setfont(4); ui_cola(ink, 0.9); ui_text((x + 16) * sc, (y + 28) * sc, "MONO"); ui_text((x + 62) * sc, (y + 28) * sc, "WIDTH");
+);
+
+function ins_strip(x, y, w, ix, iw, ink, shade) (
+  shade >= 0 ? pk_inset(x * sc, y * sc, w * sc, 44 * sc, shade);
+  gfx_setfont(4); ui_cola(ink, 0.75); gfx_x = (x + 12) * sc; gfx_y = (y + 17) * sc; gfx_drawstr("IN / OUT");
+  ins_io(x + 70, y + 4, ix, ink);
+  iw > 0 ? (
+    gfx_setfont(4); ui_cola(ink, 0.75); gfx_x = (x + 176) * sc; gfx_y = (y + 17) * sc; gfx_drawstr("STEREO");
+    ins_stereo_mini(x + 226, y + 4, iw, ink);
+  );
+);
+
+function ins_output_tray(x, y, ix, shade, ink, ledc) (
+  shade >= 0 ? pk_inset(x * sc, y * sc, 430 * sc, 100 * sc, shade);
+  pk_box(x * sc, y * sc, 430 * sc, 100 * sc, ink, "OUTPUT");
+  ui_section(4); C_INK = ink;
+  ui_knob((x + 59) * sc,  (y + 50) * sc, ix,     0,    100,   0,    0, "SAT",     "%.0f%%");
+  ui_knob((x + 137) * sc, (y + 50) * sc, ix + 1, 0,    100,   30,   0, "BIAS",    "%.0f%%");
+  ui_knob((x + 215) * sc, (y + 50) * sc, ix + 2, 40,   400,   120,  1, "LO BAND", "%.0f Hz");
+  ui_knob((x + 293) * sc, (y + 50) * sc, ix + 3, 2000, 16000, 6000, 1, "HI BAND", "%.0f Hz");
+  ui_knob((x + 371) * sc, (y + 50) * sc, ix + 4, -24,  0,     -0.3, 0, "CEILING", "%.1f dB");
+  ost_clipped = 0;
+);
