@@ -39,7 +39,7 @@ desc:GFX Lab G RS70 [drum machine]
 // Latency: 0 samples (the sequencer looks 6 ms ahead so humanised hits can land early).
 //
 // TWEAK points are marked TWEAK.
-// STATUS: Lab (experimental, may change). v0.2 (complete: sound engine, sequencer, FX strip, faceplate, presets).
+// STATUS: Lab (experimental, may change). v0.2.1 (complete: sound engine, sequencer, FX strip, faceplate, presets).
 
 import gfx-lab-drift.jsfx-inc
 import gfx-lab-output.jsfx-inc
@@ -247,6 +247,11 @@ function v_proc() instance(pos, a, chk, act, out, base, n_, rate) local(i, f) (
   this.dck(out);
 );
 
+// the delay's tap at t samples back (interpolated) -> dr_l, dr_r (audio thread only)
+function dl_read(t) local(rp, ri, ri2, f) (
+  rp = dl_w - t;  rp < 0 ? rp += DSZ;  ri = floor(rp);  f = rp - ri;  ri2 = ri + 1;  ri2 >= DSZ ? ri2 = 0;
+  dr_l = DLB[ri] + (DLB[ri2] - DLB[ri]) * f;  dr_r = DRB[ri] + (DRB[ri2] - DRB[ri]) * f;
+);
 // ---------- parameters -> engine values (audio thread) ----------
 function update_params() (
   drift_macro(drift);
@@ -267,9 +272,10 @@ dk_c = exp(-1 / (0.002 * srate));
 choke_c = exp(-1 / (0.003 * srate));
 sm_c = 1 - exp(-CR / (0.03 * srate));
 sw_c = 1 - exp(-1 / (0.012 * srate));
+dl_xfc = 1 / (0.03 * srate);  dl_xf_on = 0;
 update_params();
 s_mlvl = t_mlvl;  m_g = db2g(s_mlvl);  m_i = 0;
-s_pfb = ph_fb / 100;  s_dfb = dl_fb / 100;  s_dmix = dl_mix / 100 * 1.4;  s_drk = dr_k;  s_drmk = dr_mk;
+s_plo = ph_lo;  s_phi = ph_hi;  s_pfb = ph_fb / 100;  s_dfb = dl_fb / 100;  s_dmix = dl_mix / 100 * 1.4;  s_drk = dr_k;  s_drmk = dr_mk;
 m_ph = t_ph;  m_dr = t_dr;  m_cm = t_cm;  m_dl = t_dl;
 run = 0;  q_n = 0;  pq_n = 0;  abs_n = 0;  seq_next = 0;  lfo = 0;  cm_g = 1;  cm_env_v = 0;  s_dt = 0.3 * srate;
 cr_n = 0;  pending_pat = -1;  pat_sel_d = pat_req_last = cur_pat;
@@ -398,8 +404,9 @@ cr_n <= 0 ? (
   s_pfb += (ph_fb / 100 - s_pfb) * sm_c;  s_dfb += (dl_fb / 100 - s_dfb) * sm_c;  s_dmix += (dl_mix / 100 * 1.4 - s_dmix) * sm_c;
   s_drk += (dr_k - s_drk) * sm_c;  s_drmk += (dr_mk - s_drmk) * sm_c;
   lfo += CR * ph_rate / srate;  lfo -= floor(lfo);
-  fl = ph_lo * (ph_hi / ph_lo) ^ (0.5 - 0.5 * cos(2 * $pi * lfo));
-  fr = ph_lo * (ph_hi / ph_lo) ^ (0.5 - 0.5 * cos(2 * $pi * (lfo + 0.25)));
+  s_plo += (ph_lo - s_plo) * sm_c;  s_phi += (ph_hi - s_phi) * sm_c;          // the sweep range glides too
+  fl = s_plo * (s_phi / s_plo) ^ (0.5 - 0.5 * cos(2 * $pi * lfo));
+  fr = s_plo * (s_phi / s_plo) ^ (0.5 - 0.5 * cos(2 * $pi * (lfo + 0.25)));
   tl = tan($pi * min(fl, 0.45 * srate) / srate);  ph_al = (tl - 1) / (tl + 1);
   tr_ = tan($pi * min(fr, 0.45 * srate) / srate);  ph_ar = (tr_ - 1) / (tr_ + 1);
   cm_lv = 10 * log10(cm_env_v + 0.000000000001);
@@ -444,9 +451,14 @@ m_cm > 0.00001 ? (
   xl += (xl * cm_g - xl) * m_cm;  xr += (xr * cm_g - xr) * m_cm;
 );
 m_dl > 0.00001 || dl_tail > 0 ? (
-  s_dt += (dl_ts - s_dt) * 0.0004;
-  rp = dl_w - s_dt;  rp < 0 ? rp += DSZ;  ri = floor(rp);  fr_ = rp - ri;  ri2 = ri + 1;  ri2 >= DSZ ? ri2 = 0;
-  el = DLB[ri] + (DLB[ri2] - DLB[ri]) * fr_;  er = DRB[ri] + (DRB[ri2] - DRB[ri]) * fr_;
+  // a new delay time crossfades to the new tap over 30 ms (no tape-chirp, no zipper)
+  !dl_xf_on && abs(dl_ts - s_dt) > 0.5 ? ( dl_tb = dl_ts;  dl_xf = 0;  dl_xf_on = 1; );
+  dl_read(s_dt);  el = dr_l;  er = dr_r;
+  dl_xf_on ? (
+    dl_read(dl_tb);  dl_xf = min(1, dl_xf + dl_xfc);
+    el += (dr_l - el) * dl_xf;  er += (dr_r - er) * dl_xf;
+    dl_xf >= 1 ? ( s_dt = dl_tb;  dl_xf_on = 0; );
+  );
   dl_ll += (el - dl_ll) * dl_lpc;  dl_lr += (er - dl_lr) * dl_lpc;
   DLB[dl_w] = xl * m_dl + ts(dl_ll * s_dfb);  DRB[dl_w] = xr * m_dl + ts(dl_lr * s_dfb);
   dl_w += 1;  dl_w >= DSZ ? dl_w = 0;
