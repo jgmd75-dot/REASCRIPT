@@ -6,8 +6,10 @@ desc:GFX Lab G RS50 [drum machine]
 // folder.
 //
 // RS50 - the RS series' little stereo machine, in the spirit of the mid-80s budget rhythm composer with sixteen
-// sounds and a stereo mix. No samples: every sound is synthesised when the plug-in loads ("baked") at a 20 kHz sample
-// clock, stored 8-bit (companded; the cymbals 6-bit) and played back through the converter's gentle 9 kHz filter.
+// sounds and a stereo mix. No samples: every sound is synthesised when the plug-in loads ("baked") at the original's
+// 25 kHz clock and stored as plain 8-bit (the cymbals 6-bit): a hard, clicky kick, dark ringing toms, slapping congas
+// and clanging cowbells built from their bodies' resonances. As on the original, related sounds share a voice, so each
+// cuts the other off: the hats, the two congas, the toms and timbale, the two cowbells, clap and rim, crash and ride.
 //
 // VOICES (sixteen channels, each with LEVEL and PAN): BASS, SNARE, LO / MID / HI TOM, RIM, CLAP, CLOSED HAT, OPEN HAT
 // (CH cuts off a ringing OH), CRASH, RIDE, LO / HI CONGA, TIMBALE, LO / HI COWBELL ("BELL").
@@ -37,7 +39,7 @@ desc:GFX Lab G RS50 [drum machine]
 // Latency: 0 samples.
 //
 // TWEAK points are marked TWEAK.
-// STATUS: Lab (experimental, may change). v0.2 (complete: sound engine, sequencer, FX strip, faceplate, presets).
+// STATUS: Lab (experimental, may change). v0.3 (complete: sound engine, sequencer, FX strip, faceplate, presets).
 
 import gfx-lab-drift.jsfx-inc
 import gfx-lab-output.jsfx-inc
@@ -116,7 +118,7 @@ ui_dflt = 1;
 gfx_ext_retina = 1;
 CR = 16;
 NV = 16;                                   // tracks: BD SD LT MT HT RS CP CH OH CR RD LC HC TI LB HB
-BR = 20000;                                // the baked sounds' sample clock
+BR = 25000;                                // the baked sounds' sample clock (the original's)
 
 ost_init(0);  ostL.ost_ch_init();  ostR.ost_ch_init();
 thk_init();  thk_lift = 3.5;  thk_drv = 1.7;  thk_asym = 0.15;  thk_tr = 1.0;  thk_trim = 0;   // TWEAK: RS50's THICK
@@ -198,7 +200,7 @@ function bake_add(dst, n_, np, flo, fhi, tlo, thi, g, nlev, nhp, ntau) local(k, 
 );
 // clap: band-passed noise in four quick bursts, then a tail
 function bk_clap(dst, n_) local(i, t, b, e, tl, td) (
-  BKC.bk_svf(1150, 2.2);  tl = 1;  td = exp(-1 / (0.11 * BR));  i = 0;
+  BKC.bk_svf(1500, 2.0);  tl = 1;  td = exp(-1 / (0.08 * BR));  i = 0;
   loop(n_, t = i / BR;  b = floor(t / 0.0105);
     e = b < 3 ? exp(-(t - b * 0.0105) / 0.0045) : 0;  b >= 3 ? tl *= td;
     BKC.bk_run(rng());  dst[i] = BKC.bp * (e + (b >= 3 ? tl : 0)) * 2.2;  i += 1; );
@@ -212,41 +214,75 @@ function bk_cb(dst, n_, fa, fb, fbp) local(i, t, p1, p2, d1, d2, s) (
     s = (sqr_(p1, d1) + sqr_(p2, d2)) * 0.5;
     BKC.bk_run(s);  dst[i] = BKC.bp * (0.7 * exp(-t / 0.012) + 0.3 * exp(-t / 0.22)) * 1.6;  i += 1; );
 );
-// finish: attack ramp, end fade, normalise; 8-bit mu-law (bits = 8) or 6-bit companded (bits = 6)
+// finish: attack ramp, end fade, normalise; plain 8-bit (bits = 8) or 6-bit companded (bits = 6)
 function bk_fin(dst, n_, att, bits) local(i, pk, y, e) (
   pk = 0.000001;  i = 0;
   loop(n_, e = min(1, i / (att * BR + 1)) * min(1, (n_ - i) / (0.06 * n_));  dst[i] *= e;  pk = max(pk, abs(dst[i]));  i += 1; );
   i = 0;
   loop(n_, y = dst[i] / pk;
-    bits == 8 ? ( y = sign(y) * log(1 + 255 * abs(y)) / log(256);  y = floor(y * 127 + 0.5) / 127;
-                  y = sign(y) * (256 ^ abs(y) - 1) / 255; )
+    bits == 8 ? ( y = floor(y * 127.5 + 0.5) / 127.5; )                       // plain 8-bit (the original's): grainy decays
               : ( y = sign(y) * sqr(floor(sqrt(abs(y)) * 31 + 0.5) / 31); );
     dst[i] = y;  i += 1; );
+);
+// a struck body: modes from MODS (freq Hz, amp, decay s) x nm, all bent by a pitch drop (1 + sw from ptau), plus a
+// band-passed click (the beater / the hand: clk, at clf Hz, q clq, decay clt) and band-passed noise (nlev, nhp .. nlp Hz,
+// ntau); drv drives it into the soft clipper (0 = clean). Bake time only.
+MODS = 1189000;
+function md(k, f, a, t) ( MODS[k * 3] = f;  MODS[k * 3 + 1] = a;  MODS[k * 3 + 2] = t; );
+function bk_modes(dst, n_, nm, sw, ptau, clk, clf, clq, clt, nlev, nhp, nlp, ntau, drv) local(i, t, k, s, pe, nz, l1, l2, c1, c2)
+(
+  k = 0;  loop(nm, BKP[k] = 0;  k += 1; );
+  BKC.bk_svf(clf, clq);  l1 = l2 = 0;  c1 = op(nlp);  c2 = op(nhp);  i = 0;
+  loop(n_, t = i / BR;  pe = 1 + sw * exp(-t / ptau);  s = 0;  k = 0;
+    loop(nm, BKP[k] += MODS[k * 3] * pe / BR;  BKP[k] -= floor(BKP[k]);
+      s += sin(2 * $pi * BKP[k]) * MODS[k * 3 + 1] * exp(-t / MODS[k * 3 + 2]);  k += 1; );
+    nz = rng();  BKC.bk_run(nz);  s += BKC.bp * clk * exp(-t / clt);
+    l1 += (nz - l1) * c1;  l2 += (l1 - l2) * c2;  s += (l1 - l2) * nlev * exp(-t / ntau);
+    dst[i] = drv > 0 ? ts(s * drv) / drv : s;  i += 1; );
 );
 function slot(k, n_) ( SNDT[k * 2] = bptr;  SNDT[k * 2 + 1] = n_;  memset(bptr, 0, n_);  bptr += n_ + 64;  bptr - n_ - 64; );
 lcg_s = 50505;
 bptr = 1200000;
-b = slot(0, 10000);   bk_drum(b, 10000, 58, 2.4, 0.01, 0.18, 0, 0, 0.7, 0.05, 200, 3000, 0.01);         bk_fin(b, 10000, 0, 8);
-b = slot(1, 6000);    bk_drum(b, 6000, 205, 0.5, 0.01, 0.07, 350, 0.6, 0.3, 1.2, 1800, 8500, 0.1);       bk_fin(b, 6000, 0, 8);
-b = slot(2, 10000);   bk_drum(b, 10000, 95, 0.6, 0.05, 0.22, 0, 0, 0.2, 0.12, 200, 2000, 0.03);          bk_fin(b, 10000, 0, 8);
-b = slot(3, 10000);   bk_drum(b, 10000, 140, 0.6, 0.045, 0.2, 0, 0, 0.2, 0.12, 250, 2500, 0.03);         bk_fin(b, 10000, 0, 8);
-b = slot(4, 10000);   bk_drum(b, 10000, 200, 0.6, 0.04, 0.18, 0, 0, 0.2, 0.12, 300, 3000, 0.03);         bk_fin(b, 10000, 0, 8);
-b = slot(5, 1600);    bk_drum(b, 1600, 520, 0, 0.01, 0.01, 1650, 1.4, 0.3, 0.2, 2000, 7000, 0.005);      bk_fin(b, 1600, 0, 8);
-b = slot(6, 8000);    bk_clap(b, 8000);                                                                    bk_fin(b, 8000, 0, 8);
-b = slot(7, 4000);    bake_add(b, 4000, 12, 5500, 9500, 0.02, 0.05, 1, 0.9, 6000, 0.04);                  bk_fin(b, 4000, 0.0004, 6);
-b = slot(8, 12000);   bake_add(b, 12000, 14, 4500, 9500, 0.2, 0.4, 1, 0.7, 6000, 0.3);                    bk_fin(b, 12000, 0.0008, 6);
-b = slot(9, 24000);   bake_add(b, 24000, 22, 2800, 9500, 0.4, 0.9, 1, 0.9, 3200, 0.7);                    bk_fin(b, 24000, 0.004, 6);
-b = slot(10, 24000);  bake_add(b, 24000, 6, 620, 3200, 0.8, 1.3, 1.4, 0, 1000, 1);
-                      bake_add(b, 24000, 18, 3400, 9500, 0.5, 1.0, 1, 0.3, 4800, 0.8);                    bk_fin(b, 24000, 0.001, 6);
-b = slot(11, 7000);   bk_drum(b, 7000, 185, 0.25, 0.015, 0.12, 0, 0, 0.4, 0.04, 1000, 5000, 0.01);       bk_fin(b, 7000, 0, 8);
-b = slot(12, 6000);   bk_drum(b, 6000, 280, 0.25, 0.012, 0.1, 0, 0, 0.4, 0.04, 1200, 6000, 0.01);        bk_fin(b, 6000, 0, 8);
-b = slot(13, 8000);   bk_drum(b, 8000, 440, 0.1, 0.01, 0.16, 1250, 0.5, 0.6, 0.15, 2000, 8000, 0.03);
-                      bake_add(b, 8000, 4, 900, 2600, 0.12, 0.2, 0.5, 0, 1000, 1);                         bk_fin(b, 8000, 0, 8);
-b = slot(14, 7000);   bk_cb(b, 7000, 420, 630, 2000);                                                      bk_fin(b, 7000, 0, 8);
-b = slot(15, 7000);   bk_cb(b, 7000, 560, 840, 2650);                                                      bk_fin(b, 7000, 0, 8);
+// BASS: hard and clicky - a short body with a fast pitch drop and a beater click
+md(0, 66, 1, 0.13);  md(1, 138, 0.18, 0.03);
+b = slot(0, 8750);    bk_modes(b, 8750, 2, 4, 0.005, 2.2, 3200, 0.8, 0.003, 0.15, 1000, 7000, 0.006, 2);        bk_fin(b, 8750, 0, 8);
+// SNARE: bright and crisp - a short head tone and a lot of wire
+md(0, 190, 0.8, 0.08);  md(1, 330, 0.5, 0.05);  md(2, 475, 0.25, 0.03);
+b = slot(1, 7500);    bk_modes(b, 7500, 3, 0.4, 0.008, 0.7, 5000, 0.8, 0.002, 1.5, 1500, 11500, 0.12, 1.6);     bk_fin(b, 7500, 0, 8);
+// TOMS: dark, with head ring - a falling fundamental and the drum head's inharmonic modes
+md(0, 100, 1, 0.32);  md(1, 159, 0.35, 0.12);  md(2, 214, 0.2, 0.08);  md(3, 230, 0.15, 0.06);
+b = slot(2, 15000);   bk_modes(b, 15000, 4, 0.25, 0.05, 0.4, 1500, 0.8, 0.004, 0.08, 300, 2500, 0.02, 1.3);    bk_fin(b, 15000, 0, 8);
+md(0, 146, 1, 0.28);  md(1, 232, 0.35, 0.11);  md(2, 312, 0.2, 0.07);  md(3, 336, 0.15, 0.05);
+b = slot(3, 12500);   bk_modes(b, 12500, 4, 0.25, 0.045, 0.4, 1800, 0.8, 0.004, 0.08, 350, 3000, 0.02, 1.3);   bk_fin(b, 12500, 0, 8);
+md(0, 205, 1, 0.24);  md(1, 326, 0.35, 0.1);  md(2, 439, 0.2, 0.06);  md(3, 472, 0.15, 0.045);
+b = slot(4, 12500);   bk_modes(b, 12500, 4, 0.25, 0.04, 0.4, 2200, 0.8, 0.004, 0.08, 400, 3500, 0.02, 1.3);   bk_fin(b, 12500, 0, 8);
+// RIM: a sharp wooden knock
+md(0, 1700, 1, 0.012);  md(1, 820, 0.6, 0.01);  md(2, 3300, 0.4, 0.006);
+b = slot(5, 2500);    bk_modes(b, 2500, 3, 0, 0.01, 0.8, 5000, 0.8, 0.0015, 0.3, 2000, 10000, 0.004, 1.2);   bk_fin(b, 2500, 0, 8);
+// CLAP: thin and bright (it was "wimpy in the mix" on the original too)
+b = slot(6, 6000);    bk_clap(b, 6000);                                                                       bk_fin(b, 6000, 0, 8);
+// HATS, CYMBALS: bright metal; the crash generously long, the ride a little tinny with its bell
+b = slot(7, 3750);    bake_add(b, 3750, 14, 6500, 11500, 0.015, 0.045, 1, 1.0, 7000, 0.035);                  bk_fin(b, 3750, 0.0004, 6);
+b = slot(8, 17500);   bake_add(b, 17500, 16, 5500, 11500, 0.25, 0.5, 1, 0.8, 6500, 0.4);                      bk_fin(b, 17500, 0.0008, 6);
+b = slot(9, 55000);   bake_add(b, 55000, 26, 3000, 11500, 0.9, 2.0, 1, 1.0, 3500, 1.4);                       bk_fin(b, 55000, 0.004, 6);
+b = slot(10, 40000);  bake_add(b, 40000, 6, 900, 4200, 1.0, 1.6, 1.6, 0, 1000, 1);
+                      bake_add(b, 40000, 20, 4000, 11500, 0.6, 1.2, 1, 0.25, 6000, 0.9);                      bk_fin(b, 40000, 0.001, 6);
+// CONGAS: plenty of slap, plenty of sparkle - the head's modes and the hand's slap
+md(0, 200, 1, 0.16);  md(1, 294, 0.35, 0.08);  md(2, 400, 0.2, 0.05);  md(3, 520, 0.12, 0.03);
+b = slot(11, 8750);   bk_modes(b, 8750, 4, 0.15, 0.01, 2.0, 4500, 1.0, 0.004, 0.25, 2500, 11000, 0.008, 1.5); bk_fin(b, 8750, 0, 8);
+md(0, 318, 1, 0.13);  md(1, 467, 0.35, 0.07);  md(2, 636, 0.2, 0.04);  md(3, 827, 0.12, 0.025);
+b = slot(12, 7500);   bk_modes(b, 7500, 4, 0.15, 0.008, 2.0, 5000, 1.0, 0.0035, 0.25, 2500, 11000, 0.008, 1.5); bk_fin(b, 7500, 0, 8);
+// TIMBALE: a ringing metal shell and a tight head
+md(0, 460, 1, 0.25);  md(1, 1067, 0.5, 0.18);  md(2, 1656, 0.3, 0.12);  md(3, 2346, 0.2, 0.08);  md(4, 2900, 0.25, 0.3);
+b = slot(13, 11250);  bk_modes(b, 11250, 5, 0.05, 0.01, 1.0, 6000, 0.8, 0.002, 0.1, 2000, 9000, 0.01, 1.4);   bk_fin(b, 11250, 0, 8);
+// COWBELLS: a real bell's clang - a cluster of inharmonic partials, bright and cutting
+md(0, 430, 0.7, 0.22);  md(1, 1030, 1, 0.25);  md(2, 1430, 0.6, 0.18);  md(3, 2050, 0.4, 0.12);  md(4, 2600, 0.3, 0.1);
+b = slot(14, 10000);  bk_modes(b, 10000, 5, 0, 0.01, 0.8, 4000, 0.8, 0.0015, 0.05, 2000, 9000, 0.005, 1.8);   bk_fin(b, 10000, 0, 8);
+md(0, 570, 0.7, 0.2);  md(1, 1370, 1, 0.22);  md(2, 1900, 0.6, 0.16);  md(3, 2730, 0.4, 0.1);  md(4, 3460, 0.3, 0.08);
+b = slot(15, 10000);  bk_modes(b, 10000, 5, 0, 0.01, 0.8, 5000, 0.8, 0.0015, 0.05, 2500, 10000, 0.005, 1.8);  bk_fin(b, 10000, 0, 8);
 // playback trims (level balance between the sounds; TWEAK)
 i = 0;  loop(16, VTR[i] = 1;  i += 1; );
-VTR[7] = 1.3;  VTR[8] = 1.3;  VTR[9] = 1.6;  VTR[10] = 1.6;  VTR[13] = 1.2;  VTR[14] = 1.2;  VTR[15] = 1.2;
+VTR[7] = 1.3;  VTR[8] = 1.3;  VTR[9] = 1.6;  VTR[10] = 1.6;  VTR[11] = 1.15;  VTR[12] = 1.15;
 
 // the voices: read a baked sound at its rate (interpolated), with the declick offset; a choke fades it in 3 ms.
 // gl / gr: the hit's place in the stereo field (equal power, fixed for the hit)
@@ -318,7 +354,7 @@ dsp = 0.03 * dm_s * bdt;
 drv_db = 5 + 3 * dm_a * DDRV.drift_tick(dsp);                              // TWEAK: the bus drive (dB into the soft clipper)
 p_base = BR / srate;
 k = 0;  loop(16, PN[k] = slider(18 + k) / 100 + 0.15 * dm_a * pdrift(k, dsp * (0.8 + 0.03 * k));  k += 1; );
-OFL.svf_set(9000, 0.7);  OFR.svf_set(9000, 0.7);
+OFL.svf_set(11500, 0.6);  OFR.svf_set(11500, 0.6);                 // the converter's gentle filter
 ost_setup(0, 0.3, 120, 6000, -0.3, 1);                                   // house output stage: CLIP
 dl_t = dl_sync >= 0.5 ? (dl_div < 0.5 ? 0.125 : dl_div < 1.5 ? 0.25 : dl_div < 2.5 ? 0.375 : dl_div < 3.5 ? 0.5 :
                           dl_div < 4.5 ? 0.75 : dl_div < 5.5 ? 1 : 1.5) * 60 / max(tempo, 20) : dl_ms / 1000;
@@ -403,7 +439,12 @@ file_var(0, seq_ok);
 while (q_i < q_n && QV[q_i * 3] <= smp) (
   tr = QV[q_i * 3 + 1];  vel = QV[q_i * 3 + 2] > 1.5 ? 1 + 0.9 * ac_lvl / 100 : 1;
   k = tr;
-  k == 7 ? VC8.chk = 1;                                                     // CH chokes OH
+  // the original's eight voices: related sounds share one, so each cuts the other off (hats, congas, toms and timbale,
+  // cowbells, clap and rim, crash and ride)
+  k == 7 ? VC8.chk = 1 : k == 8 ? VC7.chk = 1 : k == 11 ? VC12.chk = 1 : k == 12 ? VC11.chk = 1 :
+  k == 14 ? VC15.chk = 1 : k == 15 ? VC14.chk = 1 : k == 5 ? VC6.chk = 1 : k == 6 ? VC5.chk = 1 :
+  k == 9 ? VC10.chk = 1 : k == 10 ? VC9.chk = 1 :
+  k >= 2 && k <= 4 || k == 13 ? ( k != 2 ? VC2.chk = 1;  k != 3 ? VC3.chk = 1;  k != 4 ? VC4.chk = 1;  k != 13 ? VC13.chk = 1; );
   p_hit = PN[k] + 0.05 * dm_a * (rand(2) - 1);
   k == 0 ? VC0.v_trig(0, vel * sqr(slider(2) / 100), p_base, p_hit);
   k == 1 ? VC1.v_trig(1, vel * sqr(slider(3) / 100), p_base, p_hit);
@@ -731,17 +772,17 @@ function p_init() local(i) (
 // PRESETS: kits (levels, pans, swing, FX), level-matched to Init on a groove. They never touch the patterns.
 function load_preset(k) local(i) (
   p_init();
-  k == 2 ? ( slider(13) = 75;  slider(14) = 75;  slider(15) = 70;  slider(16) = 70;  slider(17) = 70;  slider(29) = -70;  slider(30) = 70;  slider(31) = 35;  slider(32) = -40;  slider(33) = 40;  slider(34) = 15;  slider(35) = -1.4;  slider(51) = 1;  slider(54) = 4;  slider(55) = 25;  slider(57) = 15; );   // Latin Groove
-  k == 3 ? ( slider(8) = 75;  slider(35) = 1.2;  slider(43) = 1;  slider(44) = 25;  slider(45) = 60;  slider(46) = 1;  slider(47) = -18;  slider(48) = 3;  slider(50) = 3; );   // Electro Pop
-  k == 4 ? ( slider(35) = -0.2;  slider(36) = 80;  slider(37) = 1;  slider(43) = 1;  slider(44) = 35;  slider(45) = 40; );   // Bedroom Demo
-  k == 5 ? ( slider(20) = -75;  slider(21) = 0;  slider(22) = 75;  slider(25) = 60;  slider(26) = 60;  slider(27) = -65;  slider(28) = 65;  slider(29) = -85;  slider(30) = 85;  slider(31) = 50;  slider(32) = -55;  slider(33) = 55;  slider(35) = 2.2;  slider(38) = 1;  slider(39) = 0.12;  slider(40) = 45;  slider(41) = 25;  slider(42) = 35; );   // Wide Stereo
-  k == 6 ? ( slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0;  slider(23) = 0;  slider(24) = 0;  slider(25) = 0;  slider(26) = 0;  slider(27) = 0;  slider(28) = 0;  slider(29) = 0;  slider(30) = 0;  slider(31) = 0;  slider(32) = 0;  slider(33) = 0;  slider(35) = 2.3;  slider(37) = 1;  slider(46) = 1;  slider(47) = -20;  slider(48) = 4;  slider(50) = 4; );   // Mono Club
-  k == 7 ? ( slider(16) = 65;  slider(34) = 50;  slider(35) = 1.4;  slider(46) = 1;  slider(47) = -16;  slider(48) = 3;  slider(49) = 0;  slider(50) = 2; );   // Funk Shuffle
-  k == 8 ? ( slider(16) = 70;  slider(17) = 70;  slider(35) = 0.1;  slider(38) = 1;  slider(39) = 0.1;  slider(40) = 40;  slider(41) = 25;  slider(42) = 30;  slider(51) = 1;  slider(54) = 6;  slider(55) = 55;  slider(56) = 60;  slider(57) = 35; );   // Dub Bells
-  k == 9 ? ( slider(35) = 2.2;  slider(36) = 70;  slider(43) = 1;  slider(44) = 70;  slider(45) = 35;  slider(46) = 1;  slider(47) = -24;  slider(48) = 6;  slider(49) = 0;  slider(50) = 6; );   // Crunchy
-  k == 10 ? ( slider(1) = 30;  slider(35) = 0;  slider(37) = 1;  slider(46) = 1;  slider(47) = -14;  slider(48) = 2;  slider(49) = 1;  slider(50) = 2; );   // Soft and Round
-  k == 11 ? ( slider(10) = 70;  slider(16) = 80;  slider(17) = 80;  slider(35) = -0.2;  slider(51) = 1;  slider(54) = 3;  slider(55) = 30;  slider(57) = 18; );   // Disco Cowbell
-  k == 12 ? ( slider(35) = -0.3;  slider(36) = 0; );   // Clean Machine
+  k == 2 ? ( slider(13) = 75;  slider(14) = 75;  slider(15) = 70;  slider(16) = 70;  slider(17) = 70;  slider(29) = -70;  slider(30) = 70;  slider(31) = 35;  slider(32) = -40;  slider(33) = 40;  slider(34) = 15;  slider(35) = -1.8;  slider(51) = 1;  slider(54) = 4;  slider(55) = 25;  slider(57) = 15; );   // Latin Groove
+  k == 3 ? ( slider(8) = 75;  slider(35) = 1.9;  slider(43) = 1;  slider(44) = 25;  slider(45) = 60;  slider(46) = 1;  slider(47) = -18;  slider(48) = 3;  slider(50) = 3; );   // Electro Pop
+  k == 4 ? ( slider(35) = 0.2;  slider(36) = 80;  slider(37) = 1;  slider(43) = 1;  slider(44) = 35;  slider(45) = 40; );   // Bedroom Demo
+  k == 5 ? ( slider(20) = -75;  slider(21) = 0;  slider(22) = 75;  slider(25) = 60;  slider(26) = 60;  slider(27) = -65;  slider(28) = 65;  slider(29) = -85;  slider(30) = 85;  slider(31) = 50;  slider(32) = -55;  slider(33) = 55;  slider(35) = 2.5;  slider(38) = 1;  slider(39) = 0.12;  slider(40) = 45;  slider(41) = 25;  slider(42) = 35; );   // Wide Stereo
+  k == 6 ? ( slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0;  slider(23) = 0;  slider(24) = 0;  slider(25) = 0;  slider(26) = 0;  slider(27) = 0;  slider(28) = 0;  slider(29) = 0;  slider(30) = 0;  slider(31) = 0;  slider(32) = 0;  slider(33) = 0;  slider(35) = 3;  slider(37) = 1;  slider(46) = 1;  slider(47) = -20;  slider(48) = 4;  slider(50) = 4; );   // Mono Club
+  k == 7 ? ( slider(16) = 65;  slider(34) = 50;  slider(35) = 1.9;  slider(46) = 1;  slider(47) = -16;  slider(48) = 3;  slider(49) = 0;  slider(50) = 2; );   // Funk Shuffle
+  k == 8 ? ( slider(16) = 70;  slider(17) = 70;  slider(35) = -0.1;  slider(38) = 1;  slider(39) = 0.1;  slider(40) = 40;  slider(41) = 25;  slider(42) = 30;  slider(51) = 1;  slider(54) = 6;  slider(55) = 55;  slider(56) = 60;  slider(57) = 35; );   // Dub Bells
+  k == 9 ? ( slider(35) = 3.2;  slider(36) = 70;  slider(43) = 1;  slider(44) = 70;  slider(45) = 35;  slider(46) = 1;  slider(47) = -24;  slider(48) = 6;  slider(49) = 0;  slider(50) = 6; );   // Crunchy
+  k == 10 ? ( slider(1) = 30;  slider(35) = 0.4;  slider(37) = 1;  slider(46) = 1;  slider(47) = -14;  slider(48) = 2;  slider(49) = 1;  slider(50) = 2; );   // Soft and Round
+  k == 11 ? ( slider(10) = 70;  slider(16) = 80;  slider(17) = 80;  slider(35) = -1.5;  slider(51) = 1;  slider(54) = 3;  slider(55) = 30;  slider(57) = 18; );   // Disco Cowbell
+  k == 12 ? ( slider(35) = -0.4;  slider(36) = 0; );   // Clean Machine
   i = 1;  loop(57, ui_auto(i);  i += 1; );
 );
 // demo patterns (EDIT > Load a demo pattern): one string per track, '.' off, 'x' hit, 'X' accent
