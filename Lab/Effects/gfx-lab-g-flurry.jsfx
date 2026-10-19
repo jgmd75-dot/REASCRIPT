@@ -22,6 +22,9 @@ desc:GFX Lab G Flurry [synth]
 //   voices -> CHORUS -> DELAY (house engine; stereo / ping-pong, sync) -> SPACE (house reverb, fed by the delay)
 //   -> EQ (low / high shelf) -> DC blocker -> house output stage
 //
+// LFO: a sine to PWM, CUTOFF and PITCH. RATE in Hz (0.02 - 20), or with SYNC a note value at the project tempo
+//   (4 bars .. 1/32, dotted and triplet); while REAPER plays, a synced LFO locks to the timeline (eased in, no jumps).
+//
 // DRIFT (0 - 100 %, 50 % = standard): each voice's pitch wanders slowly on its own (up to +/-20 cents) with a small
 //   random offset per note (+/-6 cents), and its pulse width wanders a little (+/-0.08). 0 % = none, 100 % = twice
 //   the standard amount, a little faster.
@@ -102,6 +105,8 @@ slider48:eq_hi=0<-12,12,0.1>-EQ high (dB)
 slider49:vol=0<-24,6,0.1>-Volume (dB)
 slider50:npoly=8<1,8,1>-Voices
 slider51:drift=50<0,100,1>-Drift (%)
+slider52:lfo_sync=0<0,1,1{Free,Sync}>-LFO sync
+slider53:lfo_div=5<0,13,1{4 bars,2 bars,1 bar,1/2,1/2 dotted,1/4,1/4 dotted,1/4 triplet,1/8,1/8 dotted,1/8 triplet,1/16,1/16 triplet,1/32}>-LFO note value
 
 @init
 #ui_man = "gfx-lab-g-flurry";
@@ -385,7 +390,7 @@ function v_run(b) local(p, u, ph, d, s, q, ol, or_, mono, xl, xr, yl, yr, w) (
   );
 );
 
-bend = 0;  modw = 0;  sustain = 0;  age_n = 0;  cr_n = 0;  lfo_ph = 0;  lfo_v = 0;
+bend = 0;  modw = 0;  sustain = 0;  age_n = 0;  cr_n = 0;  lfo_ph = 0;  lfo_v = 0;  lfo_rate = lfo_hz;
 lcs = log(cutoff) / log(2);  kres = fres * 4.1;  drv_s = 10 ^ (fdrive / 20);
 
 // ---------- per block: delay and space settings ----------
@@ -521,6 +526,15 @@ outpk_disp = max(outpk_disp, outpk);  outpk = 0;                   // OUT meter 
 ost_clipped ? ( clip_d = 1;  ost_clipped = 0; );
 n_on = 0;  vb = VOX;  loop(NV, n_on += vb[F_ON] > 0;  vb += VS; );
 voices_disp = n_on;  n_on == 0 ? fc_disp = 0;
+// LFO SYNC: a note value at the project tempo; while REAPER plays, the phase is pulled gently onto the timeline
+lfo_bpc = lfo_div < 0.5 ? 16 : lfo_div < 1.5 ? 8 : lfo_div < 2.5 ? 4 : lfo_div < 3.5 ? 2 : lfo_div < 4.5 ? 3 : lfo_div < 5.5 ? 1 :
+          lfo_div < 6.5 ? 1.5 : lfo_div < 7.5 ? 2 / 3 : lfo_div < 8.5 ? 0.5 : lfo_div < 9.5 ? 0.75 : lfo_div < 10.5 ? 1 / 3 :
+          lfo_div < 11.5 ? 0.25 : lfo_div < 12.5 ? 1 / 6 : 0.125;                // beats per cycle
+lfo_rate = lfo_sync >= 0.5 ? max(tempo, 20) / 60 / lfo_bpc : lfo_hz;
+lfo_sync >= 0.5 && (play_state & 1) ? (
+  lfo_d = beat_position / lfo_bpc;  lfo_d -= floor(lfo_d);  lfo_d -= lfo_ph;  lfo_d -= floor(lfo_d + 0.5);
+  lfo_ph += lfo_d * 0.25;  lfo_ph -= floor(lfo_ph);                          // never a jump: a quarter of the way each block
+);
 lfo_disp = lfo_ph;
 
 @sample
@@ -530,7 +544,7 @@ spos += 1;
 // control tick
 cr_n <= 0 ? (
   cr_n = CR;
-  lfo_ph += lfo_hz * CR / srate;  lfo_ph -= floor(lfo_ph);
+  lfo_ph += lfo_rate * CR / srate;  lfo_ph -= floor(lfo_ph);
   lfo_v = sin(2 * $pi * lfo_ph);
   vb = VOX;  loop(NV, vb[F_ON] ? v_tick(vb);  vb += VS; );
 );
@@ -680,7 +694,7 @@ function sl_auto(idx) (
   idx == 42 ? slider_automate(dl_pp) : idx == 43 ? slider_automate(sp_size) : idx == 44 ? slider_automate(sp_decay) :
   idx == 45 ? slider_automate(sp_damp) : idx == 46 ? slider_automate(sp_mix) : idx == 47 ? slider_automate(eq_lo) :
   idx == 48 ? slider_automate(eq_hi) : idx == 49 ? slider_automate(vol) : idx == 50 ? slider_automate(npoly) :
-  idx == 51 ? slider_automate(drift);
+  idx == 51 ? slider_automate(drift) : idx == 52 ? slider_automate(lfo_sync) : idx == 53 ? slider_automate(lfo_div);
 );
 function param_touched(idx) (
   idx <= 32 ? slider_automate(2 ^ (idx - 1)) : sl_auto(idx);
@@ -711,6 +725,9 @@ function fmtv(v, fmt) (
   fmt == 17 ? sprintf(#kv, "%.1f s", v) :
   fmt == 18 ? ( osc_mode >= 0.5 ? sprintf(#kv, "%.1f saws", 1 + 8 * v) : sprintf(#kv, "shape %d %%", v * 100 + 0.5); ) :
   fmt == 19 ? sprintf(#kv, "%d c", v) :
+  fmt == 20 ? ( v = floor(v + 0.5);  strcpy(#kv, v == 0 ? "4 bars" : v == 1 ? "2 bars" : v == 2 ? "1 bar" : v == 3 ? "1/2" : v == 4 ? "1/2 dotted" :
+    v == 5 ? "1/4" : v == 6 ? "1/4 dotted" : v == 7 ? "1/4 triplet" : v == 8 ? "1/8" : v == 9 ? "1/8 dotted" : v == 10 ? "1/8 triplet" :
+    v == 11 ? "1/16" : v == 12 ? "1/16 triplet" : "1/32"); ) :
               sprintf(#kv, "%.2f", v);
   #kv;
 );
@@ -963,7 +980,7 @@ function p_init() (
   pv(1, 1); pv(2, 0.6); pv(3, 0.45); pv(4, 0.2); pv(5, 0); pv(6, -12); pv(7, 7); pv(8, 0.2); pv(9, 0.2); pv(10, 0);
   pv(11, 0); pv(12, 1800); pv(13, 0.35); pv(14, 0); pv(15, 0.45); pv(16, 0.5); pv(17, 0); pv(18, 0); pv(19, 0.2); pv(20, 0);
   pv(21, 2); pv(22, 350); pv(23, 20); pv(24, 400); pv(25, 2); pv(26, 600); pv(27, 85); pv(28, 350); pv(29, 0.5);
-  pv(30, 0); pv(31, 12); pv(32, 1); pv(33, 0.8); pv(34, 0); pv(35, 0); pv(36, 0.25);
+  pv(30, 0); pv(31, 12); pv(32, 1); pv(33, 0.8); pv(34, 0); pv(35, 0); pv(52, 0); pv(53, 5); pv(36, 0.25);
   pv(37, 1); pv(38, 350); pv(39, 4); pv(40, 0.4); pv(41, 0.2); pv(42, 1);
   pv(43, 0.6); pv(44, 2.8); pv(45, 0.45); pv(46, 0.2); pv(47, 0); pv(48, 0); pv(49, 0); pv(50, 8); pv(51, 50);
 );
@@ -1017,7 +1034,7 @@ function load_preset(p) local(i) (
   p == 12 ? (                                                                                  // Digital Grit
     pv(1, 0); pv(2, 0.85); pv(3, 0.3); pv(4, 0.4); pv(8, 0.2); pv(11, 3); pv(12, 160); pv(13, 0.2); pv(15, 0.2);
     pv(30, 5); pv(31, 18); pv(32, 0); pv(33, 3); pv(36, 0.2); pv(46, 0.15); ) : 0;
-  i = 1;  loop(51, param_touched(i);  i += 1; );
+  i = 1;  loop(53, param_touched(i);  i += 1; );
 );
 PRESET_MENU = "Init|Super Lead|Wide Pad|Juicy Bass|Reso Pluck|PWM Strings|Classic Brass|Rave Hoover|Tube Keys|Ice Drone|Acid Line|Digital Grit";
 
@@ -1213,7 +1230,9 @@ gfx_setfont(6);  col(C_INK, 1);  text_c(px(776), py(458), "FILTER");
 section(864, 348, 220, 140, C_SEC3, "LFO");
 g_t = 0.5 + 0.5 * sin(2 * $pi * lfo_disp);
 col(0x2FB6D4, 0.25 + 0.75 * g_t);  gfx_circle(px(922), py(368), ps(4.5), 1, 1);
-klog = 1;  kn(911, 420, 18, 33, 0.02, 20, 0.8, C_ICE, 0xFFFFFF, "RATE", 10, 0);
+lk_key(1012, 356, 56, 24, lfo_sync >= 0.5, LK_SKY, "SYNC") ? ( slider(52) = lfo_sync >= 0.5 ? 0 : 1;  param_touched(52); );
+lfo_sync >= 0.5 ? ( kstep = 1;  kn(911, 420, 18, 53, 0, 13, 5, C_ICE, 0xFFFFFF, "RATE", 20, 0); )
+                : ( klog = 1;  kn(911, 420, 18, 33, 0.02, 20, 0.8, C_ICE, 0xFFFFFF, "RATE", 10, 0); );
 kn(974, 422, 16, 34, 0, 4, 0, C_CAPW, C_INK, "CUTOFF", 13, 0);
 kn(1037, 422, 16, 35, 0, 100, 0, C_CAPW, C_INK, "PITCH", 19, 0);
 
