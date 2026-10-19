@@ -18,13 +18,24 @@ REAPER keeps the range up to date.
 
 From then on, **Extensions > ReaPack > Synchronize packages** (or ReaPack's automatic sync) brings in every fix.
 
+## The Lab (optional)
+
+The experimental GFX Lab plug-ins are a separate repository, so you can leave them out. To add them:
+**Extensions > ReaPack > Import repositories...** and paste
+
+`https://github.com/jgmd75-dot/REASCRIPT/raw/main/Lab/index.xml`
+
+then install **GFX Lab system files** first, and any Lab plug-ins you like (they appear as "GFX Lab ...", under
+Effects/GFX Lab/Lab). Lab plug-ins change often and may sound different between versions.
+
 ## What's here
 
 - `Effects/` - the Stable range (`gfx-*.jsfx`) and the GFX system files (`gfx-*.jsfx-inc`)
 - `Scripts/` - GFX ReaScripts (CC-80 chord calculator, MIDI exporters, tidy FX names)
 - `Data/gfx-drum-patterns/` - pattern files for Pulse
 - `index.xml` - the ReaPack index (generated - don't edit by hand)
-- `tools/build-index.py` - rebuilds everything from a GFX-II checkout
+- `Lab/` - the Lab repository: its plug-ins and system files (`Lab/Effects/`) and its own `Lab/index.xml`
+- `tools/build-index.py` - rebuilds the Stable from a GFX-II checkout, or the Lab from a LAB checkout (`--lab`)
 
 GFX is free donationware by JGWizrad: [gardenfx.uk](https://www.gardenfx.uk/) · [Ko-fi](https://ko-fi.com/jgwizrad).
 © 2026 John Garden.

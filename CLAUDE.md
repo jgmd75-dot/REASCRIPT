@@ -14,5 +14,9 @@ This repo is the public ReaPack repository for the GFX Stable range. John adds
   registered as actions), and "GFX Pulse patterns" (type data, into REAPER's Data/gfx-drum-patterns).
 - Effects install into `<REAPER>/Effects/GFX/Stable/`, so the plug-ins and the system files share one folder (the
   imports need that). Keep every effect package in the one category.
-- Stable only: the Lab is not offered here.
+- **The Lab** is a second, separate ReaPack repository in the same git repo: `Lab/index.xml` (index "GFX Lab",
+  category "Lab"), files under `Lab/Effects/`, versions in `Lab/versions.json`. Rebuild it with
+  `python3 tools/build-index.py PATH/TO/LAB --lab --message "what changed"` after a Lab plug-in arrives, changes or
+  leaves. Its plug-ins and the "GFX Lab system files" package install into `<REAPER>/Effects/GFX Lab/Lab/`, apart
+  from the Stable. John adds it with `https://github.com/jgmd75-dot/REASCRIPT/raw/main/Lab/index.xml`.
 - The repo must stay public (ReaPack downloads without logging in).
