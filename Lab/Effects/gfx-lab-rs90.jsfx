@@ -53,7 +53,7 @@ desc:GFX Lab G RS90 [drum machine]
 // Latency: 0 samples.
 //
 // TWEAK points are marked TWEAK.
-// STATUS: Lab (experimental, may change). v0.4 (complete: sound engine, sequencer, FX strip, faceplate, presets).
+// STATUS: Lab (experimental, may change). v0.5 (complete: sound engine, sequencer, FX strip, faceplate, presets).
 
 import gfx-lab-drift.jsfx-inc
 import gfx-lab-output.jsfx-inc
@@ -253,6 +253,12 @@ memset(DLB, 0, DSZ);  memset(DRB, 0, DSZ);  dl_w = 0;
 function db2g(d) ( exp(d * 0.11512925464970228); );
 function ts(x) ( x = max(-3, min(3, x));  x * (27 + x * x) / (27 + 9 * x * x); );
 function ec(t) ( exp(-1 / (max(t, 0.0001) * srate)); );          // a decay's per-sample factor
+// a fixed amp shape built into a voice (John's EDIT-page settings, as he heard them: the gate = one step at 120 bpm):
+// DECAY d (s) towards SUSTAIN sus until 0.125 s, then RELEASE r (s)
+function shp(t, d, sus, r) local(g, eg) (
+  g = 0.125;  eg = sus + (1 - sus) * exp(-g * 6.9 / d);
+  t < g ? sus + (1 - sus) * exp(-t * 6.9 / d) : eg * exp(-(t - g) * 6.9 / r);
+);
 function st(c) ( 2 ^ (c / 12); );
 // TPT state-variable filter (lp / bp / hp)
 function svf_set(f, q) instance(g, k, a1, a2, a3) (
@@ -297,6 +303,8 @@ function bake_add(dst, n_, np, flo, fhi, tlo, thi, g, nlev, nhp, ntau) local(k, 
     dst[i] += s;  i += 1; );
 );
 // attack ramp, end fade, normalise, then 6-bit companded (5 bits on the square root + sign) - the cymbal chip's grain
+function shp_b(t) local(g, eg) ( g = 0.125;  eg = 0.02 + 0.98 * exp(-g * 6.9 / 4);   // (the ride's shape, at bake time)
+  t < g ? 0.02 + 0.98 * exp(-t * 6.9 / 4) : eg * exp(-(t - g) * 6.9 / 1.46); );
 function bake_finish(dst, n_, att) local(i, pk, y, e)
 (
   pk = 0.000001;  i = 0;
@@ -312,6 +320,7 @@ bake_add(BK_OH, BL_OH, 18, 5000, 13500, 0.30, 0.70, 1, 0.7, 6500, 0.45);        
 bake_add(BK_CR, BL_CR, 28, 3000, 13500, 0.25, 0.60, 1, 0.9, 3500, 0.45);             bake_finish(BK_CR, BL_CR, 0.004);
 bake_add(BK_RD, BL_RD, 6, 600, 3300, 0.5, 0.8, 1.4, 0, 1000, 1);
 bake_add(BK_RD, BL_RD, 24, 3500, 13000, 0.3, 0.6, 1, 0.35, 5000, 0.45);               bake_finish(BK_RD, BL_RD, 0.001);
+i = 0;  loop(BL_RD, BK_RD[i] *= 0.87 * shp_b(i / 32000);  i += 1; );       // the ride: John's shape, 13 % down
 
 // ===================== the analogue voices (each: trig(vel), then proc() per sample; act = sounding) ============
 // BD: a shaped sine, pitch sweeping down from about 3.5x (fast) plus a slower tail; ATTACK = a short click
@@ -329,16 +338,16 @@ function bd_proc() instance(ph, a, pe, pe2, ck, act, out, lp) local(f, s, c) (
   this.dck(out);
 );
 // SD: two oscillators with a quick pitch drop, plus noise (TONE = its brightness, SNAPPY = its level)
-function sd_trig(v) instance(p1, p2, a1, a2, an, pe, act, out) (
-  this.dck_set(out);  p1 = p2 = 0;  a1 = v;  a2 = v * 0.6;  an = v;  pe = 1;  act = 1;
+function sd_trig(v) instance(p1, p2, a1, a2, an, pe, act, out, tn) (
+  this.dck_set(out);  p1 = p2 = 0;  a1 = v;  a2 = v * 0.6;  an = v;  pe = 1;  act = 1;  tn = 0;
 );
-function sd_proc() instance(p1, p2, a1, a2, an, pe, act, out) local(s, n) (
+function sd_proc() instance(p1, p2, a1, a2, an, pe, act, out, tn) local(s, n) (
   act ? (
     p1 += sd_f1 * (1 + 0.5 * pe) / srate;  p1 -= floor(p1);  p2 += sd_f2 * (1 + 0.5 * pe) / srate;  p2 -= floor(p2);  pe *= sd_pc;
     s = sin(2 * $pi * p1) * a1 + sin(2 * $pi * p2) * a2;  a1 *= sd_a1;  a2 *= sd_a2;
     SDL.svf(noise());  n = SDL.lp;  SDH.svf(n);  n = SDH.hp;
     s = s * 0.6 + n * an * sd_nl;  an *= sd_an;
-    out = ts(s * 1.2) * 0.75;
+    tn += 1;  out = ts(s * 1.2) * 0.75 * shp(tn / srate, 2.4, 0.97, 2.0);        // John's shape
     a1 < 0.00002 && an < 0.00002 ? act = 0;
   ) : out = 0;
   this.dck(out);
@@ -376,7 +385,7 @@ function cp_proc() instance(t, a, act, out, e, tl) local(s, n, b) (
     n = CPF.svf(noise());
     s = n * a * (e + (b >= 3 ? tl : 0)) * 2.2;
     t > 0.03 && tl < 0.0001 ? act = 0;
-    out = s;
+    out = s * shp(t, 1.05, 0.32, 2.4) * 0.87;                                // John's shape, 13 % down
   ) : out = 0;
   this.dck(out);
 );
@@ -408,7 +417,7 @@ function update_params() (
   bd_click = 0.05 + 0.9 * bd_att / 100;
   sd_nl = 0.15 + 1.2 * sd_snap / 100;
   SDL.svf_set(2500 * 5 ^ (sd_tone / 100), 0.7);  SDH.svf_set(600, 0.7);
-  CPF.svf_set(1150, 2.2);  MLP.svf_set(11000, 0.6);  MRP.svf_set(11000, 0.6);
+  CPF.svf_set(1675, 2.2);  MLP.svf_set(11000, 0.6);  MRP.svf_set(11000, 0.6);
   swing_k = swing / 100 / 3;                  // odd 16ths are delayed by up to a third of a step
   t_mlvl = m_lvl;
   // FX
@@ -462,7 +471,7 @@ k = 0;  loop(NV, TUNE[k] = st(slider(EB + k * 5));  k += 1; );          // layer
 g_seq = 60 / max(tempo, 20) * srate / 4;                                // the sequencer's gate: one step
 bd_f0 = TUNE[0] * 48 * st(cents * DBD.drift_tick(dsp) + 0.05 * dm_a * TOL[0] + sagc / 100);
 sd_k = TUNE[1] * st((sd_tune - 50) / 50 * 4 + cents * DSD.drift_tick(dsp) + 0.05 * dm_a * TOL[1] + sagc / 100);
-sd_f1 = 180 * sd_k;  sd_f2 = 330 * sd_k;
+sd_f1 = 207 * sd_k;  sd_f2 = 379 * sd_k;                                // (John: +2.4 st)
 lt_f = TUNE[2] * 95 * st((lt_tune - 50) / 50 * 5 + cents * DLT.drift_tick(dsp) + 0.05 * dm_a * TOL[2] + sagc / 100);
 mt_f = TUNE[3] * 140 * st((mt_tune - 50) / 50 * 5 + cents * DMT.drift_tick(dsp) + 0.05 * dm_a * TOL[3] + sagc / 100);
 ht_f = TUNE[4] * 200 * st((ht_tune - 50) / 50 * 5 + cents * DHT.drift_tick(dsp) + 0.05 * dm_a * TOL[4] + sagc / 100);
@@ -472,7 +481,7 @@ hh_r = 32000 / srate * st(mb_c);
 cr_r = 32000 / srate * st((cr_tune - 50) / 50 * 3 + mb_c);
 rd_r = 32000 / srate * st((rd_tune - 50) / 50 * 3 + mb_c);
 ch_r = hh_r * TUNE[7];  oh_r = hh_r * TUNE[8];  cr_r *= TUNE[9];  rd_r *= TUNE[10];
-CPF.svf_set(1150 * TUNE[6], 2.2);
+CPF.svf_set(1675 * TUNE[6], 2.2);                                        // (John: +6.5 st)
 ag = 0.06 * dm_a;                                                       // ageing: decay tolerances
 bd_ac = ec((0.06 + 0.7 * sqr(bd_dec / 100)) * (1 + ag * TOL[12]));  bd_pc = ec(0.005);  bd_pc2 = ec(0.05);  bd_cc = ec(0.0012);
 sd_a1 = ec(0.09 * (1 + ag * TOL[13]));  sd_a2 = ec(0.06);  sd_pc = ec(0.01);
@@ -721,17 +730,17 @@ function lb_init() local(k) (
 );
 function load_preset(k) local(i) (
   p_init();  lb_init();
-  k == 2 ? ( slider(2) = 55;  slider(3) = 65;  slider(4) = 55;  slider(7) = 60;  slider(8) = 55;  slider(22) = 30;  slider(23) = 45;  slider(29) = 0.4;  slider(37) = 1;  slider(38) = 20;  slider(39) = 60;  slider(40) = 1;  slider(41) = -16;  slider(42) = 3;  slider(43) = 1;  slider(44) = 2; );   // Detroit Techno
-  k == 3 ? ( slider(2) = 45;  slider(3) = 40;  slider(4) = 72;  slider(9) = 55;  slider(20) = 78;  slider(22) = 35;  slider(23) = 50;  slider(28) = 25;  slider(29) = -1.4;  slider(31) = 1;  slider(40) = 1;  slider(41) = -14;  slider(42) = 2.5;  slider(43) = 1;  slider(44) = 2; );   // Chicago House
-  k == 4 ? ( slider(2) = 62;  slider(3) = 90;  slider(4) = 48;  slider(5) = 90;  slider(7) = 70;  slider(8) = 70;  slider(22) = 25;  slider(23) = 35;  slider(29) = -0.7;  slider(30) = 40;  slider(31) = 1;  slider(37) = 1;  slider(38) = 65;  slider(39) = 55;  slider(40) = 1;  slider(41) = -22;  slider(42) = 8;  slider(43) = 0;  slider(44) = 6; );   // Hard Techno
-  k == 5 ? ( slider(4) = 60;  slider(9) = 60;  slider(19) = 70;  slider(22) = 30;  slider(28) = 55;  slider(29) = -1.6;  slider(45) = 1;  slider(48) = 4;  slider(49) = 30;  slider(50) = 50;  slider(51) = 18; );   // Garage Shuffle
-  k == 6 ? ( slider(3) = 75;  slider(29) = -1.8;  slider(32) = 1;  slider(33) = 0.25;  slider(34) = 70;  slider(35) = 55;  slider(36) = 40;  slider(37) = 1;  slider(38) = 45;  slider(39) = 70;  slider(45) = 1;  slider(48) = 2;  slider(49) = 40;  slider(50) = 35;  slider(51) = 22; );   // Acid Rave
-  k == 7 ? ( slider(2) = 40;  slider(3) = 55;  slider(4) = 90;  slider(5) = 90;  slider(24) = 65;  slider(29) = -1.9;  slider(31) = 1;  slider(40) = 1;  slider(41) = -18;  slider(42) = 4;  slider(43) = 1;  slider(44) = 4; );   // Big Room Boom
-  k == 8 ? ( slider(4) = 65;  slider(7) = 40;  slider(29) = -2.9;  slider(32) = 1;  slider(33) = 0.08;  slider(34) = 45;  slider(35) = 30;  slider(36) = 30;  slider(45) = 1;  slider(48) = 6;  slider(49) = 55;  slider(50) = 60;  slider(51) = 35; );   // Electro Dub
-  k == 9 ? ( slider(2) = 35;  slider(3) = 85;  slider(4) = 30;  slider(8) = 35;  slider(9) = 55;  slider(11) = 30;  slider(14) = 30;  slider(17) = 30;  slider(22) = 15;  slider(23) = 25;  slider(29) = 2.3;  slider(37) = 1;  slider(38) = 15;  slider(39) = 80; );   // Minimal Click
-  k == 10 ? ( slider(23) = 60;  slider(26) = 60;  slider(27) = 40;  slider(29) = 0.9;  slider(31) = 1;  slider(37) = 1;  slider(38) = 25;  slider(39) = 45;  slider(40) = 1;  slider(41) = -20;  slider(42) = 3;  slider(43) = 1;  slider(44) = 4; );   // Warehouse
+  k == 2 ? ( slider(2) = 55;  slider(3) = 65;  slider(4) = 55;  slider(7) = 60;  slider(8) = 55;  slider(22) = 30;  slider(23) = 45;  slider(29) = 0.2;  slider(37) = 1;  slider(38) = 20;  slider(39) = 60;  slider(40) = 1;  slider(41) = -16;  slider(42) = 3;  slider(43) = 1;  slider(44) = 2; );   // Detroit Techno
+  k == 3 ? ( slider(2) = 45;  slider(3) = 40;  slider(4) = 72;  slider(9) = 55;  slider(20) = 78;  slider(22) = 35;  slider(23) = 50;  slider(28) = 25;  slider(29) = -1.7;  slider(31) = 1;  slider(40) = 1;  slider(41) = -14;  slider(42) = 2.5;  slider(43) = 1;  slider(44) = 2; );   // Chicago House
+  k == 4 ? ( slider(2) = 62;  slider(3) = 90;  slider(4) = 48;  slider(5) = 90;  slider(7) = 70;  slider(8) = 70;  slider(22) = 25;  slider(23) = 35;  slider(29) = -1;  slider(30) = 40;  slider(31) = 1;  slider(37) = 1;  slider(38) = 65;  slider(39) = 55;  slider(40) = 1;  slider(41) = -22;  slider(42) = 8;  slider(43) = 0;  slider(44) = 6; );   // Hard Techno
+  k == 5 ? ( slider(4) = 60;  slider(9) = 60;  slider(19) = 70;  slider(22) = 30;  slider(28) = 55;  slider(29) = -1.8;  slider(45) = 1;  slider(48) = 4;  slider(49) = 30;  slider(50) = 50;  slider(51) = 18; );   // Garage Shuffle
+  k == 6 ? ( slider(3) = 75;  slider(29) = -2;  slider(32) = 1;  slider(33) = 0.25;  slider(34) = 70;  slider(35) = 55;  slider(36) = 40;  slider(37) = 1;  slider(38) = 45;  slider(39) = 70;  slider(45) = 1;  slider(48) = 2;  slider(49) = 40;  slider(50) = 35;  slider(51) = 22; );   // Acid Rave
+  k == 7 ? ( slider(2) = 40;  slider(3) = 55;  slider(4) = 90;  slider(5) = 90;  slider(24) = 65;  slider(29) = -2.2;  slider(31) = 1;  slider(40) = 1;  slider(41) = -18;  slider(42) = 4;  slider(43) = 1;  slider(44) = 4; );   // Big Room Boom
+  k == 8 ? ( slider(4) = 65;  slider(7) = 40;  slider(29) = -3.1;  slider(32) = 1;  slider(33) = 0.08;  slider(34) = 45;  slider(35) = 30;  slider(36) = 30;  slider(45) = 1;  slider(48) = 6;  slider(49) = 55;  slider(50) = 60;  slider(51) = 35; );   // Electro Dub
+  k == 9 ? ( slider(2) = 35;  slider(3) = 85;  slider(4) = 30;  slider(8) = 35;  slider(9) = 55;  slider(11) = 30;  slider(14) = 30;  slider(17) = 30;  slider(22) = 15;  slider(23) = 25;  slider(29) = 2.4;  slider(37) = 1;  slider(38) = 15;  slider(39) = 80; );   // Minimal Click
+  k == 10 ? ( slider(23) = 60;  slider(26) = 60;  slider(27) = 40;  slider(29) = 0.7;  slider(31) = 1;  slider(37) = 1;  slider(38) = 25;  slider(39) = 45;  slider(40) = 1;  slider(41) = -20;  slider(42) = 3;  slider(43) = 1;  slider(44) = 4; );   // Warehouse
   k == 11 ? ( slider(10) = 35;  slider(11) = 75;  slider(12) = 75;  slider(13) = 45;  slider(14) = 70;  slider(15) = 75;  slider(16) = 55;  slider(17) = 65;  slider(18) = 75;  slider(19) = 70;  slider(29) = -1.9;  slider(45) = 1;  slider(48) = 5;  slider(49) = 25;  slider(50) = 60;  slider(51) = 15; );   // Tribal Toms
-  k == 12 ? ( slider(22) = 45;  slider(29) = -0.7;  slider(30) = 85;  slider(37) = 1;  slider(38) = 80;  slider(39) = 25;  slider(40) = 1;  slider(41) = -24;  slider(42) = 10;  slider(43) = 0;  slider(44) = 8; );   // Dirty Lo-Fi
+  k == 12 ? ( slider(22) = 45;  slider(29) = -1.1;  slider(30) = 85;  slider(37) = 1;  slider(38) = 80;  slider(39) = 25;  slider(40) = 1;  slider(41) = -24;  slider(42) = 10;  slider(43) = 0;  slider(44) = 8; );   // Dirty Lo-Fi
   i = 1;  loop(51, ui_auto(i);  i += 1; );
   i = EB;  loop(NV * 5, ui_auto(i);  i += 1; );
 );
