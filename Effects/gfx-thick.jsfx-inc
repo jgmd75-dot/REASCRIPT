@@ -1,0 +1,96 @@
+//author: JGWizrad / Garden FX (GFX)
+//
+// gfx-thick - the THICK circuit: dense analogue low-mid weight, iron saturation and sustained body, shared by
+// SEN20, ACC24 and VAL60 (each sets its own flavour). Linked stereo, zero latency, CPU-light.
+//
+//   1. WEIGHT: a dynamic low-mid bell (band-pass around 280 Hz, added in parallel, in phase at its centre):
+//      gentle upward compression - decaying notes and room resonance are lifted (up to thk_lift dB) while loud parts
+//      are left alone; very quiet signal (below -70 dBFS) is never lifted. Sub-bass and highs are untouched.
+//   2. IRON: everything below ~500 Hz (LR4 split) through an asymmetric polynomial soft-clipper (2nd and 3rd
+//      harmonics). Only the difference the clipper makes is added back, so at low level THICK is exactly the dry
+//      signal (no crossover phasing). A cubic on a band below ~500 Hz only makes harmonics below ~1.5 kHz, so it
+//      cannot alias: no oversampling (and no latency) is needed. A 5 Hz DC blocker takes out the 2nd harmonic's offset.
+//   3. DRAG: the ultra-fast front of each transient is rounded off by up to thk_tr dB (fast peak vs slower RMS)
+//   4. the whole circuit fades in and out over 15 ms (thk_m follows the target), so THICK never clicks
+//
+// Usage:
+//   @init    thk_init();                         (after srate is known)
+//            thk_lift = 4; thk_drv = 1.6; thk_asym = 0.15; thk_tr = 1.5; thk_trim = 0;   the unit's flavour
+//   @sample  thk_proc(l, r, on);                 (on = 0 / 1) -> thk_l, thk_r;  thk_m = the fade (0 .. 1), so the
+//            unit can blend its own THICK changes (longer detector windows, slower release ...) by the same amount
+// State and coefficients all start with thk_ (and the instances TK*), so nothing clashes with a unit's names.
+
+@init
+
+function thk_svfc(fc, q) local(g) (               // TPT SVF coefficients into thk_c1 .. thk_c3 (thk_ck = 1 / q)
+  g = tan($pi * min(fc, srate * 0.45) / srate);  thk_ck = 1 / q;
+  thk_c1 = 1 / (1 + g * (g + thk_ck));  thk_c2 = g * thk_c1;  thk_c3 = g * thk_c2;
+);
+function thk_lp(x, c1, c2, c3) instance(ic1, ic2) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = c1 * ic1 + c2 * v3;  v2 = ic2 + c2 * ic1 + c3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;  v2;
+);
+// band-pass, 0 dB at its centre (k x the SVF's band output)
+function thk_bp(x, c1, c2, c3, k) instance(ic1, ic2) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = c1 * ic1 + c2 * v3;  v2 = ic2 + c2 * ic1 + c3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;  v1 * k;
+);
+// asymmetric polynomial soft-clip: unity small-signal gain, 2nd harmonic from a, 3rd from c, held flat past the knee
+// held flat from where its slope reaches zero (both sides), so it is a true soft-clipper
+function thk_shape(u, a) local(c, q) (
+  c = 0.16;  q = sqrt(4 * a * a + 12 * c);
+  u = max((2 * a - q) / (6 * c), min((2 * a + q) / (6 * c), u));
+  u + a * u * u - c * u * u * u;
+);
+
+function thk_init() (
+  thk_svfc(280, 0.8);  thk_a1 = thk_c1;  thk_a2 = thk_c2;  thk_a3 = thk_c3;  thk_ak = thk_ck;   // the WEIGHT bell
+  thk_svfc(500, 0.7071);  thk_b1 = thk_c1;  thk_b2 = thk_c2;  thk_b3 = thk_c3;                    // the IRON split
+  thk_mc = 1 - exp(-1 / (0.015 * srate));          // the 15 ms fade
+  thk_ec = 1 - exp(-1 / (0.03 * srate));           // the low-mid level (30 ms RMS)
+  thk_ga = 1 - exp(-1 / (0.010 * srate));          // WEIGHT gain: 10 ms up ...
+  thk_gr = 1 - exp(-1 / (0.120 * srate));          // ... 120 ms down
+  thk_fa = 1 - exp(-1 / (0.0003 * srate));         // DRAG: the fast peak (0.3 ms) ...
+  thk_ff = exp(-1 / (0.004 * srate));
+  thk_sc = 1 - exp(-1 / (0.015 * srate));          // ... against a 15 ms RMS
+  thk_tc = 1 - exp(-1 / (0.002 * srate));          // its gain moves over 2 ms
+  thk_dc = 1 - 2 * $pi * 5 / srate;
+  thk_m = 0;  thk_e2 = 0;  thk_g = 1;  thk_fe = 0;  thk_se = 0;  thk_tg = 1;
+  thk_lift = 4;  thk_drv = 1.6;  thk_asym = 0.15;  thk_tr = 1.5;  thk_trim = 0;
+);
+
+function thk_proc(l, r, on) local(bl, br, lv, gt, ll, lr, f, tg, w, dl, dr, k) (
+  thk_m += ((on ? 1 : 0) - thk_m) * thk_mc;
+  thk_dry_l = l;  thk_dry_r = r;
+  thk_m < 0.00001 && !on ? (
+    thk_m = 0;  thk_l = l;  thk_r = r;                                 // out: nothing to do (states rest)
+  ) : (
+    // 1. WEIGHT: lift the quieter low-mids (about 1 : 1.4 upward), up to thk_lift dB, never below -70 dBFS
+    bl = TKBL.thk_bp(l, thk_a1, thk_a2, thk_a3, thk_ak);  br = TKBR.thk_bp(r, thk_a1, thk_a2, thk_a3, thk_ak);
+    thk_e2 += (max(bl * bl, br * br) - thk_e2) * thk_ec;
+    lv = 4.342944819 * log(thk_e2 + 0.000000000001);                  // dB
+    gt = min(thk_lift, max(0, (-30 - lv) * 0.3)) * max(0, min(1, (lv + 70) / 10));
+    gt = exp(gt * 0.11512925464970228);
+    thk_g += (gt - thk_g) * (gt > thk_g ? thk_ga : thk_gr);
+    l += (thk_g - 1) * bl;  r += (thk_g - 1) * br;
+    // 2. IRON: below ~500 Hz through the asymmetric soft-clipper; only its difference is added back (DC blocked)
+    k = thk_drv;
+    ll = TK2L.thk_lp(TK1L.thk_lp(l, thk_b1, thk_b2, thk_b3), thk_b1, thk_b2, thk_b3);
+    lr = TK2R.thk_lp(TK1R.thk_lp(r, thk_b1, thk_b2, thk_b3), thk_b1, thk_b2, thk_b3);
+    ll = thk_shape(ll * k, thk_asym) / k - ll;  lr = thk_shape(lr * k, thk_asym) / k - lr;
+    dl = ll - thk_xl + thk_dc * thk_yl;  thk_xl = ll;  thk_yl = dl;
+    dr = lr - thk_xr + thk_dc * thk_yr;  thk_xr = lr;  thk_yr = dr;
+    l += dl;  r += dr;
+    // 3. DRAG: round off the very front of transients (fast peak far above the RMS)
+    f = max(abs(l), abs(r));
+    thk_fe = f > thk_fe ? thk_fe + (f - thk_fe) * thk_fa : thk_fe * thk_ff;
+    thk_se += (f * f - thk_se) * thk_sc;
+    w = thk_fe / (sqrt(thk_se) * 1.6 + 0.0000001);
+    tg = w > 1 ? max(exp(-thk_tr * 0.11512925464970228), w ^ -0.25) : 1;
+    thk_tg += (tg - thk_tg) * thk_tc;
+    tg = thk_tg * exp(thk_trim * 0.11512925464970228);
+    // 4. the fade
+    thk_l = thk_dry_l + (l * tg - thk_dry_l) * thk_m;
+    thk_r = thk_dry_r + (r * tg - thk_dry_r) * thk_m;
+  );
+);

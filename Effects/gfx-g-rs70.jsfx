@@ -1,0 +1,943 @@
+desc:GFX G RS70 [drum machine]
+//tags: instrument drum machine rhythm digital 707 sequencer lo-fi
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-thick, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate
+// (.jsfx-inc) in the same folder.
+//
+// RS70 - the RS series' digital machine, in the spirit of the mid-80s rhythm composer whose drums lived in 8-bit chips.
+// No samples: every sound is synthesised when the plug-in loads ("baked") at a 25 kHz sample clock, stored 8-bit
+// (companded; the cymbals 6-bit, as on the original) and played back through a vintage output filter.
+//
+// VOICES (thirteen channels, each with its LEVEL): BASS (two kicks: 1 round, 2 short and punchy), SNARE (1 fat, 2 tight
+// and bright), LOW / MID / HI TOM, RIM, COWBELL, CLAP, TAMBOURINE, CLOSED HAT, OPEN HAT (CH cuts off a ringing OH),
+// CRASH, RIDE.
+//   ACCENT: how far apart accents and plain hits are (plain hits sit back, accents jump out; 50 % = about 6 dB).  PITCH: the sample clock, +/- 12 semitones (every voice together).
+//   TONE: the output filter (dark .. open).
+//
+// SEQUENCER: 16 patterns of 16 steps per channel (off / hit / accent), LAST STEP per pattern, SWING. It never starts
+//   running by itself: press RUN. While REAPER plays, it locks to the timeline (bar 1 = step 1); while REAPER is
+//   stopped, RUN free-runs at the project tempo. A new pattern takes over at the end of the bar.
+// MIDI: notes play the voices too (GM drum map: 35 / 36 BD, 38 / 40 SD, 41 LT, 45 MT, 48 HT, 37 RS, 56 CB, 39 CP,
+//   54 TB, 42 CH, 46 OH, 49 CR, 51 RD); velocity above 100 = accent. MIDI passes through.
+//
+// FOLLOW: the sequencer starts and stops with REAPER's transport (off by default: it never starts by itself).
+// PATTERNS: a bank of 15 patterns; a new instance starts with them in patterns 1 - 15 (PATTERN > Load a pattern from
+//   the bank brings any of them back). PATTERN also clears or copies the pattern.
+// EDIT (layer B): a TUNE (+/- 12 semitones) and an amp envelope - ATTACK, DECAY, SUSTAIN, RELEASE - for every
+//   instrument. SUSTAIN holds for the gate (one step from the sequencer, the held note from MIDI); SUSTAIN 100 % with
+//   RELEASE at NATURAL (the default) leaves the sound as it is. Presets reset layer B to its defaults.
+//
+// SIGNAL FLOW: the voices > the output filter (TONE) > the FX strip, in this order: PHASER > DRIVE > COMP > DELAY (each
+//   with its IN key) > THICK > LEVEL > the house output stage (CLIP, -0.3 dBFS).
+//
+// DRIFT (0 - 100 %, 50 % = standard): an old digital machine.
+//   pitch      the sample clock wanders slowly (+/- 10 cents), each voice sits a little off (+/- 5 cents), and each
+//              hit lands a touch sharp or flat (+/- 3 cents)
+//   filter     the output filter's cutoff wanders (+/- 0.3 octave)
+//   humanise   each sequenced hit lands a little early or late (+/- 3 ms); MIDI notes are left as played
+//   0 % = none (machine-tight), 100 % = twice the standard amount, a little faster.
+//
+// PAD ORDER AND COLOURS: the voices are laid out BD, SN, RIM, CLAP, HH, OH, HT, MT, LT, RD, CR (then the percussion)
+//   on the panel, the grid and the EDIT page, colour-coded by family (kick brown, snare / rim red, clap orange,
+//   hats yellow, toms green, cymbals blue, percussion violet; darker = lower). The MIDI notes are unchanged.
+// GUI: in the dress of Wingspan (graphite plates, cream print, knurled caps, amber lit keys), the step grid on an
+//   LCD-style screen. Click a step to cycle off > hit > accent; drag to paint the same value along a row. Click a
+//   track name to hear it. Values show while a knob is touched.
+// PRESETS (12): kits - sounds, swing, pitch, tone and FX, level-matched to Init on a groove; they never change the
+//   patterns. (Patterns: see PATTERNS above.)
+// Latency: 0 samples (the sequencer looks 6 ms ahead so humanised hits can land early).
+//
+// TWEAK points are marked TWEAK.
+// STATUS: Stable v2.0 (from the Lab, Oct 2026). v0.7 (wider ACCENT; complete: sound engine, sequencer, FX strip, faceplate, presets; the house
+//   3D lamp keys, as the 34 series).
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-thick.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:ac_lvl=50<0,100,1>-Accent (%)
+slider2:lv_bd=80<0,100,1>-Bass level (%)
+slider3:lv_sd=70<0,100,1>-Snare level (%)
+slider4:lv_lt=65<0,100,1>-Low tom level (%)
+slider5:lv_mt=65<0,100,1>-Mid tom level (%)
+slider6:lv_ht=65<0,100,1>-Hi tom level (%)
+slider7:lv_rs=60<0,100,1>-Rim level (%)
+slider8:lv_cb=55<0,100,1>-Cowbell level (%)
+slider9:lv_cp=65<0,100,1>-Clap level (%)
+slider10:lv_tb=55<0,100,1>-Tambourine level (%)
+slider11:lv_ch=60<0,100,1>-Closed hat level (%)
+slider12:lv_oh=60<0,100,1>-Open hat level (%)
+slider13:lv_cr=50<0,100,1>-Crash level (%)
+slider14:lv_rd=50<0,100,1>-Ride level (%)
+slider15:bd_type=0<0,1,1{1,2}>-Bass drum
+slider16:sd_type=0<0,1,1{1,2}>-Snare drum
+slider17:swing=0<0,100,1>-Swing (%)
+slider18:m_lvl=0<-18,6,0.1>-Level (dB)
+slider19:drift=50<0,100,1>-Drift (%)
+slider20:thick=0<0,1,1{Off,On}>-Thick
+slider21:ph_in=0<0,1,1{Out,In}>-Phaser in
+slider22:ph_rate=0.4<0.05,5,0.01>-Phaser rate (Hz)
+slider23:ph_dep=60<0,100,1>-Phaser depth (%)
+slider24:ph_fb=40<0,90,1>-Phaser feedback (%)
+slider25:ph_col=50<0,100,1>-Phaser colour (%)
+slider26:dr_in=0<0,1,1{Out,In}>-Drive in
+slider27:dr_amt=40<0,100,1>-Drive amount (%)
+slider28:dr_tone=50<0,100,1>-Drive tone (%)
+slider29:cm_in=0<0,1,1{Out,In}>-Comp in
+slider30:cm_thr=-12<-40,0,0.1>-Comp threshold (dB)
+slider31:cm_rat=4<1,20,0.1>-Comp ratio
+slider32:cm_env=0<0,1,1{Fast,Slow}>-Comp envelope
+slider33:cm_mk=0<0,20,0.1>-Comp make-up (dB)
+slider34:dl_in=0<0,1,1{Out,In}>-Delay in
+slider35:dl_sync=1<0,1,1{Free,Sync}>-Delay sync
+slider36:dl_ms=300<20,1500,1>-Delay time (ms)
+slider37:dl_div=3<0,6,1{1/32,1/16,1/16 dotted,1/8,1/8 dotted,1/4,1/4 dotted}>-Delay note
+slider38:dl_fb=35<0,90,1>-Delay feedback (%)
+slider39:dl_damp=40<0,100,1>-Delay damp (%)
+slider40:dl_mix=25<0,100,1>-Delay mix (%)
+slider41:pitch=0<-12,12,0.1>-Pitch (st)
+slider42:tone=70<0,100,1>-Tone (%)
+slider43:follow=0<0,1,1{Off,On}>-Follow transport
+slider44:0<-12,12,0.1>-Bass tune (st)
+slider45:0<0,200,1>-Bass attack (ms)
+slider46:4000<5,4000,1>-Bass decay (ms)
+slider47:100<0,100,1>-Bass sustain (%)
+slider48:5000<5,5000,1>-Bass release (ms, 5000 = natural)
+slider49:0<-12,12,0.1>-Snare tune (st)
+slider50:0<0,200,1>-Snare attack (ms)
+slider51:4000<5,4000,1>-Snare decay (ms)
+slider52:100<0,100,1>-Snare sustain (%)
+slider53:5000<5,5000,1>-Snare release (ms, 5000 = natural)
+slider54:0<-12,12,0.1>-Low tom tune (st)
+slider55:0<0,200,1>-Low tom attack (ms)
+slider56:4000<5,4000,1>-Low tom decay (ms)
+slider57:100<0,100,1>-Low tom sustain (%)
+slider58:5000<5,5000,1>-Low tom release (ms, 5000 = natural)
+slider59:0<-12,12,0.1>-Mid tom tune (st)
+slider60:0<0,200,1>-Mid tom attack (ms)
+slider61:4000<5,4000,1>-Mid tom decay (ms)
+slider62:100<0,100,1>-Mid tom sustain (%)
+slider63:5000<5,5000,1>-Mid tom release (ms, 5000 = natural)
+slider64:0<-12,12,0.1>-Hi tom tune (st)
+slider65:0<0,200,1>-Hi tom attack (ms)
+slider66:4000<5,4000,1>-Hi tom decay (ms)
+slider67:100<0,100,1>-Hi tom sustain (%)
+slider68:5000<5,5000,1>-Hi tom release (ms, 5000 = natural)
+slider69:0<-12,12,0.1>-Rim tune (st)
+slider70:0<0,200,1>-Rim attack (ms)
+slider71:4000<5,4000,1>-Rim decay (ms)
+slider72:100<0,100,1>-Rim sustain (%)
+slider73:5000<5,5000,1>-Rim release (ms, 5000 = natural)
+slider74:0<-12,12,0.1>-Cowbell tune (st)
+slider75:0<0,200,1>-Cowbell attack (ms)
+slider76:4000<5,4000,1>-Cowbell decay (ms)
+slider77:100<0,100,1>-Cowbell sustain (%)
+slider78:5000<5,5000,1>-Cowbell release (ms, 5000 = natural)
+slider79:0<-12,12,0.1>-Clap tune (st)
+slider80:0<0,200,1>-Clap attack (ms)
+slider81:4000<5,4000,1>-Clap decay (ms)
+slider82:100<0,100,1>-Clap sustain (%)
+slider83:5000<5,5000,1>-Clap release (ms, 5000 = natural)
+slider84:0<-12,12,0.1>-Tambourine tune (st)
+slider85:0<0,200,1>-Tambourine attack (ms)
+slider86:4000<5,4000,1>-Tambourine decay (ms)
+slider87:100<0,100,1>-Tambourine sustain (%)
+slider88:5000<5,5000,1>-Tambourine release (ms, 5000 = natural)
+slider89:0<-12,12,0.1>-Closed hat tune (st)
+slider90:0<0,200,1>-Closed hat attack (ms)
+slider91:4000<5,4000,1>-Closed hat decay (ms)
+slider92:100<0,100,1>-Closed hat sustain (%)
+slider93:5000<5,5000,1>-Closed hat release (ms, 5000 = natural)
+slider94:0<-12,12,0.1>-Open hat tune (st)
+slider95:0<0,200,1>-Open hat attack (ms)
+slider96:4000<5,4000,1>-Open hat decay (ms)
+slider97:100<0,100,1>-Open hat sustain (%)
+slider98:5000<5,5000,1>-Open hat release (ms, 5000 = natural)
+slider99:0<-12,12,0.1>-Crash tune (st)
+slider100:0<0,200,1>-Crash attack (ms)
+slider101:4000<5,4000,1>-Crash decay (ms)
+slider102:100<0,100,1>-Crash sustain (%)
+slider103:5000<5,5000,1>-Crash release (ms, 5000 = natural)
+slider104:0<-12,12,0.1>-Ride tune (st)
+slider105:0<0,200,1>-Ride attack (ms)
+slider106:4000<5,4000,1>-Ride decay (ms)
+slider107:100<0,100,1>-Ride sustain (%)
+slider108:5000<5,5000,1>-Ride release (ms, 5000 = natural)
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-rs70";
+ext_noinit = 1;
+!ui_dflt ? ( ui_sz = 0;  pr_cur = 1;  cur_pat = 0; );
+ui_dflt = 1;
+gfx_ext_retina = 1;
+CR = 16;
+NV = 13;                                   // tracks: BD SD LT MT HT RS CB CP TB CH OH CR RD
+BR = 25000;                                // the baked sounds' sample clock
+
+ost_init(0);  ostL.ost_ch_init();  ostR.ost_ch_init();
+thk_init();  thk_lift = 3.5;  thk_drv = 1.7;  thk_asym = 0.15;  thk_tr = 1.0;  thk_trim = 0;   // TWEAK: RS70's THICK
+
+// ---------- memory ----------
+SEQ = 100000;                              // [pattern][track][step]: 0 off, 1 hit, 2 accent (16 x 13 x 16)
+LEN = 99000;                               // last step per pattern (1 .. 16)
+QV = 98000;                                // this block's triggers: (offset, track, velocity) x 64
+PQ = 97500;                                // the look-ahead queue: (absolute sample, track, velocity) x 128
+PHL = 97100;  PHR = 97110;  memset(PHL, 0, 20);
+DLB = 200000;  DRB = 600000;               // delay lines (2 s each, up to 192 kHz)
+DSZ = floor(2 * srate) + 4;
+BKP = 1190000;                             // bake scratch (partial states)
+SNDT = 96500;                               // per sound: [base, length] x 15 (BD1 BD2 SD1 SD2 LT MT HT RS CB CP TB CH OH CR RD)
+VTR = 96600;                               // per sound: playback trim
+// ---------- layer B: a tune and an amp envelope (ADSR) per instrument ----------
+// The envelope multiplies the sound: ATTACK rises from silence, DECAY falls to SUSTAIN, which holds for the gate (one
+// step for the sequencer, the held note for MIDI), then RELEASE. SUSTAIN 100 % with RELEASE at 5000 (NATURAL) leaves
+// the sound exactly as it is.
+EB = 44;                                 // the first of the 5 x NV layer-B sliders (tune, attack, decay, sustain, release)
+ENVS = 94000;  ENVV = 94200;  TUNE = 94300;  DEMO = 110000;
+i = 0;  loop(13, ENVV[i] = 1;  ENVS[i * 8] = 0;  TUNE[i] = 1;  i += 1; );
+function env_trig(k, gate) local(e, a, d, s, r) (
+  e = ENVS + k * 8;  a = slider(EB + k * 5 + 1);  d = slider(EB + k * 5 + 2);  s = slider(EB + k * 5 + 3) / 100;
+  r = slider(EB + k * 5 + 4);
+  e[7] = a > 0.5 || s < 0.995 || r < 4990;
+  e[7] ? (
+    e[0] = a > 0.5 ? 1 : 2;  e[1] = a > 0.5 ? 0 : 1;  e[2] = gate;  e[3] = 1 / max(1, a * 0.001 * srate);
+    e[4] = exp(-6.9 / (max(d, 1) * 0.001 * srate));  e[5] = s;  e[6] = r >= 4990 ? 1 : exp(-6.9 / (max(r, 1) * 0.001 * srate));
+    env_any = 1;
+  ) : ( e[0] = 0;  ENVV[k] = 1; );
+);
+function env_rel(k) local(e) ( e = ENVS + k * 8;  e[0] > 0 && e[0] < 3 ? e[2] = 0; );
+function env_tick(k) local(e, v) (
+  e = ENVS + k * 8;
+  e[0] == 0 ? 1 : (
+    v = e[1];
+    e[0] == 1 ? ( v += e[3];  v >= 1 ? ( v = 1;  e[0] = 2; ); ) : e[0] == 2 ? ( v = e[5] + (v - e[5]) * e[4]; ) : ( v *= e[6]; );
+    e[0] < 3 ? ( e[2] -= 1;  e[2] <= 0 ? e[0] = 3; );
+    e[1] = v;  v;
+  );
+);
+// the pattern bank: 15 patterns, made once; a new instance starts with them in patterns 1 - 15
+function dm_row(n, t, str) local(i, c) ( i = 0;  loop(16, c = str_getchar(str, i);  DEMO[(n * NV + t) * 16 + i] = c == 88 ? 2 : c == 120 ? 1 : 0;  i += 1; ); );
+memset(DEMO, 0, 15 * NV * 16);
+dm_row(0, 0, "X......x..X.....");  dm_row(0, 1, "....X.......X...");  dm_row(0, 6, "...x......x.....");  dm_row(0, 7, "....X.......X...");  dm_row(0, 9, "x.xxx.xxx.xxx.xx");  dm_row(0, 10, "......x.......x.");   // 1 Electro
+dm_row(1, 0, "X...X...X...X...");  dm_row(1, 1, "....X.......X...");  dm_row(1, 8, "..x...x...x...x.");  dm_row(1, 9, "x.x.x.x.x.x.x.x.");   // 2 Synth pop
+dm_row(2, 0, "X..x..x...x.....");  dm_row(2, 1, "....X.......X...");  dm_row(2, 6, "..x.....x.x.....");  dm_row(2, 7, "....X.......X..x");  dm_row(2, 9, "XxxxXxxxXxxxXxxx");   // 3 Freestyle
+dm_row(3, 0, "X...X...X...X...");  dm_row(3, 1, "....X.......X...");  dm_row(3, 8, "x.x.x.x.x.x.x.x.");  dm_row(3, 10, "..x...x...x...x.");   // 4 Italo
+dm_row(4, 0, "X..x..X...x..x..");  dm_row(4, 1, "....X.......X...");  dm_row(4, 5, "..x.....x.....x.");  dm_row(4, 8, "....x.......x...");  dm_row(4, 9, "x.x.x.x.x.x.x.x.");   // 5 New jack swing
+dm_row(5, 0, "X......x.xX.....");  dm_row(5, 1, "....X.......X...");  dm_row(5, 9, "x.x.x.x.x.x.x.xX");  dm_row(5, 10, "..............x.");   // 6 Hip hop
+dm_row(6, 0, "X.....X...X.....");  dm_row(6, 6, "..x.......x.....");  dm_row(6, 7, "....X.......X...");  dm_row(6, 9, "xxxxxxxxxxxxxxxx");   // 7 Miami bass
+dm_row(7, 0, "X.x....x..x.....");  dm_row(7, 1, "....X..x.x..X...");  dm_row(7, 8, "....x.......x...");  dm_row(7, 9, "x.x.x.x.x.x.x.xX");   // 8 Funk
+dm_row(8, 0, "X.....x.X.....x.");  dm_row(8, 1, "....X.......X...");  dm_row(8, 9, "x..x.xx..x.xx..x");   // 9 Shuffle
+dm_row(9, 0, "X.......X.x.....");  dm_row(9, 1, "....X.......X...");  dm_row(9, 9, "x.x.x.x.x.x.x.x.");   // 10 Ballad
+dm_row(10, 0, "X...X.x.X...X...");  dm_row(10, 1, "....X.......X...");  dm_row(10, 9, "x.x.x.x.x.x.x.x.");  dm_row(10, 11, "X...............");   // 11 Pop rock
+dm_row(11, 0, "X.....x.X.x.....");  dm_row(11, 1, "....X.......X...");  dm_row(11, 9, "x.x.x.x.x.x.x.x.");  dm_row(11, 11, "X...............");   // 12 Rock
+dm_row(12, 0, "X...X...X...X...");  dm_row(12, 6, "x.xx.x.xx.xx.x.x");  dm_row(12, 7, "....X.......X...");  dm_row(12, 10, "..x...x...x...x.");   // 13 Cowbell disco
+dm_row(13, 0, "X......x..X...x.");  dm_row(13, 7, "....X.......XxXx");  dm_row(13, 9, "x.xxx.xxx.xxx.xx");   // 14 Clap roll
+dm_row(14, 0, "X.......X.......");  dm_row(14, 1, "............XXXX");  dm_row(14, 2, "........x..x..x.");  dm_row(14, 3, "....x..x.....x..");  dm_row(14, 4, "x..x..x.........");  dm_row(14, 11, "X...............");   // 15 Tom fill
+!seq_ok ? (
+  memset(SEQ, 0, 16 * NV * 16);  i = 0;  loop(16, LEN[i] = 16;  i += 1; );
+  i = 0;  loop(15, memcpy(SEQ + i * NV * 16, DEMO + i * NV * 16, NV * 16);  i += 1; );   // patterns 1 - 15: the bank
+  seq_ok = 1;
+);
+memset(DLB, 0, DSZ);  memset(DRB, 0, DSZ);  dl_w = 0;
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function ts(x) ( x = max(-3, min(3, x));  x * (27 + x * x) / (27 + 9 * x * x); );
+function st(c) ( 2 ^ (c / 12); );
+function svf_set(f, q) instance(g, k, a1, a2, a3) (
+  g = tan($pi * min(f, 0.45 * srate) / srate);  k = 1 / q;  a1 = 1 / (1 + g * (g + k));  a2 = g * a1;  a3 = g * a2;
+);
+function svf(x) instance(g, k, a1, a2, a3, ic1, ic2, lp, bp, hp) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;  lp = v2;  bp = v1;  hp = x - k * v1 - v2;  bp;
+);
+// declick: when a voice restarts, the jump is carried by an offset that fades over 2 ms (never clicks).
+// ek = the voice's track: its envelope (ENVV) scales what it plays; le = what it last played
+function dck_set(last) instance(o, le) ( o = le; );
+function dck(x) instance(o, le, ek) ( o *= dk_c;  le = o * (abs(o) > 0.000001) + x * ENVV[ek];  le; );
+
+// ===================== the bake: every sound made once, at load (25 kHz, deterministic) =====================
+function rng() local(t) ( t = lcg_s * 16807;  lcg_s = t - floor(t / 2147483647) * 2147483647;  lcg_s / 1073741823.5 - 1; );
+function op(f) ( 1 - exp(-2 * $pi * min(f, 0.45 * BR) / BR); );   // a one-pole coefficient at the bake clock
+// a drum: a sine (and an optional second tone) sweeping down from (1 + sw) x, a click, band-passed noise; saturated
+function bk_drum(dst, n_, f0, sw, ptau, atau, fb2, a2, clk, nlev, nhp, nlp, ntau) local(i, t, p1, p2, s, nz, l1, l2, c1, c2)
+(
+  p1 = p2 = l1 = l2 = 0;  c1 = op(nlp);  c2 = op(nhp);  i = 0;
+  loop(n_, t = i / BR;
+    p1 += f0 * (1 + sw * exp(-t / ptau)) / BR;  p1 -= floor(p1);
+    p2 += fb2 * (1 + sw * 0.5 * exp(-t / ptau)) / BR;  p2 -= floor(p2);
+    s = sin(2 * $pi * p1) * exp(-t / atau) + a2 * sin(2 * $pi * p2) * exp(-t / (atau * 0.6));
+    nz = rng();  l1 += (nz - l1) * c1;  l2 += (l1 - l2) * c2;
+    s += (l1 - l2) * nlev * exp(-t / ntau) + clk * exp(-t / 0.0009) * (0.6 + 0.4 * nz);
+    dst[i] = ts(1.3 * s);  i += 1; );
+);
+function bk_svf(f, q) instance(g, k, a1, a2, a3, ic1, ic2) (
+  g = tan($pi * min(f, 0.45 * BR) / BR);  k = 1 / q;  a1 = 1 / (1 + g * (g + k));  a2 = g * a1;  a3 = g * a2;  ic1 = ic2 = 0;
+);
+function bk_run(x) instance(g, k, a1, a2, a3, ic1, ic2, lp, bp, hp) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;  lp = v2;  bp = v1;  hp = x - k * v1 - v2;  bp;
+);
+// inharmonic partials (flo .. fhi Hz, decays tlo .. thi s, gain g) plus high-passed noise; added into dst
+function bake_add(dst, n_, np, flo, fhi, tlo, thi, g, nlev, nhp, ntau) local(k, i, u, f, w, c, sn, s, nd, ne)
+(
+  k = 0;
+  loop(np,
+    u = (k + 0.5 + 0.4 * rng()) / np;  f = flo * (fhi / flo) ^ u;  w = 2 * $pi * f / BR;
+    BKP[k] = cos(w);  BKP[64 + k] = sin(w);  u = $pi * (rng() + 1);  BKP[128 + k] = cos(u);  BKP[192 + k] = sin(u);
+    BKP[256 + k] = g * (0.55 + 0.45 * rng()) / sqrt(np);  BKP[320 + k] = exp(-1 / (tlo * (thi / tlo) ^ (0.5 + 0.5 * rng()) * BR));
+    k += 1; );
+  BKN.bk_svf(nhp, 0.7);  nd = exp(-1 / (ntau * BR));  ne = 1;
+  i = 0;
+  loop(n_,
+    s = 0;  k = 0;
+    loop(np, c = BKP[128 + k];  sn = BKP[192 + k];
+      BKP[128 + k] = c * BKP[k] - sn * BKP[64 + k];  BKP[192 + k] = c * BKP[64 + k] + sn * BKP[k];
+      s += sn * BKP[256 + k];  BKP[256 + k] *= BKP[320 + k];  k += 1; );
+    nlev > 0 ? ( BKN.bk_run(rng());  s += BKN.hp * nlev * ne;  ne *= nd; );
+    dst[i] += s;  i += 1; );
+);
+// clap: band-passed noise in four quick bursts, then a tail
+function bk_clap(dst, n_, k) local(i, t, b, e, tl, td) (           // k: speed (1.1 = 1.7 semitones up)
+  BKC.bk_svf(1150 * k, 2.2);  tl = 1;  td = exp(-k / (0.11 * BR));  i = 0;
+  loop(n_, t = i / BR * k;  b = floor(t / 0.0105);
+    e = b < 3 ? exp(-(t - b * 0.0105) / 0.0045) : 0;  b >= 3 ? tl *= td;
+    BKC.bk_run(rng());  dst[i] = BKC.bp * (e + (b >= 3 ? tl : 0)) * 2.2;  i += 1; );
+);
+// cowbell: two band-limited squares (540 / 800 Hz) through a band-pass; a quick drop, then a longer fade
+function blep(t, dt) ( t < dt ? ( t /= dt;  t + t - t * t - 1; ) : t > 1 - dt ? ( t = (t - 1) / dt;  t * t + t + t + 1; ) : 0; );
+function sqr_(p, dt) local(q) ( q = p + 0.5;  q -= floor(q);  (p < 0.5 ? 1 : -1) + blep(p, dt) - blep(q, dt); );
+function bk_cb(dst, n_) local(i, t, p1, p2, d1, d2, s) (
+  BKC.bk_svf(2650, 1.4);  p1 = p2 = 0;  d1 = 545 / BR;  d2 = 815 / BR;  i = 0;
+  loop(n_, t = i / BR;  p1 += d1;  p1 -= floor(p1);  p2 += d2;  p2 -= floor(p2);
+    s = (sqr_(p1, d1) + sqr_(p2, d2)) * 0.5;
+    BKC.bk_run(s);  dst[i] = BKC.bp * (0.7 * exp(-t / 0.012) + 0.3 * exp(-t / 0.22)) * 1.6;  i += 1; );
+);
+// finish: attack ramp, end fade, normalise; 8-bit mu-law (bits = 8) or 6-bit companded (bits = 6)
+function bk_fin(dst, n_, att, bits) local(i, pk, y, e) (
+  pk = 0.000001;  i = 0;
+  loop(n_, e = min(1, i / (att * BR + 1)) * min(1, (n_ - i) / (0.06 * n_));  dst[i] *= e;  pk = max(pk, abs(dst[i]));  i += 1; );
+  i = 0;
+  loop(n_, y = dst[i] / pk;
+    bits == 8 ? ( y = sign(y) * log(1 + 255 * abs(y)) / log(256);  y = floor(y * 127 + 0.5) / 127;
+                  y = sign(y) * (256 ^ abs(y) - 1) / 255; )
+              : ( y = sign(y) * sqr(floor(sqrt(abs(y)) * 31 + 0.5) / 31); );
+    dst[i] = y;  i += 1; );
+);
+// shape a baked sound with an amp envelope (as the EDIT page does, gate = one step at 120 bpm): DECAY (s) towards
+// SUSTAIN (0 - 1) until the gate, then RELEASE (s; 0 = natural, the level holds)
+function bk_env(dst, n_, d, sus, r) local(i, t, g, e, eg) (
+  g = 0.125;  eg = sus + (1 - sus) * exp(-g * 6.9 / d);  i = 0;
+  loop(n_, t = i / BR;
+    e = t < g ? sus + (1 - sus) * exp(-t * 6.9 / d) : r > 0 ? eg * exp(-(t - g) * 6.9 / r) : eg;
+    dst[i] *= e;  i += 1; );
+);
+function slot(k, base, n_) ( SNDT[k * 2] = base;  SNDT[k * 2 + 1] = n_;  memset(base, 0, n_); );
+lcg_s = 70707;
+B0 = 1200000;
+slot(0, B0, 15000);           bk_drum(B0, 15000, 55, 2.0, 0.012, 0.22, 0, 0, 0.5, 0.05, 200, 3000, 0.01);     bk_fin(B0, 15000, 0, 8);
+slot(1, B0 + 16000, 11250);   bk_drum(B0 + 16000, 11250, 62, 2.8, 0.008, 0.14, 0, 0, 0.9, 0.08, 300, 4000, 0.008); bk_fin(B0 + 16000, 11250, 0, 8);
+// (snares, clap, open hat: John's EDIT-page settings built in - shorter snare body, a touch higher, tighter clap, a shorter open hat)
+slot(2, B0 + 28000, 8750);    bk_drum(B0 + 28000, 8750, 190, 0.5, 0.01, 0.08, 330, 0.6, 0.3, 1.0, 1500, 9000, 0.11); bk_env(B0 + 28000, 8750, 0.84, 0.43, 2.2);  bk_fin(B0 + 28000, 8750, 0, 8);
+slot(3, B0 + 37000, 7500);    bk_drum(B0 + 37000, 7500, 225, 0.6, 0.008, 0.06, 385, 0.5, 0.4, 1.3, 2500, 11000, 0.085); bk_env(B0 + 37000, 7500, 0.84, 0.43, 2.2);  bk_fin(B0 + 37000, 7500, 0, 8);
+slot(4, B0 + 45000, 15000);   bk_drum(B0 + 45000, 15000, 100, 0.6, 0.05, 0.25, 0, 0, 0.2, 0.12, 200, 2000, 0.03); bk_fin(B0 + 45000, 15000, 0, 8);
+slot(5, B0 + 61000, 15000);   bk_drum(B0 + 61000, 15000, 145, 0.6, 0.045, 0.22, 0, 0, 0.2, 0.12, 250, 2500, 0.03); bk_fin(B0 + 61000, 15000, 0, 8);
+slot(6, B0 + 77000, 15000);   bk_drum(B0 + 77000, 15000, 210, 0.6, 0.04, 0.2, 0, 0, 0.2, 0.12, 300, 3000, 0.03); bk_fin(B0 + 77000, 15000, 0, 8);
+slot(7, B0 + 93000, 2000);    bk_drum(B0 + 93000, 2000, 500, 0, 0.01, 0.012, 1700, 1.4, 0.3, 0.2, 2000, 8000, 0.005); bk_fin(B0 + 93000, 2000, 0, 8);
+slot(8, B0 + 96000, 10000);   bk_cb(B0 + 96000, 10000);                                                            bk_fin(B0 + 96000, 10000, 0, 8);
+slot(9, B0 + 107000, 10200);  bk_clap(B0 + 107000, 10200, 1.103);  bk_fin(B0 + 107000, 10200, 0, 8);  bk_env(B0 + 107000, 10200, 2.7, 0.69, 2.8);
+slot(10, B0 + 119000, 8750);  bake_add(B0 + 119000, 8750, 12, 7000, 11500, 0.08, 0.18, 1, 0.8, 6000, 0.12);      bk_fin(B0 + 119000, 8750, 0.004, 8);
+slot(11, B0 + 128000, 5000);  bake_add(B0 + 128000, 5000, 14, 6000, 11500, 0.02, 0.05, 1, 0.9, 7000, 0.04);       bk_fin(B0 + 128000, 5000, 0.0004, 6);
+slot(12, B0 + 134000, 20000); bake_add(B0 + 134000, 20000, 16, 5000, 11500, 0.25, 0.5, 1, 0.7, 6500, 0.35);       bk_fin(B0 + 134000, 20000, 0.0008, 6);  bk_env(B0 + 134000, 20000, 0.5, 0.69, 3.9);
+slot(13, B0 + 155000, 30000); bake_add(B0 + 155000, 30000, 26, 3000, 11500, 0.25, 0.55, 1, 0.9, 3500, 0.45);       bk_fin(B0 + 155000, 30000, 0.004, 6);
+slot(14, B0 + 201000, 25000); bake_add(B0 + 201000, 25000, 6, 650, 3400, 0.4, 0.7, 1.4, 0, 1000, 1);
+                              bake_add(B0 + 201000, 25000, 22, 3600, 11000, 0.25, 0.5, 1, 0.3, 5000, 0.4);      bk_fin(B0 + 201000, 25000, 0.001, 6);
+// playback trims (level balance between the sounds; TWEAK)
+VTR[0] = 0.87;  VTR[1] = 0.87;  VTR[2] = 0.94;  VTR[3] = 0.94;  VTR[4] = 0.84;  VTR[5] = 0.84;  VTR[6] = 0.84;
+VTR[7] = 0.83;  VTR[8] = 1.22;  VTR[9] = 1.53;  VTR[10] = 1.2;  VTR[11] = 1.35;  VTR[12] = 1.15;  VTR[13] = 1.76;  VTR[14] = 1.5;
+
+// the voices: read a baked sound at its rate (interpolated), with the declick offset; a choke fades it in 3 ms
+function v_trig(k, v, r) instance(pos, a, chk, act, out, base, n_, rate) (
+  this.dck_set(out);  pos = 0;  a = v * VTR[k];  chk = 0;  act = 1;  base = SNDT[k * 2];  n_ = SNDT[k * 2 + 1];  rate = r;
+);
+function v_proc() instance(pos, a, chk, act, out, base, n_, rate) local(i, f) (
+  act ? (
+    i = floor(pos);  f = pos - i;
+    i < n_ - 1 ? (
+      out = (base[i] + (base[i + 1] - base[i]) * f) * a;  chk ? a *= choke_c;  pos += rate;
+      a < 0.00002 ? act = 0;
+    ) : ( act = 0;  out = 0; );
+  ) : out = 0;
+  this.dck(out);
+);
+
+// the delay's tap at t samples back (interpolated) -> dr_l, dr_r (audio thread only)
+function dl_read(t) local(rp, ri, ri2, f) (
+  rp = dl_w - t;  rp < 0 ? rp += DSZ;  ri = floor(rp);  f = rp - ri;  ri2 = ri + 1;  ri2 >= DSZ ? ri2 = 0;
+  dr_l = DLB[ri] + (DLB[ri2] - DLB[ri]) * f;  dr_r = DRB[ri] + (DRB[ri2] - DRB[ri]) * f;
+);
+// ---------- parameters -> engine values (audio thread) ----------
+function update_params() (
+  drift_macro(drift);
+  swing_k = swing / 100 / 3;
+  t_mlvl = m_lvl;
+  t_ph = ph_in >= 0.5;  t_dr = dr_in >= 0.5;  t_cm = cm_in >= 0.5;  t_dl = dl_in >= 0.5;
+  ph_lo = 150 * 4 ^ (ph_col / 100);  ph_hi = ph_lo * (2 + 18 * ph_dep / 100);
+  dr_k = 1 + 15 * sqr(dr_amt / 100);  drv_lv = 20 * log10(dr_k);  dr_mk = db2g(-0.9 * drv_lv + 0.0108 * drv_lv * drv_lv);   // level match
+  DTL.svf_set(2500 * 8 ^ (dr_tone / 100), 0.6);  DTR.svf_set(2500 * 8 ^ (dr_tone / 100), 0.6);
+  cm_at = cm_env >= 0.5 ? 0.012 : 0.0015;  cm_rt = cm_env >= 0.5 ? 0.35 : 0.08;
+  cm_atc = 1 - exp(-CR / (cm_at * srate));  cm_rtc = 1 - exp(-CR / (cm_rt * srate));
+  dl_lpc = 1 - exp(-2 * $pi * (12000 * 0.1 ^ (dl_damp / 100)) / srate);
+);
+
+DCLK.drift_init(0.5 + rand(0.3));  DFLT.drift_init(0.6 + rand(0.4));
+TOL = 96000;  i = 0;  loop(16, TOL[i] = rand(2) - 1;  i += 1; );     // fixed per-voice tuning tolerances
+dk_c = exp(-1 / (0.002 * srate));
+VC0.ek = 0;  VC1.ek = 1;  VC2.ek = 2;  VC3.ek = 3;  VC4.ek = 4;  VC5.ek = 5;  VC6.ek = 6;  VC7.ek = 7;  VC8.ek = 8;  VC9.ek = 9;  VC10.ek = 10;  VC11.ek = 11;  VC12.ek = 12;
+choke_c = exp(-1 / (0.003 * srate));
+sm_c = 1 - exp(-CR / (0.03 * srate));
+sw_c = 1 - exp(-1 / (0.012 * srate));
+dl_xfc = 1 / (0.03 * srate);  dl_xf_on = 0;
+update_params();
+s_mlvl = t_mlvl;  m_g = db2g(s_mlvl);  m_i = 0;
+s_plo = ph_lo;  s_phi = ph_hi;  s_pfb = ph_fb / 100;  s_dfb = dl_fb / 100;  s_dmix = dl_mix / 100 * 1.4;  s_drk = dr_k;  s_drmk = dr_mk;
+m_ph = t_ph;  m_dr = t_dr;  m_cm = t_cm;  m_dl = t_dl;
+run = 0;  q_n = 0;  pq_n = 0;  abs_n = 0;  seq_next = 0;  lfo = 0;  cm_g = 1;  cm_env_v = 0;  s_dt = 0.3 * srate;
+cr_n = 0;  pending_pat = -1;  pat_sel_d = pat_req_last = cur_pat;
+// the panel's colours (Wingspan's)
+PNL = 0x26272B;  PNL2 = 0x232428;  PNL3 = 0x29292D;  INK = 0xE6DFCB;  INK2 = 0xA29D92;  CAPU = 0xC7BEB3;  CAPS = 0x9DA2A8;
+ACC = 0xE8A33A;  HDR = 0x18191C;  SCR = 0x0B0B0C;  SCRL = 0x1E1F22;
+#pmenu = "Init|Electro Funk|Freestyle|Synth Pop|Italo Disco|New Jack|Pitched Down|Chipmunk Jack|Lo-Fi Tape|Dub Echo|Arena Rock|Clean Machine";
+
+@slider
+update_params();
+
+@block
+update_params();
+aud_n_d != aud_seen ? ( aud_seen = aud_n_d;  QV[0] = 0;  QV[1] = aud_t_d;  QV[2] = 1;  aud_q = 1; ) : aud_q = 0;
+op_disp = op_acc;  op_acc = 0;  gr_disp = cm_gd * (m_cm > 0.5);
+bdt = samplesblock / srate;
+// ---------- drift: the sample clock, the output filter ----------
+dsp = 0.03 * dm_s * bdt;
+k = 0;  loop(NV, TUNE[k] = st(slider(EB + k * 5));  k += 1; );          // layer B: each instrument's TUNE
+g_seq = 60 / max(tempo, 20) * srate / 4;                                // the sequencer's gate: one step
+clk_c = 10 * dm_a * DCLK.drift_tick(dsp);                                // cents
+flt_o = 0.3 * dm_a * DFLT.drift_tick(dsp);                               // octaves
+p_base = BR / srate * st(pitch + clk_c / 100);
+f_tone = min(0.45 * srate, 2500 * 7 ^ (tone / 100) * 2 ^ flt_o);         // 2.5 .. 17.5 kHz
+ft_s = ft_s > 0 ? ft_s * (f_tone / ft_s) ^ min(1, bdt / 0.03) : f_tone;      // TONE glides (never steps)
+OFL.svf_set(ft_s, 0.75);
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);                                   // house output stage: CLIP
+dl_t = dl_sync >= 0.5 ? (dl_div < 0.5 ? 0.125 : dl_div < 1.5 ? 0.25 : dl_div < 2.5 ? 0.375 : dl_div < 3.5 ? 0.5 :
+                          dl_div < 4.5 ? 0.75 : dl_div < 5.5 ? 1 : 1.5) * 60 / max(tempo, 20) : dl_ms / 1000;
+dl_ts = min(DSZ - 4, dl_t * srate);
+
+// ---------- MIDI in ----------
+q_n = aud_q;
+while (midirecv(mo, m1, m2, m3)) (
+  m_on = (m1 & 0xF0) == 0x90 && m3 > 0;  m_off = (m1 & 0xF0) == 0x80 || ((m1 & 0xF0) == 0x90 && m3 == 0);
+  (m_on || m_off) && q_n < 64 ? (
+    tr = m2 == 36 || m2 == 35 ? 0 : m2 == 38 || m2 == 40 ? 1 : m2 == 41 || m2 == 43 ? 2 : m2 == 45 || m2 == 47 ? 3 :
+         m2 == 48 || m2 == 50 ? 4 : m2 == 37 ? 5 : m2 == 56 ? 6 : m2 == 39 ? 7 : m2 == 54 ? 8 : m2 == 42 || m2 == 44 ? 9 :
+         m2 == 46 ? 10 : m2 == 49 || m2 == 57 ? 11 : m2 == 51 || m2 == 59 ? 12 : -1;
+    tr >= 0 ? ( QV[q_n * 3] = mo;  QV[q_n * 3 + 1] = tr;  QV[q_n * 3 + 2] = m_off ? 0 : m3 > 100 ? 12 : 11;  q_n += 1; );   // 11 / 12: MIDI (held), 0: released
+  );
+  midisend(mo, m1, m2, m3);
+);
+// ---------- the sequencer: 6 ms ahead, into the look-ahead queue (humanised times) ----------
+pat_sel_d != pat_req_last ? ( pat_req_last = pat_sel_d;  run ? pending_pat = pat_sel_d : cur_pat = pat_sel_d; );
+run_t = follow >= 0.5 ? (play_state & 1) : run_req;                     // FOLLOW: run with REAPER's transport
+run_t != run ? ( run = run_t;  pq_n = 0;  run ? ( free_pos = 0;  seq_next = 0;  next_t = 0; ); );
+hum = 0.003 * dm_a * srate;                                               // +/- samples
+run ? (
+  spb = 60 / max(tempo, 20) * srate / 4;
+  la = 0.006 * srate / spb;                                               // the look-ahead, in steps
+  (play_state & 1) ? (
+    pos0 = beat_position * 4;
+    abs(pos0 - exp_pos) > 0.5 || !was_play ? ( seq_next = ceil(pos0 - 0.0001);  next_t = seq_next + (seq_next % 2 ? swing_k : 0);  pq_n = 0; );
+    was_play = 1;
+  ) : (
+    was_play ? free_pos = exp_pos;
+    pos0 = free_pos;  was_play = 0;
+  );
+  pos1 = pos0 + samplesblock / spb;
+  while (next_t < pos1 + la && pq_n < 120) (
+    t_ev = abs_n + max(0, (next_t - pos0) * spb + (rand(2) - 1) * hum);
+    stp = seq_next % 16;
+    stp == 0 && pending_pat >= 0 ? ( cur_pat = pending_pat;  pending_pat = -1; );
+    ln = max(1, LEN[cur_pat]);
+    stp_in = seq_next % ln;
+    i = 0;
+    loop(NV, vv = SEQ[(cur_pat * NV + i) * 16 + stp_in];
+      vv > 0 && pq_n < 120 ? ( PQ[pq_n * 3] = t_ev + (rand(2) - 1) * hum * 0.3;  PQ[pq_n * 3 + 1] = i;  PQ[pq_n * 3 + 2] = vv;  pq_n += 1; );
+      i += 1; );
+    PQ[pq_n * 3] = t_ev;  PQ[pq_n * 3 + 1] = -1 - stp_in;  PQ[pq_n * 3 + 2] = 0;  pq_n += 1;   // the step light
+    seq_next += 1;  next_t = seq_next + (seq_next % 2 ? swing_k : 0);
+  );
+  free_pos = pos1;  exp_pos = pos1;
+) : ( step_disp = -1;  was_play = 0; );
+// due events -> this block's trigger list
+k = 0;  j = 0;
+while (k < pq_n) (
+  PQ[k * 3] < abs_n + samplesblock ? (
+    PQ[k * 3 + 1] < 0 ? step_disp = -1 - PQ[k * 3 + 1] : q_n < 64 ? (
+      QV[q_n * 3] = max(0, floor(PQ[k * 3] - abs_n));  QV[q_n * 3 + 1] = PQ[k * 3 + 1];  QV[q_n * 3 + 2] = PQ[k * 3 + 2];  q_n += 1; );
+  ) : (
+    PQ[j * 3] = PQ[k * 3];  PQ[j * 3 + 1] = PQ[k * 3 + 1];  PQ[j * 3 + 2] = PQ[k * 3 + 2];  j += 1;
+  );
+  k += 1;
+);
+pq_n = j;
+// trigger list in time order (a few at most: insertion sort)
+k = 1;
+while (k < q_n) ( j = k;
+  while (j > 0 && QV[(j - 1) * 3] > QV[j * 3]) (
+    t0 = QV[j * 3];  t1 = QV[j * 3 + 1];  t2 = QV[j * 3 + 2];
+    QV[j * 3] = QV[(j - 1) * 3];  QV[j * 3 + 1] = QV[(j - 1) * 3 + 1];  QV[j * 3 + 2] = QV[(j - 1) * 3 + 2];
+    QV[(j - 1) * 3] = t0;  QV[(j - 1) * 3 + 1] = t1;  QV[(j - 1) * 3 + 2] = t2;  j -= 1; );
+  k += 1; );
+abs_n += samplesblock;
+q_i = 0;  smp = 0;
+
+@serialize
+file_var(0, pr_cur);
+file_var(0, ui_sz);
+file_var(0, cur_pat);
+file_mem(0, SEQ, 16 * NV * 16);
+file_mem(0, LEN, 16);
+file_var(0, seq_ok);
+
+@sample
+// ---------- fire this sample's triggers ----------
+while (q_i < q_n && QV[q_i * 3] <= smp) (
+  tr = QV[q_i * 3 + 1];  vc = QV[q_i * 3 + 2];
+  vc == 0 ? env_rel(tr) : (
+  vel = vc == 2 || vc == 12 ? 1 + 1.4 * ac_lvl / 100 : 1 - 0.4 * ac_lvl / 100;   // ACCENT spreads both ways: plain hits sit back, accents jump out (50 %: about 6.5 dB apart)
+  env_trig(tr, vc >= 10 ? 1000000000 : g_seq);
+  // the pitch: the clock, each voice's tolerance, and a touch per hit
+  vr = p_base * TUNE[tr] * st(0.05 * dm_a * TOL[tr] + 0.03 * dm_a * (rand(2) - 1));
+  tr == 0 ? VC0.v_trig(bd_type >= 0.5 ? 1 : 0, vel * sqr(lv_bd / 100), vr) :
+  tr == 1 ? VC1.v_trig(sd_type >= 0.5 ? 3 : 2, vel * sqr(lv_sd / 100), vr) :
+  tr == 2 ? VC2.v_trig(4, vel * sqr(lv_lt / 100), vr) :  tr == 3 ? VC3.v_trig(5, vel * sqr(lv_mt / 100), vr) :
+  tr == 4 ? VC4.v_trig(6, vel * sqr(lv_ht / 100), vr) :  tr == 5 ? VC5.v_trig(7, vel * sqr(lv_rs / 100), vr) :
+  tr == 6 ? VC6.v_trig(8, vel * sqr(lv_cb / 100), vr) :  tr == 7 ? VC7.v_trig(9, vel * sqr(lv_cp / 100), vr) :
+  tr == 8 ? VC8.v_trig(10, vel * sqr(lv_tb / 100), vr) :
+  tr == 9 ? ( VC9.v_trig(11, vel * sqr(lv_ch / 100), vr);  VC10.chk = 1; ) :      // CH chokes OH
+  tr == 10 ? VC10.v_trig(12, vel * sqr(lv_oh / 100), vr) :  tr == 11 ? VC11.v_trig(13, vel * sqr(lv_cr / 100), vr) :
+  tr == 12 ? VC12.v_trig(14, vel * sqr(lv_rd / 100), vr);
+  );
+  q_i += 1;
+);
+smp += 1;
+env_any ? ( k = 0;  env_any = 0;  loop(NV, ENVV[k] = env_tick(k);  ENVS[k * 8] > 0 ? env_any = 1;  k += 1; ); );
+
+// ---------- control rate ----------
+cr_n <= 0 ? (
+  cr_n = CR;
+  s_mlvl += (t_mlvl - s_mlvl) * sm_c;  m_i = (db2g(s_mlvl) - m_g) / CR;
+  s_pfb += (ph_fb / 100 - s_pfb) * sm_c;  s_dfb += (dl_fb / 100 - s_dfb) * sm_c;  s_dmix += (dl_mix / 100 * 1.4 - s_dmix) * sm_c;
+  s_drk += (dr_k - s_drk) * sm_c;  s_drmk += (dr_mk - s_drmk) * sm_c;
+  lfo += CR * ph_rate / srate;  lfo -= floor(lfo);
+  s_plo += (ph_lo - s_plo) * sm_c;  s_phi += (ph_hi - s_phi) * sm_c;          // the sweep range glides too
+  fl = s_plo * (s_phi / s_plo) ^ (0.5 - 0.5 * cos(2 * $pi * lfo));
+  fr = s_plo * (s_phi / s_plo) ^ (0.5 - 0.5 * cos(2 * $pi * (lfo + 0.25)));
+  tl = tan($pi * min(fl, 0.45 * srate) / srate);  ph_al = (tl - 1) / (tl + 1);
+  tr_ = tan($pi * min(fr, 0.45 * srate) / srate);  ph_ar = (tr_ - 1) / (tr_ + 1);
+  cm_lv = 10 * log10(cm_env_v + 0.000000000001);
+  cm_ov = cm_lv - cm_thr;
+  cm_tg = cm_ov <= -2 ? 0 : cm_ov < 2 ? -(1 - 1 / cm_rat) * sqr(cm_ov + 2) / 8 : -(1 - 1 / cm_rat) * cm_ov;
+  cm_gd += (cm_tg - cm_gd) * (cm_tg < cm_gd ? cm_atc : cm_rtc);
+  cm_gi = (db2g(cm_gd + cm_mk) - cm_g) / CR;
+);
+cr_n -= 1;
+m_g += m_i;  cm_g += cm_gi;
+m_ph += (t_ph - m_ph) * sw_c;  m_dr += (t_dr - m_dr) * sw_c;  m_cm += (t_cm - m_cm) * sw_c;  m_dl += (t_dl - m_dl) * sw_c;
+
+// ---------- the voices > the output filter ----------
+mx = VC0.v_proc() + VC1.v_proc() + VC2.v_proc() + VC3.v_proc() + VC4.v_proc() + VC5.v_proc() + VC6.v_proc()
+   + VC7.v_proc() + VC8.v_proc() + VC9.v_proc() + VC10.v_proc() + VC11.v_proc() + VC12.v_proc();
+OFL.svf(mx);  mx = OFL.lp;
+xl = xr = mx * 0.5;
+
+// ---------- FX strip: PHASER > DRIVE > COMP > DELAY ----------
+m_ph > 0.00001 ? (
+  yl = xl + ph_fbl * s_pfb;  yr = xr + ph_fbr * s_pfb;
+  k_ = 0;
+  loop(6,
+    a_ = PHL[k_];  b_ = ph_al * yl + a_;  PHL[k_] = yl - ph_al * b_;  yl = b_;
+    a_ = PHR[k_];  b_ = ph_ar * yr + a_;  PHR[k_] = yr - ph_ar * b_;  yr = b_;
+    k_ += 1; );
+  ph_fbl = yl;  ph_fbr = yr;
+  xl += ((xl + yl) * 0.5 - xl) * m_ph;  xr += ((xr + yr) * 0.5 - xr) * m_ph;
+);
+m_dr > 0.00001 ? (
+  ul = xl * s_drk;  ur = xr * s_drk;
+  F1 = sqrt(1 + ul * ul);  F2 = sqrt(1 + ur * ur);
+  yl = abs(ul - dr_xl) > 0.00001 ? (F1 - dr_Fl) / (ul - dr_xl) : (ul + dr_xl) * 0.5 / sqrt(1 + sqr((ul + dr_xl) * 0.5));
+  yr = abs(ur - dr_xr) > 0.00001 ? (F2 - dr_Fr) / (ur - dr_xr) : (ur + dr_xr) * 0.5 / sqrt(1 + sqr((ur + dr_xr) * 0.5));
+  dr_xl = ul;  dr_xr = ur;  dr_Fl = F1;  dr_Fr = F2;
+  DTL.svf(yl);  yl = DTL.lp;  DTR.svf(yr);  yr = DTR.lp;
+  yl *= s_drmk;  yr *= s_drmk;
+  xl += (yl - xl) * m_dr;  xr += (yr - xr) * m_dr;
+) : ( dr_xl = xl * s_drk;  dr_xr = xr * s_drk;  dr_Fl = sqrt(1 + dr_xl * dr_xl);  dr_Fr = sqrt(1 + dr_xr * dr_xr); );
+m_cm > 0.00001 ? (
+  pk_ = max(abs(xl), abs(xr));  cm_env_v += (pk_ * pk_ - cm_env_v) * (pk_ * pk_ > cm_env_v ? 0.2 : 0.002);
+  xl += (xl * cm_g - xl) * m_cm;  xr += (xr * cm_g - xr) * m_cm;
+);
+m_dl > 0.00001 || dl_tail > 0 ? (
+  // a new delay time crossfades to the new tap over 30 ms (no tape-chirp, no zipper)
+  !dl_xf_on && abs(dl_ts - s_dt) > 0.5 ? ( dl_tb = dl_ts;  dl_xf = 0;  dl_xf_on = 1; );
+  dl_read(s_dt);  el = dr_l;  er = dr_r;
+  dl_xf_on ? (
+    dl_read(dl_tb);  dl_xf = min(1, dl_xf + dl_xfc);
+    el += (dr_l - el) * dl_xf;  er += (dr_r - er) * dl_xf;
+    dl_xf >= 1 ? ( s_dt = dl_tb;  dl_xf_on = 0; );
+  );
+  dl_ll += (el - dl_ll) * dl_lpc;  dl_lr += (er - dl_lr) * dl_lpc;
+  DLB[dl_w] = xl * m_dl + ts(dl_ll * s_dfb);  DRB[dl_w] = xr * m_dl + ts(dl_lr * s_dfb);
+  dl_w += 1;  dl_w >= DSZ ? dl_w = 0;
+  xl += el * s_dmix;  xr += er * s_dmix;
+  dl_tail = abs(el) + abs(er) > 0.000001 ? 1 : m_dl > 0.00001;
+);
+
+// ---------- THICK, LEVEL, the house output stage ----------
+thk_proc(xl, xr, thick >= 0.5);  xl = thk_l;  xr = thk_r;
+xl *= m_g;  xr *= m_g;
+xl = ostL.ost_band(xl);  xr = ostR.ost_band(xr);
+ost_out(xl, xr);
+spl0 = ost_l;  spl1 = ost_r;
+op_acc = max(op_acc, max(abs(spl0), abs(spl1)));
+
+@gfx 1200 820
+ui_begin(1200, 820);
+
+// ---------- drawing helpers (design units x sc) ----------
+function RX(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function TX(x, y, t) ( gfx_x = x * sc;  gfx_y = y * sc;  gfx_drawstr(t); );
+function TC(cx, y, t) local(w, h) ( gfx_measurestr(t, w, h);  gfx_x = cx * sc - w * 0.5;  gfx_y = y * sc;  gfx_drawstr(t); );
+function TRT(rx, y, t) local(w, h) ( gfx_measurestr(t, w, h);  gfx_x = rx * sc - w;  gfx_y = y * sc;  gfx_drawstr(t); );
+function setv(idx, v) ( slider(idx) = v;  ui_auto(idx); );
+gfx_setfont(6, "Trebuchet MS", 15 * sc, 'b');      // labels / section titles
+gfx_setfont(7, "Trebuchet MS", 14 * sc, 'b');      // values
+gfx_setfont(8, "Trebuchet MS", 12.5 * sc, 'b');    // small print
+gfx_setfont(9, "Courier New", 22 * sc, 'b');       // readouts
+gfx_setfont(10, "Courier New", 12 * sc, 'b');      // readout captions
+gfx_setfont(12, "Trebuchet MS", 30 * sc, 'b');     // the name
+gfx_setfont(13, "Trebuchet MS", 14 * sc, 'b');     // key captions (14: the house size for lamp-key legends)
+
+function mscrew(x, y) (
+  ui_cola(0x000000, 0.45);  gfx_circle((x + 0.6) * sc, (y + 1) * sc, 4.6 * sc, 1, 1);
+  ui_col(0x0E0F10);  gfx_circle(x * sc, y * sc, 4.4 * sc, 1, 1);
+  ui_col(0x2C2E31);  gfx_circle((x - 0.6) * sc, (y - 0.7) * sc, 3.2 * sc, 1, 1);
+  ui_col(0x050506);  gfx_line((x - 2.8) * sc, (y - 1.2) * sc, (x + 2.8) * sc, (y + 1.2) * sc, 1);
+  ui_cola(0xFFFFFF, 0.18);  gfx_circle((x - 1.4) * sc, (y - 1.6) * sc, 0.9 * sc, 1, 1);
+);
+function plate(x, y, w, h, c) (
+  ui_cola(0x000000, 0.55);  gfx_rect((x + 2) * sc, (y + 3) * sc, w * sc, h * sc);
+  ui_col(ui_mix(c, 0x000000, 0.4));  RX(x, y, w, h);
+  ui_col(c);  RX(x + 1, y + 1, w - 2, h - 2);
+  gfx_gradrect((x + 1) * sc, (y + 1) * sc, (w - 2) * sc, (h - 2) * sc * 0.5, 1, 1, 1, 0.07, 0, 0, 0, 0, 0, 0, 0, -0.07 / ((h - 2) * sc * 0.5));
+  gfx_gradrect((x + 1) * sc, (y + h * 0.5) * sc, (w - 2) * sc, (h * 0.5 - 1) * sc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.14 / ((h * 0.5 - 1) * sc));
+  ui_cola(0xFFFFFF, 0.16);  gfx_rect((x + 1) * sc, (y + 1) * sc, (w - 2) * sc, 1 * sc);  gfx_rect((x + 1) * sc, (y + 1) * sc, 1 * sc, (h - 2) * sc);
+  ui_cola(0x000000, 0.45);  gfx_rect((x + 1) * sc, (y + h - 2) * sc, (w - 2) * sc, 1 * sc);  gfx_rect((x + w - 2) * sc, (y + 1) * sc, 1 * sc, (h - 2) * sc);
+  mscrew(x + 9, y + 15);  mscrew(x + w - 9, y + 15);  mscrew(x + 9, y + h - 9);  mscrew(x + w - 9, y + h - 9);
+  ui_col(HDR);  RX(x + 1, y + 1, w - 2, 6);  ui_col(ACC);  RX(x + 1, y + 5, w - 2, 2);
+);
+// section title: cream lettering with a small amber marker
+function tape(x, y, t) local(tw, th) (
+  gfx_setfont(6);  gfx_measurestr(t, tw, th);
+  ui_col(ACC);  RX(x, y + 4, 3, 14);
+  ui_col(INK);  gfx_x = (x + 10) * sc;  gfx_y = (y + 11) * sc - th * 0.5;  gfx_drawstr(t);
+);
+function screen(x, y, w, h) (
+  ui_cola(0x000000, 0.35);  RX(x - 4, y - 4, w + 8, h + 8);
+  ui_col(0x101113);  RX(x - 3, y - 3, w + 6, h + 6);
+  ui_cola(0xFFFFFF, 0.07);  RX(x - 3, y + h + 2, w + 6, 1);  RX(x + w + 2, y - 3, 1, h + 6);
+  ui_col(SCR);  RX(x, y, w, h);
+  gfx_gradrect(x * sc, y * sc, w * sc, 10 * sc, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 0, -0.5 / (10 * sc));
+);
+// lit square key, its caption printed on it (Wingspan's)
+// a key: the house 3D lamp key (lit with a glow, as the 34 series); mk_c picks its colour for one call (default amber)
+function mkey(x, y, w, h, t, on) local(hit, c) (
+  c = mk_c ? mk_c : LK_AMB;  mk_c = 0;
+  gfx_setfont(13);  lk_font = 13;  lk_font2 = 13;
+  hit = lk_key(x, y, w, h, on, c, t);
+  hit;
+);
+function fmt(f, v) (
+  f == 1 ? sprintf(#v, "%d %%", v) : f == 2 ? sprintf(#v, "%+.1f dB", v) : f == 3 ? sprintf(#v, "%.2f Hz", v) :
+  f == 4 ? sprintf(#v, "%.1f : 1", v) : f == 5 ? sprintf(#v, "%d ms", v) : f == 6 ? sprintf(#v, "%.1f dB", v) :
+  f == 7 ? sprintf(#v, "%+.1f st", v) : f == 8 ? ( v >= 1000 ? sprintf(#v, "%.2f s", v / 1000) : sprintf(#v, "%d ms", v); ) :
+  f == 9 ? ( v >= 4990 ? strcpy(#v, "NATURAL") : v >= 1000 ? sprintf(#v, "%.2f s", v / 1000) : sprintf(#v, "%d ms", v); ) : sprintf(#v, "%.2f", v);
+  #v;
+);
+// knob: house dy_knob, knurled (style 7) with an elephant's-breath cap; name under it, value on hover / drag only
+function mknob(idx, cx, cy, r, lo, hi, def, lg, cap, label, f) local(dx, dy, hov, did, act) (
+  did = 1600 + idx;  fmt(f, slider(idx));
+  idx == 31 && cm_rat >= 19.95 ? strcpy(#v, "INF : 1");
+  dx = mouse_x - cx * sc;  dy = mouse_y - cy * sc;  hov = dx * dx + dy * dy <= sqr((r + 6) * sc);
+  pressed && hov && drag_id == 0 && (mouse_cap & 4) ? ( slider(idx) = def;  ui_auto(idx);  drag_id = -1; );
+  dy_kst = 7;  dy_ink = 0xD8D8D2;  dy_ntick = 11;
+  dy_knob(cx, cy, r, idx, lo, hi, def, lg, cap, "", "");
+  act = hov || drag_id == did;
+  gfx_setfont(6);  ui_col(INK);  TC(cx, cy + r + 13, label);
+  act ? ( gfx_setfont(7);  ui_col(ACC);  TC(cx, cy - r - 30, #v); );
+);
+function vmeter(x, y, n, sh, w, pk) local(db, k, d, c) (
+  db = pk > 0.0000001 ? 20 * log10(pk) : -140;
+  ui_col(0x08080A);  RX(x - 3, y - 3, w + 6, n * sh + 6);
+  k = 0;
+  loop(n, d = -48 + 51 * (k + 0.5) / n;  c = d > 0 ? 0xFF3A2A : ACC;
+    ui_col(db >= d ? c : ui_mix(c, 0x000000, 0.86));  RX(x, y + (n - k - 1) * sh + 1, w, sh - 3);  k += 1; );
+);
+function readout(x, y, w, h, cap, v) local(hov, hit) (
+  hov = mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = hov && pressed && drag_id == 0;  hit ? drag_id = -1;
+  ui_col(0x050505);  RX(x, y, w, h);
+  ui_col(hov ? 0x1A1006 : 0x120B04);  RX(x + 3, y + 3, w - 6, h - 6);
+  ui_col(0xF2AE45);  gfx_setfont(10);  TX(x + 9, y + 6, cap);  gfx_setfont(9);  TRT(x + w - 10, y + h - 30, v);
+  hit;
+);
+// THICK: the house square grey key, a red LED beside it, the name printed below
+function sq_key(x, y, on) local(hov, hit, s) (
+  s = 22;  hov = mouse_x >= x * sc && mouse_x < (x + s) * sc && mouse_y >= y * sc && mouse_y < (y + s) * sc;
+  hit = hov && pressed && drag_id == 0;  hit ? drag_id = -1;
+  ui_col(0x0A0A0B);  ui_rrs((x - 2) * sc, (y - 2) * sc, (s + 4) * sc, (s + 4) * sc, 3 * sc);
+  ui_col(mdown && hov ? 0x6E6E70 : 0x8A8A8C);  ui_rrs(x * sc, y * sc, s * sc, s * sc, 2 * sc);
+  ui_cola(0xFFFFFF, 0.25);  gfx_rect((x + 2) * sc, (y + 1) * sc, (s - 4) * sc, 1 * sc);
+  ui_cola(0x000000, 0.3);  gfx_rect((x + 2) * sc, (y + s - 2) * sc, (s - 4) * sc, 1 * sc);
+  rd_led(x + s + 12, y + s * 0.5, 4.5, on, 0xFF3A2A);
+  hit;
+);
+// the voice colour code (a rainbow in pad order, darker = lower): kick brown, snare / rim red, clap orange,
+// hats yellow, toms green, cymbals blue, percussion violet
+function vcol(v) (
+  v == 0 ? 0x9A6440 : v == 1 ? 0xC8463D : v == 2 ? 0x3E8048 : v == 3 ? 0x55A35C : v == 4 ? 0x8CCB84 : v == 5 ? 0xE8857E :
+  v == 6 ? 0x9A6BC8 : v == 7 ? 0xE08A2E : v == 8 ? 0xBE9BE0 : v == 9 ? 0xD9B630 : v == 10 ? 0xF0D873 : v == 11 ? 0x86AEE0 : 0x3D74B8;
+);
+// the pad order (John's): BD, SN, RIM, CLAP, HH, OH, HT, MT, LT, RD, CR, then the percussion (CB, TB) -> the voice number
+function vord(i) ( i == 0 ? 0 : i == 1 ? 1 : i == 2 ? 5 : i == 3 ? 7 : i == 4 ? 9 : i == 5 ? 10 : i == 6 ? 4 : i == 7 ? 3 : i == 8 ? 2 :
+  i == 9 ? 12 : i == 10 ? 11 : i == 11 ? 6 : 8; );
+function vname(v) ( v == 0 ? "BASS" : v == 1 ? "SNARE" : v == 2 ? "LOW TOM" : v == 3 ? "MID TOM" : v == 4 ? "HI TOM" : v == 5 ? "RIM" :
+  v == 6 ? "COWBELL" : v == 7 ? "CLAP" : v == 8 ? "TAMB" : v == 9 ? "CL HAT" : v == 10 ? "OP HAT" : v == 11 ? "CRASH" : "RIDE"; );
+function in_key(x, y, idx) ( mkey(x, y, 46, 24, "IN", slider(idx) >= 0.5) ? setv(idx, slider(idx) >= 0.5 ? 0 : 1); );
+function grey(x, y, w, h, on) ( !on ? ( ui_cola(PNL, 0.55);  RX(x + 2, y + 40, w - 4, h - 44); ); );
+function p_init() local(i) (
+  slider(1) = 50;  slider(2) = 80;  slider(3) = 70;  i = 4;  loop(3, slider(i) = 65;  i += 1; );  slider(7) = 60;  slider(8) = 55;
+  slider(9) = 65;  slider(10) = 55;  slider(11) = 60;  slider(12) = 60;  slider(13) = 50;  slider(14) = 50;  slider(15) = 0;  slider(16) = 0;
+  slider(17) = 0;  slider(18) = 0;  slider(19) = 50;  slider(20) = 0;
+  slider(21) = 0;  slider(22) = 0.4;  slider(23) = 60;  slider(24) = 40;  slider(25) = 50;  slider(26) = 0;  slider(27) = 40;  slider(28) = 50;
+  slider(29) = 0;  slider(30) = -12;  slider(31) = 4;  slider(32) = 0;  slider(33) = 0;
+  slider(34) = 0;  slider(35) = 1;  slider(36) = 300;  slider(37) = 3;  slider(38) = 35;  slider(39) = 40;  slider(40) = 25;
+  slider(41) = 0;  slider(42) = 70;
+);
+// PRESETS: kits (sounds, swing, pitch, tone, FX), level-matched to Init on a groove. They never touch the patterns.
+function lb_init() local(k) (
+  k = 0;  loop(NV, slider(EB + k * 5) = 0;  slider(EB + k * 5 + 1) = 0;  slider(EB + k * 5 + 2) = 4000;
+    slider(EB + k * 5 + 3) = 100;  slider(EB + k * 5 + 4) = 5000;  k += 1; );
+);
+function load_preset(k) local(i) (
+  lb_init();
+  p_init();
+  k == 2 ? ( slider(8) = 70;  slider(9) = 75;  slider(15) = 1;  slider(16) = 1;  slider(18) = 3.1;  slider(26) = 1;  slider(27) = 20;  slider(29) = 1;  slider(30) = -18;  slider(31) = 3;  slider(33) = 3; );   // Electro Funk
+  k == 3 ? ( slider(10) = 65;  slider(16) = 1;  slider(17) = 20;  slider(18) = -1.2;  slider(34) = 1;  slider(37) = 4;  slider(38) = 30;  slider(40) = 20; );   // Freestyle
+  k == 4 ? ( slider(18) = 0.3;  slider(21) = 1;  slider(22) = 0.2;  slider(23) = 50;  slider(24) = 30;  slider(25) = 40;  slider(34) = 1;  slider(37) = 5;  slider(38) = 25;  slider(40) = 18;  slider(42) = 60; );   // Synth Pop
+  k == 5 ? ( slider(12) = 70;  slider(16) = 1;  slider(18) = -0.5;  slider(29) = 1;  slider(30) = -16;  slider(31) = 3;  slider(32) = 1;  slider(33) = 3;  slider(34) = 1;  slider(37) = 3;  slider(38) = 35;  slider(40) = 22; );   // Italo Disco
+  k == 6 ? ( slider(15) = 1;  slider(16) = 1;  slider(17) = 45;  slider(18) = 3.1;  slider(20) = 1;  slider(26) = 1;  slider(27) = 30;  slider(28) = 40;  slider(29) = 1;  slider(30) = -20;  slider(31) = 4;  slider(33) = 4; );   // New Jack
+  k == 7 ? ( slider(18) = -1.2;  slider(20) = 1;  slider(26) = 1;  slider(27) = 35;  slider(28) = 35;  slider(41) = -5;  slider(42) = 45; );   // Pitched Down
+  k == 8 ? ( slider(15) = 1;  slider(17) = 30;  slider(18) = 2.9;  slider(41) = 5;  slider(42) = 90; );   // Chipmunk Jack
+  k == 9 ? ( slider(18) = 2.9;  slider(19) = 90;  slider(26) = 1;  slider(27) = 55;  slider(28) = 30;  slider(29) = 1;  slider(30) = -24;  slider(31) = 6;  slider(32) = 1;  slider(33) = 6;  slider(42) = 30; );   // Lo-Fi Tape
+  k == 10 ? ( slider(18) = -2.4;  slider(21) = 1;  slider(22) = 0.1;  slider(23) = 40;  slider(24) = 25;  slider(25) = 30;  slider(34) = 1;  slider(37) = 6;  slider(38) = 60;  slider(39) = 60;  slider(40) = 35; );   // Dub Echo
+  k == 11 ? ( slider(4) = 80;  slider(5) = 80;  slider(6) = 80;  slider(13) = 70;  slider(18) = 0.7;  slider(20) = 1;  slider(29) = 1;  slider(30) = -18;  slider(31) = 4;  slider(32) = 1;  slider(33) = 4;  slider(34) = 1;  slider(35) = 0;  slider(36) = 90;  slider(38) = 20;  slider(40) = 15; );   // Arena Rock
+  k == 12 ? ( slider(18) = -0.1;  slider(19) = 0;  slider(42) = 100; );   // Clean Machine
+  i = 1;  loop(42, ui_auto(i);  i += 1; );
+  i = EB;  loop(NV * 5, ui_auto(i);  i += 1; );
+);
+
+
+// =============================== the face ===============================
+rd_brushed(0, 0, 1200, 820, 0x16171A);
+// ---- top strip: the name plate, presets, size ----
+ui_cola(0x000000, 0.25);  RX(0, 0, 1200, 78);
+ui_col(0x0A0A0C);  RX(0, 75, 1200, 3);  ui_cola(ACC, 0.35);  RX(0, 77, 1200, 1);
+ui_cola(0x000000, 0.45);  rd_rr(16 * sc, 13 * sc, 250 * sc, 54 * sc, 4 * sc);
+ui_col(0x0E0F11);  rd_rr(14 * sc, 10 * sc, 250 * sc, 54 * sc, 4 * sc);
+ui_col(0x1A1B1E);  rd_rr(15 * sc, 11 * sc, 248 * sc, 51 * sc, 3 * sc);
+ui_col(ACC);  gfx_circle(44 * sc, 37 * sc, 17 * sc, 1, 1);
+ui_cola(0xFFFFFF, 0.25);  gfx_circle(40 * sc, 32 * sc, 7 * sc, 1, 1);
+gfx_setfont(4);  ui_col(0x141414);  ui_text(44 * sc, 31 * sc, "GFX");
+gfx_setfont(12);  ui_col(0xEDEBE4);  TX(72, 12, "RS70");
+gfx_setfont(8);  ui_col(0xA8A9AD);  TX(164, 20, "RHYTHM");  TX(164, 37, "COMPOSER");
+mscrew(24, 20);  mscrew(24, 54);  mscrew(254, 20);  mscrew(254, 54);
+g_k = pk_preset(300 * sc, 21 * sc, 520 * sc, 34 * sc, pr_cur, #pmenu);
+g_k > 0 ? ( load_preset(g_k);  pr_cur = g_k; );
+gfx_setfont(8);  ui_col(INK2);  TC(960, 22, "MODEL R7");  TC(960, 40, "DIGITAL DRUMS");
+ui_size_picker(1118 * sc, 26 * sc);
+
+!lb_on ? (
+// ---- INSTRUMENTS: a LEVEL for each of the thirteen sounds ----
+plate(8, 88, 1184, 218, PNL);
+tape(24, 100, "INSTRUMENTS");
+gfx_setfont(8);  ui_col(INK2);  TRT(1070, 104, "LEVEL");
+mkey(1086, 96, 92, 28, "EDIT", 0) ? lb_on = 1;                          // layer B: tune and envelope per instrument
+g_j = 0;
+loop(13,
+  g_cx = 62 + g_j * 89.5;  g_tv = vord(g_j);
+  mknob(2 + g_tv, g_cx, 176, 22, 0, 100, g_tv == 0 ? 80 : g_tv == 1 ? 70 : g_tv < 5 ? 65 : g_tv == 5 ? 60 : g_tv == 6 ? 55 : g_tv == 7 ? 65 : g_tv == 8 ? 55 : g_tv < 11 ? 60 : 50,
+    0, vcol(g_tv), vname(g_tv), 1);
+  g_j += 1;
+);
+// the two kicks and the two snares: lit selector keys under BASS and SNARE
+mk_c = LK_YEL;  mkey(30, 240, 30, 26, "1", bd_type < 0.5) ? setv(15, 0);  mk_c = LK_YEL;  mkey(64, 240, 30, 26, "2", bd_type >= 0.5) ? setv(15, 1);
+mk_c = LK_YEL;  mkey(120, 240, 30, 26, "1", sd_type < 0.5) ? setv(16, 0);  mk_c = LK_YEL;  mkey(154, 240, 30, 26, "2", sd_type >= 0.5) ? setv(16, 1);
+gfx_setfont(8);  ui_col(INK2);  TC(62, 272, "KICK");  TC(152, 272, "SNARE");
+TX(236, 252, "CH CUTS OH  -  CLICK A NAME IN THE GRID TO HEAR IT");
+
+// ---- SEQUENCER: the step grid on an LCD screen ----
+plate(8, 316, 880, 296, PNL2);
+tape(24, 328, "SEQUENCER");
+gfx_setfont(8);  ui_col(INK2);  TRT(872, 332, "CLICK A STEP: HIT > ACCENT > OFF  -  DRAG TO PAINT");
+mk_c = LK_RED;  follow >= 0.5 ? mkey(26, 364, 104, 36, run ? "PLAYING" : "WAITING", run) :
+  mkey(26, 364, 104, 36, run_req ? "STOP" : "RUN", run_req) ? run_req = !run_req;
+mk_c = LK_YEL;  mkey(26, 408, 104, 26, "FOLLOW", follow >= 0.5) ? ( setv(43, follow >= 0.5 ? 0 : 1);  run_req = 0; );
+sprintf(#ls, "%d", LEN[cur_pat]);
+readout(26, 442, 104, 46, "LAST STEP", #ls) ? (
+  strcpy(#lm, "");  g_j = 1;  loop(16, g_j == LEN[cur_pat] ? strcat(#lm, "!");  strcat(#lm, sprintf(#stp, "%d", g_j));  g_j < 16 ? strcat(#lm, "|");  g_j += 1; );
+  gfx_x = 26 * sc;  gfx_y = 496 * sc;  g_k = gfx_showmenu(#lm);  g_k > 0 ? LEN[cur_pat] = g_k;
+);
+mknob(17, 78, 522, 15, 0, 100, 0, 0, CAPU, "SWING", 1);
+mkey(26, 580, 104, 24, "PATTERN", 0) ? (
+  strcpy(#em, "Clear this pattern|>Copy this pattern to");  g_j = 1;
+  loop(16, strcat(#em, g_j == 16 ? "|<" : "|");  strcat(#em, sprintf(#stp, "%d", g_j));  g_j += 1; );
+  strcat(#em, "|>Load a pattern from the bank|Electro|Synth pop|Freestyle|Italo|New jack swing|Hip hop|Miami bass|Funk|Shuffle|Ballad|Pop rock|Rock|Cowbell disco|Clap roll|<Tom fill");
+  gfx_x = 26 * sc;  gfx_y = 604 * sc;  g_k = gfx_showmenu(#em);
+  g_k == 1 ? memset(SEQ + cur_pat * NV * 16, 0, NV * 16);
+  g_k >= 2 && g_k <= 17 ? ( g_p = g_k - 2;  g_p != cur_pat ? ( memcpy(SEQ + g_p * NV * 16, SEQ + cur_pat * NV * 16, NV * 16);  LEN[g_p] = LEN[cur_pat]; ); );
+  g_k >= 18 ? ( memcpy(SEQ + cur_pat * NV * 16, DEMO + (g_k - 18) * NV * 16, NV * 16);  LEN[cur_pat] = 16; );
+);
+// pattern keys on the step columns
+g_s = 0;
+loop(16, g_x = 196 + g_s * 41 + floor(g_s / 4) * 6;
+  mkey(g_x, 352, 36, 24, sprintf(#stp, "%d", g_s + 1), g_s == cur_pat || (g_s == pending_pat && (time_precise() * 3) % 2 < 1)) ? pat_sel_d = g_s;
+  g_s += 1; );
+gfx_setfont(8);  ui_col(INK2);  TC(166, 357, "PAT");
+// the screen
+screen(150, 386, 722, 216);
+g_sd = step_disp;
+g_s = 0;
+loop(16, g_x = 196 + g_s * 41 + floor(g_s / 4) * 6;
+  ui_col(g_s == g_sd ? ACC : g_s < LEN[cur_pat] ? 0x3A3426 : 0x1A1916);  RX(g_x, 392, 36, 4);
+  g_s += 1; );
+g_t = 0;
+loop(13,
+  g_y = 400 + g_t * 15.4;  g_tv = vord(g_t);
+  ui_col(vcol(g_tv));  RX(153, g_y + 1, 4, 11);                                // the voice's colour
+  g_hov = mouse_x >= 152 * sc && mouse_x < 192 * sc && mouse_y >= g_y * sc && mouse_y < (g_y + 14) * sc;
+  gfx_setfont(10);  ui_col(g_hov ? 0xFFD890 : 0xC88A30);
+  TX(161, g_y + 1, g_tv == 0 ? "BD" : g_tv == 1 ? "SD" : g_tv == 2 ? "LT" : g_tv == 3 ? "MT" : g_tv == 4 ? "HT" : g_tv == 5 ? "RS" :
+    g_tv == 6 ? "CB" : g_tv == 7 ? "CP" : g_tv == 8 ? "TB" : g_tv == 9 ? "CH" : g_tv == 10 ? "OH" : g_tv == 11 ? "CR" : "RD");
+  g_hov && pressed && drag_id == 0 ? ( drag_id = -1;  aud_t_d = g_tv;  aud_n_d += 1; );
+  g_s = 0;
+  loop(16,
+    g_x = 196 + g_s * 41 + floor(g_s / 4) * 6;
+    g_a = (cur_pat * NV + g_tv) * 16 + g_s;  g_v = SEQ[g_a];
+    g_in = mouse_x >= g_x * sc && mouse_x < (g_x + 36) * sc && mouse_y >= g_y * sc && mouse_y < (g_y + 13) * sc;
+    g_in && pressed && drag_id == 0 ? ( drag_id = -3;  paint_v = (g_v + 1) % 3;  SEQ[g_a] = paint_v;  g_v = paint_v; );
+    g_in && drag_id == -3 && mdown && g_v != paint_v ? ( SEQ[g_a] = paint_v;  g_v = paint_v; );
+    ui_col(g_v == 2 ? 0xFFE2A8 : g_v == 1 ? ACC : g_in ? 0x2E2A22 : g_s >= LEN[cur_pat] ? 0x0E0E0D : 0x1D1B17);
+    RX(g_x, g_y, 36, 13);
+    g_v == 2 ? ( ui_col(ACC);  RX(g_x, g_y + 11, 36, 2); );
+    g_s == g_sd ? ( ui_cola(0xFFFFFF, 0.10);  RX(g_x, g_y, 36, 13); );
+    g_s += 1; );
+  g_t += 1;
+);
+
+// ---- MASTER ----
+plate(896, 316, 296, 296, PNL3);
+tape(912, 328, "MASTER");
+mknob(1, 950, 404, 20, 0, 100, 50, 0, CAPU, "ACCENT", 1);
+mknob(41, 1046, 404, 20, -12, 12, 0, 0, CAPU, "PITCH", 7);
+mknob(42, 950, 492, 20, 0, 100, 70, 0, CAPU, "TONE", 1);
+mknob(18, 1046, 492, 20, -18, 6, 0, 0, CAPS, "LEVEL", 2);
+mknob(19, 930, 578, 12, 0, 100, 50, 0, CAPS, "", 1);
+gfx_setfont(6);  ui_col(INK);  TX(954, 570, "DRIFT");
+sq_key(1012, 567, thick >= 0.5) ? setv(20, thick >= 0.5 ? 0 : 1);
+gfx_setfont(6);  ui_col(INK);  TX(1058, 570, "THICK");
+g_pk = max(g_pk * 0.85, op_disp);
+vmeter(1148, 352, 24, 8.5, 12, g_pk);  vmeter(1166, 352, 24, 8.5, 12, g_pk);
+gfx_setfont(8);  ui_col(INK2);  TC(1166, 568, "OUT");
+TRT(1140, 352 + 8.5 * 24 * 3 / 51 - 7, "0");  TRT(1140, 352 + 8.5 * 24 * 21 / 51 - 7, "-18");  TRT(1140, 352 + 8.5 * 24 - 12, "-48");
+
+);
+lb_on ? (
+// ---- layer B (EDIT): a tune and an amp envelope for every instrument ----
+plate(8, 88, 1184, 524, PNL);
+tape(24, 100, "EDIT  -  TUNE AND ENVELOPE (ADSR) FOR EACH INSTRUMENT");
+mkey(1086, 96, 92, 28, "EDIT", 1) ? lb_on = 0;
+mkey(970, 96, 108, 28, "RESET ALL", 0) ? ( lb_init();  g_j = EB;  loop(NV * 5, ui_auto(g_j);  g_j += 1; ); );
+g_j = 0;
+loop(5,
+  g_y = 196 + g_j * 84;
+  gfx_setfont(6);  ui_col(INK);  TX(26, g_y - 16, g_j == 0 ? "TUNE" : g_j == 1 ? "ATTACK" : g_j == 2 ? "DECAY" : g_j == 3 ? "SUSTAIN" : "RELEASE");
+  gfx_setfont(8);  ui_col(INK2);  TX(26, g_y + 4, g_j == 0 ? "+/- 12 SEMITONES" : g_j == 1 ? "0 - 200 MS" : g_j == 2 ? "TO THE SUSTAIN" : g_j == 3 ? "HELD FOR THE GATE" : "AFTER THE GATE");
+  g_j += 1; );
+g_k = 0;
+loop(NV,
+  g_cx = 196 + g_k * 77;  g_tv = vord(g_k);  g_c = vcol(g_tv);
+  g_hov = mouse_x >= (g_cx - 36) * sc && mouse_x < (g_cx + 36) * sc && mouse_y >= 134 * sc && mouse_y < 156 * sc;
+  gfx_setfont(8);  ui_col(g_hov ? ACC : INK);
+  TC(g_cx, 138, vname(g_tv));
+  ui_col(g_c);  RX(g_cx - 28, 156, 56, 3);                                        // the voice's colour
+  g_hov && pressed && drag_id == 0 ? ( drag_id = -1;  aud_t_d = g_tv;  aud_n_d += 1; );
+  g_k > 0 ? ( ui_cola(INK, 0.1);  RX(g_cx - 38, 134, 1, 450); );
+  mknob(EB + g_tv * 5, g_cx, 196, 16, -12, 12, 0, 0, g_c, "", 7);
+  mknob(EB + g_tv * 5 + 1, g_cx, 280, 16, 0, 200, 0, 0, g_c, "", 8);
+  mknob(EB + g_tv * 5 + 2, g_cx, 364, 16, 5, 4000, 4000, 1, g_c, "", 8);
+  mknob(EB + g_tv * 5 + 3, g_cx, 448, 16, 0, 100, 100, 0, g_c, "", 1);
+  mknob(EB + g_tv * 5 + 4, g_cx, 532, 16, 5, 5000, 5000, 1, g_c, "", 9);
+  g_k += 1; );
+gfx_setfont(8);  ui_col(INK2);  TX(26, 588, "SUSTAIN 100 % WITH RELEASE AT NATURAL = THE SOUND AS IT IS.   THE GATE: ONE STEP (SEQUENCER) OR THE HELD NOTE (MIDI).   CLICK A NAME TO HEAR IT.");
+);
+// ---- the FX strip ----
+FY = 622;  FH = 190;  FK = 712;
+g_x = 8;  plate(g_x, FY, 326, FH, PNL);  tape(g_x + 16, FY + 12, "PHASER");
+mknob(22, g_x + 50, FK, 19, 0.05, 5, 0.4, 1, CAPU, "RATE", 3);  mknob(23, g_x + 126, FK, 19, 0, 100, 60, 0, CAPU, "DEPTH", 1);
+mknob(24, g_x + 202, FK, 19, 0, 90, 40, 0, CAPU, "FEEDBACK", 1);  mknob(25, g_x + 278, FK, 19, 0, 100, 50, 0, CAPU, "COLOUR", 1);
+grey(g_x, FY, 326, FH, ph_in >= 0.5);  in_key(g_x + 326 - 62, FY + 12, 21);
+g_x = 342;  plate(g_x, FY, 170, FH, PNL2);  tape(g_x + 16, FY + 12, "DRIVE");
+mknob(27, g_x + 48, FK, 19, 0, 100, 40, 0, CAPU, "AMOUNT", 1);  mknob(28, g_x + 124, FK, 19, 0, 100, 50, 0, CAPU, "TONE", 1);
+grey(g_x, FY, 170, FH, dr_in >= 0.5);  in_key(g_x + 170 - 62, FY + 12, 26);
+g_x = 520;  plate(g_x, FY, 352, FH, PNL3);  tape(g_x + 16, FY + 12, "COMP");
+mknob(30, g_x + 48, FK, 19, -40, 0, -12, 0, CAPU, "THRESH", 6);  mknob(31, g_x + 124, FK, 19, 1, 20, 4, 1, CAPU, "RATIO", 4);
+mknob(33, g_x + 200, FK, 19, 0, 20, 0, 0, CAPU, "MAKE-UP", 2);
+mkey(g_x + 262, 672, 64, 26, "FAST", cm_env < 0.5) ? setv(32, 0);  mkey(g_x + 262, 704, 64, 26, "SLOW", cm_env >= 0.5) ? setv(32, 1);
+ui_col(0x08080A);  RX(g_x + 40, 774, 302, 14);
+g_k = 0;  loop(20, ui_col(-gr_disp >= g_k + 0.5 ? ACC : ui_mix(ACC, 0x000000, 0.86));  RX(g_x + 42 + g_k * 15, 776, 12, 10);  g_k += 1; );
+gfx_setfont(8);  ui_col(INK2);  TRT(g_x + 34, 773, "GR");
+grey(g_x, FY, 352, FH, cm_in >= 0.5);  in_key(g_x + 352 - 62, FY + 12, 29);
+g_x = 880;  plate(g_x, FY, 312, FH, PNL);  tape(g_x + 16, FY + 12, "DELAY");
+dl_sync >= 0.5 ? (
+  g_div = floor(dl_div + 0.5);
+  readout(g_x + 16, 682, 72, 52, "NOTE", g_div == 0 ? "1/32" : g_div == 1 ? "1/16" : g_div == 2 ? "1/16." : g_div == 3 ? "1/8" : g_div == 4 ? "1/8." : g_div == 5 ? "1/4" : "1/4.") ? (
+    strcpy(#dm, "");  g_j = 0;
+    loop(7, g_j == g_div ? strcat(#dm, "!");
+      strcat(#dm, g_j == 0 ? "1/32" : g_j == 1 ? "1/16" : g_j == 2 ? "1/16 dotted" : g_j == 3 ? "1/8" : g_j == 4 ? "1/8 dotted" : g_j == 5 ? "1/4" : "1/4 dotted");
+      g_j < 6 ? strcat(#dm, "|");  g_j += 1; );
+    gfx_x = (g_x + 16) * sc;  gfx_y = 736 * sc;  g_k = gfx_showmenu(#dm);  g_k > 0 ? setv(37, g_k - 1);
+  );
+) : mknob(36, g_x + 52, FK, 19, 20, 1500, 300, 1, CAPU, "TIME", 5);
+mk_c = LK_YEL;  mkey(g_x + 22, 766, 60, 26, "SYNC", dl_sync >= 0.5) ? setv(35, dl_sync >= 0.5 ? 0 : 1);
+mknob(38, g_x + 130, FK, 19, 0, 90, 35, 0, CAPU, "FEEDBACK", 1);  mknob(39, g_x + 202, FK, 19, 0, 100, 40, 0, CAPU, "DAMP", 1);
+mknob(40, g_x + 268, FK, 19, 0, 100, 25, 0, CAPU, "MIX", 1);
+grey(g_x, FY, 312, FH, dl_in >= 0.5);  in_key(g_x + 312 - 62, FY + 12, 34);
+
+pk_end();
+ui_end();

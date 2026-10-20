@@ -1,0 +1,912 @@
+desc:GFX C2ME [channel strip]
+//author: JGWizrad / Garden FX (GFX)
+//
+// C2ME — C2E's channel EQ and C2M's stereo pair of compressor / limiter modules in one unit:
+// a 70s British broadcast-console channel. Reference (comments only): the M-series console's
+// input / EQ module and DL2716 compressor / limiter.
+//
+// Signal path:
+//   INPUT   TRIM, PH, the input transformer and the console op-amp (C2E's input stage, O/L LED)
+//   then, in the order the ORDER key sets (EQ > DYN or DYN > EQ; the modules swap places on the panel):
+//   EQ      HPF / LPF (F) and the four bands (EQ) - exactly as C2E
+//   DYN     C2M's A / B modules (A = left, B = right; LINK shares the detectors and gangs the controls),
+//           each a compressor (red GR) and a peak limiter (amber GR); MIX = parallel compression
+//   OUTPUT  the output transformer, then WIDTH. Mix tool: no clip stage.
+//   WIDTH   the console's stereo image matrix on the fully processed signal: L / R -> M / S, the side scaled,
+//           then back to L / R. 0 % = mono (M on both sides), 100 % = untouched (bit for bit), 200 % = the side
+//           doubled. The mid is never changed, so mono compatibility holds at every setting. Glided (20 ms).
+// IRON: the one pair of transformers (in at the start, out at the end).
+// DRIFT = supply + bloom + iron: the supply rail (the input stage's headroom and a hair of level),
+//   the VCA bloom and recovery breathing, and each side's transformer core.
+// An ORDER change ducks the output for a few ms and swaps the chain at the silent point.
+// Calibration: 0 dBu = -18 dBFS.
+//
+// STATUS: Stable v2.0 (from the Lab, Oct 2026). v0.2 (WIDTH).
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+slider1:a_cin=1<0,1,1{Off,On}>-A comp in
+slider2:a_cthr=0<-20,10,0.1>-A comp threshold (dBu)
+slider3:a_crat=3<1.5,5,0.1>-A ratio
+slider4:a_crec=0.4<0.1,4,0.01>-A comp recovery (s)
+slider5:a_gain=2<0,20,0.1>-A gain (dB)
+slider6:a_fast=0<0,1,1{Slow,Fast}>-A attack
+slider7:a_auto=0<0,1,1{Off,On}>-A auto recovery
+slider8:a_lin=1<0,1,1{Off,On}>-A limiter in
+slider9:a_lthr=12<-4,16,0.1>-A limit threshold (dBu)
+slider10:a_lrec=0<0,2,1{75 ms,5 s,Auto}>-A limit recovery
+slider11:a_on=1<0,1,1{Out,In}>-A in
+slider12:b_cin=1<0,1,1{Off,On}>-B comp in
+slider13:b_cthr=0<-20,10,0.1>-B comp threshold (dBu)
+slider14:b_crat=3<1.5,5,0.1>-B ratio
+slider15:b_crec=0.4<0.1,4,0.01>-B comp recovery (s)
+slider16:b_gain=2<0,20,0.1>-B gain (dB)
+slider17:b_fast=0<0,1,1{Slow,Fast}>-B attack
+slider18:b_auto=0<0,1,1{Off,On}>-B auto recovery
+slider19:b_lin=1<0,1,1{Off,On}>-B limiter in
+slider20:b_lthr=12<-4,16,0.1>-B limit threshold (dBu)
+slider21:b_lrec=0<0,2,1{75 ms,5 s,Auto}>-B limit recovery
+slider22:b_on=1<0,1,1{Out,In}>-B in
+slider23:link=1<0,1,1{Off,On}>-Link
+slider24:trim=0<-20,20,0.1>-Trim (dB)
+slider25:phase=0<0,1,1{Normal,Reversed}>-Phase
+slider26:hpf=20<20,400,1>-HPF (Hz, 20 = off)
+slider27:lpf=20000<2500,20000,10>-LPF (Hz, 20000 = off)
+slider28:filt_in=1<0,1,1{Out,In}>-Filters in
+slider29:eq_in=1<0,1,1{Out,In}>-EQ in
+slider30:hf_g=0<-15,15,0.1>-HF gain (dB)
+slider31:hf_f=8000<2700,16000,10>-HF frequency (Hz)
+slider32:hf_bell=0<0,1,1{Shelf,Bell}>-HF shape
+slider33:hmf_g=0<-15,15,0.1>-HMF gain (dB)
+slider34:hmf_f=2500<1100,6800,10>-HMF frequency (Hz)
+slider35:lmf_g=0<-15,15,0.1>-LMF gain (dB)
+slider36:lmf_f=700<180,2400,1>-LMF frequency (Hz)
+slider37:lf_g=0<-15,15,0.1>-LF gain (dB)
+slider38:lf_f=100<47,470,1>-LF frequency (Hz)
+slider39:lf_bell=0<0,1,1{Shelf,Bell}>-LF shape
+slider40:iron=1<0,1,1{Off,On}>-Iron
+slider41:drift=3<0,10,0.1>-Drift (supply + bloom + iron)
+slider42:mix=100<0,100,1>-Dynamics mix (%)
+slider43:order=0<0,1,1{EQ first,DYN first}>-Order
+slider44:width=100<0,200,0.1>-Width (%: 0 mono, 100 normal, 200 wide)
+
+@init
+ext_noinit = 1;
+pr_cur = 1;
+gfx_ext_retina = 1;
+first_run = 1;
+CR = 16;
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function cms(ms) ( 1 - exp(-1 / max(1, ms * 0.001 * srate)); );
+// soft saturation (rational tanh), unity slope at 0, flat beyond +-3. TWEAK: the curve itself.
+function ts(x) ( x = max(-3, min(3, x));  x * (27 + x * x) / (27 + 9 * x * x); );
+
+// =====================================================================
+// DYNAMICS (C2M): compressor, VCA bloom, peak limiter
+// =====================================================================
+function ch_cfg(base) instance(cin, thr, sl, ac, rcr, aut, mk, lin, lthr, lmode, on) (
+  cin = slider(base) >= 0.5;
+  thr = slider(base + 1) - 18;                               // dBu -> dBFS
+  sl = 1 - 1 / slider(base + 2);
+  rcr = slider(base + 3);
+  mk = db2g(slider(base + 4));
+  ac = slider(base + 5) >= 0.5 ? cms(1) : cms(10);
+  aut = slider(base + 6) >= 0.5;
+  lin = slider(base + 7) >= 0.5;
+  lthr = db2g(slider(base + 8) - 18);
+  lmode = slider(base + 9);
+  on = slider(base + 10) >= 0.5;
+);
+function ch_blk(rs) instance(rcr, rc, rcf, rcs, acs, lmode, lr, lrf, lrs, lsa) (
+  rc  = cms(rcr * 350 * rs);                                 // RECOVERY: time to recover most of the way
+  rcf = cms(120 * rs);  rcs = cms(1800 * rs);  acs = cms(300);   // AUTO: fast + slow stage
+  lr  = lmode == 1 ? cms(5000) : cms(75);
+  lrf = cms(75);  lrs = cms(2000);  lsa = cms(30);           // limiter AUTO
+);
+function ch_det(x) instance(ms) ( ms += (x * x - ms) * det_c;  10 * log10(ms + 0.0000000001) + 3; );
+function ch_gain(lv) instance(cin, thr, sl, ac, rc, rcf, rcs, acs, aut, e, ef, es) local(o, t) (
+  cin ? (
+    o = lv - thr;
+    t = o <= -3 ? 0 : o < 3 ? -sl * (o + 3) * (o + 3) / 12 : -sl * o;
+    aut ? (
+      ef += (t - ef) * (t < ef ? ac : rcf);
+      es += (t - es) * (t < es ? acs : rcs);                 // the slow stage charges only on long passages
+      e = min(ef, es);
+    ) : (
+      e += (t - e) * (t < e ? ac : rc);  ef = e;  es = e;
+    );
+  ) : ( e += (0 - e) * off_c;  ef = e;  es = e; );
+  e;
+);
+function ch_vca(x) instance(e, cin, sw) local(k, y) (
+  sw += (cin - sw) * xs_c;
+  k = 0.55 * bloom_k * (1 + 0.07 * min(-e, 20));
+  y = (ts(x * k + 0.08) - ts(0.08)) / (k * 0.9943);
+  x + (y - x) * sw;
+);
+function ch_lim(x) instance(lin, lthr, lmode, lg, lf, ls, lr, lrf, lrs, lsa) local(t) (
+  t = lin && abs(x) > lthr ? lthr / abs(x) : 1;
+  lmode == 2 ? (
+    lf = t < lf ? t : lf + (1 - lf) * lrf;
+    ls = t < ls ? ls + (t - ls) * lsa : ls + (1 - ls) * lrs;
+    lg = min(lf, ls);
+  ) : (
+    lg = t < lg ? t : lg + (1 - lg) * lr;  lf = lg;  ls = lg;
+  );
+  lg;
+);
+
+// =====================================================================
+// 1. INPUT STAGE: trim, input transformer, console op-amp curve
+// =====================================================================
+// TWEAK: XF_K = how hard the transformer's lows saturate; OP_K = op-amp drive (higher = earlier
+// coloration); OP_B = asymmetry (even harmonics). At 0 dBu (-18 dBFS) all three are near-clean.
+XF_K = 1.6;  XF_W = 1.04;  OP_K = 0.42;  OP_B = 0.06;
+function in_xfmr(x) instance(lo, ik) local(s) (
+  lo += (x - lo) * xf_c;                   // the lows (one-pole at ~150 Hz)
+  s = ts(lo * ik) / ik * XF_W;             // saturate them alone, with a touch of weight
+  x + s - lo;
+);
+function in_opamp(x, k) ( (ts(x * k + OP_B) - ts(OP_B)) / (k * op_d); );   // op_d: unity small-signal gain
+// the whole input stage, both sides (works on yl / yr)
+function input_stage() (
+  yl *= trim_s * pol_s;  yr *= trim_s * pol_s;
+  olpk = max(olpk, max(abs(yl), abs(yr)));                  // O/L watches the level into the op-amp
+  xw_s > 0.00001 ? ( yl += (XFL.in_xfmr(yl) - yl) * xw_s;  yr += (XFR.in_xfmr(yr) - yr) * xw_s; );
+  yl = in_opamp(yl, opa_k);  yr = in_opamp(yr, opa_k);
+);
+
+// =====================================================================
+// 2. FILTERS: zero-delay state-variable HPF / LPF, 12 dB/oct (Q 0.707)
+// =====================================================================
+function svf_c(fc) instance(g, k, a1, a2, a3) (
+  g = tan($pi * min(fc, 0.45 * srate) / srate);  k = 1.41421356;
+  a1 = 1 / (1 + g * (g + k));  a2 = g * a1;  a3 = g * a2;
+);
+function svf_t(x) instance(a1, a2, a3, k, ic1, ic2, lp, bp, hp) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;
+  lp = v2;  bp = v1;  hp = x - k * v1 - v2;
+);
+
+// =====================================================================
+// 3. EQ BANDS: zero-delay SVF bell / shelves (analogue prototypes, bilinear, pre-warped)
+//    bell:       H(s) = (s^2 + s A/Q + 1) / (s^2 + s/(A Q) + 1),  A = 10^(dB/40)
+//    low shelf:  A (s^2 + s sqrtA/Q + A) / (A s^2 + s sqrtA/Q + 1)
+//    high shelf: A (A s^2 + s sqrtA/Q + 1) / (s^2 + s sqrtA/Q + A)
+// =====================================================================
+// TWEAK: proportional Q - Q at 0 dB, and how much it tightens per dB of boost / cut
+PQ_Q0 = 0.55;  PQ_PER_DB = 0.09;  SHELF_Q = 0.6;
+function pq(db) ( PQ_Q0 * (1 + PQ_PER_DB * abs(db)); );
+// kind: 0 bell, 1 low shelf, 2 high shelf
+function eq_c(kind, fc, db, q) instance(a1, a2, a3, m0, m1, m2) local(a, g, k) (
+  a = 10 ^ (db / 40);
+  g = tan($pi * min(fc, 0.45 * srate) / srate);
+  kind == 0 ? ( k = 1 / (q * a);  m0 = 1;  m1 = k * (a * a - 1);  m2 = 0; ) :
+  kind == 1 ? ( g /= sqrt(a);  k = 1 / q;  m0 = 1;  m1 = k * (a - 1);  m2 = a * a - 1; ) :
+              ( g *= sqrt(a);  k = 1 / q;  m0 = a * a;  m1 = k * (1 - a) * a;  m2 = 1 - a * a; );
+  a1 = 1 / (1 + g * (g + k));  a2 = g * a1;  a3 = g * a2;
+);
+function eq_t(x) instance(a1, a2, a3, m0, m1, m2, ic1, ic2) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;
+  m0 * x + m1 * v1 + m2 * v2;
+);
+// the high half (HF, HMF) and the low half (LMF, LF), both sides (work on el / er)
+function eq_high() ( el = HMFL.eq_t(HFL.eq_t(el));  er = HMFR.eq_t(HFR.eq_t(er)); );
+function eq_low()  ( el = LFL.eq_t(LMFL.eq_t(el));  er = LFR.eq_t(LMFR.eq_t(er)); );
+// the filters, both sides (work on fl / fr)
+function filters() (
+  hpf_on ? ( HPL.svf_t(fl);  fl = HPL.hp;  HPR.svf_t(fr);  fr = HPR.hp; );
+  lpf_on ? ( LPL.svf_t(fl);  fl = LPL.lp;  LPR.svf_t(fr);  fr = LPR.lp; );
+);
+
+// =====================================================================
+// 4. OUTPUT: the output transformer's softly rounded top
+// =====================================================================
+function out_xfmr(x) instance(h) ( h += (x - h) * ho_c;  x + (h - x) * 0.35; );
+function walk(dt) instance(v, tg, tm) (
+  tm -= dt;  tm <= 0 ? ( tg = rand(2) - 1;  tm = 2 + rand(5); );
+  v += (tg - v) * min(1, dt / 2.5);
+  v;
+);
+
+// ---------- DYN block: C2M's A / B modules on zl / zr (A = left, B = right) ----------
+function dyn_block() local(dl, dr2, vl, vr, ql, qr, gl, gr, ol, orr) (
+  dl = zl;  dr2 = zr;
+  vl = A.ch_det(dl);  vr = B.ch_det(dr2);
+  lnk ? ( vl = max(vl, vr);  vr = vl; );
+  A.ch_gain(vl);  B.ch_gain(vr);
+  ql = dl * db2g(A.e);  qr = dr2 * db2g(B.e);
+  ql = A.ch_vca(ql);  qr = B.ch_vca(qr);
+  A.mks += (A.mk - A.mks) * sm;  B.mks += (B.mk - B.mks) * sm;
+  ql *= A.mks;  qr *= B.mks;
+  gl = A.ch_lim(ql);  gr = B.ch_lim(qr);
+  lnk ? ( gl = min(gl, gr);  gr = gl; );
+  ql *= gl;  qr *= gr;
+  A.ow += (A.on - A.ow) * xs_c;  B.ow += (B.on - B.ow) * xs_c;
+  ol = dl + (ql - dl) * A.ow;  orr = dr2 + (qr - dr2) * B.ow;
+  mix_s += (mix_t - mix_s) * sm;                            // MIX: dry back in (parallel compression)
+  ol = dl + (ol - dl) * mix_s;  orr = dr2 + (orr - dr2) * mix_s;
+  emA = min(emA, A.e * A.ow);  emB = min(emB, B.e * B.ow);
+  glA = min(glA, A.ow > 0.5 ? gl : 1);  glB = min(glB, B.ow > 0.5 ? gr : 1);
+  zl = ol;  zr = orr;
+);
+// ---------- EQ block: C2E's filters and bands on zl / zr ----------
+function eq_block() (
+  fl = zl;  fr = zr;
+  filters();
+  zl += (fl - zl) * fin_s;  zr += (fr - zr) * fin_s;
+  el = zl;  er = zr;
+  eq_high();  eq_low();
+  zl += (el - zl) * eqin_s;  zr += (er - zr) * eqin_s;
+);
+
+A.lg = A.lf = A.ls = 1;  B.lg = B.lf = B.ls = 1;
+bloom_k = 1;  rel_s = 1;  ord_cur = 0;  ord_st = 0;  dk = 1;
+
+function update_params() (
+  A.ch_cfg(1);  B.ch_cfg(12);  lnk = link >= 0.5;
+  det_c = cms(5);  off_c = cms(20);  sm = cms(20);  mix_t = mix / 100;
+  dkr = 1 / (0.006 * srate);                 // ORDER duck: 6 ms down, 6 ms up
+  t_trim = db2g(trim);  t_pol = phase >= 0.5 ? -1 : 1;
+  t_hpf = log(max(hpf, 20));  t_lpf = log(min(lpf, 20000));
+  hpf_on = hpf > 20.5;  lpf_on = lpf < 19990;
+  t_fin = filt_in >= 0.5;  t_eqin = eq_in >= 0.5;
+  t_hfg = hf_g;   t_hff = log(hf_f);   t_hmfg = hmf_g;  t_hmff = log(hmf_f);
+  t_lmfg = lmf_g; t_lmff = log(lmf_f); t_lfg = lf_g;    t_lff = log(lf_f);
+  t_xw = iron >= 0.5;  dr = drift / 10;
+  xf_c = 1 - exp(-2 * $pi * 150 / srate);
+  ho_c = 1 - exp(-2 * $pi * min(16000, srate * 0.45) / srate);
+  sm_c = 1 - exp(-CR / (0.03 * srate));    // control glide: ~30 ms
+  xs_c = cms(10);                           // per-sample crossfades (polarity, in / out keys)
+  t_wid = width / 100;  wd_c = cms(20);     // WIDTH: side gain, glided over ~20 ms (no zipper)
+  A.ch_blk(rel_s);  B.ch_blk(rel_s);
+  op_d = (ts(OP_B + 0.0001) - ts(OP_B - 0.0001)) / 0.0002;
+  first_run ? (
+    trim_s = t_trim;  pol_s = t_pol;  s_hpf = t_hpf;  s_lpf = t_lpf;  fin_s = t_fin;  eqin_s = t_eqin;
+    s_hfg = t_hfg;  s_hff = t_hff;  s_hmfg = t_hmfg;  s_hmff = t_hmff;
+    s_lmfg = t_lmfg;  s_lmff = t_lmff;  s_lfg = t_lfg;  s_lff = t_lff;  xw_s = t_xw;
+    XFL.ik = XFR.ik = XF_K;
+    A.mks = A.mk;  B.mks = B.mk;  A.ow = A.on;  B.ow = B.on;  A.sw = A.cin;  B.sw = B.cin;
+    mix_s = mix_t;  ord_cur = order >= 0.5;  wid_s = t_wid;  first_run = 0;
+  );
+);
+function control_tick() local(hs, ls) (
+  s_hpf += (t_hpf - s_hpf) * sm_c;   s_lpf += (t_lpf - s_lpf) * sm_c;
+  s_hfg += (t_hfg - s_hfg) * sm_c;   s_hff += (t_hff - s_hff) * sm_c;
+  s_hmfg += (t_hmfg - s_hmfg) * sm_c;  s_hmff += (t_hmff - s_hmff) * sm_c;
+  s_lmfg += (t_lmfg - s_lmfg) * sm_c;  s_lmff += (t_lmff - s_lmff) * sm_c;
+  s_lfg += (t_lfg - s_lfg) * sm_c;   s_lff += (t_lff - s_lff) * sm_c;
+  HPL.svf_c(exp(s_hpf));  HPR.svf_c(exp(s_hpf));
+  LPL.svf_c(exp(s_lpf));  LPR.svf_c(exp(s_lpf));
+  hs = hf_bell >= 0.5 ? 0 : 2;  ls = lf_bell >= 0.5 ? 0 : 1;
+  HFL.eq_c(hs, exp(s_hff), s_hfg, hs ? SHELF_Q : pq(s_hfg));    HFR.eq_c(hs, exp(s_hff), s_hfg, hs ? SHELF_Q : pq(s_hfg));
+  HMFL.eq_c(0, exp(s_hmff), s_hmfg, pq(s_hmfg));                HMFR.eq_c(0, exp(s_hmff), s_hmfg, pq(s_hmfg));
+  LMFL.eq_c(0, exp(s_lmff), s_lmfg, pq(s_lmfg));                LMFR.eq_c(0, exp(s_lmff), s_lmfg, pq(s_lmfg));
+  LFL.eq_c(ls, exp(s_lff), s_lfg, ls ? SHELF_Q : pq(s_lfg));    LFR.eq_c(ls, exp(s_lff), s_lfg, ls ? SHELF_Q : pq(s_lfg));
+);
+
+@slider
+update_params();
+
+@block
+prm_dirty ? ( prm_dirty = 0;  update_params(); );
+// drift: supply rail, bloom, each side's core
+bdt = samplesblock / srate;
+w_sup = SUP.walk(bdt);  w_il = IL.walk(bdt);  w_ir = IR.walk(bdt);  bw1 = BL1.walk(bdt);  bw2 = BL2.walk(bdt);
+opa_k = OP_K * (1 + 0.25 * dr * w_sup);
+sup_g = db2g(0.08 * dr * w_sup);
+XFL.ik = XF_K * (1 + 0.3 * dr * w_il);  XFR.ik = XF_K * (1 + 0.3 * dr * w_ir);
+bloom_k = 1 + 0.35 * dr * bw1;
+rel_s = 1 + 0.2 * dr * bw2;
+A.ch_blk(rel_s);  B.ch_blk(rel_s);
+// display hand-offs
+gca_disp = min(gca_disp, emA);  gcb_disp = min(gcb_disp, emB);
+gla_disp = min(gla_disp, 20 * log10(max(glA, 0.00001)));
+glb_disp = min(glb_disp, 20 * log10(max(glB, 0.00001)));
+lma_disp = max(lma_disp, glA < 0.999);  lmb_disp = max(lmb_disp, glB < 0.999);
+emA = 0;  emB = 0;  glA = 1;  glB = 1;
+inpk_disp = max(inpk_disp, inpk);  inpk = 0;
+outpk_disp = max(outpk_disp, outpk);  outpk = 0;
+ol_disp = max(ol_disp, olpk);  olpk = 0;
+
+@sample
+cr_n <= 0 ? ( control_tick();  cr_n = CR; );
+cr_n -= 1;
+trim_s += (t_trim - trim_s) * xs_c;  pol_s += (t_pol - pol_s) * xs_c;
+fin_s += (t_fin - fin_s) * xs_c;  eqin_s += (t_eqin - eqin_s) * xs_c;  xw_s += (t_xw - xw_s) * xs_c;
+xl = spl0;  xr = spl1;
+inpk = max(inpk, max(abs(xl), abs(xr)));
+
+// input stage
+yl = xl;  yr = xr;
+input_stage();
+
+// EQ and DYN in the ORDER set; a change ducks the output and swaps at the silent point
+ord_st == 0 && (order >= 0.5) != ord_cur ? ord_st = 1;
+zl = yl;  zr = yr;
+ord_cur ? ( dyn_block();  eq_block(); ) : ( eq_block();  dyn_block(); );
+yl = zl;  yr = zr;
+ord_st == 1 ? ( dk -= dkr;  dk <= 0 ? ( dk = 0;  ord_cur = order >= 0.5;  ord_st = 2; ); ) :
+ord_st == 2 ? ( dk += dkr;  dk >= 1 ? ( dk = 1;  ord_st = 0; ); );
+ord_st ? ( yl *= dk * dk * (3 - 2 * dk);  yr *= dk * dk * (3 - 2 * dk); );
+
+// output transformer, supply wander
+xw_s > 0.00001 ? ( tl = OXL.out_xfmr(yl);  tr = OXR.out_xfmr(yr);  yl += (tl - yl) * xw_s;  yr += (tr - yr) * xw_s; );
+yl *= sup_g;  yr *= sup_g;
+
+// ---------- WIDTH: the M / S image matrix (last, on the fully processed stereo signal) ----------
+// M = (L + R) / 2, S = (L - R) / 2; S x width; L = M + S, R = M - S. At exactly 100 % it's skipped (bit for bit).
+wid_s += (t_wid - wid_s) * wd_c;
+abs(wid_s - t_wid) < 0.000001 ? wid_s = t_wid;                   // land exactly on the setting
+wid_s != 1 ? (
+  wd_m = (yl + yr) * 0.5;  wd_sd = (yl - yr) * 0.5 * wid_s;
+  yl = wd_m + wd_sd;  yr = wd_m - wd_sd;
+);
+
+outpk = max(outpk, max(abs(yl), abs(yr)));
+spl0 = yl;  spl1 = yr;
+
+@serialize
+file_var(0, pr_cur);
+
+@gfx 1080 760
+// =====================================================================
+// GUI — C2E's EQ module and C2M's A / B modules side by side (ORDER swaps them), a dynamics plate
+// under the pair (MIX, ORDER), and the right strip: response, DRIFT, IRON, meters.
+// =====================================================================
+function col(h, a) (
+  gfx_r = floor(h / 65536) / 255;  gfx_g = (floor(h / 256) % 256) / 255;  gfx_b = (h % 256) / 255;  gfx_a = a;
+);
+function shade(h, f) local(r, g, b) (
+  r = min(255, floor(floor(h / 65536) * f));  g = min(255, floor((floor(h / 256) % 256) * f));
+  b = min(255, floor((h % 256) * f));  r * 65536 + g * 256 + b;
+);
+function u_db(x) ( 8.685889638065035 * log(max(x, 0.000000001)); );   // GUI's own g2db
+function px(v) ( ox + v * sc; );
+function py(v) ( oy + v * sc; );
+function ps(v) ( v * sc; );
+function text_c(x, y, str) local(w, h) (
+  gfx_measurestr(str, w, h);  gfx_x = x - w * 0.5;  gfx_y = y - h * 0.5;  gfx_drawstr(str);
+);
+// a touched control; with LINK on, its partner on the other module follows
+function rivet(x, y) (
+  col(0x7C847E, 1);  gfx_circle(px(x), py(y), ps(3.5), 1, 1);
+  col(0xEDEFE8, 0.45); gfx_circle(px(x) - ps(1), py(y) - ps(1), ps(1.2), 1, 1);
+);
+// pointer as a filled quad: clean at any angle
+function pointer(x, y, sa, ca, r0, r1, hw) local(ax, ay, bx, by, dx, dy) (
+  ax = x + sa * r0;  ay = y - ca * r0;  bx = x + sa * r1;  by = y - ca * r1;  dx = ca * hw;  dy = sa * hw;
+  gfx_triangle(ax + dx, ay + dy, bx + dx, by + dy, bx - dx, by - dy, ax - dx, ay - dy);
+);
+
+// Desk knob: grey skirt, light body, coloured flat cap with one soft edge highlight, a pointer
+// line across cap and skirt; scale dots; value on hover only. klog = 1 before a call = log taper.
+// fmt: 1 dBu, 2 ratio, 3 seconds, 4 dB gain, 5 drift
+// ---------- house lamp keys (34-series), as on the Cherwell units ----------
+LK_AMB = 0xF2A41E;  LK_YEL = 0xF2C230;  LK_SKY = 0x7FB8E6;  LK_RED = 0xE8402E;
+LK_GRN = 0x5CC46E;  LK_ORG = 0xE8782A;  lk_well = 0x141518;
+function ui_mix(c1, c2, t) (
+  floor(floor(c1 / 65536) * (1 - t) + floor(c2 / 65536) * t) * 65536 +
+  floor((floor(c1 / 256) % 256) * (1 - t) + (floor(c2 / 256) % 256) * t) * 256 +
+  floor((c1 % 256) * (1 - t) + (c2 % 256) * t);
+);
+function ui_rrs(x, y, w, h, r) local(i, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  i = 0;
+  loop(r,
+    d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);
+    gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);
+    i += 1;
+  );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+function lk_rr(x, y, w, h, r) ( ui_rrs(px(x), py(y), ps(w), ps(h), ps(r)); );
+function ui_keytext(cx, cy, str) local(w, h) (
+  gfx_measurestr(str, w, h); gfx_x = floor(cx - w * 0.5 + 0.5); gfx_y = floor(cy - h * 0.58 + 0.5); gfx_drawstr(str);
+);
+function lk_key(x, y, w, h, on, c, str) local(hov, hit, k, lens, dn, i, t, dx, dy) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov;
+  dn = hov && lmb ? 1 : 0;
+  k = min(w / 54, h / 40);
+  lens = shade(ui_mix(c, 0xCFC9BC, 0.5), 0.76);
+  on ? lens = c;
+  on ? (
+    col(c, 0.10); lk_rr(x - 9 * k, y - 9 * k, w + 18 * k, h + 18 * k, 10 * k);
+    col(c, 0.18); lk_rr(x - 6 * k, y - 6 * k, w + 12 * k, h + 12 * k, 8 * k);
+  );
+  col(lk_well, 1);           lk_rr(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k, 5 * k);
+  col(shade(lens, 0.55), 1); lk_rr(x, y + 1 / sc, w, h, 4 * k);
+  y += (dn - 1) / sc;
+  on ? (
+    col(lens, 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    i = 1;
+    loop(4,
+      t = 0.07 * i * (1 + 0.6 * max(1 - k, 0));
+      dx = (i == 1 ? 3 : i == 2 ? 6 : i == 3 ? 10 : 14) * k;
+      dy = (i == 1 ? 2 : i == 2 ? 4 : i == 3 ? 7 : 9) * k;
+      col(ui_mix(c, 0xFFFFFF, t), 1); lk_rr(x + dx, y + dy, w - 2 * dx, h - 1 / sc - 2 * dy, 4 * k);
+      i += 1;
+    );
+  ) : (
+    col(shade(lens, 0.62), 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    col(shade(lens, 0.78), 1); lk_rr(x + 2 * k, y + 2 * k, w - 4 * k, h - 5 * k, 4 * k);
+    col(shade(lens, 0.92), 1); lk_rr(x + 5 * k, y + 4 * k, w - 10 * k, h - 10 * k, 4 * k);
+    col(lens, 1);              lk_rr(x + 9 * k, y + 7 * k, w - 18 * k, h - 17 * k, 4 * k);
+  );
+  col(0xFFFFFF, on ? 0.45 : 0.22);  gfx_rect(px(x + 4 * k), py(y), ps(w - 8 * k), max(1, ps(1.5)));
+  hov && !dn ? ( col(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1 / sc, 4 * k); );
+  gfx_setfont(9);  col(shade(c, on ? 0.30 : 0.17), 1);
+  ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
+  hit;
+);
+
+function led(x, y, on) (
+  col(0x140A08, 1);  gfx_circle(px(x), py(y), ps(6), 1, 1);
+  col(0xFF4A30, on ? 1 : 0.15);  gfx_circle(px(x), py(y), ps(4.2), 1, 1);
+  on ? ( col(0xFF4A30, 0.3);  gfx_circle(px(x), py(y), ps(8), 1, 1); );
+);
+// In / out level meter, -48..+3 dB in 1.5 dB segments
+function vmeter(x, y0, h, db, lbl, pk) local(n, sh, j, d, yy) (
+  n = 34;  sh = h / n;
+  col(0x141815, 1);  gfx_rect(px(x - 3), py(y0 - 3), ps(22), ps(h + 6), 1);
+  j = 0;
+  loop(n,
+    d = -48 + (j + 1) * 1.5;
+    yy = y0 + h - (j + 1) * sh;
+    d > 0 ? col(0xE0503A, db >= d - 1.5 ? 1 : 0.15) :
+    d > -6 ? col(0xE8C060, db >= d - 1.5 ? 1 : 0.15) :
+             col(0x8FC47A, db >= d - 1.5 ? 1 : 0.15);
+    gfx_rect(px(x), py(yy) + 1, ps(16), ps(sh) - 1, 1);
+    // floating peak: its segment lit, with a bright top edge
+    pk > -48 && pk >= d - 1.5 && pk < d ? (
+      col(d > 0 ? 0xE0503A : d > -6 ? 0xE8C060 : 0x8FC47A, 1);  gfx_rect(px(x), py(yy) + 1, ps(16), ps(sh) - 1, 1);
+      col(0xFFFFFF, 0.7);  gfx_rect(px(x), py(yy) + 1, ps(16), max(1, ps(1)), 1);
+    );
+    j += 1;
+  );
+  gfx_setfont(6);  col(0xEDEFE8, 1);  text_c(px(x + 8), py(y0 + h + 16), lbl);
+);
+// ---------- cased square lit key (ported from gfx-ui cs_key): a lit lens in a dark case ----------
+function cs_key(x, y, w, h, on, c, str) local(X, Y, W, H, e, hov, hit) (
+  X = px(x);  Y = py(y);  W = ps(w);  H = ps(h);  e = min(W, H) * 0.14;
+  hov = mouse_x >= X && mouse_x < X + W && mouse_y >= Y && mouse_y < Y + H;
+  hit = click && hov;
+  on ? ( col(c, 0.28);  gfx_rect(X - ps(6), Y - ps(6), W + ps(12), H + ps(12), 1); );
+  col(0x111214, 1);  gfx_rect(X - ps(3), Y - ps(3), W + ps(6), H + ps(6), 1);
+  col(on ? c : shade(c, 0.42), 1);  gfx_rect(X, Y, W, H, 1);
+  on ? (
+    col(0xFFFFFF, 0.22);  gfx_rect(X + ps(3), Y + ps(3), W - ps(6), H * 0.32, 1);
+  ) : (
+    col(0xFFFFFF, 0.07);  gfx_rect(X + ps(2), Y + ps(2), W - ps(4), H - ps(4), 1);
+    col(0x000000, 0.25);  gfx_rect(X, Y, W, e, 1);  gfx_rect(X, Y + e, e, H - e, 1);
+  );
+  hov ? ( col(0xFFFFFF, 0.06);  gfx_rect(X, Y, W, H, 1); );
+  gfx_setfont(2);  col(on ? 0x1A1A1A : 0x0E0E0E, on ? 1 : 0.85);
+  ui_keytext(X + W * 0.5, Y + H * 0.5, str);
+  hit;
+);
+
+// ---------- house preset bar: [PRESETS][<][>][LCD] ----------
+function pb_count(menu) local(k, n) ( n = 1;  k = 0;  loop(strlen(menu), str_getchar(menu, k) == 124 ? n += 1;  k += 1; );  n; );
+function pb_item(menu, i, dst) local(k, k0, n, c, len) (
+  strcpy(dst, "");  len = strlen(menu);  k = 0;  k0 = 0;  n = 1;
+  loop(len + 1,
+    c = k < len ? str_getchar(menu, k) : 124;
+    c == 124 ? ( n == i ? strcpy_substr(dst, menu, k0, k - k0);  n += 1;  k0 = k + 1; );
+    k += 1;
+  );
+  dst;
+);
+function pb_tri(cx, cy, s, dir) (
+  gfx_triangle(px(cx + dir * s), py(cy), px(cx - dir * s), py(cy - s), px(cx - dir * s), py(cy + s));
+);
+function preset_bar(x, y, h, lw, cur, menu) local(n, sel, open, lx, tw, th, i) (
+  n = pb_count(menu);  sel = 0;  open = 0;
+  lk_key(x + 4, y + 4, 92, h - 8, 0, PB_KEY, "PRESETS") ? open = 1;
+  lk_key(x + 106, y + 4, 38, h - 8, 0, PB_KEY, "") ? ( sel = cur <= 1 || cur > n ? n : cur - 1; );
+  lk_key(x + 154, y + 4, 38, h - 8, 0, PB_KEY, "") ? ( sel = cur >= n || cur < 1 ? 1 : cur + 1; );
+  col(PB_INK, 1);  pb_tri(x + 125, y + h * 0.5 - 0.5, 5, -1);  pb_tri(x + 173, y + h * 0.5 - 0.5, 5, 1);
+  lx = x + 206;
+  col(0x000000, 0.3);  gfx_rect(px(lx + 2), py(y + 5), ps(lw), ps(h - 6), 1);
+  col(0x050505, 1);    gfx_rect(px(lx), py(y + 3), ps(lw), ps(h - 6), 1);
+  gfx_gradrect(px(lx + 3), py(y + 6), ps(lw - 6), ps(h - 12), 0.17, 0.10, 0.02, 1, 0, 0, 0, 0, -0.06 / ps(h), -0.04 / ps(h), -0.01 / ps(h), 0);
+  col(0xFFFFFF, 0.06); gfx_line(px(lx + 4), py(y + 7), px(lx + lw - 5), py(y + 7), 1);
+  cur >= 1 && cur <= n ? pb_item(menu, cur, #pb_nm) : strcpy(#pb_nm, "--");
+  gfx_setfont(8);  col(0xE8A33A, 1);  gfx_measurestr(#pb_nm, tw, th);
+  gfx_x = px(lx + 10);  gfx_y = py(y + h * 0.5) - th * 0.5;  gfx_drawstr(#pb_nm);
+  click && mouse_x >= px(lx) && mouse_x < px(lx + lw) && mouse_y >= py(y) && mouse_y < py(y + h) ? open = 1;
+  open ? (
+    strcpy(#pb_m, "");  i = 1;
+    loop(n, i == cur ? strcat(#pb_m, "!");  strcat(#pb_m, pb_item(menu, i, #pb_t));  strcat(#pb_m, "|");  i += 1; );
+    strcat(#pb_m, "Reset all to defaults");
+    gfx_x = px(x);  gfx_y = py(y + h);  i = gfx_showmenu(#pb_m);  i > 0 ? sel = i;
+  );
+  sel;
+);
+
+function param_touched(idx) local(m) (
+  slider_automate(2 ^ (idx - 1));
+  link >= 0.5 && idx <= 22 ? (
+    m = idx <= 11 ? idx + 11 : idx - 11;
+    slider(m) = slider(idx);  slider_automate(2 ^ (m - 1));
+  );
+  gui_dirty = 1;
+);
+LK_SAGE = 0xA0AF84;
+
+// Desk knob. fmt: 1 dBu, 2 ratio, 3 s, 4 +dB, 6 %, 11 signed dB, 12 Hz, 17 Hz (OFF at min), 18 Hz (OFF at max)
+function kn(cx, cy, r, idx, vmin, vmax, def, cap, pcol, lbl, fmt)
+  local(x, y, rr, v, t, hov, now, a0, a1, tv, b, j, w, h, ty, lg)
+(
+  lg = klog;  klog = 0;
+  x = px(cx);  y = py(cy);  rr = ps(r);
+  hov = sqr(mouse_x - x) + sqr(mouse_y - y) <= sqr(rr * 1.2);
+  v = slider(idx);
+  t = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  click && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : ( drag_idx = idx;  drag_y = mouse_y;  drag_t = t; );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  drag_idx == idx ? (
+    t = max(0, min(1, drag_t + (drag_y - mouse_y) / ps(220)));
+    v = lg ? vmin * exp(t * log(vmax / vmin)) : vmin + t * (vmax - vmin);
+    lg ? ( j = 10 ^ (floor(log10(v)) - 2);  v = floor(v / j + 0.5) * j; ) : v = floor(v * 10 + 0.5) / 10;
+    v = max(vmin, min(vmax, v));
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = slider(idx);
+  t = lg ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;  tv = a0 + t * (a1 - a0);
+  col(0xEDEFE8, 0.7);  j = 0;
+  loop(11, b = a0 + j / 10 * (a1 - a0);  gfx_circle(x + sin(b) * (rr + ps(7)), y - cos(b) * (rr + ps(7)), ps(1.2), 1, 1);  j += 1; );
+  col(0x000000, 0.35);  gfx_circle(x + ps(2), y + ps(3), rr, 1, 1);
+  col(0x8A8C86, 1);     gfx_circle(x, y, rr, 1, 1);
+  col(0x5E605B, 1);     gfx_circle(x, y, rr, 0, 1);
+  col(0xBDBCB5, 1);     gfx_circle(x, y, rr * 0.76, 1, 1);
+  col(cap, 1);          gfx_circle(x, y, rr * 0.6, 1, 1);
+  col(0xFFFFFF, 0.28);  gfx_arc(x, y, rr * 0.55, -1.7, -0.2, 1);
+  col(shade(cap, 0.7), 1);  gfx_circle(x, y, rr * 0.6, 0, 1);
+  col(pcol, 1);  pointer(x, y, sin(tv), cos(tv), rr * 0.1, rr * 0.97, ps(r > 24 ? 1.6 : 1.3));
+  gfx_line(x + sin(tv) * rr * 0.1, y - cos(tv) * rr * 0.1, x + sin(tv) * rr * 0.97, y - cos(tv) * rr * 0.97, 1);
+  // printed range at the ends of the travel
+  gfx_setfont(5);  col(0xEDEFE8, 0.75);
+  strlen(#klo) ? ( gfx_measurestr(#klo, w, h);  gfx_x = x + sin(a0) * (rr + ps(12)) - w;  gfx_y = y - cos(a0) * (rr + ps(12)) - h * 0.2;  gfx_drawstr(#klo); );
+  strlen(#khi) ? ( gfx_x = x + sin(a1) * (rr + ps(12));  gfx_y = y - cos(a1) * (rr + ps(12)) - h * 0.2;  gfx_drawstr(#khi); );
+  strcpy(#klo, "");  strcpy(#khi, "");
+  gfx_setfont(6);  col(0xEDEFE8, 1);  text_c(x, y + rr + ps(17), lbl);
+  hov || drag_idx == idx ? (
+    fmt == 1 ? sprintf(#kv, "%+.1f dBu", v) :
+    fmt == 2 ? sprintf(#kv, "%.1f:1", v) :
+    fmt == 3 ? ( v < 1 ? sprintf(#kv, "%d ms", v * 1000) : sprintf(#kv, "%.2f s", v); ) :
+    fmt == 4 ? sprintf(#kv, "+%.1f dB", v) :
+    fmt == 6 ? sprintf(#kv, "%d %%", v) :
+    fmt == 11 ? sprintf(#kv, "%+.1f dB", v) :
+    fmt == 12 || (fmt == 17 && v > vmin + 0.5) || (fmt == 18 && v < vmax - 5) ? (
+      v < 1000 ? sprintf(#kv, "%d Hz", v) : sprintf(#kv, "%.2f kHz", v / 1000); ) :
+    fmt == 17 || fmt == 18 ? strcpy(#kv, "OFF") :
+               sprintf(#kv, "%.1f", v);
+    gfx_setfont(3);  gfx_measurestr(#kv, w, h);
+    ty = y - rr - ps(12) - h;
+    col(0x1A1F1C, 0.95);  gfx_rect(x - w * 0.5 - ps(6), ty - ps(3), w + ps(12), h + ps(6), 1);
+    col(0xEDEFE8, 1);     text_c(x, ty + h * 0.5, #kv);
+  );
+);
+function q22(x, y, w, h, sel, str) local(hov, hit, yy) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov;
+  yy = sel ? y : y + 1.5;
+  col(0x000000, 0.35);  gfx_rect(px(x + 1), py(yy + 1.5), ps(w), ps(h - 1.5), 1);
+  col(sel ? 0xF0E8D2 : 0xB3AE9F, 1);  gfx_rect(px(x), py(yy), ps(w), ps(h - 1.5), 1);
+  col(shade(sel ? 0xF0E8D2 : 0xB3AE9F, 0.72), 1);
+  gfx_rect(px(x), py(yy + h - 3.5), ps(w), ps(2), 1);  gfx_rect(px(x + w - 2), py(yy), ps(2), ps(h - 1.5), 1);
+  hov ? ( col(0xFFFFFF, 0.1);  gfx_rect(px(x), py(yy), ps(w), ps(h - 1.5), 1); );
+  sel ? (
+    col(0xF2A41E, 0.35);  gfx_circle(px(x + w - 6), py(yy + 6), ps(4.5), 1, 1);
+    col(0xF2A41E, 1);     gfx_circle(px(x + w - 6), py(yy + 6), ps(2.4), 1, 1);
+  );
+  gfx_setfont(7);  col(sel ? 0x2A2A28 : 0x4A4840, 1);  text_c(px(x + w * 0.5 - 2), py(yy + h * 0.5 + 1), str);
+  hit;
+);
+function gr_pos(d) ( log(1 + max(d, 0)) / log(27); );
+function grmeter(x, y0, h, grc, grl) local(n, sh, j, p, q, yy) (
+  n = 22;  sh = h / n;  p = gr_pos(grc);  q = gr_pos(grl);
+  col(0x140A08, 1);  gfx_rect(px(x - 3), py(y0 - 3), ps(22), ps(h + 6), 1);
+  j = 0;
+  loop(n,
+    yy = y0 + j * sh;
+    col(0xFF4A30, p >= (j + 0.5) / n ? 1 : 0.13);
+    gfx_rect(px(x), py(yy) + 1, ps(7), ps(sh) - 1, 1);
+    col(0xF2A41E, q >= (j + 0.5) / n ? 1 : 0.13);
+    gfx_rect(px(x + 9), py(yy) + 1, ps(7), ps(sh) - 1, 1);
+    j += 1;
+  );
+  gfx_setfont(5);  col(0xEDEFE8, 0.9);
+  j = 0;
+  loop(6,
+    p = j == 0 ? 1 : j == 1 ? 2 : j == 2 ? 4 : j == 3 ? 8 : j == 4 ? 16 : 26;
+    sprintf(#gl, "%d", p);
+    text_c(px(x + 30), py(y0 + h * gr_pos(p)), #gl);
+    j += 1;
+  );
+);
+function grey_out(x, y, w, h) ( col(0x2A302C, 0.42);  gfx_rect(px(x), py(y), ps(w), ps(h), 1); );
+function module(x0, o, nm, grc, grl, lm) local(cl, ll, on, u_a) (
+  cl = slider(1 + o) >= 0.5;  ll = slider(8 + o) >= 0.5;  on = slider(11 + o) >= 0.5;
+  // plate (full height), with a narrow darker bottom / right edge
+  col(0x46524A, 1);  gfx_rect(px(x0), py(66), ps(200), ps(684), 1);
+  col(0x4B584F, 1);  gfx_rect(px(x0 + 50), py(78), ps(146), ps(300), 1);   // limiter: a shade lighter
+  col(0x2E3631, 1);  gfx_rect(px(x0), py(747), ps(200), ps(3), 1);  gfx_rect(px(x0 + 197), py(66), ps(3), ps(684), 1);
+  col(0x56645A, 1);  gfx_rect(px(x0), py(66), ps(197), ps(1), 1);
+  rivet(x0 + 10, 76);  rivet(x0 + 190, 76);  rivet(x0 + 10, 740);  rivet(x0 + 190, 740);
+  // gain reduction
+  gfx_setfont(5);  col(0xFF6A50, 1);  text_c(px(x0 + 17.5), py(92), "C");
+  col(0xF2A41E, 1);  text_c(px(x0 + 26.5), py(92), "L");
+  grmeter(x0 + 14, 104, 266, grc, grl);
+  // PEAK LIMIT
+  gfx_setfont(4);  col(0xEDEFE8, 1);  text_c(px(x0 + 124), py(92), "PEAK LIMIT");
+  q22(x0 + 56, 110, 44, 28, slider(10 + o) == 0, "75ms") ? ( slider(10 + o) = 0;  param_touched(10 + o); );
+  q22(x0 + 102, 110, 40, 28, slider(10 + o) == 1, "5s") ? ( slider(10 + o) = 1;  param_touched(10 + o); );
+  q22(x0 + 144, 110, 48, 28, slider(10 + o) == 2, "AUTO") ? ( slider(10 + o) = 2;  param_touched(10 + o); );
+  gfx_setfont(5);  col(0xEDEFE8, 0.85);  text_c(px(x0 + 124), py(152), "RECOVERY");
+  kn(x0 + 124, 228, 27, 9 + o, -4, 16, 12, 0xEEEFEA, 0x1E1F1E, "THRESHOLD", 1);
+  u_a = -0.75 * $pi + 0.2 * 1.5 * $pi;                                     // 0 dBu on the limit dial
+  gfx_setfont(5);  col(0xEDEFE8, 1);  text_c(px(x0 + 124 + sin(u_a) * 44), py(228 - cos(u_a) * 44), "0");
+  !ll ? grey_out(x0 + 50, 168, 146, 126);
+  lk_key(x0 + 60, 318, 70, 34, ll, LK_RED, "LIMIT") ? ( slider(8 + o) = ll ? 0 : 1;  param_touched(8 + o); );
+  led(x0 + 160, 335, lm);
+  // COMPRESSOR
+  col(0x2E3631, 1);  gfx_rect(px(x0 + 10), py(388), ps(180), ps(1.5), 1);
+  col(0x56645A, 1);  gfx_rect(px(x0 + 10), py(389.5), ps(180), ps(1), 1);
+  gfx_setfont(4);  col(0xEDEFE8, 1);  text_c(px(x0 + 100), py(408), "COMPRESSOR");
+  kn(x0 + 55, 470, 23, 5 + o, 0, 20, 2, 0xD8432E, 0xF4F2EA, "GAIN", 4);
+  kn(x0 + 145, 470, 23, 3 + o, 1.5, 5, 3, 0xD8432E, 0xF4F2EA, "RATIO", 2);
+  klog = 1;  kn(x0 + 55, 568, 23, 4 + o, 0.1, 4, 0.4, 0x1E1F1E, 0xF4F2EA, "RECOVERY", 3);
+  kn(x0 + 145, 568, 23, 2 + o, -20, 10, 0, 0xEEEFEA, 0x1E1F1E, "THRESHOLD", 1);
+  u_a = -0.75 * $pi + (2 / 3) * 1.5 * $pi;                                 // 0 dBu on the comp dial
+  gfx_setfont(5);  col(0xEDEFE8, 1);  text_c(px(x0 + 145 + sin(u_a) * 39), py(568 - cos(u_a) * 39), "0");
+  !cl ? grey_out(x0 + 4, 422, 192, 196);
+  lk_key(x0 + 8, 642, 58, 34, slider(6 + o) >= 0.5, LK_ORG, "FAST") ? ( slider(6 + o) = slider(6 + o) >= 0.5 ? 0 : 1;  param_touched(6 + o); );
+  lk_key(x0 + 71, 642, 58, 34, slider(7 + o) >= 0.5, LK_YEL, "AUTO") ? ( slider(7 + o) = slider(7 + o) >= 0.5 ? 0 : 1;  param_touched(7 + o); );
+  lk_key(x0 + 134, 642, 58, 34, cl, LK_GRN, "COMP") ? ( slider(1 + o) = cl ? 0 : 1;  param_touched(1 + o); );
+  // LINK (both modules show it), the module's letter, IN
+  lk_key(x0 + 8, 692, 58, 34, link >= 0.5, LK_SKY, "LINK") ? (
+    link >= 0.5 ? ( slider(23) = 0; ) : (
+      slider(23) = 1;
+      u_k = 1;  loop(11, slider(u_k + 11) = slider(u_k);  u_k += 1; );     // LINK on: A is copied to B
+      slider_automate(4194303);
+    );
+    slider_automate(2 ^ 22);  gui_dirty = 1;
+  );
+  gfx_setfont(1);  col(0xEDEFE8, 0.9);  text_c(px(x0 + 100), py(709), nm);
+  !on ? grey_out(x0, 66, 200, 616);
+  lk_key(x0 + 134, 692, 58, 34, on, LK_AMB, "IN") ? ( slider(11 + o) = on ? 0 : 1;  param_touched(11 + o); );
+);
+function rsp_w(f, fc) ( tan($pi * min(f, 0.49 * srate) / srate) / tan($pi * min(fc, 0.45 * srate) / srate); );
+// |N(jW)| / |D(jW)| for N = n2 s^2 + n1 s + n0, D = d2 s^2 + d1 s + d0
+function rsp_mag(w, n2, n1, n0, d2, d1, d0) local(nr, ni, dr_, di) (
+  nr = n0 - n2 * w * w;  ni = n1 * w;  dr_ = d0 - d2 * w * w;  di = d1 * w;
+  sqrt((nr * nr + ni * ni) / max(dr_ * dr_ + di * di, 0.00000000000000000001));
+);
+function rsp_band(f, kind, fc, db, q) local(a, w, sa) (
+  a = 10 ^ (db / 40);  w = rsp_w(f, fc);  sa = sqrt(a);
+  kind == 0 ? rsp_mag(w, 1, a / q, 1, 1, 1 / (a * q), 1) :
+  kind == 1 ? a * rsp_mag(w, 1, sa / q, a, a, sa / q, 1) :
+              a * rsp_mag(w, a, sa / q, 1, 1, sa / q, a);
+);
+function rsp_db(f) local(m, w, hs, ls, qq) (
+  m = 1;
+  filt_in >= 0.5 ? (
+    hpf > 20.5 ? ( w = rsp_w(f, hpf);  m *= rsp_mag(w, 1, 0, 0, 1, 1.41421356, 1); );
+    lpf < 19990 ? ( w = rsp_w(f, lpf);  m *= rsp_mag(w, 0, 0, 1, 1, 1.41421356, 1); );
+  );
+  eq_in >= 0.5 ? (
+    hs = hf_bell >= 0.5 ? 0 : 2;  ls = lf_bell >= 0.5 ? 0 : 1;
+    qq = 0.55 * (1 + 0.09 * abs(hf_g));   m *= rsp_band(f, hs, hf_f, hf_g, hs ? 0.6 : qq);
+    qq = 0.55 * (1 + 0.09 * abs(hmf_g));  m *= rsp_band(f, 0, hmf_f, hmf_g, qq);
+    qq = 0.55 * (1 + 0.09 * abs(lmf_g));  m *= rsp_band(f, 0, lmf_f, lmf_g, qq);
+    qq = 0.55 * (1 + 0.09 * abs(lf_g));   m *= rsp_band(f, ls, lf_f, lf_g, ls ? 0.6 : qq);
+  );
+  20 * log10(max(m, 0.000001)) + trim;
+);
+function response(x, y, w, h) local(i, f, d, yy, lx, ly, gx) (
+  col(0x8C99A6, 1);  gfx_rect(px(x - 2), py(y - 2), ps(w + 4), ps(h + 4), 1);
+  col(0x0B120E, 1);  gfx_rect(px(x), py(y), ps(w), ps(h), 1);
+  // grid: 100 Hz, 1 kHz, 10 kHz; +/-6, +/-12 dB
+  col(0x24332A, 1);
+  i = 0;  loop(3, gx = x + w * (log10(100 * 10 ^ i) - log10(20)) / 3;  gfx_line(px(gx), py(y), px(gx), py(y + h), 1);  i += 1; );
+  i = -2;  loop(5, yy = y + h * 0.5 - i * 6 * h / 36;  gfx_line(px(x), py(yy), px(x + w), py(yy), 1);  i += 1; );
+  col(0x3E5546, 1);  gfx_line(px(x), py(y + h * 0.5), px(x + w), py(y + h * 0.5), 1);
+  gfx_setfont(5);  col(0x6F8C79, 1);
+  gfx_x = px(x + w * (2 - log10(20)) / 3) + ps(3);  gfx_y = py(y + h - 15);  gfx_drawstr("100");
+  gfx_x = px(x + w * (3 - log10(20)) / 3) + ps(3);  gfx_y = py(y + h - 15);  gfx_drawstr("1k");
+  gfx_x = px(x + w * (4 - log10(20)) / 3) + ps(3);  gfx_y = py(y + h - 15);  gfx_drawstr("10k");
+  gfx_x = px(x + 4);  gfx_y = py(y + 3);  gfx_drawstr("+18");
+  gfx_x = px(x + 4);  gfx_y = py(y + h - 15);  gfx_drawstr("-18");
+  // the curve
+  i = 0;
+  loop(161,
+    f = 20 * 10 ^ (3 * i / 160);
+    d = max(-18, min(18, rsp_db(f)));
+    yy = y + h * 0.5 - d * h / 36;
+    lx = x + w * i / 160;
+    i > 0 ? (
+      col(0xF2A41E, 0.25);  gfx_line(px(gx), py(ly) + 1, px(lx), py(yy) + 1, 1);
+      col(0xF2C230, 1);     gfx_line(px(gx), py(ly), px(lx), py(yy), 1);
+    );
+    gx = lx;  ly = yy;  i += 1;
+  );
+);
+
+// ---------- presets (GUI thread only) ----------
+
+// ---------- the EQ module (C2E), at x = MX ----------
+function divider(y) ( col(0x2E3631, 1);  gfx_rect(px(MX + 10), py(y), ps(MW - 20), ps(1.5), 1);  col(0x56645A, 1);  gfx_rect(px(MX + 10), py(y + 1.5), ps(MW - 20), ps(1), 1); );
+function rowname(y, s) ( gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(MX + 14);  gfx_y = py(y);  gfx_drawstr(s); );
+function band(y, nm, ig, i_f, fmin, fmax, fdef, cap, pc, lo, hi, ib) (
+  gfx_setfont(6);  col(0xEDEFE8, 1);  text_c(px(MX + 34), py(y), nm);
+  strcpy(#klo, "-15");  strcpy(#khi, "+15");
+  kn(MX + 100, y, 22, ig, -15, 15, 0, 0xEEEFEA, 0x1E1F1E, "GAIN", 11);
+  klog = 1;  strcpy(#klo, lo);  strcpy(#khi, hi);
+  kn(MX + 190, y, 22, i_f, fmin, fmax, fdef, cap, pc, "FREQ", 12);
+  ib > 0 ? (
+    lk_key(MX + 240, y - 14, 46, 28, slider(ib) >= 0.5, LK_SAGE, "BELL") ? ( slider(ib) = slider(ib) >= 0.5 ? 0 : 1;  param_touched(ib); );
+  );
+);
+function eq_module() (
+  col(0x46524A, 1);  gfx_rect(px(MX), py(66), ps(MW), ps(684), 1);
+  col(0x2E3631, 1);  gfx_rect(px(MX), py(747), ps(MW), ps(3), 1);  gfx_rect(px(MX + MW - 3), py(66), ps(3), ps(684), 1);
+  col(0x56645A, 1);  gfx_rect(px(MX), py(66), ps(MW - 3), ps(1), 1);
+  rivet(MX + 10, 76);  rivet(MX + MW - 10, 76);  rivet(MX + 10, 740);  rivet(MX + MW - 10, 740);
+  rowname(84, "INPUT");
+  led(MX + 30, 128, ol_hold > 0);  gfx_setfont(5);  col(0xEDEFE8, 0.8);  text_c(px(MX + 30), py(146), "O/L");
+  strcpy(#klo, "-20");  strcpy(#khi, "+20");
+  kn(MX + 150, 124, 24, 24, -20, 20, 0, 0xEEEFEA, 0x1E1F1E, "TRIM", 11);
+  lk_key(MX + 236, 108, 50, 34, phase >= 0.5, LK_SKY, "PH") ? ( slider(25) = phase >= 0.5 ? 0 : 1;  param_touched(25); );
+  divider(176);
+  rowname(186, "FILTERS");
+  klog = 1;  strcpy(#klo, "OFF");  strcpy(#khi, "400");
+  kn(MX + 62, 236, 22, 26, 20, 400, 20, 0x3E8E4E, 0xF4F2EA, "HPF", 17);
+  klog = 1;  strcpy(#klo, "2k5");  strcpy(#khi, "OFF");
+  kn(MX + 172, 236, 22, 27, 2500, 20000, 20000, 0xE8C43A, 0x1E1F1E, "LPF", 18);
+  lk_key(MX + 236, 220, 50, 34, filt_in >= 0.5, LK_AMB, "F") ? ( slider(28) = filt_in >= 0.5 ? 0 : 1;  param_touched(28); );
+  divider(290);
+  rowname(300, "EQUALISER");
+  lk_key(MX + 236, 296, 50, 30, eq_in >= 0.5, LK_AMB, "EQ") ? ( slider(29) = eq_in >= 0.5 ? 0 : 1;  param_touched(29); );
+  band(370, "HF",  30, 31, 2700, 16000, 8000, 0xE8C43A, 0x1E1F1E, "2k7", "16k", 32);
+  band(466, "HMF", 33, 34, 1100, 6800,  2500, 0x3E8E4E, 0xF4F2EA, "1k1", "6k8", 0);
+  band(562, "LMF", 35, 36, 180,  2400,  700,  0x3E8E4E, 0xF4F2EA, "180", "2k4", 0);
+  band(658, "LF",  37, 38, 47,   470,   100,  0x1E1F1E, 0xF4F2EA, "47",  "470", 39);
+  !eq_in ? ( col(0x2A302C, 0.38);  gfx_rect(px(MX + 4), py(330), ps(MW - 8), ps(370), 1); );
+);
+
+// ---------- presets (GUI thread only) ----------
+function set_ch(o, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec) (
+  slider(1 + o) = cin;  slider(2 + o) = cthr;  slider(3 + o) = rat;  slider(4 + o) = rec;  slider(5 + o) = gain;
+  slider(6 + o) = fast;  slider(7 + o) = aut;  slider(8 + o) = lin;  slider(9 + o) = lthr;  slider(10 + o) = lrec;
+  slider(11 + o) = 1;
+);
+function set_eq(trm, ph, hp, lp, fi, ei, hg, hf, hb, hmg, hmf, lmg, lmf, lg, lff, lb) (
+  slider(24) = trm;  slider(25) = ph;  slider(26) = hp;  slider(27) = lp;  slider(28) = fi;  slider(29) = ei;
+  slider(30) = hg;  slider(31) = hf;  slider(32) = hb;  slider(33) = hmg;  slider(34) = hmf;
+  slider(35) = lmg;  slider(36) = lmf;  slider(37) = lg;  slider(38) = lff;  slider(39) = lb;
+);
+function set_dyn(cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec) (
+  set_ch(0, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec);
+  set_ch(11, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec);
+  slider(23) = 1;
+);
+function set_m(irn, dft, mxp, ord) ( slider(40) = irn;  slider(41) = dft;  slider(42) = mxp;  slider(43) = ord; );
+function load_preset(p) (
+  //               COMP THR RATIO REC GAIN FAST AUTO LIM LTHR LREC        TRIM PH HPF LPF  F EQ  HF  HFf  HB HMF HMFf LMF LMFf LF  LFf LB
+  p == 2 ? ( set_dyn(1, -4,  3,   0.6, 5,  0,   1,   1,  10,  2);  set_eq(0, 0, 80, 20000, 1, 1, 3, 10000, 0, 2, 3600, -2, 400, -1.5, 150, 0);  set_m(1, 3, 100, 0); ) :  // Vocal Channel
+  p == 3 ? ( set_dyn(1, -10, 5,   1,   9,  1,   1,   1,  6,   2);  set_eq(0, 0, 100, 16000, 1, 1, 2, 8000, 0, 3, 3000, -3, 300, 0, 100, 0);  set_m(1, 2, 100, 1); ) :   // Broadcast Voice
+  p == 4 ? ( set_dyn(1, -6,  4,   0.2, 6,  1,   0,   1,  10,  0);  set_eq(0, 0, 30, 20000, 1, 1, 3, 12000, 0, -2, 2500, -3, 450, 3, 70, 0);  set_m(1, 4, 70, 0); ) :     // Drum Bus
+  p == 5 ? ( set_dyn(1, -6,  4,   0.3, 6,  1,   0,   1,  8,   0);  set_eq(0, 0, 35, 8000, 1, 1, 0, 8000, 0, 3, 1200, -3, 300, 3, 80, 0);  set_m(1, 3, 100, 1); ) :     // Bass DI
+  p == 6 ? ( set_dyn(1, -6,  2.5, 0.3, 4,  0,   0,   1,  12,  0);  set_eq(0, 0, 100, 20000, 1, 1, 3, 12000, 0, -2, 2500, -2, 450, -3, 180, 0);  set_m(1, 3, 100, 0); ) : // Acoustic Guitar
+  p == 7 ? ( set_dyn(1, 2,   1.5, 0.4, 1.5, 0,  1,   1,  14,  2);  set_eq(0, 0, 20, 20000, 1, 1, 1.5, 14000, 0, 0, 2500, -1, 300, 1, 60, 0);  set_m(1, 3, 100, 1); ) :  // Mix Bus Glue
+  p == 8 ? ( set_dyn(1, -18, 5,   0.1, 16, 1,   0,   1,  4,   0);  set_eq(0, 0, 60, 12000, 1, 1, -2, 6000, 0, 3, 2200, 0, 700, 2, 100, 0);  set_m(1, 6, 50, 0); ) :     // Room Squash
+  p == 9 ? ( set_dyn(0, 0,   3,   0.4, 0,  0,   0,   0,  16,  0);  set_eq(6, 0, 20, 20000, 1, 0, 0, 8000, 0, 0, 2500, 0, 700, 0, 100, 0);  set_m(1, 6, 100, 0); ) :     // Desk Colour Only
+           ( set_dyn(1, 0,   3,   0.4, 2,  0,   0,   1,  12,  0);  set_eq(0, 0, 20, 20000, 1, 1, 0, 8000, 0, 0, 2500, 0, 700, 0, 100, 0);  set_m(1, 3, 100, 0); );     // Init / Reset
+  slider(44) = 100;                                    // WIDTH: normal
+  slider_automate(17592186044415);
+  gui_dirty = 1;
+);
+PRESET_MENU = "Init|Vocal Channel|Broadcast Voice|Drum Bus|Bass DI|Acoustic Guitar|Mix Bus Glue|Room Squash|Desk Colour Only";
+PB_KEY = 0xD8D4C4;  PB_INK = 0x2A2E2B;
+
+// ---------- frame setup ----------
+sc = min(gfx_w / 1080, gfx_h / 760);
+ox = (gfx_w - 1080 * sc) * 0.5;
+oy = (gfx_h - 760 * sc) * 0.5;
+lmb = mouse_cap & 1;
+click = lmb && !last_lmb;
+
+gfx_setfont(1, "Verdana", ps(24), 'b');
+gfx_setfont(2, "Century Gothic", ps(11), 'b');
+gfx_setfont(3, "Verdana", ps(12), 'b');
+gfx_setfont(4, "Century Gothic", ps(15), 'b');
+gfx_setfont(5, "Verdana", ps(11), 'b');
+gfx_setfont(6, "Century Gothic", ps(13), 'b');
+gfx_setfont(7, "Verdana", ps(11), 'b');
+gfx_setfont(8, "Courier New", ps(16), 'b');
+gfx_setfont(9, "Century Gothic", ps(14), 'b');      // lamp-key legends (bigger than before: easier to read)
+
+in_m  = max(inpk_disp,  in_m * 0.85);   inpk_disp = 0;
+out_m = max(outpk_disp, out_m * 0.85);
+u_now = time_precise();  u_pd = u_db(outpk_disp);  outpk_disp = 0;
+u_pd >= opk_h ? ( opk_h = u_pd;  opk_t = u_now; ) : u_now - opk_t > 1.5 ? opk_h -= 20 * (u_now - opk_last);
+opk_h = max(opk_h, -60);  opk_last = u_now;
+ol_disp > 1 ? ol_hold = 8 : ol_hold = max(0, ol_hold - 1);  ol_disp = 0;
+u_g = -min(gca_disp, 0);  gca_disp = 0;  gca_m = u_g > gca_m ? u_g : gca_m * 0.88;
+u_g = -min(gcb_disp, 0);  gcb_disp = 0;  gcb_m = u_g > gcb_m ? u_g : gcb_m * 0.88;
+u_g = -min(gla_disp, 0);  gla_disp = 0;  gla_m = u_g > gla_m ? u_g : gla_m * 0.88;
+u_g = -min(glb_disp, 0);  glb_disp = 0;  glb_m = u_g > glb_m ? u_g : glb_m * 0.88;
+u_la = lma_disp;  lma_disp = 0;  u_lb = lmb_disp;  lmb_disp = 0;
+la_hold = u_la ? 6 : max(0, la_hold - 1);  lb_hold = u_lb ? 6 : max(0, lb_hold - 1);
+
+// ---------- faceplate ----------
+col(0x2A302C, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+col(0x343B36, 1);  gfx_rect(px(0), py(0), ps(1080), ps(56), 1);
+col(0x1E2320, 1);  gfx_rect(px(0), py(56), ps(1080), ps(2), 1);
+col(0x1E2320, 1);  gfx_rect(px(0), py(757), ps(1080), ps(3), 1);  gfx_rect(px(1077), py(0), ps(3), ps(760), 1);
+rivet(8, 8);  rivet(1072, 8);  rivet(8, 752);  rivet(1072, 752);
+gfx_setfont(1);  col(0xEDEFE8, 1);  gfx_x = px(24);  gfx_y = py(6);  gfx_drawstr("C2ME");
+gfx_setfont(5);  col(0xC7BEB3, 1);  gfx_x = px(24);  gfx_y = py(36);  gfx_drawstr("CONSOLE CHANNEL");
+gfx_setfont(4);  col(0xE8782A, 1);  gfx_x = px(1036); gfx_y = py(18);  gfx_drawstr("GFX");
+pb_k = preset_bar(520, 11, 34, 300, pr_cur, PRESET_MENU);
+pb_k > 0 ? ( load_preset(pb_k);  pr_cur = pb_k > 9 ? 1 : pb_k; );
+
+// ---------- the modules, in the ORDER set ----------
+u_ord = order >= 0.5;
+MW = 300;  MX = u_ord ? 440 : 20;  u_dx = u_ord ? 20 : 330;
+eq_module();
+module(u_dx, 0, "A", gca_m, gla_m, la_hold > 0);
+module(u_dx + 210, 11, "B", gcb_m, glb_m, lb_hold > 0);
+
+// ---------- right strip: response, DRIFT, IRON, meters ----------
+RX = 750;
+col(0x404B44, 1);  gfx_rect(px(RX), py(66), ps(310), ps(684), 1);
+col(0x2E3631, 1);  gfx_rect(px(RX), py(747), ps(310), ps(3), 1);  gfx_rect(px(RX + 307), py(66), ps(3), ps(684), 1);
+col(0x56645A, 1);  gfx_rect(px(RX), py(66), ps(307), ps(1), 1);
+rivet(RX + 10, 76);  rivet(RX + 300, 76);  rivet(RX + 10, 740);  rivet(RX + 300, 740);
+gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(RX + 14);  gfx_y = py(84);  gfx_drawstr("EQ RESPONSE");
+response(RX + 14, 108, 282, 200);
+// left half under the display: ORDER, MIX (dynamics, parallel), DRIFT
+gfx_setfont(5);  col(0xEDEFE8, 0.85);  text_c(px(RX + 78), py(330), "ORDER");
+lk_key(RX + 30, 342, 96, 36, 1, LK_SKY, u_ord ? "DYN > EQ" : "EQ > DYN") ? ( slider(43) = u_ord ? 0 : 1;  param_touched(43); );
+kn(RX + 78, 436, 24, 42, 0, 100, 100, 0xEEEFEA, 0x1E1F1E, "MIX", 6);
+kn(RX + 78, 548, 24, 44, 0, 200, 100, 0xEEEFEA, 0x1E1F1E, "WIDTH", 6);   // 0 mono, 100 normal, 200 wide
+gfx_setfont(5);  col(0xEDEFE8, 1);  text_c(px(RX + 78), py(548 - 39), "0");        // 0 = normal width (side unchanged, 100 %)
+u_t = drift / 10;
+col(0xE8782A, 0.18);  gfx_arc(px(RX + 78), py(636), ps(35), -0.75 * $pi, -0.75 * $pi + u_t * 1.5 * $pi, 1);
+col(0xE8782A, 0.55);  gfx_arc(px(RX + 78), py(636), ps(34), -0.75 * $pi, -0.75 * $pi + u_t * 1.5 * $pi, 1);
+kn(RX + 78, 636, 24, 41, 0, 10, 3, 0x6E7B70, 0xF4F2EA, "DRIFT", 5);
+gfx_setfont(5);  col(0xC7BEB3, 1);  text_c(px(RX + 78), py(692), "SUPPLY + BLOOM");
+text_c(px(RX + 78), py(706), "+ IRON");
+// right half: IRON above IN, PEAK above OUT, then the meters
+cs_key(RX + 170, 336, 40, 40, iron >= 0.5, LK_ORG, "IRON") ? ( slider(40) = iron >= 0.5 ? 0 : 1;  param_touched(40); );
+opk_h <= -59.9 ? strcpy(#opk, "-inf") : sprintf(#opk, "%+.1f", opk_h);
+gfx_setfont(5);  gfx_measurestr("PEAK", u_tw, u_th);  col(0xEDEFE8, 1);  gfx_x = px(RX + 262) - u_tw * 0.5;  gfx_y = py(336);  gfx_drawstr("PEAK");
+col(0x141815, 1);  gfx_rect(px(RX + 240), py(356), ps(44), ps(20), 1);
+col(opk_h > 0 ? 0xE0503A : opk_h > -6 ? 0xE8C060 : 0xEDEFE8, 1);  text_c(px(RX + 262), py(366), #opk);
+click && mouse_x >= px(RX + 240) && mouse_x < px(RX + 284) && mouse_y >= py(356) && mouse_y < py(376) ? opk_h = -60;
+vmeter(RX + 182, 400, 304, u_db(in_m),  "IN", -99);
+vmeter(RX + 254, 400, 304, u_db(out_m), "OUT", opk_h);
+col(0x2E3631, 1);  gfx_rect(px(RX + 154), py(328), ps(1.5), ps(400), 1);  col(0x56645A, 1);  gfx_rect(px(RX + 155.5), py(328), ps(1), ps(400), 1);
+
+// ---------- end of frame ----------
+!lmb ? drag_idx = 0;
+last_lmb = lmb;
+gui_dirty ? ( prm_dirty = 1;  gui_dirty = 0; );
