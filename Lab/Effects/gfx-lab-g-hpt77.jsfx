@@ -39,8 +39,11 @@ desc:GFX Lab G HPT77 [synth]
 //   levels, DRIVE - more rasp, level-matched - and OCTAVE -2 .. +1), PITCH (DROP: each note starts up to 12 semitones
 //   high and falls into its pitch over DROP TIME; WOBBLE: a slow vibrato, RATE 0.05 - 8 Hz, DEPTH up to 100 cents),
 //   with a picture of the note's pitch.
-//   VOCAL MIX: voice against fog horn -> the huge reverb (the house broadcast-reverb engine: REVERB SIZE; its decay
-//   and mix set by the presets; a SIZE change glides, so the tail swoops rather than clicks) -> a light tape stage -> output stage (CLIP, ceiling -0.3 dBFS) -> LEVEL
+//   VOCAL MIX: voice against fog horn -> the huge reverb (the house broadcast-reverb engine; SPACE: SIZE, DECAY 1 - 20 s,
+//   SEND (how much of it), PRE-DELAY (+0 - 250 ms on the size's own), HPF and LPF on what goes in (12 dB / octave);
+//   every change glides - a SIZE change makes the tail swoop rather than click) -> a light tape stage -> output stage
+//   (CLIP, ceiling -0.3 dBFS) -> LEVEL. The main level sits at the house calibration: held notes about -23 dBFS RMS,
+//   peaks around -8 dBFS.
 // KEYBOARD (in the FOG HORN section):
 //   SPLIT (key + LED): the keyboard splits at SPLIT AT (C1 - C7; the arrows step a semitone, Shift an octave). BELOW and
 //   ABOVE each choose VOICE (the singers) or HORN (the fog horn played from the keys at the key's pitch, FOG DETUNE,
@@ -88,7 +91,7 @@ desc:GFX Lab G HPT77 [synth]
 //   released when the transport stops. MIDI passes through.
 // Latency: 0 samples.
 //
-// STATUS: v1.1.1 - in the Lab (Oct 2026): the SATB groups and their layers (each with a filter LFO and a step sequencer),
+// STATUS: v1.1.2 - in the Lab (Oct 2026): the SATB groups and their layers (each with a filter LFO and a step sequencer),
 //   the fog horn's layer, 16 presets.
 
 import gfx-lab-drift.jsfx-inc
@@ -250,6 +253,9 @@ slider148:h_fdec=1.5<0.01,10,0.001:log>-Horn filter decay (s)
 slider149:h_fsus=50<0,100,1>-Horn filter sustain (%)
 slider150:h_frel=2<0.02,12,0.001:log>-Horn filter release (s)
 slider151:h_on=1<0,1,1{Off,On}>-Fog horn on
+slider152:rv_hpf=20<20,2000,1:log>-Reverb HPF (Hz)
+slider153:rv_lpf=20000<1000,20000,1:log>-Reverb LPF (Hz)
+slider154:rv_pre=0<0,250,1>-Reverb pre-delay (ms, added)
 
 @init
 #ui_man = "gfx-lab-g-hpt77";
@@ -700,6 +706,7 @@ function seq_switch(on) local(k, b) (
 
 ch_g = 1;  bend = 0;  sustain = 0;  age_n = 0;  cr_n = 0;  seq_on = 0;  sq_start = 0;  bpos = 0;  step_d = -1;  fog_e = 0;  fp1 = 0;  fp2 = 0;  fp3 = 0;  fs_s = fshift;
 h_onx = h_on >= 0.5;  fg_st = 0;  fg_fe = 0;  fg_dd = 0;  fg_held = 0;  h_wph = 0;  h_wob = 0;  fi1m = fi2m = fi3m = 0;
+rvh_s = rv_hpf;  rvl_s = rv_lpf;  rvp_s = rv_pre;
 rvd_s = rv_decay;  sz_cur = 0.3 + 0.7 * rv_size / 100;  RVB = 1910;
 st_grp = 0;
 fg.drift_init(0.8 + rand(0.3));  fw.drift_init(1 + rand(0.4));
@@ -787,6 +794,9 @@ sq_lb = pat_sync >= 0.5 ? sq_len : max(tempo, 20) / 60 / max(pat_hz, 0.1);   // 
 // the reverb: SIZE sets the line lengths and pre-delay; decay and damping
 kb2 = min(1, samplesblock / (0.25 * srate));                         // the reverb's size and decay glide (preset changes)
 rvd_s += (rv_decay - rvd_s) * kb2;
+rvh_s *= (rv_hpf / rvh_s) ^ kb;  rvl_s *= (rv_lpf / rvl_s) ^ kb;      // the send's HPF / LPF glide (30 ms)
+k = tan($pi * min(rvh_s, 0.45 * srate) / srate);  rh_a1 = 1 / (1 + k * (k + 1.414));  rh_a2 = k * rh_a1;  rh_a3 = k * rh_a2;
+k = tan($pi * min(rvl_s, 0.45 * srate) / srate);  rl_a1 = 1 / (1 + k * (k + 1.414));  rl_a2 = k * rl_a1;  rl_a3 = k * rl_a2;
 sz_t = 0.3 + 0.7 * rv_size / 100;                                     // SIZE: the line lengths glide per sample (no jumps)
 sz_c = 1 - exp(-1 / (0.3 * srate));
 k = 0;
@@ -898,15 +908,21 @@ fog_e > 0.00002 ? (
 h_onx += ((h_on >= 0.5) - h_onx) * sm_c;                              // the HORN key: on / off (30 ms)
 hxL = ts(hxL * h_dg) * h_dk * h_onx;  hxR = ts(hxR * h_dg) * h_dk * h_onx;            // the keyboard horns, as loud as the drone
 vpk = max(vpk, max(abs(vxL), abs(vxR)) * vg);  fpk = max(fpk, max(abs(fo), max(abs(hxL), abs(hxR))) * fgg);
-yl = vxL * vg + (fo * 0.92 + hxL) * fgg;  yr = vxR * vg + (fo + hxR) * fgg;
+yl = (vxL * vg + (fo * 0.92 + hxL) * fgg) * 0.4;  yr = (vxR * vg + (fo + hxR) * fgg) * 0.4;   // TWEAK: the main level (-8 dB: the house calibration)
 
 // ---------- the huge reverb (house engine) ----------
 sp_live || rv_tail > 0.00001 ? (
   sz_cur += (sz_t - sz_cur) * sz_c;
   ln_len[0] = RVB[0] * sz_cur;  ln_len[1] = RVB[1] * sz_cur;  ln_len[2] = RVB[2] * sz_cur;  ln_len[3] = RVB[3] * sz_cur;
   ln_len[4] = RVB[4] * sz_cur;  ln_len[5] = RVB[5] * sz_cur;  ln_len[6] = RVB[6] * sz_cur;  ln_len[7] = RVB[7] * sz_cur;
-  sp_pre = (sz_cur - 0.3) / 0.7 * 0.04 * srate + 0.01 * srate;  pr_i = floor(sp_pre);  pr_f = sp_pre - pr_i;   // pre-delay, read between samples
-  bv_pre(yl, yr);
+  rvp_s += (rv_pre - rvp_s) * sz_c;                                    // PRE-DELAY (added to the size's own; it glides)
+  sp_pre = (sz_cur - 0.3) / 0.7 * 0.04 * srate + 0.01 * srate + rvp_s * 0.001 * srate;  pr_i = floor(sp_pre);  pr_f = sp_pre - pr_i;   // pre-delay, read between samples
+  // the send's HPF and LPF (12 dB / octave each, TPT): keep the lows out of the space, darken it
+  q1 = yl - rh_l2;  q2 = rh_a1 * rh_l1 + rh_a2 * q1;  q3 = rh_l2 + rh_a2 * rh_l1 + rh_a3 * q1;  rh_l1 = 2 * q2 - rh_l1;  rh_l2 = 2 * q3 - rh_l2;  sdl = yl - 1.414 * q2 - q3;
+  q1 = yr - rh_r2;  q2 = rh_a1 * rh_r1 + rh_a2 * q1;  q3 = rh_r2 + rh_a2 * rh_r1 + rh_a3 * q1;  rh_r1 = 2 * q2 - rh_r1;  rh_r2 = 2 * q3 - rh_r2;  sdr = yr - 1.414 * q2 - q3;
+  q1 = sdl - rl_l2;  q2 = rl_a1 * rl_l1 + rl_a2 * q1;  q3 = rl_l2 + rl_a2 * rl_l1 + rl_a3 * q1;  rl_l1 = 2 * q2 - rl_l1;  rl_l2 = 2 * q3 - rl_l2;  sdl = q3;
+  q1 = sdr - rl_r2;  q2 = rl_a1 * rl_r1 + rl_a2 * q1;  q3 = rl_r2 + rl_a2 * rl_r1 + rl_a3 * q1;  rl_r1 = 2 * q2 - rl_r1;  rl_r2 = 2 * q3 - rl_r2;  sdr = q3;
+  bv_pre(sdl, sdr);
   pl = pre_l(pr_i);  pr = pre_r(pr_i);  pl += (pre_l(pr_i + 1) - pl) * pr_f;  pr += (pre_r(pr_i + 1) - pr) * pr_f;
   dif_run(pl, pr, 0.75, 0.9);                                          // (the diffusers keep one size: no jumps)
   fdn_run(dif_l, dif_r);
@@ -1067,7 +1083,10 @@ function auto_hi(i) (
   i == 148 ? slider_automate(h_fdec) :
   i == 149 ? slider_automate(h_fsus) :
   i == 150 ? slider_automate(h_frel) :
-  i == 151 ? slider_automate(h_on);
+  i == 151 ? slider_automate(h_on) :
+  i == 152 ? slider_automate(rv_hpf) :
+  i == 153 ? slider_automate(rv_lpf) :
+  i == 154 ? slider_automate(rv_pre);
 );
 function param_touched(idx) ( idx <= 63 ? slider_automate(2 ^ (idx - 1)) : auto_hi(idx);  gui_dirty = 1; );
 function pointer(x, y, sa, ca, r0, r1, hw) local(ax, ay, bx, by, dx, dy) (
@@ -1083,6 +1102,8 @@ function fmtv(v, fmt) (
   fmt == 5 ? sprintf(#kv, "%.1f c", v) :
   fmt == 7 ? sprintf(#kv, "%.2f Hz", v) :
   fmt == 10 ? sprintf(#kv, "%+.2f oct", v) :
+  fmt == 11 ? sprintf(#kv, "%.1f s", v) :
+  fmt == 12 ? sprintf(#kv, "+%d ms", floor(v + 0.5)) :
   fmt == 9 ? ( v >= 1000 ? sprintf(#kv, "%.1f kHz", v / 1000) : sprintf(#kv, "%d Hz", floor(v + 0.5)); ) :
   fmt == 8 ? ( v < 1 ? sprintf(#kv, "%d ms", floor(v * 1000 + 0.5)) : sprintf(#kv, "%.2f s", v); ) :
   fmt == 6 ? ( v = floor(v + 0.5);  strcpy(#kv, v == 0 ? "1/32" : v == 1 ? "1/16" : v == 2 ? "1/8 T" : v == 3 ? "1/8" : v == 4 ? "1/4 T" :
@@ -1528,7 +1549,7 @@ function p_init() (
   pv(65, 0); pv(66, 0); pv(67, 0); pv(68, 0.03); pv(69, 0.3); pv(70, 100); pv(71, 0.35); pv(72, 0); pv(73, 20000); pv(74, 0); pv(75, 0); pv(76, 0); pv(77, 0.01); pv(78, 0.5); pv(79, 50); pv(80, 0.5);
   pv(81, 0); pv(82, 0); pv(83, 0); pv(84, 0.03); pv(85, 0.3); pv(86, 100); pv(87, 0.35); pv(88, 0); pv(89, 20000); pv(90, 0); pv(91, 0); pv(92, 0); pv(93, 0.01); pv(94, 0.5); pv(95, 50); pv(96, 0.5);
   pv(21, 420); pv(22, 0); pv(23, 0); pv(24, 100); pv(25, 100);
-  pv(141, 0); pv(142, 0); pv(143, 0); pv(144, 0.6); pv(145, 0.3); pv(146, 0); pv(147, 0.5); pv(148, 1.5); pv(149, 50); pv(150, 2); pv(151, 1);
+  pv(141, 0); pv(142, 0); pv(143, 0); pv(144, 0.6); pv(145, 0.3); pv(146, 0); pv(147, 0.5); pv(148, 1.5); pv(149, 50); pv(150, 2); pv(151, 1); pv(152, 20); pv(153, 20000); pv(154, 0);
   pv(26, 0); pv(27, 48); pv(28, 1); pv(29, 0); pv(30, 0); pv(31, 4); pv(32, 0);
   pv(97, 0); pv(98, 2); pv(99, 3); pv(100, 100); pv(101, 15); pv(102, 50); pv(103, 0); pv(104, 0); pv(105, 0); pv(106, 0); pv(107, 2);
   pv(108, 0); pv(109, 2); pv(110, 3); pv(111, 100); pv(112, 15); pv(113, 50); pv(114, 0); pv(115, 0); pv(116, 0); pv(117, 0); pv(118, 2);
@@ -1638,7 +1659,7 @@ function load_preset(p) local(i) (
   p == 14 ? ( pv(7, 0.9); );   // Gated Choir
   p == 15 ? ( pv(7, 5.0); );   // Bending Horns
   p == 16 ? ( pv(7, -2.5); );   // Step Chant
-  i = 1;  loop(151, i != 9 ? param_touched(i);  i += 1; );
+  i = 1;  loop(154, i != 9 ? param_touched(i);  i += 1; );
 );
 PRESET_MENU = "Default|Heptapod Call|Low Atmospheric Fog|Choppy Staccato Speech|Alien Pulse|Massive Drone Node|Rhythmic Glyphs|Linguistic Tension|Deep Space Rumble|Vocal Stutter|Minimalist Sequence|Dark Horizon|SATB Cathedral|Gated Choir|Bending Horns|Step Chant";
 
@@ -1782,7 +1803,12 @@ loop(16,
 
 // ---------- SPACE ----------
 section(792, 516, 384, 316, C_SEC2, "SPACE");
-kn(984, 670, 56, 6, 0, 100, 90, "REVERB SIZE", 1);
+kn(868, 628, 34, 6, 0, 100, 90, "SIZE", 1);
+kn(984, 628, 30, 15, 1, 20, 9, "DECAY", 11);
+kn(1100, 628, 30, 16, 0, 100, 40, "SEND", 1);
+kn(868, 752, 26, 154, 0, 250, 0, "PRE-DELAY", 12);
+klog = 1;  kn(984, 752, 26, 152, 20, 2000, 20, "HPF", 9);
+klog = 1;  kn(1100, 752, 26, 153, 1000, 20000, 20000, "LPF", 9);
 
 ); // the main panel (a layer covers it)
 
