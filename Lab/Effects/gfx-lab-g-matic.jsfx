@@ -2,7 +2,7 @@ desc:GFX Lab G-Matic [lo-fi tape]
 //tags: lo-fi tape varispeed saturation bitcrusher
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-lab-drift, gfx-lab-output, gfx-lab-input, gfx-lab-clip (.jsfx-inc) in the same folder.
+// Requires gfx-lab-drift, gfx-lab-output, gfx-lab-input, gfx-lab-clip, gfx-lab-os (.jsfx-inc) in the same folder.
 //
 // G-Matic: a worn broadcast video deck's audio track, in the spirit of the cream 3/4-inch editing decks of the
 // 70s and 80s, pushed into lo-fi: a record amp that crunches, hiss, a transport that can be run slow or fast, a cheap
@@ -31,12 +31,15 @@ desc:GFX Lab G-Matic [lo-fi tape]
 //   (each switched by its title lamp), TRANSPORT (the red STUTTER key, SLICE, GLITCH and the shuttle wheel: VARISPEED).
 //   Values show while a control is touched; double-click (or Ctrl-click) resets; Shift = fine. S / M / L / ? top right.
 // PRESETS: twelve, level-matched on programme (pink noise at -18 dBFS RMS in = -18 out); none of them presses STUTTER.
-// Latency: 12.5 ms (reported): the tape heads' resting point.
+// OS (the header key, 1x / 2x / 4x, default 1x): oversampling for DRIVE, the one stage that bends the sound (CRUSH's
+//   aliasing is the point of it, and stays). A change dips the output for 5 ms and swaps at the silent point.
+// Latency: 12.5 ms (reported): the tape heads' resting point; OS adds 31 samples at 2x, 37 at 4x.
 
 import gfx-lab-drift.jsfx-inc
 import gfx-lab-output.jsfx-inc
 import gfx-lab-input.jsfx-inc
 import gfx-lab-clip.jsfx-inc
+import gfx-lab-os.jsfx-inc
 
 slider1:trim_db=0<-24,12,0.1>-Trim (dB)
 slider2:drive_db=6<0,24,0.1>-Drive (dB)
@@ -57,6 +60,7 @@ slider16:stut_on=0<0,1,1{Off,On}>-Stutter
 slider17:slice_ms=120<50,250,1>-Slice (ms)
 slider18:glitch_pc=0<0,100,0.1>-Glitch (%)
 slider19:drop_pc=0<0,100,0.1>-Dropouts (%)
+slider20:os_sel=0<0,2,1{1x,2x,4x}>-Oversampling
 
 @init
 #ui_man = "gfx-lab-g-matic";
@@ -86,7 +90,8 @@ tp_home = ceil(0.0125 * srate);                      // where the heads rest at 
 tp_xn = ceil(0.02 * srate);                          // head change crossfade
 tp_d = tp_home; tp_d2 = tp_home; tp_x = 0;
 tp_sk = ceil(0.015 * srate);                         // alignment search: +/- 15 ms (one period down to 67 Hz)
-pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = tp_home + 1;   // (+1: the drive curve and filters)
+os_design(); os_base = tp_home + 1;                  // (+1: the drive curve and filters)
+os_f = os_tf = os_f2n(os_sel); os_gsetup();
 
 // ---------- the slice buffer (STUTTER / GLITCH) ----------
 GB_N = ceil(0.6 * srate) + 16;
@@ -188,11 +193,12 @@ drift_macro(drift_pc);
 @block
 in_setup(trim_db, 1);
 ost_setup(0, 0, 120, 6000, -0.3, 1);
-pdc_delay = tp_home + 1;                              // (ost_setup clears it)
+os_tf = os_f2n(os_sel);                              // OS: the factor asked for (os_gate swaps it in)
+pdc_delay = os_base + os_lat(os_f);                  // (ost_setup clears it)
 drift_macro(drift_pc);
 t_drv = 10 ^ (drive_db / 20);
 t_mk = 10 ^ ((0.7 - 0.9685 * drive_db + 0.001905 * sqr(drive_db) + 0.0004475 * drive_db ^ 3) / 20);   // level match (pink, -18 dBFS; +0.7: the head loss)
-clL.clp_pf_block(drive_db / 24, srate, samplesblock); clR.clp_pf_block(drive_db / 24, srate, samplesblock);
+clL.clp_pf_block(drive_db / 24, srate * os_f, samplesblock * os_f); clR.clp_pf_block(drive_db / 24, srate * os_f, samplesblock * os_f);
 clL.clp_set(1, 1, 0.8, 0); clR.clp_set(1, 1, 0.8, 0);
 // wow up to +/- 0.6 % at 0.55 Hz, flutter up to +/- 0.25 % at 7.5 Hz (as read-head excursions, in samples)
 wow_inc = 0.55 / srate; flt_inc = 7.5 / srate;
@@ -246,7 +252,21 @@ vin_s_d += 0.5 * (l * l + r * r); vin_n_d += 1;
 
 // ---------- DRIVE: the record amp ----------
 // asymmetric soft curve (limits +1 / -0.8: even harmonics), level-matched on programme
-dl = clL.clp_run(clL.clp_pf_run(l * s_drv)); dr = clR.clp_run(clR.clp_pf_run(r * s_drv));
+// OS: a factor change swaps in at the silent point (os_gate); the drive's state is cleared there
+os_gate();
+os_chg ? ( osuL.os_clr(); osuR.os_clr(); osdL.os_clr(); osdR.os_clr();
+  clL.clp_reset(); clR.clp_reset(); clL.clp_pf_reset(); clR.clp_pf_reset();
+  clL.clp_pf_block(drive_db / 24, srate * os_f, 1); clR.clp_pf_block(drive_db / 24, srate * os_f, 1); );
+osuL.os_up(l * s_drv); osuR.os_up(r * s_drv);
+oa0 = clL.clp_run(clL.clp_pf_run(osuL.s0)); ob0 = clR.clp_run(clR.clp_pf_run(osuR.s0));
+os_f > 1 ? (
+  oa1 = clL.clp_run(clL.clp_pf_run(osuL.s1)); ob1 = clR.clp_run(clR.clp_pf_run(osuR.s1));
+  os_f > 2 ? (
+    oa2 = clL.clp_run(clL.clp_pf_run(osuL.s2)); ob2 = clR.clp_run(clR.clp_pf_run(osuR.s2));
+    oa3 = clL.clp_run(clL.clp_pf_run(osuL.s3)); ob3 = clR.clp_run(clR.clp_pf_run(osuR.s3));
+  );
+);
+dl = osdL.os_dn(oa0, oa1, oa2, oa3); dr = osdR.os_dn(ob0, ob1, ob2, ob3);
 s_mk += (t_mk - s_mk) * k30;
 dl *= s_mk; dr *= s_mk;
 dcyl = dl - dcxl + 0.99935 * dcyl; dcxl = dl; l = dcyl;          // DC blocker ~5 Hz
@@ -350,7 +370,7 @@ m_radio > 0.0001 ? (
 );
 
 // ---------- output ----------
-l *= s_out; r *= s_out;
+l *= s_out * os_g; r *= s_out * os_g;
 l = ostL.ost_band(l); r = ostR.ost_band(r);
 ost_out(l, r);
 spl0 = ost_l; spl1 = ost_r;
@@ -627,7 +647,7 @@ function vu(x, y, w, h, frac, pk, name) local(cx, cy, rr, j, d, f, a, x1, y1, x2
   gfx_setfont(6);  col(C_INK, 1);  text_c(px(cx), py(y + h + 22), name);
 );
 function pv(i, v) ( slider(i) = v; );
-function sl_all() local(i) ( i = 1;  loop(19, param_touched(i);  i += 1; ); );
+function sl_all() local(i) ( i = 1;  loop(19, param_touched(i);  i += 1; ); );   // (OS is not part of a preset)
 
 // ---------- presets ----------
 // (each level-matched: pink noise at -18 dBFS RMS comes out at -18 dBFS RMS; none of them presses STUTTER)
@@ -814,6 +834,9 @@ col(0x26282A, 1);  gfx_circle(px(g_dx + 1), py(g_dy + 1.5), ps(9), 1, 1);
 col(0xF6F4EE, 1);  pointer(px(g_wx), py(g_wy), sin(g_a), cos(g_a), ps(g_wr - 9), ps(g_wr - 1), ps(1.8));
 gfx_setfont(6);  col(C_INK, 1);  text_c(px(g_wx), py(g_wy + g_wr + 34), "VARISPEED");
 g_hov || drag_idx == 3 ? hover_tag(px(g_wx), py(g_wy - g_wr - 44), fmtv(speed, 7));
+
+// ---------- OS (left of the S / M / L / ? picker) ----------
+os_key(ox / sc + 958, oy / sc + 22, 20, C_INK, 7);
 
 // ---------- S / M / L / ? ----------
 g_j = 0;
