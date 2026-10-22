@@ -1,0 +1,847 @@
+desc:GFX Lab G-Matic [lo-fi tape]
+//tags: lo-fi tape varispeed saturation bitcrusher
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-lab-drift, gfx-lab-output, gfx-lab-input, gfx-lab-clip (.jsfx-inc) in the same folder.
+//
+// G-Matic: a worn broadcast video deck's audio track, in the spirit of the cream 3/4-inch editing decks of the
+// 70s and 80s, pushed into lo-fi: a record amp that crunches, hiss, a transport that can be run slow or fast, a cheap
+// digital track and a small radio speaker.
+//
+// SIGNAL FLOW
+//   TRIM / GUARD > DRIVE (the record amp: asymmetric soft curve, anti-aliased, DC blocked, level-matched)
+//   > HISS (pink tape hiss, onto the tape) > TAPE (VARISPEED 0.5 - 1.5x: the whole sound goes up or down, as a tape
+//   run at the wrong speed; WOW and FLUTTER; head loss follows the speed) > DROPOUTS (oxide shed from old tape: short
+//   dips in level that dull the top as well) > STUTTER / GLITCH (the slice buffer) > CRUSH (BITS and RATE: the cheap digital
+//   track) > RADIO (a narrow, resonant small-speaker band) > OUTPUT > CLIP at -0.3 dBFS.
+//   The keys (HISS, CRUSH, RADIO) crossfade over 15 ms; every knob glides; VARISPEED has the inertia of a motor
+//   (150 ms). The transport is a two-head tape loop: at 1x it is one clean head (a straight delay); off 1x each head
+//   runs until it reaches the end of its 90 ms window, then the next one fades in over 20 ms.
+// DRIFT (0 - 100 %, 50 % = standard): the tired transport - the speed wanders (about +/- 2.5 cents, slowly) and the
+//   tape warps (an irregular slow wow, about +/- 0.15 %). 0 = a perfect machine, 100 % = twice the standard.
+// DROPOUTS (0 - 100 %): how often and how deep. Each dropout lasts 15 - 150 ms, dips 3 - 30 dB with a 3 ms edge, and
+//   its top end falls towards 1.2 kHz. About one every 8 s at 20 %, 1.3 a second at 50 %, 3 a second at 100 %.
+// STUTTER (key): grabs the last SLICE (50 - 250 ms) and loops it until the key is let go. GLITCH (0 - 100 %): the
+//   deck does it by itself - at each slice's end there is that chance (squared: gentle low down) of a stutter of
+//   2 - 5 repeats of a full or half slice. The loop's seam is crossfaded (4 ms); in and out fade over 5 ms.
+// GUI: a cream broadcast video deck (1080 x 560). Top: the INPUT / OUTPUT VU pair (0 VU = -18 dBFS) and the smoked
+//   tape window - two reels that turn at the tape's speed and a red tape counter (h:mm:ss:ff, 25 frames) that runs
+//   with REAPER's transport at the VARISPEED rate and holds while the deck stutters; STUTTER and DROPOUT lamps.
+//   Bottom: RECORD (DRIVE, TRIM, OUTPUT), TAPE (WOW, FLUTTER, DROPOUTS, HISS key + level, DRIFT), CRUSH and RADIO
+//   (each switched by its title lamp), TRANSPORT (the red STUTTER key, SLICE, GLITCH and the shuttle wheel: VARISPEED).
+//   Values show while a control is touched; double-click (or Ctrl-click) resets; Shift = fine. S / M / L / ? top right.
+// PRESETS: twelve, level-matched on programme (pink noise at -18 dBFS RMS in = -18 out); none of them presses STUTTER.
+// Latency: 12.5 ms (reported): the tape heads' resting point.
+
+import gfx-lab-drift.jsfx-inc
+import gfx-lab-output.jsfx-inc
+import gfx-lab-input.jsfx-inc
+import gfx-lab-clip.jsfx-inc
+
+slider1:trim_db=0<-24,12,0.1>-Trim (dB)
+slider2:drive_db=6<0,24,0.1>-Drive (dB)
+slider3:speed=1<0.5,1.5,0.001>-Varispeed (x)
+slider4:wow_pc=25<0,100,0.1>-Wow (%)
+slider5:flut_pc=20<0,100,0.1>-Flutter (%)
+slider6:hiss_on=1<0,1,1{Off,On}>-Hiss
+slider7:hiss_db=-60<-80,-30,0.1>-Hiss level (dB)
+slider8:crush_on=0<0,1,1{Off,On}>-Crush
+slider9:bits=12<4,16,0.1>-Bits
+slider10:rate_k=16<2,48,0.1>-Rate (kHz)
+slider11:radio_on=0<0,1,1{Off,On}>-Radio
+slider12:band_pc=50<0,100,0.1>-Radio band (%)
+slider13:reso_pc=30<0,100,0.1>-Radio resonance (%)
+slider14:drift_pc=50<0,100,0.1>-Drift (%)
+slider15:out_db=0<-24,12,0.1>-Output (dB)
+slider16:stut_on=0<0,1,1{Off,On}>-Stutter
+slider17:slice_ms=120<50,250,1>-Slice (ms)
+slider18:glitch_pc=0<0,100,0.1>-Glitch (%)
+slider19:drop_pc=0<0,100,0.1>-Dropouts (%)
+
+@init
+#ui_man = "gfx-lab-g-matic";
+ext_noinit = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; ); ui_dflt = 1;
+
+in_init();
+ost_init(0); ostL.ost_ch_init(); ostR.ost_ch_init();
+clL.clp_reset(); clR.clp_reset();
+clL.clp_pf_cfg(0.45 * srate, 9000, -1.5, 250); clR.clp_pf_cfg(0.45 * srate, 9000, -1.5, 250);
+clL.clp_pf_reset(); clR.clp_pf_reset();
+
+// ---------- smoothing ----------
+k30 = 1 - exp(-1 / (0.03 * srate));                  // knobs
+k15 = 1 - exp(-1 / (0.015 * srate));                 // keys
+kmot = 1 - exp(-1 / (0.15 * srate));                 // the transport motor
+CR = 16;                                             // control rate (samples)
+
+// ---------- the tape loop ----------
+TP_N = ceil(0.3 * srate) + 16;
+TP_L = 65536; TP_R = TP_L + TP_N;
+memset(TP_L, 0, 2 * TP_N);
+tp_w = 0;
+tp_lo = ceil(0.0045 * srate);                        // nearest a head may read (room for wow and warp)
+tp_win = ceil(0.09 * srate);                         // a head's travel
+tp_home = ceil(0.0125 * srate);                      // where the heads rest at 1x = the latency
+tp_xn = ceil(0.02 * srate);                          // head change crossfade
+tp_d = tp_home; tp_d2 = tp_home; tp_x = 0;
+tp_sk = ceil(0.015 * srate);                         // alignment search: +/- 15 ms (one period down to 67 Hz)
+pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = tp_home + 1;   // (+1: the drive curve and filters)
+
+// ---------- the slice buffer (STUTTER / GLITCH) ----------
+GB_N = ceil(0.6 * srate) + 16;
+GB_L = 262144; GB_R = GB_L + GB_N;
+memset(GB_L, 0, 2 * GB_N);
+LB_N = ceil(0.3 * srate) + 16;                       // the captured loop (with its 4 ms lead-in for the seam)
+LB_L = 1048576; LB_R = LB_L + LB_N;
+memset(LB_L, 0, 2 * LB_N);
+gb_w = 0; st_act = 0; st_mix = 0; st_p = 0; st_len = 1; st_left = 0; st_key = 0;
+st_sx = ceil(0.004 * srate);                         // seam crossfade
+st_rmp = 1 / (0.005 * srate);                        // in / out
+gl_cnt = ceil(slice_ms * 0.001 * srate);
+// ---------- dropouts ----------
+dr_t = 0; dr_len = 0; dr_dep = 0; dr_e = 0;
+dr_a = ceil(0.003 * srate);
+dr_k = 1 - exp(-2 * $pi * 1200 / srate);             // the dull top inside a dropout
+dr_ks = 1 - exp(-1 / (0.002 * srate));
+
+wow_ph = 0; flt_ph = 0;
+dSpd.drift_init(0.8 + rand(1) * 0.4);
+dWarp.drift_init(0.8 + rand(1) * 0.4);
+dWowr.drift_init(0.8 + rand(1) * 0.4);
+dFlt.drift_init(0.8 + rand(1) * 0.4);
+
+// ---------- start values (no glide from zero on load) ----------
+s_drv = 10 ^ (drive_db / 20); s_spd = speed;
+s_mk = 10 ^ ((0.7 - 0.9685 * drive_db + 0.001905 * sqr(drive_db) + 0.0004475 * drive_db ^ 3) / 20);
+s_wow = wow_pc / 100; s_flt = flut_pc / 100;
+s_hg = 10 ^ (hiss_db / 20); s_bits = bits; s_rate = rate_k * 1000;
+s_band = band_pc / 100; s_reso = reso_pc / 100; s_out = 10 ^ (out_db / 20);
+s_dm = drift_pc / 50; m_hiss = hiss_on; m_crush = crush_on; m_radio = radio_on;
+cr_ph = 1; cr_hl = cr_hr = 0;
+cnt = 0;
+
+// ---------- helpers ----------
+// 4-point Hermite read of a tape line, d samples behind the last write
+function tp_rd(b, d) local(p, i, f, y0, y1, y2, y3, c1, c2, c3) (
+  p = tp_w - 1 - d; p < 0 ? p += TP_N;
+  i = floor(p); f = p - i;
+  y0 = b[i == 0 ? TP_N - 1 : i - 1]; y1 = b[i]; y2 = b[(i + 1) % TP_N]; y3 = b[(i + 2) % TP_N];
+  c1 = 0.5 * (y2 - y0); c2 = y0 - 2.5 * y1 + 2 * y2 - 0.5 * y3; c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+  ((c3 * f + c2) * f + c1) * f + y1;
+);
+// best start for a fresh head near delay t, to follow the head at delay c: the lag (+/- tp_sk, never nearer than tp_lo)
+// whose last 6 ms (every 8th sample, L + R) correlates best with the old head's, scaled by its own level.
+// Coarse (steps of 8) then fine (steps of 1 round the best), so the search stays cheap.
+function tp_cor(c, t) local(j, a, b, s, e, pc, pt) (
+  s = e = 0; j = 0;
+  while (j < 288) (
+    pc = tp_w - 1 - c - j; pc < 0 ? pc += TP_N;
+    pt = tp_w - 1 - t - j; pt < 0 ? pt += TP_N;
+    a = TP_L[pc] + TP_R[pc]; b = TP_L[pt] + TP_R[pt];
+    s += a * b; e += b * b;
+    j += 8;
+  );
+  s / sqrt(e + 0.0000000001);
+);
+function tp_seek(t, c) local(k, lo, hi, i, best, bk) (
+  c = floor(c); t = floor(t);
+  lo = max(t - tp_sk, tp_lo); hi = t + tp_sk;
+  best = -1000000000; bk = t; k = lo;
+  while (k <= hi) ( i = tp_cor(c, k); i > best ? ( best = i; bk = k; ); k += 8; );
+  t = bk; k = max(t - 7, tp_lo); hi = t + 7;
+  while (k <= hi) ( i = tp_cor(c, k); i > best ? ( best = i; bk = k; ); k += 1; );
+  bk;
+);
+// STUTTER: copy the last n samples (+ the seam's lead-in) of the slice buffer into the loop buffer, start the loop
+function st_grab(n) local(m, a, k) (
+  n = min(max(floor(n), st_sx + 2), LB_N - st_sx - 2);
+  m = n + st_sx;
+  a = gb_w - m; a < 0 ? a += GB_N;
+  k = min(m, GB_N - a);
+  memcpy(LB_L, GB_L + a, k); memcpy(LB_R, GB_R + a, k);
+  k < m ? ( memcpy(LB_L + k, GB_L, m - k); memcpy(LB_R + k, GB_R, m - k); );
+  st_len = n; st_p = 0; st_act = 1;
+);
+// TPT state-variable filter: coefficients (fc in Hz, q) then one sample; sv_lp / sv_hp / sv_bp
+function sv_set(fc, q) instance(a1, a2, a3, kk) local(g) (
+  g = tan($pi * min(fc, 0.45 * srate) / srate); kk = 1 / q;
+  a1 = 1 / (1 + g * (g + kk)); a2 = g * a1; a3 = g * a2;
+);
+function sv_run(x) instance(a1, a2, a3, kk, ic1, ic2, lp, bp, hp) local(v1, v2, v3) (
+  v3 = x - ic2; v1 = a1 * ic1 + a2 * v3; v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2;
+  abs(ic1) < 0.000000000001 ? ic1 = 0; abs(ic2) < 0.000000000001 ? ic2 = 0;
+  lp = v2; bp = v1; hp = x - kk * v1 - v2;
+  lp;
+);
+// pink noise (economy three-pole), white in -1..1
+function pk_run() instance(b0, b1, b2) local(w) (
+  w = rand(2) - 1;
+  b0 = 0.99765 * b0 + w * 0.0990460; b1 = 0.96300 * b1 + w * 0.2965164; b2 = 0.57000 * b2 + w * 1.0526913;
+  b0 + b1 + b2 + w * 0.1848;
+);
+
+@slider
+drift_macro(drift_pc);
+
+@block
+in_setup(trim_db, 1);
+ost_setup(0, 0, 120, 6000, -0.3, 1);
+pdc_delay = tp_home + 1;                              // (ost_setup clears it)
+drift_macro(drift_pc);
+t_drv = 10 ^ (drive_db / 20);
+t_mk = 10 ^ ((0.7 - 0.9685 * drive_db + 0.001905 * sqr(drive_db) + 0.0004475 * drive_db ^ 3) / 20);   // level match (pink, -18 dBFS; +0.7: the head loss)
+clL.clp_pf_block(drive_db / 24, srate, samplesblock); clR.clp_pf_block(drive_db / 24, srate, samplesblock);
+clL.clp_set(1, 1, 0.8, 0); clR.clp_set(1, 1, 0.8, 0);
+// wow up to +/- 0.6 % at 0.55 Hz, flutter up to +/- 0.25 % at 7.5 Hz (as read-head excursions, in samples)
+wow_inc = 0.55 / srate; flt_inc = 7.5 / srate;
+wow_a = 0.006 * srate / (2 * $pi * 0.55);
+flt_a = 0.0025 * srate / (2 * $pi * 7.5);
+wrp_a = 0.0015 * srate / ($pi * 0.4);                // the warp's excursion (x amount / speed, glided)
+// drift: the speed wanders +/- 0.15 % (0.08 Hz), the warp +/- 0.15 % (0.4 Hz), at 50 %
+spd_inc = 0.08 * dm_s / srate; wrp_inc = 0.4 * dm_s / srate;
+st_n = slice_ms * 0.001 * srate;
+gl_p = sqr(glitch_pc / 100) * 0.6;                    // chance at each slice's end
+dr_rate = 3 * sqr(drop_pc / 100) / srate;              // dropouts per sample
+
+
+@serialize
+file_var(0, ui_sz); file_var(0, pr_cur);
+
+@sample
+// ---------- control rate ----------
+cnt <= 0 ? (
+  cnt = CR;
+  // head loss: the top falls with the speed
+  hlL.sv_set(15000 * s_spd, 0.6); hlR.sv_set(15000 * s_spd, 0.6);
+  // radio: the band narrows (HPF 80 -> 700 Hz, LPF 12 k -> 2.4 kHz), the resonance rises (Q 0.7 -> 4.5)
+  rq = 0.7 + 3.8 * s_reso;
+  rhL.sv_set(80 * 8.75 ^ s_band, 0.707); rhR.sv_set(80 * 8.75 ^ s_band, 0.707);
+  rlL.sv_set(12000 * 0.2 ^ s_band, rq); rlR.sv_set(12000 * 0.2 ^ s_band, rq);
+  r_mk = 1 / (1 + 0.35 * s_reso);                        // the peak's extra level, taken back
+  cr_lp = min(0.45 * s_rate, 0.45 * srate);
+  crL.sv_set(cr_lp, 0.6); crR.sv_set(cr_lp, 0.6);
+);
+cnt -= 1;
+
+// ---------- glides ----------
+s_drv += (t_drv - s_drv) * k30;
+s_spd += (speed - s_spd) * kmot;
+s_wow += (wow_pc / 100 - s_wow) * k30;
+s_flt += (flut_pc / 100 - s_flt) * k30;
+s_hg += (10 ^ (hiss_db / 20) - s_hg) * k30;
+s_bits += (bits - s_bits) * k30;
+s_rate += (rate_k * 1000 - s_rate) * k30;
+s_band += (band_pc / 100 - s_band) * k30;
+s_reso += (reso_pc / 100 - s_reso) * k30;
+s_out += (10 ^ (out_db / 20) - s_out) * k30;
+m_hiss += (hiss_on - m_hiss) * k15;
+m_crush += (crush_on - m_crush) * k15;
+m_radio += (radio_on - m_radio) * k15;
+
+// ---------- input ----------
+in_process(spl0, spl1); l = in_l; r = in_r;
+vin_s_d += 0.5 * (l * l + r * r); vin_n_d += 1;
+
+// ---------- DRIVE: the record amp ----------
+// asymmetric soft curve (limits +1 / -0.8: even harmonics), level-matched on programme
+dl = clL.clp_run(clL.clp_pf_run(l * s_drv)); dr = clR.clp_run(clR.clp_pf_run(r * s_drv));
+s_mk += (t_mk - s_mk) * k30;
+dl *= s_mk; dr *= s_mk;
+dcyl = dl - dcxl + 0.99935 * dcyl; dcxl = dl; l = dcyl;          // DC blocker ~5 Hz
+dcyr = dr - dcxr + 0.99935 * dcyr; dcxr = dr; r = dcyr;
+
+// ---------- HISS onto the tape ----------
+m_hiss > 0.0001 ? (
+  hg = s_hg * m_hiss * 0.614;                               // pink scaled so the level reads as its RMS (dBFS)
+  l += hg * hnL.pk_run(); r += hg * hnR.pk_run();
+);
+
+// ---------- TAPE: varispeed, wow, flutter, warp ----------
+TP_L[tp_w] = l; TP_R[tp_w] = r; tp_w += 1; tp_w >= TP_N ? tp_w = 0;
+s_dm += (dm_a - s_dm) * k30;
+ratio = s_spd * (1 + s_dm * 0.0015 * dSpd.drift_tick(spd_inc));
+// near 1x a weak spring pulls the head home (21 s; under a cent), so the resting latency stays put
+sp = max(0, 1 - abs(s_spd - 1) / 0.02);
+ratio += sp * min(max(0.000001 * (tp_d - tp_home), -0.0002), 0.0002) * (tp_x > 0 ? 0 : 1);
+tp_d += 1 - ratio;
+tp_x > 0 ? tp_d2 += 1 - ratio;
+// a head at the end of its travel hands over to a fresh one (20 ms crossfade)
+// a head at the end of its travel hands over to a fresh one (20 ms crossfade); the crossfade's own travel is allowed for
+tp_x == 0 && (tp_d < tp_lo + tp_xn * max(ratio - 1, 0) || tp_d > tp_lo + tp_win) ? (
+  // near 1x (drift alone) the fresh head starts at home; off 1x at the far end of the window, for a full run;
+  // either way nudged to where the sound lines up best with the old head (no dip as they cross)
+  tp_d2 = tp_d;
+  tp_d = abs(ratio - 1) < 0.02 ? tp_home : tp_d < tp_lo + tp_win * 0.5 ? tp_lo + tp_win - tp_sk : tp_lo + tp_xn * 0.5 + tp_sk;
+  tp_d = tp_seek(tp_d, tp_d2);
+  tp_x = 1;
+);
+wow_ph += wow_inc * (1 + 0.25 * dm_a * dWowr.drift_tick(0.3 / srate)); wow_ph >= 1 ? wow_ph -= 1;
+flt_ph += flt_inc; flt_ph >= 1 ? flt_ph -= 1;
+mo = s_wow * wow_a * sin(2 * $pi * wow_ph)
+   + s_flt * flt_a * (sin(2 * $pi * flt_ph) + 0.35 * dFlt.drift_tick(13 / srate))
+   + s_dm / (0.5 + 0.5 * s_dm) * wrp_a * dWarp.drift_tick(wrp_inc);
+l = tp_rd(TP_L, tp_d + mo); r = tp_rd(TP_R, tp_d + mo);
+tp_x > 0 ? (
+  xf = 0.5 - 0.5 * cos($pi * tp_x / tp_xn);                 // the new head fades in, the old one out
+  l = l * xf + tp_rd(TP_L, tp_d2 + mo) * (1 - xf);
+  r = r * xf + tp_rd(TP_R, tp_d2 + mo) * (1 - xf);
+  tp_x += 1; tp_x > tp_xn ? tp_x = 0;
+);
+l = hlL.sv_run(l); r = hlR.sv_run(r);                          // head loss
+
+// ---------- DROPOUTS ----------
+dr_t <= 0 && drop_pc > 0 && rand(1) < dr_rate ? (
+  dr_len = ceil((0.015 + 0.135 * sqr(rand(1))) * srate); dr_t = dr_len;
+  dr_dep = (0.3 + 0.67 * rand(1)) * (0.6 + 0.4 * drop_pc / 100);   // 3 - 30 dB
+);
+dr_t > 0 ? ( dr_g = min(1, min(dr_len - dr_t, dr_t) / dr_a); dr_t -= 1; ) : dr_g = 0;
+dr_e += (dr_g - dr_e) * dr_ks;
+drl += (l - drl) * dr_k; drr += (r - drr) * dr_k;
+dr_e > 0.00001 ? (
+  l += (drl - l) * dr_e * 0.85; r += (drr - r) * dr_e * 0.85;
+  l *= 1 - dr_dep * dr_e; r *= 1 - dr_dep * dr_e;
+);
+
+// ---------- STUTTER / GLITCH ----------
+GB_L[gb_w] = l; GB_R[gb_w] = r; gb_w += 1; gb_w >= GB_N ? gb_w = 0;
+stut_on && !st_key ? ( st_grab(st_n); st_left = -1; );        // the key: loop until let go
+!stut_on && st_key && st_left < 0 ? st_act = 0;
+st_key = stut_on;
+// GLITCH: at each slice's end, a chance of 2 - 5 repeats of a full or half slice (never over a loop still fading)
+gl_cnt -= 1;
+gl_cnt <= 0 ? (
+  gl_cnt = ceil(st_n);
+  st_mix == 0 && glitch_pc > 0 && rand(1) < gl_p ? (
+    st_grab(st_n * (rand(1) < 0.5 ? 1 : 0.5));
+    st_left = st_len * (2 + floor(rand(1) * 4));
+  );
+);
+st_act && st_left > 0 ? ( st_left -= 1; st_left <= 0 ? st_act = 0; );
+st_mix = st_act ? min(st_mix + st_rmp, 1) : max(st_mix - st_rmp, 0);
+st_mix > 0 ? (
+  // the loop: LB holds the lead-in (st_sx) then the slice; the seam's last st_sx samples fade into the lead-in
+  i = st_sx + st_p;
+  sl = LB_L[i]; sr2 = LB_R[i];
+  st_p > st_len - st_sx ? (
+    w = (st_len - st_p) / st_sx; w = 0.5 - 0.5 * cos($pi * w);
+    sl = sl * w + LB_L[i - st_len] * (1 - w); sr2 = sr2 * w + LB_R[i - st_len] * (1 - w);
+  );
+  st_p += 1; st_p >= st_len ? st_p = 0;
+  w = 0.5 - 0.5 * cos($pi * st_mix);
+  l += (sl - l) * w; r += (sr2 - r) * w;
+) : st_p = 0;
+
+// ---------- CRUSH: bits and rate ----------
+m_crush > 0.0001 ? (
+  cr_ph += s_rate / srate;
+  cr_ph >= 1 ? ( cr_ph -= floor(cr_ph); cr_hl = l; cr_hr = r; );
+  q = 2 ^ (1 - s_bits);
+  cl = floor(cr_hl / q + 0.5) * q; cr2 = floor(cr_hr / q + 0.5) * q;
+  cl = crL.sv_run(cl); cr2 = crR.sv_run(cr2);
+  l += (cl - l) * m_crush; r += (cr2 - r) * m_crush;
+) : ( cr_hl = l; cr_hr = r; crL.sv_run(l); crR.sv_run(r); );
+
+// ---------- RADIO: the small speaker ----------
+m_radio > 0.0001 ? (
+  al = rlL.sv_run(rhL.sv_run(l) ; rhL.hp) * r_mk; ar = rlR.sv_run(rhR.sv_run(r) ; rhR.hp) * r_mk;
+  l += (al - l) * m_radio; r += (ar - r) * m_radio;
+);
+
+// ---------- output ----------
+l *= s_out; r *= s_out;
+l = ostL.ost_band(l); r = ostR.ost_band(r);
+ost_out(l, r);
+spl0 = ost_l; spl1 = ost_r;
+vout_s_d += 0.5 * (spl0 * spl0 + spl1 * spl1); vout_n_d += 1; opk_d = max(opk_d, max(abs(spl0), abs(spl1)));
+// the tape counter (for the panel): runs with the transport at the tape's speed, holds while the deck stutters
+(play_state & 1) ? ( !tc_run ? tc_d = play_position; tc_run = 1; st_act ? 0 : tc_d += ratio / srate; ) : tc_run = 0;
+st_disp = st_act; dr_disp = dr_e;
+
+@gfx 1080 560
+// =====================================================================
+// GUI - G-MATIC: a cream broadcast video deck. A lime-white faceplate (the house palette), the upper deck with the
+// VU pair and the smoked tape window (reels, red seven-segment counter, status lamps), the lower control plate in
+// recessed sections; dark pointer knobs in light metal rings, square lit transport keys (STUTTER red, HISS blue),
+// title lamps for CRUSH / RADIO, the big knurled shuttle wheel for VARISPEED. (Helpers from MAG78 / OC77.)
+// =====================================================================
+C_FACE = 0xE8E0CB;  C_LOW = 0xDDD4BE;  C_SEC1 = 0xD4CAB2;  C_SEC2 = 0xD0C6AD;  C_SEC3 = 0xD8CFB8;
+C_INK = 0x2B2722;  C_INK2 = 0x6B6253;  C_SCL = 0x3E392F;  C_BEZ = 0x141312;
+C_LCDBG = 0x0E0D0A;  C_LCDTX = 0xFFB347;
+lk_well = 0x141312;
+
+function col(h, a) ( gfx_r = floor(h / 65536) / 255;  gfx_g = (floor(h / 256) % 256) / 255;  gfx_b = (h % 256) / 255;  gfx_a = a; );
+function shade(h, f) local(r, g, b) (
+  r = min(255, floor(floor(h / 65536) * f));  g = min(255, floor((floor(h / 256) % 256) * f));  b = min(255, floor((h % 256) * f));
+  r * 65536 + g * 256 + b;
+);
+function ui_mix(c1, c2, t) (
+  floor(floor(c1 / 65536) * (1 - t) + floor(c2 / 65536) * t) * 65536 +
+  floor((floor(c1 / 256) % 256) * (1 - t) + (floor(c2 / 256) % 256) * t) * 256 + floor((c1 % 256) * (1 - t) + (c2 % 256) * t);
+);
+function px(v) ( ox + v * sc; );
+function py(v) ( oy + v * sc; );
+function ps(v) ( v * sc; );
+function u_rect(x, y, w, h) ( gfx_rect(px(x), py(y), ps(w), ps(h), 1); );
+function text_c(x, y, str) local(w, h) ( gfx_measurestr(str, w, h);  gfx_x = x - w * 0.5;  gfx_y = y - h * 0.5;  gfx_drawstr(str); );
+function text_l(x, y, str) local(w, h) ( gfx_measurestr(str, w, h);  gfx_x = x;  gfx_y = y - h * 0.5;  gfx_drawstr(str); );
+function rivet(x, y) ( col(0x8C8370, 1);  gfx_circle(px(x), py(y), ps(4), 1, 1);  col(0xF6F1E4, 1);  gfx_circle(px(x) - ps(1), py(y) - ps(1), ps(1.4), 1, 1); );
+function shd_r(x, y, w, h) local(i) ( i = 0;  loop(4, col(0x000000, 0.13);  u_rect(x + 2 + i * 1.3, y + 3 + i * 1.6, w + i * 0.6, h + i * 0.6);  i += 1; ); );
+function shd_c(cx, cy, r) local(i) ( i = 0;  loop(4, col(0x000000, 0.13);  gfx_circle(px(cx + 2 + i * 1.2), py(cy + 3 + i * 1.5), ps(r + i * 0.6), 1, 1);  i += 1; ); );
+function vig_c(cx, cy, r, a) local(i) ( i = 0;  loop(7, col(0x000000, a * (1 - i / 7));  gfx_circle(px(cx), py(cy), ps(r - i * 0.8), 0, 1);  gfx_circle(px(cx + 0.4), py(cy + 0.4), ps(r - i * 0.8 - 0.4), 0, 1);  i += 1; ); );
+// a vignette edge on a rectangle: darker towards the rim over 6 px, half as much again on the bottom and right
+function vig_r(x, y, w, h, a) local(i, t) (
+  i = 0;
+  loop(6, t = a * (1 - i / 6);
+    col(0x000000, t);  u_rect(x + i, y + i, w - 2 * i, 1);  u_rect(x + i, y + i + 1, 1, h - 2 * i - 2);
+    col(0x000000, t * 1.5);  u_rect(x + i, y + h - 1 - i, w - 2 * i, 1);  u_rect(x + w - 1 - i, y + i + 1, 1, h - 2 * i - 2);
+    i += 1; );
+);
+// a recessed section of the lower plate: three shades of the faceplate, its title on the band's centre line
+function section(x, y, w, h, c, title) (
+  col(c, 1);  u_rect(x, y, w, h);
+  col(shade(c, 0.80), 1);  u_rect(x, y, w, 2);  u_rect(x, y + 2, 2, h - 2);              // shaded top + left (recessed)
+  col(shade(c, 1.06), 1);  u_rect(x + 2, y + h - 1, w - 2, 1);  u_rect(x + w - 1, y + 2, 1, h - 3);
+  col(C_SCL, 0.45);  u_rect(x + 14, y + 32, w - 28, 1.5);
+  strlen(title) ? ( gfx_setfont(4);  col(C_INK, 1);  text_l(px(x + 16), py(y + 18), title); );
+);
+function param_touched(idx) ( slider_automate(2 ^ (idx - 1)); );
+function sled(x, y, r, c, lv) ( col(0x0A0A0A, 1);  gfx_circle(px(x), py(y), ps(r + 2), 1, 1);  col(ui_mix(shade(c, 0.3), c, min(1, lv)), 1);  gfx_circle(px(x), py(y), ps(r), 1, 1);
+  lv > 0.05 ? ( col(c, 0.25 * min(1, lv));  gfx_circle(px(x), py(y), ps(r * 2.2), 1, 1);  col(0xFFFFFF, 0.6 * min(1, lv));  gfx_circle(px(x - r * 0.3), py(y - r * 0.3), ps(r * 0.35), 1, 1); ); );
+function pointer(x, y, s_a, c_a, r0, r1, hw) local(ax, ay, bx, by, dx, dy) (
+  ax = x + s_a * r0;  ay = y - c_a * r0;  bx = x + s_a * r1;  by = y - c_a * r1;  dx = c_a * hw;  dy = s_a * hw;
+  gfx_triangle(ax + dx, ay + dy, bx + dx, by + dy, bx - dx, by - dy, ax - dx, ay - dy);
+  gfx_line(ax + dx, ay + dy, bx + dx, by + dy, 1);  gfx_line(ax - dx, ay - dy, bx - dx, by - dy, 1);
+);
+function fmtv(v, fmt) (
+  fmt == 1 ? sprintf(#kv, "%d %%", v) :
+  fmt == 2 ? sprintf(#kv, "%+.1f dB", v) :
+  fmt == 3 ? sprintf(#kv, "%.1f dB", v) :
+  fmt == 4 ? sprintf(#kv, "%.1f bits", v) :
+  fmt == 5 ? sprintf(#kv, "%.1f kHz", v) :
+  fmt == 6 ? sprintf(#kv, "%d ms", v) :
+  fmt == 7 ? sprintf(#kv, "x %.3f", v) :
+  sprintf(#kv, "%.2f", v);
+  #kv;
+);
+function hover_tag(x, y, str) local(w, h) (
+  gfx_setfont(3);  gfx_measurestr(str, w, h);
+  col(C_LCDBG, 0.95);  gfx_rect(x - w * 0.5 - ps(6), y - h * 0.5 - ps(3), w + ps(12), h + ps(6), 1);
+  col(C_LCDTX, 1);  text_c(x, y, str);
+);
+// a pointer knob: a dark cap in a light metal ring, a white line, a dark scale on the cream
+function kn(cx, cy, r, idx, vmin, vmax, def, lbl, fmt) local(x, y, rr, v, t, hov, now, a0, a1, tv, b, j)
+(
+  x = px(cx);  y = py(cy);  rr = ps(r);
+  hov = sqr(mouse_x - x) + sqr(mouse_y - y) <= sqr(rr * 1.2);
+  v = max(vmin, min(vmax, slider(idx)));
+  t = (v - vmin) / (vmax - vmin);
+  click && hov && !drag_idx ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.35) ? ( slider(idx) = def;  param_touched(idx);  drag_idx = 0; )
+                                                                            : ( drag_idx = idx;  drag_y0 = mouse_y;  drag_mv = 0;  drag_t = t; );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  hov && mouse_wheel != 0 && !drag_idx ? (
+    t = max(0, min(1, t + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.03)));
+    v = vmin + t * (vmax - vmin);
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+    mouse_wheel = 0;
+  );
+  drag_idx == idx ? (
+    !drag_mv && abs(mouse_y - drag_y0) > ps(3) ? ( drag_mv = 1;  drag_y0 = mouse_y; );
+    drag_mv ? (
+      // Shift = fine: the travel so far is kept, the rest goes at 1000 px
+      (mouse_cap & 8) != drag_sh ? ( drag_sh = mouse_cap & 8;  drag_t = t;  drag_y0 = mouse_y; );
+      t = max(0, min(1, drag_t + (drag_y0 - mouse_y) / ps(drag_sh ? 1000 : 200)));
+      v = vmin + t * (vmax - vmin);
+      v = max(vmin, min(vmax, v));
+      v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+    );
+  );
+  v = max(vmin, min(vmax, slider(idx)));
+  t = (v - vmin) / (vmax - vmin);
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;  tv = a0 + t * (a1 - a0);
+  j = 0;
+  loop(11,
+    b = a0 + j / 10 * (a1 - a0);  col(C_SCL, j % 5 == 0 ? 0.95 : 0.55);
+    gfx_circle(x + sin(b) * (rr + ps(8)), y - cos(b) * (rr + ps(8)), ps(j % 5 == 0 ? 1.6 : 1.1), 1, 1);
+    j += 1;
+  );
+  shd_c(cx, cy, r);
+  col(0xC9CCD0, 1);  gfx_circle(x, y, rr, 1, 1);  col(0x6A6C70, 1);  gfx_circle(x, y, rr, 0, 1);  col(0xFFFFFF, 0.4);  gfx_arc(x, y, rr - ps(1.5), -1.7, -0.3, 1);
+  col(kcap ? kcap : 0x1F2023, 1);  gfx_circle(x, y, rr * 0.82, 1, 1);  vig_c(cx, cy, r * 0.82, 0.16);
+  col(0xFFFFFF, 0.10);  gfx_arc(x, y, rr * 0.7, -1.8, -0.1, 1);
+  col(0xF6F4EE, 1);  pointer(x, y, sin(tv), cos(tv), rr * 0.1, rr * 0.9, ps(r > 26 ? 2.4 : 1.8));
+  kcap = 0;
+  strlen(lbl) ? ( gfx_setfont(6);  col(C_INK, 1);  text_c(x, y + rr + ps(20), lbl); );
+  hov || drag_idx == idx ? hover_tag(x, y - rr - ps(20), fmtv(v, fmt));
+);
+function ui_rrs(x, y, w, h, r) local(i, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  i = 0;
+  loop(r, d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);  gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);  i += 1; );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+function lk_rr(x, y, w, h, r) ( ui_rrs(px(x), py(y), ps(w), ps(h), ps(r)); );
+function ui_keytext(cx, cy, str) local(w, h) ( gfx_measurestr(str, w, h); gfx_x = floor(cx - w * 0.5 + 0.5); gfx_y = floor(cy - h * 0.58 + 0.5); gfx_drawstr(str); );
+// a lamp key (the preset keys)
+function lk_key(x, y, w, h, on, c, str) local(hov, hit, k, lens, dn, i, t, dx, dy) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov && !drag_idx;
+  dn = hov && lmb ? 1 : 0;
+  k = min(w / 54, h / 40);
+  lens = shade(ui_mix(c, 0xCFC9BC, 0.5), 0.76);
+  on ? lens = c;
+  shd_r(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k);
+  col(lk_well, 1);           lk_rr(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k, 5 * k);
+  col(shade(lens, 0.55), 1); lk_rr(x, y + 1 / sc, w, h, 4 * k);
+  y += (dn - 1) / sc;
+  col(shade(lens, 0.62), 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+  col(shade(lens, 0.78), 1); lk_rr(x + 2 * k, y + 2 * k, w - 4 * k, h - 5 * k, 4 * k);
+  col(shade(lens, 0.92), 1); lk_rr(x + 5 * k, y + 4 * k, w - 10 * k, h - 10 * k, 4 * k);
+  col(lens, 1);              lk_rr(x + 9 * k, y + 7 * k, w - 18 * k, h - 17 * k, 4 * k);
+  col(0xFFFFFF, 0.22);  gfx_rect(px(x + 4 * k), py(y), ps(w - 8 * k), max(1, ps(1.5)));
+  hov && !dn ? ( col(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1 / sc, 4 * k); );
+  gfx_setfont(lk_fnt ? lk_fnt : 2);  lk_fnt = 0;  col(shade(c, 0.17), 1);
+  ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
+  hit;
+);
+function lcd_box(x, y, w, h) ( col(0x2A2722, 1);  u_rect(x - 2, y - 2, w + 4, h + 4);  col(0x050402, 1);  u_rect(x, y, w, h);  col(C_LCDBG, 1);  u_rect(x + 3, y + 3, w - 6, h - 6); );
+function lcd(x, y, w, h, fnt, str) local(tw, th, gy) (
+  lcd_box(x, y, w, h);
+  gfx_setfont(fnt);  gfx_measurestr(str, tw, th);  gy = py(y + h * 0.5) - th * 0.5;
+  col(C_LCDTX, 0.22);  gfx_x = px(x + 10) - 1;  gfx_y = gy;  gfx_drawstr(str);  gfx_x = px(x + 10) + 1;  gfx_y = gy;  gfx_drawstr(str);
+  col(C_LCDTX, 1);  gfx_x = px(x + 10);  gfx_y = gy;  gfx_drawstr(str);
+);
+function pb_count(menu) local(k, n) ( n = 1;  k = 0;  loop(strlen(menu), str_getchar(menu, k) == 124 ? n += 1;  k += 1; );  n; );
+function pb_item(menu, i, dst) local(k, k0, n, c, len) (
+  strcpy(dst, "");  len = strlen(menu);  k = 0;  k0 = 0;  n = 1;
+  loop(len + 1, c = k < len ? str_getchar(menu, k) : 124;  c == 124 ? ( n == i ? strcpy_substr(dst, menu, k0, k - k0);  n += 1;  k0 = k + 1; );  k += 1; );
+  dst;
+);
+function pb_tri(cx, cy, s, dir) ( gfx_triangle(px(cx + dir * s), py(cy), px(cx - dir * s), py(cy - s), px(cx - dir * s), py(cy + s)); );
+// the house preset bar: [PRESETS][◄][►][LCD] (h 34, PRESETS 64 wide, arrows 24, 4 px after PRESETS, 2 between, 6 before the LCD)
+function preset_bar(x, y, h, lw, cur, menu) local(n, sel, open, lx, i) (
+  n = pb_count(menu);  sel = 0;  open = 0;
+  lk_fnt = 5;  lk_key(x, y, 64, h, 0, 0xD8D0BC, "PRESETS") ? open = 1;
+  lk_key(x + 68, y, 24, h, 0, 0xD8D0BC, "") ? ( sel = cur <= 1 || cur > n ? n : cur - 1; );
+  lk_key(x + 94, y, 24, h, 0, 0xD8D0BC, "") ? ( sel = cur >= n || cur < 1 ? 1 : cur + 1; );
+  col(0x1A1B1C, 1);  pb_tri(x + 80, y + h * 0.5, 4.5, -1);  pb_tri(x + 106, y + h * 0.5, 4.5, 1);
+  lx = x + 124;
+  cur >= 1 && cur <= n ? pb_item(menu, cur, #pb_nm) : strcpy(#pb_nm, "--");
+  lcd(lx, y, lw, h, 8, #pb_nm);
+  click && mouse_x >= px(lx) && mouse_x < px(lx + lw) && mouse_y >= py(y) && mouse_y < py(y + h) ? open = 1;
+  open ? (
+    strcpy(#pb_m, "");  i = 1;
+    loop(n, i == cur ? strcat(#pb_m, "!");  strcat(#pb_m, pb_item(menu, i, #pb_t));  i < n ? strcat(#pb_m, "|");  i += 1; );
+    gfx_x = px(x);  gfx_y = py(y + h);  i = gfx_showmenu(#pb_m);  i > 0 ? sel = i;
+  );
+  sel;
+);
+// a section title lamp (cream ring, amber centre, soft halo when lit): click switches the section in / out
+function tlamp(x, y, title, on, idx) local(hov) (
+  col(0x2A2722, 1);  gfx_circle(px(x + 9), py(y), ps(10), 1, 1);
+  col(on ? 0xFFF4D8 : 0xA89F8C, 1);  gfx_circle(px(x + 9), py(y), ps(8), 1, 1);
+  col(on ? 0xF2A41E : 0x5A5246, 1);  gfx_circle(px(x + 9), py(y), ps(5), 1, 1);
+  on ? ( col(0xF2A41E, 0.28);  gfx_circle(px(x + 9), py(y), ps(15), 1, 1);  col(0xFFFFFF, 0.6);  gfx_circle(px(x + 7.5), py(y - 1.5), ps(1.6), 1, 1); );
+  gfx_setfont(4);  col(on ? C_INK : C_INK2, 1);  text_l(px(x + 28), py(y), title);
+  hov = mouse_x >= px(x - 4) && mouse_x < px(x + 110) && mouse_y >= py(y - 13) && mouse_y < py(y + 13);
+  click && hov && !drag_idx ? ( slider(idx) = on ? 0 : 1;  param_touched(idx); );
+);
+// a square lit transport key: a coloured cap in a black bezel; lit = bright cap with a feathered glow, dark = dim
+// tinted cap with a light legend; a vignette edge, a soft shadow
+function tkey(x, y, w, h, on, c, str) local(hov, hit, dn, cap, i, t) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov && !drag_idx;  dn = hov && lmb;
+  on ? ( col(c, 0.12);  lk_rr(x - 12, y - 12, w + 24, h + 24, 12);  col(c, 0.18);  lk_rr(x - 7, y - 7, w + 14, h + 14, 9); );
+  shd_r(x - 5, y - 5, w + 10, h + 10);
+  col(0x0C0C0C, 1);  lk_rr(x - 5, y - 5, w + 10, h + 10, 5);
+  y += dn ? 1 : 0;
+  cap = on ? c : ui_mix(shade(c, 0.42), 0x6A665E, 0.35);
+  col(cap, 1);  lk_rr(x, y, w, h, 3);
+  on ? (
+    i = 1;
+    loop(5, t = i / 5;  col(ui_mix(c, 0xFFF6E0, 0.45 * t), 1);  lk_rr(x + w * 0.1 * t, y + h * 0.1 * t, w - w * 0.2 * t, h - h * 0.2 * t, 3);  i += 1; );
+  );
+  vig_r(x, y, w, h, on ? 0.10 : 0.16);
+  col(0xFFFFFF, on ? 0.35 : 0.12);  u_rect(x + 3, y + 1, w - 6, 1.5);
+  hov && !dn ? ( col(0xFFFFFF, 0.08);  lk_rr(x, y, w, h, 3); );
+  gfx_setfont(6);  col(on ? shade(c, 0.28) : ui_mix(cap, 0xFFFFFF, 0.6), 1);  ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
+  hit;
+);
+// a seven-segment digit (0 - 9), w x h, segment thickness th; unlit segments show faintly
+function seg7(x, y, w, h, d, th) local(m, i, on, sx, sy, sw, sh) (
+  m = d == 0 ? 63 : d == 1 ? 6 : d == 2 ? 91 : d == 3 ? 79 : d == 4 ? 102 : d == 5 ? 109 : d == 6 ? 125 : d == 7 ? 7 : d == 8 ? 127 : 111;
+  i = 0;
+  loop(7,
+    on = (m & (2 ^ i)) != 0;
+    i == 0 ? ( sx = x + th;  sy = y;  sw = w - 2 * th;  sh = th; ) :
+    i == 1 ? ( sx = x + w - th;  sy = y + th;  sw = th;  sh = h * 0.5 - 1.5 * th; ) :
+    i == 2 ? ( sx = x + w - th;  sy = y + h * 0.5 + 0.5 * th;  sw = th;  sh = h * 0.5 - 1.5 * th; ) :
+    i == 3 ? ( sx = x + th;  sy = y + h - th;  sw = w - 2 * th;  sh = th; ) :
+    i == 4 ? ( sx = x;  sy = y + h * 0.5 + 0.5 * th;  sw = th;  sh = h * 0.5 - 1.5 * th; ) :
+    i == 5 ? ( sx = x;  sy = y + th;  sw = th;  sh = h * 0.5 - 1.5 * th; ) :
+             ( sx = x + th;  sy = y + h * 0.5 - 0.5 * th;  sw = w - 2 * th;  sh = th; );
+    on ? ( col(0xFF2A18, 0.22);  u_rect(sx - 1.5, sy - 1.5, sw + 3, sh + 3);  col(0xFF4A30, 1);  u_rect(sx, sy, sw, sh); )
+       : ( col(0x4A1410, 0.55);  u_rect(sx, sy, sw, sh); );
+    i += 1;
+  );
+);
+function colon7(x, y, h) ( col(0xFF4A30, 1);  u_rect(x, y + h * 0.28, 3.5, 3.5);  u_rect(x, y + h * 0.66, 3.5, 3.5); );
+// a VU meter: a cream face in a heavy dark bezel, -20 .. +3 with a red arc from 0, "VU", a red peak LED top right
+function vu_frac(vdb) local(a) ( a = 10 ^ (max(-24, min(5, vdb)) / 20);  (a - 0.1) / (1.4125 - 0.1); );
+function vu(x, y, w, h, frac, pk, name) local(cx, cy, rr, j, d, f, a, x1, y1, x2, y2) (
+  shd_r(x - 6, y - 6, w + 12, h + 12);
+  col(0x161514, 1);  lk_rr(x - 6, y - 6, w + 12, h + 12, 6);
+  col(0xF5E8C2, 1);  u_rect(x, y, w, h);
+  col(0xFFF6DA, 0.6);  u_rect(x + 4, y + 4, w - 8, h * 0.45);
+  vig_r(x, y, w, h, 0.12);
+  cx = x + w * 0.5;  cy = y + h * 1.12;  rr = h * 0.86;
+  // the scale
+  j = 0;
+  loop(11,
+    d = j == 0 ? -20 : j == 1 ? -10 : j == 2 ? -7 : j == 3 ? -5 : j == 4 ? -3 : j == 5 ? -2 : j == 6 ? -1 : j == 7 ? 0 : j == 8 ? 1 : j == 9 ? 2 : 3;
+    f = vu_frac(d);  a = (-0.72 + 1.44 * f);
+    col(d >= 0 ? 0xC0281C : 0x2A2620, 1);
+    x1 = cx + sin(a) * (rr - 8);  y1 = cy - cos(a) * (rr - 8);  x2 = cx + sin(a) * (rr - 1);  y2 = cy - cos(a) * (rr - 1);
+    gfx_line(px(x1), py(y1), px(x2), py(y2), 1);  gfx_line(px(x1) + 1, py(y1), px(x2) + 1, py(y2), 1);
+    gfx_setfont(10);
+    (d == -20 || d == -10 || d == -5 || d == -3 || d == 0 || d == 3) ? (
+      sprintf(#vt, d > 0 ? "+%d" : "%d", d);  text_c(px(cx + sin(a) * (rr + 9)), py(cy - cos(a) * (rr + 9)), #vt); );
+    j += 1;
+  );
+  col(0xC0281C, 1);  gfx_arc(px(cx), py(cy), ps(rr - 3), -0.72 + 1.44 * vu_frac(0), 0.72, 1);  gfx_arc(px(cx), py(cy), ps(rr - 4), -0.72 + 1.44 * vu_frac(0), 0.72, 1);
+  col(0x2A2620, 1);  gfx_arc(px(cx), py(cy), ps(rr - 3), -0.72, -0.72 + 1.44 * vu_frac(0), 1);
+  gfx_setfont(4);  col(0x2A2620, 1);  text_c(px(cx), py(y + h * 0.62), "VU");
+  gfx_setfont(10);  col(0x6B6253, 1);  text_c(px(cx), py(y + h * 0.80), "-18 dBFS");
+  // the needle
+  a = -0.72 + 1.44 * max(-0.04, min(1.04, frac));
+  col(0x141210, 1);  pointer(px(cx), py(cy), sin(a), cos(a), ps(rr * 0.3), ps(rr - 4), ps(0.8));
+  col(0x2A2622, 1);  u_rect(x, y + h - 12, w, 12);  col(0xFFFFFF, 0.1);  u_rect(x, y + h - 12, w, 1);
+  // the peak LED
+  sled(x + w - 12, y + 12, 3.5, 0xFF3A22, pk);
+  gfx_setfont(6);  col(C_INK, 1);  text_c(px(cx), py(y + h + 22), name);
+);
+function pv(i, v) ( slider(i) = v; );
+function sl_all() local(i) ( i = 1;  loop(19, param_touched(i);  i += 1; ); );
+
+// ---------- presets ----------
+// (each level-matched: pink noise at -18 dBFS RMS comes out at -18 dBFS RMS; none of them presses STUTTER)
+function p_init() (
+  pv(1, 0); pv(2, 6); pv(3, 1); pv(4, 25); pv(5, 20); pv(6, 1); pv(7, -60); pv(8, 0); pv(9, 12); pv(10, 16);
+  pv(11, 0); pv(12, 50); pv(13, 30); pv(14, 50); pv(15, 0); pv(16, 0); pv(17, 120); pv(18, 0); pv(19, 0);
+);
+PRESET_MENU = "Default|Clean Transfer|Worn Edit Master|Slow Motion|Fast Forward|Transistor Radio|Night Broadcast|Eight-Bit Track|Melting Tape|Glitch Deck|Oxide Shed|Dub Wobble";
+function load_preset(p) (
+  p_init();
+  p == 2 ? ( pv(2, 2);  pv(4, 6);  pv(5, 6);  pv(7, -72);  pv(14, 20); );   // Clean Transfer
+  p == 3 ? ( pv(2, 9);  pv(4, 35);  pv(5, 30);  pv(7, -54);  pv(14, 60);  pv(19, 20); );   // Worn Edit Master
+  p == 4 ? ( pv(2, 7);  pv(3, 0.75);  pv(4, 30);  pv(5, 15);  pv(7, -58);  pv(15, 0.1); );   // Slow Motion
+  p == 5 ? ( pv(3, 1.33);  pv(4, 15);  pv(5, 25);  pv(7, -62);  pv(15, 0.1); );   // Fast Forward
+  p == 6 ? ( pv(2, 12);  pv(4, 20);  pv(7, -50);  pv(11, 1);  pv(12, 70);  pv(13, 45);  pv(15, 1.4); );   // Transistor Radio
+  p == 7 ? ( pv(7, -46);  pv(8, 1);  pv(10, 22);  pv(11, 1);  pv(12, 40);  pv(13, 20);  pv(15, 2.1);  pv(19, 10); );   // Night Broadcast
+  p == 8 ? ( pv(2, 8);  pv(4, 10);  pv(5, 10);  pv(6, 0);  pv(8, 1);  pv(9, 8);  pv(10, 11);  pv(15, 0.7); );   // Eight-Bit Track
+  p == 9 ? ( pv(2, 10);  pv(3, 0.94);  pv(4, 80);  pv(5, 40);  pv(7, -52);  pv(14, 100);  pv(19, 25); );   // Melting Tape
+  p == 10 ? ( pv(2, 8);  pv(17, 90);  pv(18, 45);  pv(19, 30); );   // Glitch Deck
+  p == 11 ? ( pv(4, 35);  pv(5, 30);  pv(7, -50);  pv(15, 0.6);  pv(19, 70); );   // Oxide Shed
+  p == 12 ? ( pv(2, 10);  pv(4, 70);  pv(5, 45);  pv(11, 1);  pv(12, 25);  pv(13, 15);  pv(14, 80);  pv(15, 1.2); );   // Dub Wobble
+  sl_all();
+);
+
+// ---------- frame ----------
+g_ret = gfx_ext_retina > 1 ? gfx_ext_retina : 1;
+g_want = ui_sz == 1 ? 0.85 : ui_sz == 2 ? 1.3 : 1;
+sc = g_ret * max(min(g_want, min(gfx_w / (1080 * g_ret), gfx_h / (560 * g_ret))), 0.5);
+ox = (gfx_w - 1080 * sc) * 0.5;  oy = (gfx_h - 560 * sc) * 0.5;
+lmb = mouse_cap & 1;  click = lmb && !last_lmb;  kcap = 0;
+gfx_setfont(1, "Trebuchet MS", ps(32), 'b');
+gfx_setfont(2, "Trebuchet MS", ps(14), 'b');
+gfx_setfont(3, "Trebuchet MS", ps(14), 'b');
+gfx_setfont(4, "Trebuchet MS", ps(16), 'b');
+gfx_setfont(5, "Trebuchet MS", ps(12.5), 'b');
+gfx_setfont(6, "Trebuchet MS", ps(14), 'b');
+gfx_setfont(8, "Courier New", ps(19), 'b');
+gfx_setfont(10, "Trebuchet MS", ps(11), 'b');
+// the VUs: RMS since the last frame, spring ballistics (about 300 ms to 99 %, a little overshoot)
+g_dt = min(0.1, max(0.005, time_precise() - g_tlast));  g_tlast = time_precise();
+g_vi = vin_n_d > 0 ? sqrt(vin_s_d / vin_n_d) : 0;  vin_s_d = 0;  vin_n_d = 0;
+g_vo = vout_n_d > 0 ? sqrt(vout_s_d / vout_n_d) : 0;  vout_s_d = 0;  vout_n_d = 0;
+g_ti = vu_frac(g_vi > 0.000001 ? 20 * log10(g_vi) + 18 : -40);
+g_to = vu_frac(g_vo > 0.000001 ? 20 * log10(g_vo) + 18 : -40);
+g_n = ceil(g_dt / 0.002);
+loop(g_n, g_av = 900 * (g_ti - g_pi) - 48 * g_ui;  g_ui += g_av * 0.002;  g_pi += g_ui * 0.002;
+          g_av = 900 * (g_to - g_po) - 48 * g_uo;  g_uo += g_av * 0.002;  g_po += g_uo * 0.002; );
+// the output peak LED: lit above -3 dBFS, held 1 s
+opk_d > 0.708 ? g_pkt = time_precise();  opk_d = 0;
+g_pk = time_precise() - g_pkt < 1 ? 1 : 0;
+
+// ---------- faceplate ----------
+col(0x2A2722, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+col(C_FACE, 1);  u_rect(0, 0, 1080, 560);
+col(0xFFFFFF, 0.25);  u_rect(0, 0, 1080, 1);
+col(0x000000, 0.22);  u_rect(0, 556, 1080, 4);  u_rect(1076, 0, 4, 556);
+rivet(10, 10);  rivet(1070, 10);  rivet(10, 550);  rivet(1070, 550);
+gfx_setfont(1);  col(C_INK, 1);  text_l(px(28), py(34), "G-MATIC");
+gfx_setfont(10);  col(C_INK2, 1);  text_l(px(176), py(26), "VIDEO DECK AUDIO");  text_l(px(176), py(43), "LO-FI TAPE PROCESSOR");
+pb_k = preset_bar(372, 16, 34, 300, pr_cur, PRESET_MENU);
+pb_k > 0 ? ( load_preset(pb_k);  pr_cur = pb_k; );
+col(C_SCL, 0.75);  u_rect(16, 62, 1048, 2);
+
+// ---------- upper deck: VU pair + the tape window ----------
+vu(34, 86, 160, 100, g_pi, 0, "INPUT");
+vu(222, 86, 160, 100, g_po, g_pk, "OUTPUT");
+// the smoked window
+shd_r(404, 78, 644, 156);
+col(0x9A917E, 1);  u_rect(402, 76, 648, 160);
+col(0x1A1918, 1);  u_rect(406, 80, 640, 152);
+col(0x232220, 1);  u_rect(410, 84, 632, 144);
+// the reels (left feeds right; they turn at the tape's speed; the packs move with the counter)
+g_ang = tc_d * 2.6;
+g_pack = 0.5 + 0.5 * sin(tc_d * 0.01);
+g_j = 0;
+loop(2,
+  g_cx = g_j == 0 ? 492 : 650;  g_cy = 156;
+  g_pr = 26 + 30 * (g_j == 0 ? g_pack : 1 - g_pack);
+  col(0x3A2E26, 1);  gfx_circle(px(g_cx), py(g_cy), ps(g_pr), 1, 1);                    // the tape pack
+  col(0x50423A, 1);  gfx_circle(px(g_cx), py(g_cy), ps(g_pr), 0, 1);
+  col(0x8C8A86, 0.35);  gfx_circle(px(g_cx), py(g_cy), ps(60), 0, 1);                 // the flange
+  col(0xD8D4CA, 1);  gfx_circle(px(g_cx), py(g_cy), ps(22), 1, 1);                    // the hub
+  col(0x2A2826, 1);  gfx_circle(px(g_cx), py(g_cy), ps(8), 1, 1);
+  g_k = 0;
+  loop(3, g_a = g_ang * (g_j == 0 ? 1 : 1.25) + g_k * 2.0944;
+    col(0x2A2826, 1);  pointer(px(g_cx), py(g_cy), sin(g_a), cos(g_a), ps(9), ps(19), ps(3));  g_k += 1; );
+  g_j += 1;
+);
+col(0x3A2E26, 1);  u_rect(492, 156 + 26 + 30 * g_pack - 1, 158, 2);
+// glass reflections
+col(0xFFFFFF, 0.05);  gfx_triangle(px(410), py(84), px(560), py(84), px(470), py(228), px(410), py(228));
+col(0xFFFFFF, 0.035);  gfx_triangle(px(590), py(84), px(640), py(84), px(560), py(228), px(510), py(228));
+// the counter: h:mm:ss:ff at 25 frames
+col(0x0C0B0A, 1);  u_rect(748, 96, 284, 74);  col(0x2E0A08, 1);  u_rect(752, 100, 276, 66);
+g_t = max(0, tc_d);  g_h = floor(g_t / 3600) % 10;  g_m = floor(g_t / 60) % 60;  g_s = floor(g_t) % 60;  g_f = floor((g_t - floor(g_t)) * 25);
+seg7(764, 110, 24, 46, g_h, 5);  colon7(797, 110, 46);
+seg7(808, 110, 24, 46, floor(g_m / 10), 5);  seg7(838, 110, 24, 46, g_m % 10, 5);  colon7(871, 110, 46);
+seg7(882, 110, 24, 46, floor(g_s / 10), 5);  seg7(912, 110, 24, 46, g_s % 10, 5);  colon7(945, 110, 46);
+seg7(956, 110, 24, 46, floor(g_f / 10), 5);  seg7(986, 110, 24, 46, g_f % 10, 5);
+gfx_setfont(10);  col(0xB8B0A0, 1);
+text_c(px(776), py(180), "H");  text_c(px(835), py(180), "MIN");  text_c(px(909), py(180), "SEC");  text_c(px(983), py(180), "FR");
+// status lamps
+sled(762, 210, 5, 0xFF3A22, st_disp);  gfx_setfont(10);  col(0xD8D2C4, 1);  text_l(px(774), py(210), "STUTTER");
+sled(872, 210, 5, 0xFFB030, min(1, dr_disp * 2));  col(0xD8D2C4, 1);  text_l(px(884), py(210), "DROPOUT");
+sled(978, 210, 5, 0x7CE05A, (play_state & 1) ? 1 : 0);  col(0xD8D2C4, 1);  text_l(px(990), py(210), "PLAY");
+
+// ---------- lower plate ----------
+col(C_LOW, 1);  u_rect(16, 248, 1048, 300);
+col(0xFFFFFF, 0.35);  u_rect(16, 248, 1048, 1);
+// RECORD
+section(24, 256, 176, 284, C_SEC1, "RECORD");
+kcap = 0x7A2A22;  kn(112, 352, 30, 2, 0, 24, 6, "DRIVE", 3);
+kn(68, 466, 16, 1, -24, 12, 0, "TRIM", 2);
+kn(156, 466, 16, 15, -24, 12, 0, "OUTPUT", 2);
+// TAPE
+section(212, 256, 262, 284, C_SEC2, "TAPE");
+kn(258, 344, 20, 4, 0, 100, 25, "WOW", 1);
+kn(343, 344, 20, 5, 0, 100, 20, "FLUTTER", 1);
+kn(428, 344, 20, 19, 0, 100, 0, "DROPOUTS", 1);
+tkey(234, 446, 52, 40, hiss_on >= 0.5, 0x3A86D8, "HISS") ? ( slider(6) = hiss_on >= 0.5 ? 0 : 1;  param_touched(6); );
+kn(343, 466, 16, 7, -80, -30, -60, "LEVEL", 3);
+hiss_on < 0.5 ? ( col(C_SEC2, 0.5);  u_rect(316, 432, 56, 96); );
+kn(428, 466, 16, 14, 0, 100, 50, "DRIFT", 1);
+// CRUSH
+section(486, 256, 196, 136, C_SEC3, "");
+tlamp(500, 274, "CRUSH", crush_on >= 0.5, 8);
+kn(536, 334, 18, 9, 4, 16, 12, "BITS", 4);
+kn(632, 334, 18, 10, 2, 48, 16, "RATE", 5);
+crush_on < 0.5 ? ( col(C_SEC3, 0.5);  u_rect(498, 296, 172, 90); );
+// RADIO
+section(486, 404, 196, 136, C_SEC3, "");
+tlamp(500, 422, "RADIO", radio_on >= 0.5, 11);
+kn(536, 482, 18, 12, 0, 100, 50, "BAND", 1);
+kn(632, 482, 18, 13, 0, 100, 30, "RESONANCE", 1);
+radio_on < 0.5 ? ( col(C_SEC3, 0.5);  u_rect(498, 444, 172, 90); );
+// TRANSPORT
+section(694, 256, 362, 284, C_SEC1, "TRANSPORT");
+tkey(750, 304, 84, 56, stut_on >= 0.5, 0xD8382A, "STUTTER") ? ( slider(16) = stut_on >= 0.5 ? 0 : 1;  param_touched(16); );
+kn(744, 466, 18, 17, 50, 250, 120, "SLICE", 6);
+kn(840, 466, 18, 18, 0, 100, 0, "GLITCH", 1);
+// the shuttle wheel: VARISPEED 0.5 - 1.5x (1x at the top); drag, wheel, double-click = 1x
+g_wx = 968;  g_wy = 386;  g_wr = 64;
+g_hov = sqr(mouse_x - px(g_wx)) + sqr(mouse_y - py(g_wy)) <= sqr(ps(g_wr + 6));
+click && g_hov && !drag_idx ? (
+  g_now = time_precise();
+  (mouse_cap & 4) || (last_click_idx == 3 && g_now - last_click_t < 0.35) ? ( slider(3) = 1;  param_touched(3);  drag_idx = 0; )
+                                                                          : ( drag_idx = 3;  drag_y0 = mouse_y;  drag_mv = 0;  drag_t = (speed - 0.5); );
+  last_click_idx = 3;  last_click_t = g_now;
+);
+g_hov && mouse_wheel != 0 && !drag_idx ? (
+  slider(3) = max(0.5, min(1.5, speed + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.002 : 0.01)));  param_touched(3);  mouse_wheel = 0; );
+drag_idx == 3 ? (
+  !drag_mv && abs(mouse_y - drag_y0) > ps(3) ? ( drag_mv = 1;  drag_y0 = mouse_y; );
+  drag_mv ? (
+    (mouse_cap & 8) != drag_sh ? ( drag_sh = mouse_cap & 8;  drag_t = speed - 0.5;  drag_y0 = mouse_y; );
+    g_v = 0.5 + max(0, min(1, drag_t + (drag_y0 - mouse_y) / ps(drag_sh ? 1200 : 240)));
+    abs(g_v - 1) < 0.006 && !drag_sh ? g_v = 1;                                        // a light detent at 1x
+    g_v != speed ? ( slider(3) = g_v;  param_touched(3); );
+  );
+);
+g_t = max(0, min(1, speed - 0.5));  g_a = -0.75 * $pi + g_t * 1.5 * $pi;
+g_j = 0;
+loop(11, g_b = -0.75 * $pi + g_j / 10 * 1.5 * $pi;  col(C_SCL, g_j % 5 == 0 ? 0.95 : 0.55);
+  gfx_circle(px(g_wx + sin(g_b) * (g_wr + 10)), py(g_wy - cos(g_b) * (g_wr + 10)), ps(g_j % 5 == 0 ? 2 : 1.3), 1, 1);  g_j += 1; );
+gfx_setfont(5);  col(C_INK, 1);
+text_c(px(g_wx - sin(0.75 * $pi) * (g_wr + 26)), py(g_wy - cos(0.75 * $pi) * (g_wr + 26)), "0.5");
+text_c(px(g_wx + sin(0.75 * $pi) * (g_wr + 26)), py(g_wy - cos(0.75 * $pi) * (g_wr + 26)), "1.5");
+text_c(px(g_wx), py(g_wy - g_wr - 22), "1x");
+shd_c(g_wx, g_wy, g_wr);
+col(0x1C1D1F, 1);  gfx_circle(px(g_wx), py(g_wy), ps(g_wr), 1, 1);
+// the knurled rim (turns with the wheel)
+g_j = 0;
+loop(48, g_b = g_a + g_j / 48 * 2 * $pi;  col(g_j % 2 ? 0x34363A : 0x141516, 1);
+  gfx_line(px(g_wx + sin(g_b) * (g_wr - 9)), py(g_wy - cos(g_b) * (g_wr - 9)), px(g_wx + sin(g_b) * (g_wr - 1)), py(g_wy - cos(g_b) * (g_wr - 1)), 1);
+  g_j += 1; );
+col(0x3A3C40, 1);  gfx_circle(px(g_wx), py(g_wy), ps(g_wr - 10), 1, 1);
+col(0x2E3033, 1);  gfx_circle(px(g_wx), py(g_wy), ps(g_wr - 16), 1, 1);
+col(0xFFFFFF, 0.10);  gfx_arc(px(g_wx), py(g_wy), ps(g_wr - 12), -1.9, -0.2, 1);  gfx_arc(px(g_wx), py(g_wy), ps(g_wr - 13), -1.8, -0.3, 1);
+vig_c(g_wx, g_wy, g_wr - 10, 0.18);
+// the finger dimple and the index line
+g_dx = g_wx + sin(g_a) * (g_wr - 30);  g_dy = g_wy - cos(g_a) * (g_wr - 30);
+col(0x151617, 1);  gfx_circle(px(g_dx), py(g_dy), ps(11), 1, 1);
+col(0x26282A, 1);  gfx_circle(px(g_dx + 1), py(g_dy + 1.5), ps(9), 1, 1);
+col(0xF6F4EE, 1);  pointer(px(g_wx), py(g_wy), sin(g_a), cos(g_a), ps(g_wr - 9), ps(g_wr - 1), ps(1.8));
+gfx_setfont(6);  col(C_INK, 1);  text_c(px(g_wx), py(g_wy + g_wr + 34), "VARISPEED");
+g_hov || drag_idx == 3 ? hover_tag(px(g_wx), py(g_wy - g_wr - 44), fmtv(speed, 7));
+
+// ---------- S / M / L / ? ----------
+g_j = 0;
+loop(4,
+  g_x = 998 + g_j * 14;  g_kon = g_j == 0 ? ui_sz == 1 : g_j == 1 ? ui_sz == 0 : g_j == 2 ? ui_sz == 2 : sz_help;
+  col(C_BEZ, 1);  u_rect(g_x, 24, 13, 18);
+  col(g_kon ? 0xF5E8C2 : 0x5A5650, 1);  u_rect(g_x + 1, 25, 11, 16);
+  gfx_setfont(5);  col(g_kon ? 0x111214 : 0xF0ECE0, 1);  text_c(px(g_x + 6.5), py(33), g_j == 0 ? "S" : g_j == 1 ? "M" : g_j == 2 ? "L" : "?");
+  click && !sz_help && mouse_x >= px(g_x) && mouse_x < px(g_x + 13) && mouse_y >= py(24) && mouse_y < py(42) ? (
+    g_j == 0 ? ui_sz = 1 : g_j == 1 ? ui_sz = 0 : g_j == 2 ? ui_sz = 2 : ( sz_help = 1;  sz_new = 1; );
+  );
+  g_j += 1;
+);
+sz_help && click && !sz_new ? sz_help = 0;
+sz_new = 0;
+sz_help ? (
+  col(0x000000, 0.62);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+  strcpy(#hl3, "Manual - https://www.gardenfx.uk/manual/");  strcat(#hl3, #ui_man);  strcat(#hl3, ".pdf");
+  gfx_setfont(5);  gfx_measurestr(#hl3, g_tw, g_th);
+  g_cw = max(g_tw + ps(40), ps(380));  g_ch = ps(130);  g_cx = (gfx_w - g_cw) * 0.5;  g_cy = (gfx_h - g_ch) * 0.5;
+  col(0x000000, 0.5);  ui_rrs(g_cx + ps(3), g_cy + ps(5), g_cw, g_ch, ps(8));
+  col(0x1C1D20, 1);    ui_rrs(g_cx, g_cy, g_cw, g_ch, ps(8));
+  col(0xE0603A, 1);    gfx_rect(g_cx + ps(20), g_cy + ps(36), g_cw - ps(40), max(1, ps(1)), 1);
+  gfx_setfont(6);  col(0xF2F2EE, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(14);  gfx_drawstr("Design by JGWizrad.  © John Garden 2026");
+  gfx_setfont(5);  col(0xE8B23A, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(50);  gfx_drawstr("https://www.gardenfx.uk/");
+  col(0xD8D6D0, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(72);  gfx_drawstr(#hl3);
+  col(0x85837E, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(102);  gfx_drawstr("Click anywhere to close.");
+);
+!lmb ? ( drag_idx = 0;  drag_sh = 0; );
+mouse_wheel = 0;
+last_lmb = lmb;
