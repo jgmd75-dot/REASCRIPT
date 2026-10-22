@@ -32,6 +32,13 @@ desc:GFX Lab Aureus [multiband processor]
 // LINK (MASTER): lit (the default) - every band's compressor and D EQ, and the safety limiter, hear both sides and
 //   move them together, so the image stays put. Dark: dual mono - each side its own detector and gain in all of them,
 //   so a loud hit on one side leaves the other alone. A change crossfades over 10 ms.
+// OS (right of the title): the DRIVEs' oversampling, 1x (as before, the default), 2x, 4x - each click steps on.
+//   Each band goes up after its EQ, through its DRIVE and back down before its COMP; the dry for MIX is delayed to
+//   match. A change dips the output for 5 ms, swaps, comes back. Latency 0 / 31 / 37 samples (reported).
+//
+// Requires gfx-lab-os (.jsfx-inc) in the same folder.
+
+import gfx-lab-os.jsfx-inc
 
 slider1:0<0,7,1{Init,Golden Glue,Tape Polish,Opto Smooth,Air Lift,Iron Low End,VCA Punch,Dynamic Tame}>-Preset
 slider2:25<0,100,1>-Drift (%)
@@ -80,6 +87,7 @@ slider46:0<-12,12,0.1>-B4 Gain (dB)
 slider47:0<0,1,1{Off,On}>-B4 Solo
 slider48:0<0,1,1{Off,On}>-B4 Mute
 slider49:1<0,1,1{Off,On}>-Link
+slider50:0<0,2,1{1x,2x,4x}>-Oversampling
 
 @init
 gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
@@ -339,14 +347,36 @@ function drive(x, t, d, lpc) instance(h0, dc1, dc2, lp, lo, hd, x1, v1, a1, ty, 
   ms += (v*v - ms)*au_er; es += (ms - es)*au_es;
   y += 0.5*dv/sqrt(1 + 2*es);                                // the half-sample lag made up
   t == 1 ? (
-    dc2 = y - dc1 + 0.9995*dc2; dc1 = y; y = dc2;            // DC block
+    dc2 = y - dc1 + au_dcr*dc2; dc1 = y; y = dc2;            // DC block
     lp += lpc*(y - lp); y = lp;                              // HF roll-off with drive
   ) : t == 2 ? (
     y += (ul - ul*ul*ul/6.75)*IPHI;
   );
   y/(1 + 0.6*(d - 1));
 );
-au_er = 1 - exp(-1/(0.01*srate)); au_es = 1 - exp(-1/(0.003*srate)); au_hc = 1 - exp(-1/(0.0001*srate));
+// the DRIVEs' rate-dependent coefficients, at their running rate (srate x the OS factor)
+function au_rate() local(fs) (
+  fs = srate*os_f;
+  au_er = 1 - exp(-1/(0.01*fs)); au_es = 1 - exp(-1/(0.003*fs)); au_hc = 1 - exp(-1/(0.0001*fs));
+  au_dcr = os_f == 1 ? 0.9995 : 1 - 0.0005/os_f;
+  xfLp = 1 - exp(-TWO_PI*F1*PHI/fs);
+);
+// one band's DRIVE at 2x / 4x: up, the DRIVE per phase, down -> au_yl, au_yr
+function au_os(yl, yr, t, d, lpc) local(i, a, c, p0, p1, p2, p3, q0, q1, q2, q3) (
+  this.ul.os_up(yl); this.ur.os_up(yr);
+  i = 0;
+  loop(os_f,
+    a = this.ul.os_s(i); c = this.ur.os_s(i);
+    d > 1.0001 ? ( a = this.dvl.drive(a, t, d, lpc); c = this.dvr.drive(c, t, d, lpc); );
+    i == 0 ? ( p0 = a; q0 = c; ) : i == 1 ? ( p1 = a; q1 = c; ) : i == 2 ? ( p2 = a; q2 = c; ) : ( p3 = a; q3 = c; );
+    i += 1;
+  );
+  au_yl = this.nl.os_dn(p0, p1, p2, p3); au_yr = this.nr.os_dn(q0, q1, q2, q3);
+);
+function au_osclr() ( this.ul.os_clr(); this.ur.os_clr(); this.nl.os_clr(); this.nr.os_clr(); this.dvl.ty = this.dvr.ty = -1; );
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider50); os_gsetup();
+au_rate();
+osd = alloc(128); memset(osd, 0, 128); osd_w = 0;    // the dry's delay for MIX at 2x / 4x
 
 // =====================================================================
 // Presets
@@ -391,7 +421,7 @@ vuL = 0; vuR = 0; mOut = 0; mLim = 0; limEnv = 0;
 limRel = exp(-1/(0.15*srate));
 vuC = cms(0.3);
 vu_sine = 10 * log10(2);   // +3.01 dB: RMS -> sine peak, so a sine peaking at the ref level reads 0 VU
-xfLp = 1 - exp(-TWO_PI*F1*PHI/srate);          // transformer low split: F1 * PHI
+xfLp = 1 - exp(-TWO_PI*F1*PHI/(srate*os_f));   // transformer low split: F1 * PHI
 vnd = alloc(2); memset(vnd, 0, 2);            // VU needle positions (GUI)
 ax_old = alloc(64); ax_new = alloc(64);          // preset duck: the settings before / after a preset
 ax_dkr = 1 / (0.012*srate); ax_dk = 1; ax_dst = 0;
@@ -427,7 +457,7 @@ slider6 != lastX ? (
   lastX = slider6;
   F1 = xf1(slider6); F2 = F1*10; F3 = xf3(F1);
   xbuild(); eqcentres();
-  xfLp = 1 - exp(-TWO_PI*F1*PHI/srate);
+  xfLp = 1 - exp(-TWO_PI*F1*PHI/(srate*os_f));
   b = 0; loop(4, bp[b*40 + 26] = -999; b += 1; );     // force EQ recalculation
 );
 mixW = slider5/100;
@@ -445,8 +475,9 @@ loop(4,
   p[5] = slider(i + 5)/100;
   p[6] = db2g(slider(i + 6));
   p[7] = slider(i + 8) > 0.5 ? 0 : (anySolo && slider(i + 7) < 0.5) ? 0 : 1;   // mute / solo
-  p[9] = 1 - exp(-TWO_PI*min(srate*0.45, 20000/(1 + 0.12*(p[3] - 1)))/srate);  // tape HF roll-off
-  p[3] <= 1.0001 ? ( b == 0 ? dL0.ty = dR0.ty = -1 : b == 1 ? dL1.ty = dR1.ty = -1 : b == 2 ? dL2.ty = dR2.ty = -1 : dL3.ty = dR3.ty = -1; );   // drive out: re-read when it comes back in
+  p[9] = 1 - exp(-TWO_PI*min(srate*0.45, 20000/(1 + 0.12*(p[3] - 1)))/(srate*os_f));  // tape HF roll-off
+  p[3] <= 1.0001 ? ( b == 0 ? dL0.ty = dR0.ty = -1 : b == 1 ? dL1.ty = dR1.ty = -1 : b == 2 ? dL2.ty = dR2.ty = -1 : dL3.ty = dR3.ty = -1;
+                     b == 0 ? o0.dvl.ty = o0.dvr.ty = -1 : b == 1 ? o1.dvl.ty = o1.dvr.ty = -1 : b == 2 ? o2.dvl.ty = o2.dvr.ty = -1 : o3.dvl.ty = o3.dvr.ty = -1; );   // drive out: re-read when it comes back in
 
   // EQ (D type is refreshed in @sample)
   (p[0] != 2 && (p[1] != p[26] || p[0] != p[27])) ? ( eqset(b, p[0], p[1]); p[26] = p[1]; p[27] = p[0]; );
@@ -470,6 +501,9 @@ loop(4,
 ax_dst == 3 ? ax_dst = 2;                    // the new settings are in: fade back in
 
 @sample
+os_gate();
+os_chg ? ( au_rate(); o0.au_osclr(); o1.au_osclr(); o2.au_osclr(); o3.au_osclr(); memset(osd, 0, 128); );   // the OS swap (at silence)
+os_tf = os_f2n(slider50);
 // ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
 gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
 gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
@@ -482,6 +516,10 @@ lk_u = 1 - lk_s;                             // the dual-mono share (0 = linked,
 outL = 0; outR = 0;
 split(inL, 0); aL1 = xb1; aL2 = xb2; aL3 = xb3; aL4 = xb4; dryL = xdry;
 split(inR, 9); aR1 = xb1; aR2 = xb2; aR3 = xb3; aR4 = xb4; dryR = xdry;
+os_f > 1 ? (                                 // the dry, delayed to match the oversampled DRIVEs
+  osd_w = (osd_w + 1) & 63; osd[osd_w] = dryL; osd[64 + osd_w] = dryR;
+  osd_r = (osd_w - os_lat(os_f)) & 63; dryL = osd[osd_r]; dryR = osd[64 + osd_r];
+);
 
 b = 0;
 loop(4,
@@ -515,6 +553,11 @@ loop(4,
   yr = bq(bq(yr, eqA + b*18 + 9), eqB + b*18 + 9);
 
   // ---- DRIVE ----
+  os_f > 1 ? (
+    b == 0 ? o0.au_os(yl, yr, p[2], p[3], p[9]) : b == 1 ? o1.au_os(yl, yr, p[2], p[3], p[9]) :
+    b == 2 ? o2.au_os(yl, yr, p[2], p[3], p[9]) : o3.au_os(yl, yr, p[2], p[3], p[9]);
+    yl = au_yl; yr = au_yr;
+  ) :
   p[3] > 1.0001 ? (
     b == 0 ? ( yl = dL0.drive(yl, p[2], p[3], p[9]); yr = dR0.drive(yr, p[2], p[3], p[9]); ) :
     b == 1 ? ( yl = dL1.drive(yl, p[2], p[3], p[9]); yr = dR1.drive(yr, p[2], p[3], p[9]); ) :
@@ -591,8 +634,8 @@ lk_u > 0 ? (
   limEnvL = limEnvR = limEnv;
 oL *= lg; oR *= lg;
 );
-spl0 = max(-1, min(1, oL));
-spl1 = max(-1, min(1, oR));
+spl0 = max(-1, min(1, oL))*os_g;
+spl1 = max(-1, min(1, oR))*os_g;
 
 vuL += vuC*(spl0*spl0 - vuL);
 vuR += vuC*(spl1*spl1 - vuR);
@@ -1029,6 +1072,7 @@ cblk(); gfx_setfont(3); TC(1504, 386, "OUTPUT"); gfx_setfont(4); kn_hot ? TC(150
 mLim > 0.5 ? col(1.0, 0.18, 0.10) : col(0.35, 0.08, 0.05); CIRC(1328, 438, 6, 1);
 cblk(); gfx_setfont(5); TX(1340, 432, "LIMIT");
 btn(1416, 424, 68, 30, "LINK", slider49 >= 0.5, 4, 0) ? setk(49, slider49 >= 0.5 ? 0 : 1);
+!hlp ? ( au_sc = sc; sc = S; os_key(304 + ox/S, 36 + oy/S, 50, 0x111111, 11); sc = au_sc; );   // OS, right of the title
 screw(1530, 440);
 
 // ? pop-up: design credit and the manual

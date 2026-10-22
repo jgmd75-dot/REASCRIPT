@@ -2,8 +2,8 @@ desc:GFX Lab Benthick 3B [bus processor]
 //tags: bus processor saturation transformer transistor compressor limiter width mastering
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-lab-drift, gfx-lab-input, gfx-lab-output, gfx-lab-ui, gfx-lab-panel, gfx-lab-dyn, gfx-lab-faceplate and
-// gfx-lab-instrument (.jsfx-inc) in the same folder.
+// Requires gfx-lab-drift, gfx-lab-input, gfx-lab-output, gfx-lab-ui, gfx-lab-panel, gfx-lab-dyn, gfx-lab-faceplate,
+// gfx-lab-instrument and gfx-lab-os (.jsfx-inc) in the same folder.
 //
 // A solid-state iron and transistor bus processor: tight low-end weight, fast transient clamping and
 // dense glue, without woolly tube artefacts. 3B lays the stages out as columns, left to right in signal
@@ -35,8 +35,12 @@ desc:GFX Lab Benthick 3B [bus processor]
 // ANTI-ALIASING (the house drive standard): IRON's upper core, CLASS-A, COMP 2's colour and S SAT are read with
 //   first-order ADAA, its half-sample lag made up (see bt_th), so small signals still pass at unity, phase-true with
 //   the dry for MIX (IRON's low core only sees the band below 160 Hz: nothing of it folds back, so it is read plain).
-//   No oversampling, no latency. The curves are smooth (no knee to track); there is no pre-filter (the front end's
-//   colour - IRON's lows, CLASS-A's upper mids - is what is being driven).
+//   The curves are smooth (no knee to track); there is no pre-filter (the front end's colour - IRON's lows, CLASS-A's
+//   upper mids - is what is being driven).
+// OS (header, left of PRESETS): the FRONT END's oversampling, 1x (as before, the default), 2x, 4x - each click steps
+//   on. The FRONT END is the drive; COMP 2's grit and S SAT are light touches and stay at the base rate (ADAA). The dry
+//   for MIX is delayed to match. A change dips the output for 5 ms, swaps, comes back. Latency 0 / 31 / 37 samples
+//   (reported).
 
 import gfx-lab-drift.jsfx-inc
 import gfx-lab-input.jsfx-inc
@@ -46,6 +50,7 @@ import gfx-lab-panel.jsfx-inc
 import gfx-lab-dyn.jsfx-inc
 import gfx-lab-faceplate.jsfx-inc
 import gfx-lab-instrument.jsfx-inc
+import gfx-lab-os.jsfx-inc
 
 slider1:4<0,18,0.1>-Drive (dB)
 slider2:0<0,1,1{Iron,Class-A}>-Front end
@@ -86,6 +91,7 @@ slider36:1<0,1,1{Out,In}>-Bus comp in
 slider37:4<0,4,1{0.1 s,0.3 s,0.6 s,1.2 s,Auto}>-Bus comp release
 slider38:5<0,18,0.1>-Bus comp makeup (dB)
 slider39:1<0,1,1{Off,On}>-Link
+slider40:0<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
@@ -176,16 +182,24 @@ function fe_dc(x) instance(xm, ym) local(y) (
   min(max(y, -4), 4);
 );
 // a peaking biquad's coefficients (the CLASS-A pre / de-emphasis)
-function pk_coefs(f, q, gdb) local(w0, cw, al, A, n) (
-  w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); al = sin(w0) / (2 * q); A = 10 ^ (gdb / 40);
+function pk_coefs(f, q, gdb, fs) local(w0, cw, al, A, n) (
+  w0 = 2 * $pi * min(f, fs * 0.45) / fs; cw = cos(w0); al = sin(w0) / (2 * q); A = 10 ^ (gdb / 40);
   n = 1 + al / A; pk_b0 = (1 + al * A) / n; pk_b1 = -2 * cw / n; pk_b2 = (1 - al * A) / n; pk_a1 = pk_b1; pk_a2 = (1 - al / A) / n;
 );
 
-ir_lpc = 1 - exp(-2 * $pi * 160 / srate);
+// the FRONT END's rate-dependent coefficients, at its running rate (srate x the OS factor)
+function fe_rate() local(fs) (
+  fs = srate * os_f;
+  ir_lpc = 1 - exp(-2 * $pi * 160 / fs);
+  pk_coefs(2800, 0.8, 4, fs);  ca_b0 = pk_b0; ca_b1 = pk_b1; ca_b2 = pk_b2; ca_a1 = pk_a1; ca_a2 = pk_a2;
+  pk_coefs(2800, 0.8, -4, fs); cd_b0 = pk_b0; cd_b1 = pk_b1; cd_b2 = pk_b2; cd_a1 = pk_a1; cd_a2 = pk_a2;
+  fe_er = 1 - exp(-1 / (0.01 * fs)); fe_es = 1 - exp(-1 / (0.003 * fs));   // the ADAA lag's followers in the FRONT END
+);
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider40); os_gsetup();
+OSD = 70000;                                          // the dry's delay for MIX at 2x / 4x (64 per side)
+fe_rate();
 ir_b = 0.28; ir_tb = ost_tanh(ir_b); ir_sl = 1 - ir_tb * ir_tb;
 dc_c = 1 - 2 * $pi * 5 / srate;
-pk_coefs(2800, 0.8, 4);  ca_b0 = pk_b0; ca_b1 = pk_b1; ca_b2 = pk_b2; ca_a1 = pk_a1; ca_a2 = pk_a2;
-pk_coefs(2800, 0.8, -4); cd_b0 = pk_b0; cd_b1 = pk_b1; cd_b2 = pk_b2; cd_a1 = pk_a1; cd_a2 = pk_a2;
 tl_c = 1 - exp(-2 * $pi * 700 / srate);
 sm = 1 - exp(-1 / (0.03 * srate));
 lk_c = 1 - exp(-1 / (0.01 * srate));   // LINK crossfade
@@ -199,7 +213,8 @@ function update() local(r) (
   topo_t = slider2;
   ms_on = slider3;
   sdrv_t = ms_on ? 10 ^ (slider4 / 20) : 1;
-  ir_hy = 0.06 * srate / 1000 * (0.4 + 0.6 * slider1 / 18);
+  ir_hy = 0.06 * srate * os_f / 1000 * (0.4 + 0.6 * slider1 / 18);
+  os_tf = os_f2n(slider40);
   slider5 != sc_last ? ( sc_last = slider5;
     h3L.bq_set(1, slider5, 0.707, 0); h3R.bq_set(1, slider5, 0.707, 0);
     h1L.bq_set(1, slider5, 0.707, 0); h1R.bq_set(1, slider5, 0.707, 0);
@@ -225,6 +240,7 @@ function update() local(r) (
   out_t = 10 ^ (slider24 / 20);
   in_setup(slider25, slider26);
   ost_setup(slider27 / 100, slider28 / 100, slider29, slider30, slider31, 0);   // output stage: straight through
+  pdc_delay = os_base + os_lat(os_f);                                          // (ost_setup clears it)
 );
 
 // ---------- presets ----------
@@ -324,12 +340,20 @@ file_var(0, ui_hw);
 file_var(0, pr_cur);
 
 @sample
+// OS: a change of factor dips the output and swaps at the silent point
+os_gate();
+os_chg ? ( fe_rate(); update(); feUA.os_clr(); feUB.os_clr(); feDA.os_clr(); feDB.os_clr(); memset(OSD, 0, 128);
+           feIA.lo = feIB.lo = feIA.um = feIB.um = 0; );
 // input stage: DC block, trim, guard
 in_process(spl0, spl1);
 xL = in_l; xR = in_r;
 pkI_d = max(pkI_d, max(abs(xL), abs(xR)));
 
 yL = xL; yR = xR;   // the dry, for MIX
+os_f > 1 ? (        // (delayed to match the oversampled FRONT END)
+  osd_w = (osd_w + 1) & 63; OSD[osd_w] = xL; OSD[64 + osd_w] = xR;
+  osd_r = (osd_w - os_lat(os_f)) & 63; yL = OSD[osd_r]; yR = OSD[64 + osd_r];
+);
 
 drv_s += (drv_t - drv_s) * sm; topo_s += (topo_t - topo_s) * sm; sdrv_s += (sdrv_t - sdrv_s) * sm;
 tgl_s += (tgl_t - tgl_s) * sm; tgh_s += (tgh_t - tgh_s) * sm;
@@ -339,7 +363,32 @@ lk_s += (lk_t - lk_s) * lk_c; lk_s > 0.9999 && lk_t ? lk_s = 1; lk_s < 0.0001 &&
 lk_u = 1 - lk_s;   // the dual-mono share (0 = linked, as the Stable unit)
 
 // ---------- 1 FRONT END ----------
-fe_on ? (
+os_f > 1 ? (
+  // 2x / 4x: up, the core at the high rate, down (the filters keep running with the FRONT END out: the latency stays)
+  fe_on && ms_on ? ( fa = (xL + xR) * 0.5; fb = (xL - xR) * 0.5; ) : ( fa = xL; fb = xR; );
+  feUA.os_up(fa); feUB.os_up(fb);
+  gb = drv_s * sdrv_s;
+  fe_bs = bt_er; fe_bt = bt_es; bt_er = fe_er; bt_es = fe_es;
+  fe_i = 0;
+  loop(os_f,
+    fa = feUA.os_s(fe_i); fb = feUB.os_s(fe_i);
+    fe_on ? (
+      topo_s < 0.999 ? ( ia = feIA.fe_iron(fa, drv_s); ib = feIB.fe_iron(fb, gb); );
+      topo_s > 0.001 ? ( ca = feCA.fe_classa(fa, drv_s); cb = feCB.fe_classa(fb, gb); );
+      fa = topo_s < 0.001 ? ia : topo_s > 0.999 ? ca : ia + (ca - ia) * topo_s;
+      fb = topo_s < 0.001 ? ib : topo_s > 0.999 ? cb : ib + (cb - ib) * topo_s;
+    );
+    fe_i == 0 ? ( fe_p0 = fa; fe_q0 = fb; ) : fe_i == 1 ? ( fe_p1 = fa; fe_q1 = fb; ) :
+    fe_i == 2 ? ( fe_p2 = fa; fe_q2 = fb; ) : ( fe_p3 = fa; fe_q3 = fb; );
+    fe_i += 1;
+  );
+  bt_er = fe_bs; bt_es = fe_bt;
+  fa = feDA.os_dn(fe_p0, fe_p1, fe_p2, fe_p3); fb = feDB.os_dn(fe_q0, fe_q1, fe_q2, fe_q3);
+  fe_on ? (
+    ms_on ? ( xL = fa + fb; xR = fa - fb; ) : ( xL = fa; xR = fb; );
+    xL = dcL.fe_dc(xL); xR = dcR.fe_dc(xR);
+  ) : ( xL = fa; xR = fb; );
+) : fe_on ? (
   ms_on ? ( fa = (xL + xR) * 0.5; fb = (xL - xR) * 0.5; ) : ( fa = xL; fb = xR; );
   gb = drv_s * sdrv_s;
   // IRON <-> CLASS-A: both run while the key's crossfade is moving, so the switch never clicks
@@ -443,8 +492,8 @@ oL = (yL + (dL - yL) * mix_s) * out_s;
 oR = (yR + (dR - yR) * mix_s) * out_s;
 oL = ostL.ost_band(oL); oR = ostR.ost_band(oR);
 ost_out(oL, oR);
-spl0 = ost_l;
-spl1 = ost_r;
+spl0 = ost_l * os_g;
+spl1 = ost_r * os_g;
 pkL_d = max(pkL_d, abs(spl0)); pkR_d = max(pkR_d, abs(spl1));
 
 @gfx 1180 570
@@ -520,6 +569,7 @@ pm_ || (pressed && drag_id == 0 && mouse_x >= 832 * sc && mouse_x < 1064 * sc &&
   k_ = gfx_showmenu(#pmenu);
   k_ > 0 ? ( load_preset(k_); pr_cur = k_ <= PRESET_N ? k_ : 0; );
 );
+os_key(636, 24, 40, INK, 12);
 ui_size_picker(1080 * sc, 26 * sc);
 
 // ---------- the columns, in signal order ----------

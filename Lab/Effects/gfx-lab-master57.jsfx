@@ -2,8 +2,8 @@ desc:GFX Lab Master57 [mastering chain]
 //tags: mastering disc cutting lathe elliptical eq compressor vari-mu limiter hf limiter valve stereo series57
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-lab-drift, gfx-lab-input, gfx-lab-output, gfx-lab-ui, gfx-lab-panel and gfx-lab-s57 (.jsfx-inc) in the
-// same folder.
+// Requires gfx-lab-drift, gfx-lab-input, gfx-lab-output, gfx-lab-ui, gfx-lab-panel, gfx-lab-s57 and gfx-lab-os
+// (.jsfx-inc) in the same folder.
 //
 // MASTER57 (Series 57). The last of the series: the disc-mastering chain of 1957, the year the stereo disc arrived -
 // everything the lathe needed between the tape and the cutter.
@@ -15,13 +15,15 @@ desc:GFX Lab Master57 [mastering chain]
 //       programme dependent), PARALLEL (the dry share). The ratio rises with the reduction.
 //   HF LIMITER  the cutter's protection: the top above 7 kHz is held down when it passes HF LIMIT (a dynamic shelf),
 //       so cymbals and sibilance can't burn the cutter (or the listener).
-//   PEAK LIMITER  a valve peak limiter, 2x oversampled: LIMIT drives the programme into it, CEILING is the most it
+//   PEAK LIMITER  a valve peak limiter, oversampled as the OS key says (2x as before, the default): LIMIT drives the programme into it, CEILING is the most it
 //       lets out (-12 .. 0 dBFS). A fast attack, a programme-dependent release, a soft valve knee.
 //   LINK (OUTPUT): lit (the default) - the compressor and both limiters hear both sides and turn them down together,
 //       so the image stays put. Dark: dual mono - each side its own detector and gain in all three, so a loud hit on
 //       one side leaves the other alone. A change crossfades over 10 ms.
 //   Each section has its IN button. OUTPUT. The house output stage (its band SAT; no clip of its own - the limiter
-//   is the clip). Latency: 31 samples (the limiter's oversampling), reported.
+//   is the clip). Latency: the limiter's oversampling, reported.
+//   OS (header, left of the face keys): the PEAK LIMITER's oversampling - 1x (no latency), 2x (31 samples, the
+//       default), 4x (37 samples); each click steps on. A change dips the output for 5 ms, swaps, comes back.
 // ULM / COPENHAGEN (the face): ULM - a precise EQ, a firm compressor and a tight limiter. COPENHAGEN - broader EQ
 //   curves, a slower, softer compressor, a rounder limiter and a breath of output iron. Level matched.
 // DRIFT (0 - 100 %, 50 % = standard): the valves' bias wanders a little (the compressor's threshold, the limiter's
@@ -33,6 +35,7 @@ import gfx-lab-output.jsfx-inc
 import gfx-lab-ui.jsfx-inc
 import gfx-lab-panel.jsfx-inc
 import gfx-lab-s57.jsfx-inc
+import gfx-lab-os.jsfx-inc
 
 slider1:0<-24,12,0.1>-Input trim (dB)
 slider2:1<0,1,1{Off,On}>-Input guard
@@ -58,6 +61,7 @@ slider21:120<40,400,1>-Sat low band (Hz)
 slider22:6000<2000,16000,10>-Sat high band (Hz)
 slider23:1<0,1,1{Ulm,Copenhagen}>-Face
 slider24:1<0,1,1{Off,On}>-Link
+slider25:1<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
@@ -69,9 +73,7 @@ out_pin:right output
 s57_lamp = 1;                                           // Series 57 keys drawn as the house lamp keys
 ext_noinit = 1;
 s57_mem = 0;
-ms_HB = s57_alloc(64); s57_hbdesign(ms_HB, 63, 8);
-msuL.s57_upinit(63, ms_HB, 64); msuR.s57_upinit(63, ms_HB, 64); msdL.s57_dninit(63, ms_HB, 64); msdR.s57_dninit(63, ms_HB, 64);
-ms_LAT = 31;
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider25); os_gsetup();   // the PEAK LIMITER's oversampling (gfx-lab-os)
 
 function ms_update() (
   in_setup(slider1, slider2 >= 0.5);
@@ -83,7 +85,8 @@ function ms_update() (
   ms_tlk = slider24 >= 0.5;
   drift_macro(slider18);
   ost_setup(slider19 / 100, slider20 / 100, slider21, slider22, 0, 0);
-  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = ms_LAT;
+  os_tf = os_f2n(slider25);
+  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = os_base + os_lat(os_f);
 );
 function ms_filters() local(f) (
   msLo.s57_bqset(4, 100, slider4, ms_fc ? 0.5 : 0.7, srate); msLp.s57_bqset(4, 100, slider4, ms_fc ? 0.5 : 0.7, srate);
@@ -162,8 +165,8 @@ function ms_hside(h) instance(he, hg) local(hp, ho) (
   ho = 20 * log10(max(he, 0.0000001)) - ms_hft;
   hg = ho > 0 ? 10 ^ (-ho * 0.75 / 20) : 1;
 );
-function ms_lside(a, b) instance(lgv) local(pk, tg) (
-  pk = max(abs(a), abs(b));
+function ms_lside(a, b, c, d) instance(lgv) local(pk, tg) (
+  pk = abs(a); os_f > 1 ? pk = max(pk, abs(b)); os_f > 2 ? pk = max(pk, max(abs(c), abs(d)));
   tg = pk > ms_cl ? ms_cl / pk : 1;
   lgv = tg < lgv ? lgv + (tg - lgv) * ms_lka * 8 : lgv + (tg - lgv) * (ms_cgr > 3 ? 0.00015 : 0.0006);
 );
@@ -189,13 +192,15 @@ file_var(0, ui_sz);
 file_var(0, pr_cur);
 
 @sample
+os_gate();
+os_chg ? ( msuL.os_clr(); msuR.os_clr(); msdL.os_clr(); msdR.os_clr(); );   // the OS swap (at silence)
 ms_lg += (ms_tlg - ms_lg) * ms_sm; ms_og += (ms_tog - ms_og) * ms_sm;
 ms_fst == 1 ? ( ms_fade -= ms_fd; ms_fade <= 0 ? (
   ms_fade = 0; ms_eq = ms_teq; ms_cp = ms_tcp; ms_hf = ms_thf; ms_pl = ms_tpl; ms_el = ms_tel;
   ms_tfc != ms_fc ? ( ms_fc = ms_tfc; ms_filters(); );
   ms_lv = 1; ms_cgr = 0; ms_ce = 0; ms_hg = 1; ms_he = 0; ms_le = 0; ms_lgv = 1;
   mcA.lv = mcB.lv = 1; mcA.ce = mcB.ce = mcA.cgr = mcB.cgr = 0; mhA.he = mhB.he = 0; mhA.hg = mhB.hg = 1; mlA.lgv = mlB.lgv = 1;
-  ms_hold = ms_LAT + 8; ms_fst = 2; ); ) :
+  ms_hold = os_lat(os_f) + 8; ms_fst = 2; ); ) :
 ms_fst == 2 ? ( ms_hold -= 1; ms_hold <= 0 ? ms_fst = 3; ) :
 ms_fst == 3 ? ( ms_fade += ms_fd; ms_fade >= 1 ? ( ms_fade = 1; ms_fst = 0; ); );
 
@@ -246,31 +251,30 @@ ms_hf ? (
     ms_l += ms_hl * (ms_hg - 1); ms_r += ms_hr * (ms_hg - 1);
   );
 );
-// ---------- PEAK LIMITER (2x): LIMIT in, a fast gain with a programme-dependent release, a soft valve knee, CEILING ----------
+// ---------- PEAK LIMITER (at the OS rate): LIMIT in, a fast gain with a programme-dependent release, a soft valve knee, CEILING ----------
 function ms_soft(x) local(t, a) (
   t = ms_cl * (ms_lsoft + ms_dkn); a = abs(x);
   a <= t ? x : sign(x) * (t + (ms_cl - t) * s57_th((a - t) / (ms_cl - t)));
 );
-msuL.s57_up(ms_pl ? ms_l * ms_lg : ms_l); msuR.s57_up(ms_pl ? ms_r * ms_lg : ms_r);
+msuL.os_up(ms_pl ? ms_l * ms_lg : ms_l); msuR.os_up(ms_pl ? ms_r * ms_lg : ms_r);
 ms_pl ? (
-  ms_a0 = msuL.o0; ms_b0 = msuR.o0; ms_a1_ = msuL.o1; ms_b1 = msuR.o1;
-  ms_pk = max(max(abs(ms_a0), abs(ms_b0)), max(abs(ms_a1_), abs(ms_b1)));
+  ms_pk = 0; ms_i = 0; loop(os_f, ms_pk = max(ms_pk, max(abs(msuL.os_s(ms_i)), abs(msuR.os_s(ms_i)))); ms_i += 1; );
   ms_tg = ms_pk > ms_cl ? ms_cl / ms_pk : 1;
   ms_lgv = ms_tg < ms_lgv ? ms_lgv + (ms_tg - ms_lgv) * ms_lka * 8 : ms_lgv + (ms_tg - ms_lgv) * (ms_cgr > 3 ? 0.00015 : 0.0006);
   ms_lgm = max(ms_lgm, -20 * log10(max(ms_lgv, 0.0001)));
   ms_lku > 0 ? (
-    mlA.ms_lside(ms_a0, ms_a1_); mlB.ms_lside(ms_b0, ms_b1);
+    mlA.ms_lside(msuL.s0, msuL.s1, msuL.s2, msuL.s3); mlB.ms_lside(msuR.s0, msuR.s1, msuR.s2, msuR.s3);
     ms_ga = ms_lgv + (mlA.lgv - ms_lgv) * ms_lku; ms_gb = ms_lgv + (mlB.lgv - ms_lgv) * ms_lku;
     ms_lgm = max(ms_lgm, -20 * log10(max(min(ms_ga, ms_gb), 0.0001)));
-    ms_q0l = ms_soft(ms_a0 * ms_ga); ms_q0r = ms_soft(ms_b0 * ms_gb);
-    ms_q1l = ms_soft(ms_a1_ * ms_ga); ms_q1r = ms_soft(ms_b1 * ms_gb);
   ) : (
-    mlA.lgv = mlB.lgv = ms_lgv;
-    ms_q0l = ms_soft(ms_a0 * ms_lgv); ms_q0r = ms_soft(ms_b0 * ms_lgv);
-    ms_q1l = ms_soft(ms_a1_ * ms_lgv); ms_q1r = ms_soft(ms_b1 * ms_lgv);
+    mlA.lgv = mlB.lgv = ms_lgv; ms_ga = ms_gb = ms_lgv;
   );
-) : ( ms_q0l = msuL.o0; ms_q0r = msuR.o0; ms_q1l = msuL.o1; ms_q1r = msuR.o1; );
-ms_yl = msdL.s57_dn(ms_q0l, ms_q1l); ms_yr = msdR.s57_dn(ms_q0r, ms_q1r);
+  ms_q0l = ms_soft(msuL.s0 * ms_ga); ms_q0r = ms_soft(msuR.s0 * ms_gb);
+  os_f > 1 ? ( ms_q1l = ms_soft(msuL.s1 * ms_ga); ms_q1r = ms_soft(msuR.s1 * ms_gb); );
+  os_f > 2 ? ( ms_q2l = ms_soft(msuL.s2 * ms_ga); ms_q2r = ms_soft(msuR.s2 * ms_gb);
+               ms_q3l = ms_soft(msuL.s3 * ms_ga); ms_q3r = ms_soft(msuR.s3 * ms_gb); );
+) : ( ms_q0l = msuL.s0; ms_q0r = msuR.s0; ms_q1l = msuL.s1; ms_q1r = msuR.s1; ms_q2l = msuL.s2; ms_q2r = msuR.s2; ms_q3l = msuL.s3; ms_q3r = msuR.s3; );
+ms_yl = msdL.os_dn(ms_q0l, ms_q1l, ms_q2l, ms_q3l); ms_yr = msdR.os_dn(ms_q0r, ms_q1r, ms_q2r, ms_q3r);
 // COPENHAGEN: a breath of output iron
 ms_fc ? ( ms_lo1 += (ms_yl - ms_lo1) * ms_klo; ms_yl += (s57_th(ms_lo1 * 1.5) / 1.5 - ms_lo1) * 0.5;
           ms_lo2 += (ms_yr - ms_lo2) * ms_klo; ms_yr += (s57_th(ms_lo2 * 1.5) / 1.5 - ms_lo2) * 0.5; );
@@ -278,15 +282,17 @@ ms_yl *= ms_og * ms_fade; ms_yr *= ms_og * ms_fade;
 ms_pkl = max(ms_pkl, abs(ms_yl)); ms_pkr = max(ms_pkr, abs(ms_yr));
 ms_yl = mso.ost_band(ms_yl); ms_yr = msp.ost_band(ms_yr);
 ost_out(ms_yl, ms_yr);
-spl0 = abs(ost_l) < 0.00000000000000000001 ? 0 : ost_l;
-spl1 = abs(ost_r) < 0.00000000000000000001 ? 0 : ost_r;
+spl0 = abs(ost_l) < 0.00000000000000000001 ? 0 : ost_l * os_g;
+spl1 = abs(ost_r) < 0.00000000000000000001 ? 0 : ost_r * os_g;
 
 @gfx 960 440
 ui_begin(960, 440);
 s57_pal(slider23);
 s57_fonts();
 s57_face(960, 440);
+s57_hdros = 1;
 k_ = s57_header(960, "MASTER57", "SERIES 57", "MASTERING CHAIN", #ms_pm, 23);
+os_key(690, 16, 25, S57_INK, 16);
 k_ > 0 ? load_preset(k_);
 
 s57_path(960, 412, 5);
