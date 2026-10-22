@@ -26,6 +26,11 @@ desc:GFX Lab ORCHD [MIDI chords]
 // MEMORY: M+ stores the chord on the keys (with its length), REST stores a rest of the chosen length, MR plays
 //   the stored sequence at the project tempo (press MR again to stop), MC clears it. The sequence is saved
 //   with the project (up to 32 steps).
+// WRITE: with WRITE lit, = and MR also write their chords into a MIDI item on the selected track at the edit cursor
+//   (and move the cursor on), the way CC-80 did. A plug-in can't write items itself, so this needs the companion
+//   script "GFX ORCHD - write MIDI" running (load it once from the Actions list; it waits in the background). ORCHD
+//   hands each chord to it through shared memory (gmem "GFX_ORCHD"). To capture what you play on a MIDI keyboard,
+//   record the track's output (MIDI) instead.
 // No drift (John, Oct 2026): ORCHD plays exactly what you ask.
 // GUI: CC-80's pocket calculator - cream case, solar cell, green LCD, rubber keys with small LEDs on the keys that
 //   hold a setting. The LCD shows the chord name and its spelling (by letter, so Cdim7 = C - Eb - Gb - Bbb), the
@@ -34,6 +39,8 @@ desc:GFX Lab ORCHD [MIDI chords]
 // Latency: 0 samples. Audio passes through untouched.
 
 import gfx-lab-ui.jsfx-inc
+
+options:gmem=GFX_ORCHD
 
 slider1:s_root=0<0,7,1{None,C,D,E,F,G,A,B}>-Root
 slider2:s_acc=0<0,2,1{Natural,Flat,Sharp}>-Accidental
@@ -45,6 +52,7 @@ slider7:s_oct=0<-2,2,1>-Octave
 slider8:s_lead=0<0,1,1{Off,On}>-Leading note
 slider9:s_ch=1<1,16,1>-MIDI channel for = and MR
 slider10:s_top=7<0,11,1{C,Db,D,Eb,E,F,F#,G,Ab,A,Bb,B}>-Leading note (top)
+slider11:s_write=0<0,1,1{Off,On}>-Write = and MR into the item
 
 @init
 #ui_man = "gfx-lab-orchd";
@@ -71,6 +79,7 @@ OB  = 6000;      // outgoing MIDI this block: 4 per event (offset, status, data1
 OBMAX = 480;
 REG_LO = 40; REG_HI = 84; CENTRE = 62;
 vl_lo = 0; vl_hi = REG_HI;
+PSV = 120;       // the voice-leading state saved while MR is written
 MSTR = 200;      // string slots for the memory step names (200 - 231)
 
 LPC[0] = 0; LPC[1] = 2; LPC[2] = 4; LPC[3] = 5; LPC[4] = 7; LPC[5] = 9; LPC[6] = 11;
@@ -219,16 +228,16 @@ function top_add() local(has, iv, k, L, deg, li, a) (
 );
 // The voicing: plain voice leading, or with LEAD the leading note on top (between E4 and Eb5) and the rest of the
 // chord voice-led within the octave under it
-function voice() local(T, j, k) (
+function voice() local(TP, j, k) (
   s_lead ? (
-    T = 64 + (s_top + 8) % 12;
+    TP = 64 + (s_top + 8) % 12;
     j = 0; k = 0; loop(ch_n, CHD[k] != s_top ? ( CHD[j] = CHD[k]; j += 1; ); k += 1; ); ch_n = j;
     ch_n > 0 ? (
-      vl_lo = T - 12; vl_hi = T - 1;
-      vlead() >= 1000000 ? ( vl_lo = T - 24; vlead(); );
+      vl_lo = TP - 12; vl_hi = TP - 1;
+      vlead() >= 1000000 ? ( vl_lo = TP - 24; vlead(); );
       vl_lo = 0; vl_hi = REG_HI;
     ) : vl_n = 0;
-    VL[vl_n] = T; vl_n += 1;
+    VL[vl_n] = TP; vl_n += 1;
   ) : vlead();
 );
 
@@ -325,6 +334,22 @@ function v_run(tend) local(i, v, k, n) (
   snd_disp = n;
 );
 
+// ---------- WRITE: hand chords to the companion script through gmem ----------
+// gmem: 0 request counter (bumped when a request is complete), 1 note count, 2 total length (quarter notes),
+//       3 channel, 16.. notes: start (qn from the cursor), length (qn), pitch, velocity
+function wr_begin() ( wr_n = 0; );
+function wr_chord(q, len, vel) local(k, sh) (
+  sh = 12 * s_oct; k = 0;
+  loop(vl_n,
+    wr_n < 1000 ? (
+      gmem[16 + wr_n * 4] = q; gmem[17 + wr_n * 4] = len; gmem[18 + wr_n * 4] = VL[k] + sh; gmem[19 + wr_n * 4] = vel;
+      wr_n += 1;
+    );
+    k += 1;
+  );
+);
+function wr_send(total) ( gmem[1] = wr_n; gmem[2] = total; gmem[3] = s_ch - 1; gmem[0] += 1; );
+
 // the name of memory step k into its string slot
 function mem_name(k) local(m) (
   m = MEM + k * 8;
@@ -355,7 +380,24 @@ rest_dirty ? (
 );
 mc_dirty ? ( seq_on = 0; mem_n_d = 0; mc_dirty = 0; );
 mr_dirty ? (
-  seq_on ? seq_on = 0 : mem_n_d > 0 ? ( seq_on = 1; seq_k = 0; seq_t = now; );
+  seq_on ? seq_on = 0 : mem_n_d > 0 ? (
+    s_write ? (                                     // write the whole sequence, then play it with the same voicings
+      k = 0; loop(prv_n, PSV[k] = PRV[k]; k += 1; ); psv_n = prv_n;
+      wr_begin(); q = 0; k = 0;
+      loop(mem_n_d,
+        m = MEM + k * 8;
+        !m[6] ? (
+          ch_build(m[0], m[1], m[2], m[3], m[4]); top_add(); voice();
+          j = 0; loop(vl_n, PRV[j] = VL[j]; j += 1; ); prv_n = vl_n;
+          wr_chord(q, DQN[m[5]], 100);
+        );
+        q += DQN[m[5]]; k += 1;
+      );
+      wr_send(q);
+      k = 0; loop(psv_n, PRV[k] = PSV[k]; k += 1; ); prv_n = psv_n;
+    );
+    seq_on = 1; seq_k = 0; seq_t = now;
+  );
   mr_dirty = 0;
 );
 play_dirty ? (
@@ -363,6 +405,7 @@ play_dirty ? (
     ch_build(s_root - 1, s_acc == 1 ? -1 : s_acc == 2 ? 1 : 0, s_q, s_sev, s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0);
     top_add();
     fire(now, s_ch - 1, 100, -1, DQN[s_dur] * qn_s);
+    s_write ? ( wr_begin(); wr_chord(0, DQN[s_dur], 100); wr_send(DQN[s_dur]); );
     last_sig = -1;
   );
   play_dirty = 0;
@@ -471,7 +514,8 @@ function g_press(id) (
   id == 30 ? ( mem_n_d > 0 ? mr_dirty = 1 : g_err(7); ) :
   id == 31 ? ( mc_dirty = 1; strcpy(#g_st, "MEM CLEAR"); ) :
   id == 32 ? ( mem_n_d < MEMMAX ? ( rest_dirty = 1; strcpy(#g_st, "REST STORED"); ) : g_err(6); ) :
-  id == 33 ? ( s_root ? play_dirty = 1 : g_err(1); );
+  id == 33 ? ( s_root ? play_dirty = 1 : g_err(1); ) :
+  id == 34 ? ( g_set(11, 1 - s_write); strcpy(#g_st, s_write ? "WRITE ON" : "WRITE OFF"); );
 );
 function g_lit(id) (                                   // -1 = a key without an LED
   id >= 1 && id <= 7 ? s_root == id :
@@ -481,7 +525,7 @@ function g_lit(id) (                                   // -1 = a key without an 
   id >= 18 && id <= 20 ? s_ext == id - 17 :
   id >= 21 && id <= 24 ? s_dur == id - 21 :
   id == 25 ? s_oct < 0 : id == 26 ? s_oct > 0 :
-  id == 27 ? s_lead :
+  id == 27 ? s_lead : id == 34 ? s_write :
   id == 30 ? mem_n_d > 0 : -1;
 );
 // CC-80's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
@@ -597,7 +641,8 @@ g_key(x0,               y, u, kh, 8,  0x2E2E32, 0xF4F1E8, "b");
 g_key(x0 + (u + gap),   y, u, kh, 9,  0x2E2E32, 0xF4F1E8, "#");
 g_key(x0 + (u + gap)*2, y, u, kh, 25, 0x6F6F76, 0xF4F1E8, "OCT-");
 g_key(x0 + (u + gap)*3, y, u, kh, 26, 0x6F6F76, 0xF4F1E8, "OCT+");
-g_key(x0 + (u + gap)*4, y, u * 3 + gap * 2, kh, 33, 0xE48A2A, 0x1E1E1E, "=");
+g_key(x0 + (u + gap)*4, y, u, kh, 34, 0x6F6F76, 0xF4F1E8, "WRITE");
+g_key(x0 + (u + gap)*5, y, u * 2 + gap, kh, 33, 0xE48A2A, 0x1E1E1E, "=");
 y += kh + gap;
 
 // footer: computer keys
