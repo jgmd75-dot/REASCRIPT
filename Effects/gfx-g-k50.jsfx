@@ -88,6 +88,7 @@ out_pin:left output
 out_pin:right output
 
 @init
+fl_ok = 0;
 #ui_man = "gfx-g-k50";                                  // the ? pop-up links to this manual
 
 NV = 12; VS = 172;
@@ -1020,7 +1021,14 @@ function mgroup(x, y, w, h, sec, title, shade) (
 );
 snd = -1;
 // the per-block coefficients of the sound (also run at once when a sound change applies in @sample)
+// the output filter's coefficients and the analogue voices' resonance, from the glided FILTER / RESONANCE
+function fl_gf() (
+  gf_g = tan($pi * min(18000 * 2 ^ fl_fo, srate * 0.45) / srate); gf_k = 2 - 1.9 * fl_rs;
+  gf_a1 = 1 / (1 + gf_g * (gf_g + gf_k)); gf_a2 = gf_g * gf_a1; gf_a3 = gf_g * gf_a2;
+  va_res = fres + fl_rs * (1.02 - fres);
+);
 function lx_coefs() (
+  fl_k = 1 - exp(-1 / (0.015 * srate));
   // envelope coefficients (with the ATTACK / RELEASE macros)
   a_inc = 1 / max(max(aA * atk_k, 0.003) * srate, 1);      // never faster than 3 ms (no click)
   fi_step = 1 / ((eng == 1 ? 0.003 : 0.002) * srate); dc_k = exp(-1 / (0.002 * srate));
@@ -1032,10 +1040,8 @@ function lx_coefs() (
   tone_oct = (tone - 0.5) * 3 + dg_top;            // TONE: +/- 1.5 octaves on filters / brightness (+ the digital drift)
   // output filter for the FM / string / bar sounds (FILTER 0 and no RESONANCE = bypassed)
   gf_on = eng != 0 && (filt_oct < -0.01 || reso > 0.005);
-  gf_g = tan($pi * min(18000 * 2 ^ filt_oct, srate * 0.45) / srate); gf_k = 2 - 1.9 * reso;
-  gf_a1 = 1 / (1 + gf_g * (gf_g + gf_k)); gf_a2 = gf_g * gf_a1; gf_a3 = gf_g * gf_a2;
+  fl_ok ? fl_gf();
   // analogue sounds: the knobs move each note's filter
-  va_res = fres + reso * (1.02 - fres);
   pe_c = tc(pe_t); pn_damp = tc(0.18 * rel_k) ^ 0.5; pn_kd = tc(0.012); org_rel = tc(org_rt * rel_k); org_ai = 1 / (max(org_at * atk_k, 0.0005) * srate); org_ck = tc(0.004); lw_rel = tc(0.08 * rel_k); lw_ck = tc(0.004);
   (eng == 4 || eng == 5) ? ( pv = 0; loop(NV, VB[pv * VS + F_ACT] ? pn_norm(VB + pv * VS); pv += 1; ); );
 );
@@ -1106,6 +1112,12 @@ while (evi < evn && (evq[evi * 4] <= spos || spos >= samplesblock - 1)) (   // (
   evi += 1;
 );
 spos += 1;
+// FILTER, RESONANCE and TONE glide (two 15 ms stages on the octaves, 15 ms on RESONANCE), so a turned knob never steps;
+// the output filter and the analogue voices' resonance follow every 16 samples
+!fl_ok ? ( fl_f1 = fl_fo = filt_oct; fl_t1 = fl_to = tone_oct; fl_rs = reso; fl_ok = 1; );
+fl_f1 += (filt_oct - fl_f1) * fl_k; fl_fo += (fl_f1 - fl_fo) * fl_k; fl_t1 += (tone_oct - fl_t1) * fl_k; fl_to += (fl_t1 - fl_to) * fl_k;
+fl_rs += (reso - fl_rs) * fl_k;
+(fl_n -= 1) <= 0 ? ( fl_n = 16; fl_gf(); );
 lx_pcf ? ( lx_pck -= lx_pcr; lx_pck <= 0 ? ( lx_pck = 0; lx_pcapply(); ); lx_pcg = 0.5 - 0.5 * cos($pi * lx_pck); ) :
 lx_pck < 1 ? ( lx_pck = min(lx_pck + lx_pcr, 1); lx_pcg = 0.5 - 0.5 * cos($pi * lx_pck); );
 
@@ -1164,7 +1176,7 @@ loop(NV,
         b[F_FST] == 0 ? ( b[F_FE] += f_inc; b[F_FE] >= 1 ? ( b[F_FE] = 1; b[F_FST] = 1; ); ) : b[F_FE] = fS + (b[F_FE] - fS) * f_dec;
       ) : ( b[F_AE] *= a_rel; b[F_FE] *= a_rel; );
       // 4-pole filter
-      fc = fbase * 2 ^ (famt * b[F_FE] * (vf > 0 ? (1 - vf) * (0.6 + 0.4 * b[F_VEL]) + vf * b[F_VEL] * b[F_VEL] * 1.2 : 0.6 + 0.4 * b[F_VEL]) + tone_oct + filt_oct + b[F_E1] + ins_cut + ktrk * log(f / 261.6) / log(2) + flfo * sin(2 * $pi * flph) + at_f * at_s);
+      fc = fbase * 2 ^ (famt * b[F_FE] * (vf > 0 ? (1 - vf) * (0.6 + 0.4 * b[F_VEL]) + vf * b[F_VEL] * b[F_VEL] * 1.2 : 0.6 + 0.4 * b[F_VEL]) + fl_to + fl_fo + b[F_E1] + ins_cut + ktrk * log(f / 261.6) / log(2) + flfo * sin(2 * $pi * flph) + at_f * at_s);
       g = tan($pi * min(fc, srate * 0.42) / srate); gG = g / (1 + g);
       u = tanh_(x * 0.5 - va_res * 3.9 * b[F_S4]);
       v_ = (u - b[F_S1]) * gG; y1 = v_ + b[F_S1]; b[F_S1] = y1 + v_;

@@ -80,6 +80,7 @@ HN = 1000; hcount = 0;                     // held-note stack (last-note priorit
 memset(HN, 0, 128);
 ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
 ins_drift_init();
+fl_ok = 0;
 bend = 1; nd_mul = 1; cur = 48; tgt = 48; vel = 0.8; acc = 0; gate = 0;
 // @init runs again when playback starts: the held-note stack is cleared above, so release the envelopes too, or a
 // note sounding at that moment would never get its note-off (a hung note)
@@ -168,6 +169,7 @@ function update() (
   uni = slider8 / 100; uni_l = min(uni * 4, 1) * 0.6; uni_d = 2 ^ (uni * 30 / 1200);
   noise_l = slider9 / 100 * 0.5;
   ftype = slider10; cutoff = slider11; res = slider12 / 100; envamt = slider13 / 100; keytr = slider14 / 100;
+  fl_lc = log(cutoff);                    // the cutoff in log Hz: the target of the per-sample glide
   fenv.vo_adsr_set(slider15, slider16, slider17 / 100, slider18);
   aenv.vo_adsr_set(slider19, slider20, slider21 / 100, slider22);
   accent = slider23 / 100;
@@ -215,6 +217,9 @@ update();
 
 @block
 update();
+// the filter glide: two 15 ms stages on the cutoff, 15 ms on RESO and ENV (starts on its targets)
+fl_k = 1 - exp(-1 / (0.015 * srate));
+!fl_ok ? ( fl_c1 = fl_c2 = fl_lc; fl_rs = res; fl_ev = envamt; fl_ok = 1; );
 while (midirecv(mofs, m1, m2, m3)) (
   st = m1 & 0xF0;
   st == 0x90 && m3 > 0 ? note_on(m2, m3) :
@@ -246,10 +251,12 @@ noise_l > 0 ? y += noise_l * (rand(2) - 1);
 y *= 0.35;
 
 // filter
+// CUTOFF, RESO and ENV glide per sample, so a turned knob or automation sweeps smoothly (never in steps)
+fl_c1 += (fl_lc - fl_c1) * fl_k; fl_c2 += (fl_c1 - fl_c2) * fl_k; fl_rs += (res - fl_rs) * fl_k; fl_ev += (envamt - fl_ev) * fl_k;
 fe = fenv.vo_adsr();
-oct = (envamt + acc * 0.5) * fe * 7 + keytr * (cur - 48) / 12 + lfo * lfo_c * 3 + ins_cut;
-fc = min(max(cutoff * 2 ^ oct, 20), srate * 0.45);
-y = ftype == 2 ? flt.vo_svf(y, fc, res) : flt.vo_ladder(y, fc, res, ftype);
+oct = (fl_ev + acc * 0.5) * fe * 7 + keytr * (cur - 48) / 12 + lfo * lfo_c * 3 + ins_cut;
+fc = min(max(exp(fl_c2 + oct * 0.693147), 20), srate * 0.45);
+y = ftype == 2 ? flt.vo_svf(y, fc, fl_rs) : flt.vo_ladder(y, fc, fl_rs, ftype);
 y = vo_tanh(y * 0.9) / 0.9;          // tames resonant peaks, transparent at normal levels
 
 // amp: envelope, velocity, accent

@@ -95,6 +95,7 @@ out_pin:left output
 out_pin:right output
 
 @init
+fl_ok = 0;
 #ui_man = "gfx-g-pc70";
 NV = 16; VS = 172;
 VB = 1000;                       // voice blocks: VB + v * VS (the GM voices use VB + v * VS + 100 ..)
@@ -515,8 +516,8 @@ function p_on(v, b, n, vg) local(pb, q, at, de, re, f, len, j, lp, k) (
     p_env(pb, q);                                       // the filter envelope starts as the patch's amp shape
     pb[55] = q[10] > 0 ? 2^(q[10]/1200) : 0; pb[56] = q[11]; pb[57] = q[12]; pb[58] = q[13];
     pb[59] = q[4]; pb[60] = q[5];
-    pb[61] = min(max(q[2]*2^(filt_oct + tone_oct), 30), srate*0.45);
-    pb[20] = 2*(1 - min(max(q[3] + reso*(0.95 - q[3]), 0), 0.95));
+    pb[61] = min(max(q[2]*2^(fl_fo + fl_to), 30), srate*0.45);
+    pb[20] = 2*(1 - min(max(q[3] + fl_rs*(0.95 - q[3]), 0), 0.95));
     pb[62] = vg*10^(q[15]/20)*0.5; pb[63] = q[14];
     pb[54] = q[12]; pb[53] = q[0] == 4 ? exp(-1/(max(q[13], 5)*0.001*srate)) : 1; pb[16] = q[12];
     pb[0] = 1; pb[1] = 0; pb[24] = 0; pb[22] = rand(1); pb[4] = 1; pb[2] = 0;
@@ -526,6 +527,12 @@ function p_on(v, b, n, vg) local(pb, q, at, de, re, f, len, j, lp, k) (
       lp = 0; j = 0; loop(len, lp += (rand(2) - 1 - lp)*min(1, q[2]/8000 + 0.2); KSB[v*KSL + j] = lp*2; j += 1; );
     );
   );
+);
+// the output filter's coefficients and the analogue voices' resonance, from the glided FILTER / RESONANCE
+function fl_gf() (
+  gf_g = tan($pi * min(18000 * 2 ^ fl_fo, srate * 0.45) / srate); gf_k = 2 - 1.9 * fl_rs;
+  gf_a1 = 1 / (1 + gf_g * (gf_g + gf_k)); gf_a2 = gf_g * gf_a1; gf_a3 = gf_g * gf_a2;
+  va_res = fres + fl_rs * (1.02 - fres);
 );
 // control rate (every 32 samples): pitch, vibrato, mod wheel, filter
 function p_ctl(pb) local(q, vib, st, f, oct, g, k) (
@@ -537,7 +544,7 @@ function p_ctl(pb) local(q, vib, st, f, oct, g, k) (
   f = 440*2^((st - 69)/12)*tune*pdrift;
   pb[11] = min(f/srate, 0.45);
   pb[12] = pb[55] > 0 ? min(pb[11]*pb[55], 0.45) : 0;
-  oct = (pb[59]*fam_k + max(0, fam_k - 1)*1.5)*(pb[2] - 1) + pb[60]*(pb[10] - 60)/12 + ins_cut;
+  oct = (pb[59]*fl_fa + max(0, fl_fa - 1)*1.5)*(pb[2] - 1) + pb[60]*(pb[10] - 60)/12 + ins_cut;
   f = min(max(pb[61]*2^oct, 30), srate*0.45);
   g = tan($pi*f/srate); k = pb[20];
   pb[50] = 1/(1 + g*(g + k)); pb[51] = g*pb[50]; pb[52] = g*pb[51];
@@ -1321,12 +1328,11 @@ aS_e = min(max(aS + sus_o, 0), 1); fS_e = min(max(fS + fsus_o, 0), 1);   // SUST
 gl_c = glide > 0 ? 1 - exp(-1 / (glide * srate)) : 1;
 fm_rel = tc(0.28 * rel_k); ks_damp = 0.6; gl_rel = tc(1.5 * rel_k); chf_d = tc(0.03);
 tone_oct = (tone - 0.5) * 3;                     // TONE: +/- 1.5 octaves on filters / brightness
+fl_k = 1 - exp(-1 / (0.015 * srate));
 // output filter for the FM / string / bar / piano / organ sounds (FILTER 0 and no RESONANCE = bypassed)
 gf_on = eng >= 1 && eng <= 5 && (filt_oct < -0.01 || reso > 0.005);
-gf_g = tan($pi * min(18000 * 2 ^ filt_oct, srate * 0.45) / srate); gf_k = 2 - 1.9 * reso;
-gf_a1 = 1 / (1 + gf_g * (gf_g + gf_k)); gf_a2 = gf_g * gf_a1; gf_a3 = gf_g * gf_a2;
-// analogue sounds: the knobs move each note's filter
-va_res = fres + reso * (1.02 - fres);
+// analogue sounds: the knobs move each note's filter (the output filter and va_res: fl_gf, from the glides)
+fl_ok ? fl_gf();
 pe_c = tc(pe_t); pn_damp = tc(0.18 * rel_k) ^ 0.5; pn_kd = tc(0.012); org_rel = tc(0.03 * rel_k); org_ck = tc(0.004);
 (eng == 4 || eng == 5) ? ( pv = 0; loop(NV, VB[pv * VS + F_ACT] ? pn_norm(VB + pv * VS); pv += 1; ); );
 // tempo: the host's when playing, else free-running at its tempo
@@ -1351,6 +1357,12 @@ while (evi < evn && (evq[evi * 4] <= spos || spos >= samplesblock - 1)) (   // (
   evi += 1;
 );
 spos += 1;
+// FILTER, RESONANCE, TONE and the filter envelope's AMOUNT glide (two 15 ms stages on the octaves, 15 ms on the rest),
+// so a turned knob never steps; the output filter and the analogue voices' resonance follow every 16 samples
+!fl_ok ? ( fl_f1 = fl_fo = filt_oct; fl_t1 = fl_to = tone_oct; fl_rs = reso; fl_fa = fam_k; fl_ok = 1; );
+fl_f1 += (filt_oct - fl_f1) * fl_k; fl_fo += (fl_f1 - fl_fo) * fl_k; fl_t1 += (tone_oct - fl_t1) * fl_k; fl_to += (fl_t1 - fl_to) * fl_k;
+fl_rs += (reso - fl_rs) * fl_k; fl_fa += (fam_k - fl_fa) * fl_k;
+(fl_n -= 1) <= 0 ? ( fl_n = 16; fl_gf(); );
 bend_m += (2^(bend_t/12) - bend_m)*bend_c;
 pdrift = ins_pitch*bend_m;
 nz = rand(2) - 1;
@@ -1411,7 +1423,7 @@ loop(NV,
         b[F_FST] == 0 ? ( b[F_FE] += f_inc; b[F_FE] >= 1 ? ( b[F_FE] = 1; b[F_FST] = 1; ); ) : b[F_FE] = fS_e + (b[F_FE] - fS_e) * f_dec;
       ) : ( b[F_AE] *= a_rel; b[F_FE] *= f_rel; );
       // 4-pole filter
-      fc = fbase * 2 ^ ((famt * fam_k + max(0, fam_k - 1) * 1.5) * b[F_FE] * (vf > 0 ? (1 - vf) * (0.6 + 0.4 * b[F_VEL]) + vf * b[F_VEL] * b[F_VEL] * 1.2 : 0.6 + 0.4 * b[F_VEL]) + tone_oct + filt_oct + b[F_E1] + ins_cut + ktrk * log(f / 261.6) / log(2) + flfo * sin(2 * $pi * flph));
+      fc = fbase * 2 ^ ((famt * fl_fa + max(0, fl_fa - 1) * 1.5) * b[F_FE] * (vf > 0 ? (1 - vf) * (0.6 + 0.4 * b[F_VEL]) + vf * b[F_VEL] * b[F_VEL] * 1.2 : 0.6 + 0.4 * b[F_VEL]) + fl_to + fl_fo + b[F_E1] + ins_cut + ktrk * log(f / 261.6) / log(2) + flfo * sin(2 * $pi * flph));
       g = tan($pi * min(fc, srate * 0.42) / srate); gG = g / (1 + g);
       u = tanh_(x * 0.5 - va_res * 3.9 * b[F_S4]);
       v_ = (u - b[F_S1]) * gG; y1 = v_ + b[F_S1]; b[F_S1] = y1 + v_;

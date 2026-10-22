@@ -205,6 +205,7 @@ MOP  = 32100;                                              // the four oscillato
 MLF  = 32300;                                              // the four LFOs: 24 slots each
 MMF  = 32420; MMT = 32430; MMO = 32440; MMC = 32450;       // LFO sums per oscillator: fine, tune, octave, cutoff
 MMA  = 32460; MMP = 32470; MMX = 32480;                    // amp (a product), PW, and the pairs' MIX
+MFG  = 32600;                                              // the filters' glides: 4 slots per oscillator (log cutoff x 2, reso)
 MRLT = 32500; MRG = 32520; MAPL = 32540;                   // reverb: line lengths, gains, input allpass lengths
 MRV  = 40000; MRVN = 16384;                                // reverb lines 8 x 16384 (40000 - 171071)
 MAP  = 172000; MAPN = 4096;                                // 4 input allpass rings x 4096 (172000 - 188383)
@@ -411,6 +412,7 @@ function update() local(i, sp, rain) (
   mn_aa = vo_coef(slider36); mn_ad = vo_coef(slider37); mn_as = slider38 / 100; mn_ar = vo_coef(slider39);
   mn_avel = slider40 / 100; mn_fenv = slider41 / 100;
   mn_gc = slider42 > 0 ? mn_c8(slider42) : 1;
+  mn_fk = 1 - exp(-8 / (0.015 * srate));                   // the filters' CUTOFF / RESO / ENV glide: 15 ms stages
   mn_dgc = mn_c8(max(slider42, slider20 * 0.25));           // the drone glides to a new root at least as slowly as it swells
   mn_brng = slider43;
   i = 0; loop(4, mn_lset(i); i += 1; );
@@ -628,6 +630,7 @@ mn_ct >= 8 ? (
   mn_xv = mn_lfov(mn_xs, mn_xph, mn_xh, mn_xa, mn_xb);
   // ----- the lead pair's envelope drives its filters too -----
   mn_snap = mn_first;
+  mn_snap ? mn_fev = mn_fenv : mn_fev += (mn_fenv - mn_fev) * mn_fk;
   mn_fsnap ? ( MOP[48 + 11] = mn_fnote + MOP[48 + 1] + MMO[2]; MOP[72 + 11] = mn_fnote + MOP[72 + 1] + MMO[3]; mn_fsnap = 0; );
   // ----- each oscillator: pitch (glided), increment, PW, filter, gain, sends -----
   mn_i = 0;
@@ -638,13 +641,17 @@ mn_ct >= 8 ? (
     mn_p = mn_q[11] + MMT[mn_i] + MMF[mn_i] + mn_q[12] + mn_dps + (mn_i >= 2 ? mn_bend : 0);
     mn_q[13] = min(exp((mn_p - 69) * L12) * mn_440s, 0.45);
     mn_q[14] = min(max(mn_q[2] + MMP[mn_i], 0.05), 0.95);
-    mn_fc = mn_q[3] * 2 ^ (MMC[mn_i] + (mn_i >= 2 ? mn_fenv * 4 * mn_fl : 0));
-    mn_g = tan(min(max(mn_fc, 20), mn_fmax) * mn_pis); mn_kk = 2 - 2 * mn_q[4];
+    // CUTOFF (two 15 ms stages) and RESO glide, so a turned knob or automation never steps
+    mn_gl = MFG + mn_i * 4; mn_lc = log(mn_q[3]);
+    mn_snap ? ( mn_gl[0] = mn_gl[1] = mn_lc; mn_gl[2] = mn_q[4]; ) : (
+      mn_gl[0] += (mn_lc - mn_gl[0]) * mn_fk; mn_gl[1] += (mn_gl[0] - mn_gl[1]) * mn_fk; mn_gl[2] += (mn_q[4] - mn_gl[2]) * mn_fk; );
+    mn_fc = exp(mn_gl[1] + (MMC[mn_i] + (mn_i >= 2 ? mn_fev * 4 * mn_fl : 0)) * 0.693147);
+    mn_g = tan(min(max(mn_fc, 20), mn_fmax) * mn_pis); mn_kk = 2 - 2 * mn_gl[2];
     mn_q[15] = 1 / (1 + mn_g * (mn_g + mn_kk)); mn_q[16] = mn_g * mn_q[15]; mn_q[17] = mn_g * mn_q[16];
     // pair level and MIX (equal power), the LFO's AMP; a resonant filter is turned down a little
     mn_mx = min(max((mn_i < 2 ? mn_dmix : mn_fmix) + MMX[mn_i >= 2], 0), 1);
     mn_q[18] = (mn_i < 2 ? mn_dlev : mn_flev) * ((mn_i & 1) ? sin(mn_mx * 0.5 * $pi) : cos(mn_mx * 0.5 * $pi)) * MMA[mn_i]
-               * (1 - 0.35 * mn_q[4]);
+               * (1 - 0.35 * mn_gl[2]);
     // sends, moved by the FX LFO (odd and even oscillators in opposite directions)
     mn_s = (mn_i & 1) ? -mn_xv * mn_xd : mn_xv * mn_xd;
     mn_q[19] += (mn_q[8]  * ((mn_xt & 2) ? max(1 + mn_s, 0) : 1) - mn_q[19]) * mn_sgc;

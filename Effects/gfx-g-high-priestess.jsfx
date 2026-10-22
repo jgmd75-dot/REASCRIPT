@@ -248,6 +248,12 @@ function hp_get_echo() local(v, q, best, bl, ne, v0) (
   best < 0 ? ( bl = 10; v = v0; loop(HPVN - v0, q = HPV + v * HPVS; q[0] && q[8] && q[5] < bl ? ( bl = q[5]; best = v; ); v += 1; ); );
   best;
 );
+// a voice's ladder coefficient: the glided cutoff, the envelope, key tracking (every 16 samples, at its start, per block)
+function hp_vf(q) local(fc) (
+  fc = exp(hp_fc2 + (q[35] * hp_fev * 6 + (q[6] + hp_lpc - 60) / 12 * 0.4) * 0.693147);
+  q[27] = min(1 - exp(-2 * $pi * min(fc, srate * 0.42) / srate), 0.92);
+  q[45] = 1 - max(q[27] - 0.6, 0) * 2.2;                 // resonance eased near the top (no ringing at Nyquist)
+);
 // a voice's pitch, filter and levels for a block (and at its start)
 function hp_prep(q) local(lp, f, fj, fc, w, b) (
   lp = q[6] + hp_lpc;
@@ -258,9 +264,7 @@ function hp_prep(q) local(lp, f, fj, fc, w, b) (
   q[40] = fj * 2.76 < 0.45 * srate ? hp_gls * 0.55 * (1 + 0.45 * sin(2 * $pi * b * 0.37)) : 0;
   q[41] = fj * 5.40 < 0.45 * srate ? hp_gls * 0.34 * (1 + 0.5 * sin(2 * $pi * (b * 0.61 + 0.3))) : 0;
   q[42] = fj * 8.93 < 0.45 * srate ? hp_gls * 0.2 * (1 + 0.55 * sin(2 * $pi * (b * 0.89 + 0.6))) : 0;
-  fc = hp_cut * 2 ^ (hp_coct + q[35] * hp_env * 6 + (lp - 60) / 12 * 0.4);
-  q[27] = min(1 - exp(-2 * $pi * min(fc, srate * 0.42) / srate), 0.92);
-  q[45] = 1 - max(q[27] - 0.6, 0) * 2.2;                 // resonance eased near the top (no ringing at Nyquist)
+  hp_vf(q);
   q[43] = (1 - hp_vs + hp_vs * q[2]) * q[49];
 );
 function hp_pan(q, p) local(a) ( p = min(max(p, -1), 1); a = (p + 1) * $pi * 0.25; q[12] = cos(a) * 1.4142; q[13] = sin(a) * 1.4142; );
@@ -387,7 +391,7 @@ function hp_update() local(f) (
   ins_output_setup(43);
 );
 function hp_srinit() local(i) (
-  hp_sr = srate; hp_sm = s57_kt(0.02, srate); hp_sk = s57_kt(1.1, srate);
+  hp_srt = srate; hp_sm = s57_kt(0.02, srate); hp_fk = s57_kt(0.015, srate); hp_fok = 0; hp_sk = s57_kt(1.1, srate);
   ost_init(0);
 );
 hp_update(); hp_srinit();
@@ -408,7 +412,7 @@ function hp_pal() (
 hp_update();
 
 @block
-srate != hp_sr ? hp_srinit();
+srate != hp_srt ? hp_srinit();      // (hp_srt: hp_sr is the Scroll's right channel)
 hp_update();
 hp_panic ? ( hp_all_off(); memset(HPC, 0, HPCN * HPCS); hp_scroll_clear(); hp_panic = 0; );
 hp_lmode != slider39 ? ( hp_all_off(); hp_lmode = slider39; );
@@ -440,6 +444,8 @@ hp_veil = min(max(slider13 / 100 + hp_lfo * slider18 / 100 + hp_cc1 * 0.6, 0), 1
 hp_cut = slider10;
 hp_coct = hp_lfo * slider17 / 100 * 4 + hp_zc * hp_fate * 0.3 - hp_veil * 2.2;
 hp_env = slider12 / 100;
+hp_flt = log(hp_cut) + hp_coct * 0.693147;              // the cutoff in log Hz: hp_fc2 glides to it per sample
+!hp_fok ? ( hp_fc1 = hp_fc2 = hp_flt; hp_fev = hp_env; hp_fok = 1; );
 hp_rkt = slider11 / 100 * 3.9; hp_rct = 1 + 1.3 * slider11 / 100;
 hp_vw = min(max(slider14 / 100 + hp_zv * hp_fate * 0.07, 0), 1);
 hp_fset(0, hp_vow(hp_vw, 0), 80); hp_fset(1, hp_vow(hp_vw, 1), 95); hp_fset(2, hp_vow(hp_vw, 2), 130);
@@ -535,6 +541,9 @@ while (hp_qr < hp_qn && (HPQ[hp_qr * 10] <= hp_sp || hp_sp >= samplesblock - 1))
 hp_sp += 1;
 
 // ---------- the controls, glided ----------
+// the ladder's cutoff (two 15 ms stages) and ENV glide, and the voices follow their filter envelopes every 16 samples
+hp_fc1 += (hp_flt - hp_fc1) * hp_fk; hp_fc2 += (hp_fc1 - hp_fc2) * hp_fk; hp_fev += (hp_env - hp_fev) * hp_fk;
+hp_ftk -= 1; hp_ftk < 0 ? hp_ftk = 15;
 hp_mph += (hp_mpt - hp_mph) * hp_sm; hp_w1 += (hp_w1t - hp_w1) * hp_sm; hp_w2 += (hp_w2t - hp_w2) * hp_sm;
 hp_wk += (hp_wkt - hp_wk) * hp_sm; hp_wd += (hp_wdt - hp_wd) * hp_sm; hp_wn += (hp_wnt - hp_wn) * hp_sm;
 hp_fmi += (hp_fmt - hp_fmi) * hp_sm; hp_rng += (hp_rgt - hp_rng) * hp_sm;
@@ -584,6 +593,7 @@ loop(HPVN,
     hp_rng > 0.001 ? b_ *= 1 - hp_rng + hp_rng * 1.5 * j_;
     x_ = b_ * hp_gb + j_ * hp_gj;
     // THE VEIL: the ladder
+    hp_ftk == 0 ? hp_vf(q_);
     q_[26] += (q_[27] - q_[26]) * 0.06; g_ = q_[26];
     u_ = s57_th(x_ * 0.75 - hp_rk4 * q_[45] * q_[25]);
     q_[22] += g_ * (u_ - q_[22]); q_[23] += g_ * (q_[22] - q_[23]); q_[24] += g_ * (q_[23] - q_[24]); q_[25] += g_ * (q_[24] - q_[25]);

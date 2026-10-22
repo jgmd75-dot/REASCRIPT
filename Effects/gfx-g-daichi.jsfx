@@ -360,8 +360,9 @@ function update() local(r, g) (
   dh_pw = slider12 / 100;
   dh_ma4 = dh_c4(vo_coef(slider13)); dh_md4 = dh_c4(vo_coef(slider14)); dh_mamt = slider15 / 100; dh_mdst = slider16;
   dh_ft = slider17; dh_cut = slider18; dh_res = slider19 / 100;
-  dh_k = 2 - 1.985 * dh_res;                         // state-variable damping (12 dB types)
-  dh_lk = dh_res * 4.15;                             // ladder feedback (24 dB): self-oscillates near the top
+  fl_lc = log(dh_cut);                               // the cutoff in log Hz: the target of the per-sample glide
+  dh_k = 2 - 1.985 * fl_rs;                          // state-variable damping (12 dB types), from the glided RESO
+  dh_lk = fl_rs * 4.15;                              // ladder feedback (24 dB): self-oscillates near the top
   dh_sat = slider20 / 100; dh_sg = 1 + dh_sat * 5; dh_sn = 1 / (1 + dh_sat * 1.6);
   dh_key = slider21 / 100; dh_fenv = slider22 / 100; dh_fvel = slider23 / 100;
   dh_fa4 = dh_c4(vo_coef(slider24)); dh_fd4 = dh_c4(vo_coef(slider25)); dh_fs = slider26 / 100; dh_fr4 = dh_c4(vo_coef(slider27));
@@ -410,6 +411,7 @@ dh_pfl.clp_pf_cfg(40000, 6000, -1.5, 150); dh_pfr.clp_pf_cfg(40000, 6000, -1.5, 
 dh_pfl.clp_pf_reset(); dh_pfr.clp_pf_reset();
 
 ins_drift_init();
+fl_ok = 0;
 dh_bend = 0; dh_mw = 0; dh_pedal = 0; dh_hc = 0; dh_age = 0; dh_last = -1; dh_qc = 0;
 dh_wasarp = 0; dh_lastmode = -1; dh_ct = 0; dh_l1ph = dh_l2ph = 0; dh_l1h = dh_l2h = 0;
 dh_dcxl = dh_dcyl = dh_dcxr = dh_dcyr = 0; dh_vol = 1; dh_wp = 0; dh_cwp = 0; dh_dts = -1;
@@ -448,6 +450,9 @@ ui_dflt = 1;
 srate != dh_sr ? dh_srinit();
 dh_treq > 0 ? ( load_preset(dh_treq); dh_treq = 0; );     // a preset asked for from outside the panel (test hook)
 dh_pcr = 1 / (0.012 * srate);
+// the filter glide: two 15 ms stages on the cutoff, 15 ms on RESO and ENV (starts on its targets)
+fl_k = 1 - exp(-1 / (0.015 * srate));
+!fl_ok ? ( fl_c1 = fl_c2 = log(slider18); fl_rs = slider19 / 100; fl_ev = slider22 / 100; fl_ok = 1; );
 dh_panic && !dh_pcf ? ( dh_i = 0; loop(16, DV[dh_i * 64 + 13] > 0 ? dh_pcf = 1; dh_i += 1; ); );   // sounding: fade first
 !dh_pcf ? update();
 arp_params(slider57, dh_arp_beats(slider59), slider58, slider60 / 100, 0, 16, 0, 1, 0, 0, 0, 100, 0);
@@ -520,11 +525,14 @@ dh_spos += 1;
 dh_pcf ? ( dh_pck -= dh_pcr; dh_pck <= 0 ? ( dh_pck = 0; dh_pcapply(); ); dh_pcg = 0.5 - 0.5 * cos($pi * dh_pck); ) :
 dh_pck < 1 ? ( dh_pck = min(dh_pck + dh_pcr, 1); dh_pcg = 0.5 - 0.5 * cos($pi * dh_pck); );
 
+// CUTOFF, RESO and ENV glide per sample, so a turned knob or automation sweeps smoothly (never in steps)
+fl_c1 += (fl_lc - fl_c1) * fl_k; fl_c2 += (fl_c1 - fl_c2) * fl_k; fl_rs += (dh_res - fl_rs) * fl_k; fl_ev += (dh_fenv - fl_ev) * fl_k;
 // ---------- control rate (every 4 samples): LFOs and the modulation sums ----------
 dh_ct += 1;
 dh_tick = dh_ct >= 4;
 dh_tick ? (
   dh_ct = 0;
+  dh_k = 2 - 1.985 * fl_rs; dh_lk = fl_rs * 4.15;
   dh_l1ph += dh_l1r * 4 / srate; dh_l1ph >= 1 ? ( dh_l1ph -= floor(dh_l1ph); dh_l1h = rand(2) - 1; );
   dh_l2ph += dh_l2r * 4 / srate; dh_l2ph >= 1 ? ( dh_l2ph -= floor(dh_l2ph); dh_l2h = rand(2) - 1; );
   dh_l1 = dh_lfov(dh_l1s, dh_l1ph, dh_l1h);
@@ -562,8 +570,8 @@ loop(16,
       dh_p[25] = min(exp((dh_b2 - 69) * L12) * dh_440s, 0.45);
       // filter
       dh_v = dh_p[6];
-      dh_o = dh_fenv * dh_e * (1 - dh_fvel + dh_fvel * dh_v) * 7 + dh_key * (dh_p[4] - 60) / 12 + dh_fvel * (dh_v - 0.7) * 1.5 + dh_loct;
-      dh_g = tan(min(max(dh_cut * exp(dh_o * LN2), 16), dh_fmax) * dh_pis);
+      dh_o = fl_ev * dh_e * (1 - dh_fvel + dh_fvel * dh_v) * 7 + dh_key * (dh_p[4] - 60) / 12 + dh_fvel * (dh_v - 0.7) * 1.5 + dh_loct;
+      dh_g = tan(min(max(exp(fl_c2 + dh_o * LN2), 16), dh_fmax) * dh_pis);
       dh_ft == 1 ? (
         dh_p[26] = dh_g / (1 + dh_g); dh_p[27] = 1 - dh_p[26]; dh_p[28] = sqr(sqr(dh_p[26]));
       ) : (
