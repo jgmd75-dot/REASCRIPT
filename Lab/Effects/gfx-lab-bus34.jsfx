@@ -2,7 +2,7 @@ desc:GFX Lab BUS34 [stereo colour unit]
 //tags: mix bus colour saturation drive density eq shelf hf compressor stereo width transformer mid side
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel, gfx-lab-dyn and gfx-lab-clip (.jsfx-inc) in the same folder.
+// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel, gfx-lab-dyn, gfx-lab-clip and gfx-lab-os (.jsfx-inc) in the same folder.
 //
 // BUS34. A 2U analogue stereo colour unit for the mix bus or stereo stems, in the spirit of a modern British design: six
 // colouring tools in one rack (the sound is designed from scratch). The signal runs left to right:
@@ -30,6 +30,10 @@ desc:GFX Lab BUS34 [stereo colour unit]
 //   DRIFT   (0 - 100 %, 50 % = standard, 0 = none): transformer heat and drive bias. The transformer warms with the lows
 //           it is fed (rising over a couple of seconds, cooling over about six): its saturation deepens and leans (more
 //           2nd harmonic). The drive's bias wanders slowly on its own path.
+//   OS      (the header key, left of the size picker) the DRIVE section's oversampling: 1x (as before, the default), 2x,
+//           4x - each click steps on. Only the DRIVE runs oversampled (the EQ, HF COMP and IMAGE are linear; the
+//           TRANSFORMER only saturates the lows, below 150 Hz). A change dips the output for 5 ms, swaps, comes back.
+//           Latency: 0 / 31 / 37 samples (reported).
 //   VFD / MATRIX  the panel's look (VFD charcoal and violet; MATRIX battleship grey with sky blue). The look only.
 //   PRESETS 12 (Init + 11) plus Reset all to defaults. A preset sets the six tools, the HPF and STEREO / M/S; INPUT,
 //           OUTPUT, DRIFT and the look are left alone (Reset all restores them too).
@@ -56,6 +60,7 @@ slider19:0<-12,12,0.1>-Output trim (dB)
 slider20:50<0,100,1>-Drift (%)
 slider21:0<0,1,1{VFD,Matrix}>-Look
 slider22:1<0,1,1{Off,On}>-Link
+slider23:0<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
@@ -69,6 +74,7 @@ import gfx-lab-ui.jsfx-inc
 import gfx-lab-panel.jsfx-inc
 import gfx-lab-dyn.jsfx-inc
 import gfx-lab-clip.jsfx-inc
+import gfx-lab-os.jsfx-inc
 
 @init
 #ui_man = "gfx-bus34";                                  // the ? pop-up links to this manual
@@ -145,6 +151,26 @@ function dr_prime() (
   this.sA.x1 = this.sB.x1 = dr_bs; this.sA.ad1 = this.sB.ad1 = this.sA.clp_ad(dr_bs);
   this.hA.x1 = this.hB.x1 = dr_bh; this.hA.ad1 = this.hB.ad1 = this.hA.clp_ad(dr_bh);
 );
+// the same at 2x / 4x (OS): the signal goes up, through the curves (faded by the IN key at the high rate, so the
+// latency stays the same with DRIVE out) and back down
+function dr_os() instance(rs, rh) local(u, v, i, ya, yb, ha, hb, p0, p1, p2, p3, q0, q1, q2, q3) (
+  bs_dpk = max(bs_dpk, max(abs(bs_a), abs(bs_b)) * bs_dgs);
+  this.upA.os_up(bs_a); this.upB.os_up(bs_b);
+  i = 0;
+  loop(os_f,
+    u = i == 0 ? this.upA.s0 : i == 1 ? this.upA.s1 : i == 2 ? this.upA.s2 : this.upA.s3;
+    v = i == 0 ? this.upB.s0 : i == 1 ? this.upB.s1 : i == 2 ? this.upB.s2 : this.upB.s3;
+    bs_gD > 0 ? (
+      ya = this.sA.clp_run(u * bs_dgs + dr_bs) - rs; yb = this.sB.clp_run(v * bs_dgs + dr_bs) - rs;
+      ha = this.hA.clp_run(u * bs_dgs + dr_bh) - rh; hb = this.hB.clp_run(v * bs_dgs + dr_bh) - rh;
+      u += bs_eD * ((ya + bs_dns * (ha - ya)) / bs_dgs - u); v += bs_eD * ((yb + bs_dns * (hb - yb)) / bs_dgs - v);
+    );
+    i == 0 ? ( p0 = u; q0 = v; ) : i == 1 ? ( p1 = u; q1 = v; ) : i == 2 ? ( p2 = u; q2 = v; ) : ( p3 = u; q3 = v; );
+    i += 1;
+  );
+  bs_a = this.dnA.os_dn(p0, p1, p2, p3); bs_b = this.dnB.os_dn(q0, q1, q2, q3);
+);
+function dr_osclr() ( this.upA.os_clr(); this.upB.os_clr(); this.dnA.os_clr(); this.dnB.os_clr(); );
 function dr_reset() ( this.sA.clp_reset(); this.sB.clp_reset(); this.hA.clp_reset(); this.hB.clp_reset(); );
 function dr_tidy() ( this.sA.clp_tidy(); this.sB.clp_tidy(); this.hA.clp_tidy(); this.hB.clp_tidy(); );
 
@@ -186,12 +212,13 @@ function hc_tidy() instance(env, enva, envb) ( env = bs_tn(env); enva = bs_tn(en
 function set_run(xl, xr, ms) local(oa, ob) (
   bs_lkm = ms ? 0 : bs_lu;
   ms ? ( bs_a = (xl + xr) * 0.5; bs_b = (xl - xr) * 0.5; ) : ( bs_a = xl; bs_b = xr; );
+  os_f > 1 ? this.dr.dr_os() :
   bs_gD > 0 ? ( oa = bs_a; ob = bs_b; this.dr.dr_run(); bs_a = oa + bs_eD * (bs_a - oa); bs_b = ob + bs_eD * (bs_b - ob); );
   bs_gE > 0 ? ( oa = bs_a; ob = bs_b; this.eq.eq_run(); bs_a = oa + bs_eE * (bs_a - oa); bs_b = ob + bs_eE * (bs_b - ob); );
   bs_gH > 0 ? ( oa = bs_a; ob = bs_b; this.hc.hc_run(); bs_a = oa + bs_eH * (bs_a - oa); bs_b = ob + bs_eH * (bs_b - ob); );
   ms ? ( oa = bs_a; bs_a = oa + bs_b; bs_b = oa - bs_b; );
 );
-function set_reset() ( this.dr.dr_reset(); this.eq.eq_reset(); this.hc.hc_reset(); );
+function set_reset() ( this.dr.dr_reset(); this.dr.dr_osclr(); this.eq.eq_reset(); this.hc.hc_reset(); );
 function set_tidy() ( this.dr.dr_tidy(); this.eq.eq_tidy(); this.hc.hc_tidy(); );
 
 // ---------- the shared stages: HPF (before the set), IMAGE and TRANSFORMER (after it) ----------
@@ -261,6 +288,7 @@ function bs_srinit() (
   ost_init(0);
 );
 bs_srinit();
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider23); os_gsetup();
 in_init();
 dB.drift_init(0.8 + rand(0.4)); dT.drift_init(0.8 + rand(0.4));
 drift_macro(50);
@@ -279,9 +307,11 @@ file_var(0, ui_sz);
 file_var(0, pr_cur);
 
 @block
-srate != bs_sr ? bs_srinit();
+srate != bs_sr ? ( bs_srinit(); os_gsetup(); );
+os_tf = os_f2n(slider23);
 in_setup(slider1, 0);
 ost_setup(0, 0.3, 120, 6000, -0.3, 1);                // the house output stage: CLIP (a colour unit)
+pdc_delay = os_base + os_lat(os_f);                     // (ost_setup clears it)
 drift_macro(slider20);
 // STEREO / M/S: a change starts the crossfade into the other set (warmed up first); one more change waits for it
 bs_mt = slider18 >= 0.5;
@@ -335,6 +365,8 @@ bsa_heat = bs_heat;
 
 @sample
 spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+os_gate();
+os_chg ? ( sA.set_reset(); sB.set_reset(); sA.dr.dr_prime(); sB.dr.dr_prime(); );     // the OS swap (at silence)
 in_process(spl0, spl1);
 bs_xl = in_l; bs_xr = in_r;
 abs(bs_xl) < 0.000000000000001 ? bs_xl = 0; abs(bs_xr) < 0.000000000000001 ? bs_xr = 0;
@@ -378,8 +410,8 @@ bs_heat += (bs_tfd * bs_eT > bs_heat ? tf_kh : tf_kc) * (min(bs_tfd * bs_eT, 1) 
 bs_yl = bs_a * bs_outs; bs_yr = bs_b * bs_outs;
 bs_yl != bs_yl ? bs_yl = 0; bs_yr != bs_yr ? bs_yr = 0;
 ost_out(bs_yl, bs_yr);
-spl0 = max(-4, min(4, ost_l));
-spl1 = max(-4, min(4, ost_r));
+spl0 = max(-4, min(4, ost_l)) * os_g;
+spl1 = max(-4, min(4, ost_r)) * os_g;
 bs_opl = max(bs_opl, abs(spl0)); bs_opr = max(bs_opr, abs(spl1));
 
 
@@ -588,6 +620,7 @@ k_ > 0 ? load_preset(k_);
 kr_kc = LK_RED; kr_key(636, 25, 76, 28, "STEREO", slider18 < 0.5) ? ( slider18 = 0; ui_auto(18); );
 kr_kc = LK_RED; kr_key(716, 25, 56, 28, "M/S", slider18 >= 0.5) ? ( slider18 = 1; ui_auto(18); );
 kr_kc = LK_BLU; slider18 >= 0.5 ? kr_dim(786, 25, 62, 28, "LINK") : ( kr_key(786, 25, 62, 28, "LINK", slider22 >= 0.5) ? kr_tog(22); );
+os_key(966, 28, 23, KRI, 7);
 ui_size_picker(1000 * sc, 30 * sc);
 
 // =====================================================================

@@ -26,11 +26,11 @@ desc:GFX Lab ORCHD [MIDI chords]
 // MEMORY: M+ stores the chord on the keys (with its length), REST stores a rest of the chosen length, MR plays
 //   the stored sequence at the project tempo (press MR again to stop), MC clears it. The sequence is saved
 //   with the project (up to 32 steps).
-// WRITE: with WRITE lit, = and MR also write their chords into a MIDI item on the selected track at the edit cursor
-//   (and move the cursor on), the way CC-80 did. A plug-in can't write items itself, so this needs the companion
+// WRITE (lit on a new ORCHD): = and MR also write their chords into a MIDI item on the selected track at the edit
+//   cursor (and move the cursor on), the way CC-80 did - with the transport stopped too (the panel sends them). A plug-in can't write items itself, so this needs the companion
 //   script "GFX ORCHD - write MIDI" running (load it once from the Actions list; it waits in the background). ORCHD
 //   hands each chord to it through shared memory (gmem "GFX_ORCHD"). To capture what you play on a MIDI keyboard,
-//   record the track's output (MIDI) instead.
+//   record the track's output (MIDI) instead. The LCD says WRITTEN, or START SCRIPT when the script isn't running.
 // No drift (John, Oct 2026): ORCHD plays exactly what you ask.
 // GUI: CC-80's pocket calculator - cream case, solar cell, green LCD, rubber keys with small LEDs on the keys that
 //   hold a setting. The LCD shows the chord name and its spelling (by letter, so Cdim7 = C - Eb - Gb - Bbb), the
@@ -52,7 +52,7 @@ slider7:s_oct=0<-2,2,1>-Octave
 slider8:s_lead=0<0,1,1{Off,On}>-Leading note
 slider9:s_ch=1<1,16,1>-MIDI channel for = and MR
 slider10:s_top=7<0,11,1{C,Db,D,Eb,E,F,F#,G,Ab,A,Bb,B}>-Leading note (top)
-slider11:s_write=0<0,1,1{Off,On}>-Write = and MR into the item
+slider11:s_write=1<0,1,1{Off,On}>-Write = and MR into the item
 
 @init
 #ui_man = "gfx-lab-orchd";
@@ -79,7 +79,6 @@ OB  = 6000;      // outgoing MIDI this block: 4 per event (offset, status, data1
 OBMAX = 480;
 REG_LO = 40; REG_HI = 84; CENTRE = 62;
 vl_lo = 0; vl_hi = REG_HI;
-PSV = 120;       // the voice-leading state saved while MR is written
 MSTR = 200;      // string slots for the memory step names (200 - 231)
 
 LPC[0] = 0; LPC[1] = 2; LPC[2] = 4; LPC[3] = 5; LPC[4] = 7; LPC[5] = 9; LPC[6] = 11;
@@ -297,7 +296,7 @@ function fire(t, ch, vel, src, len) local(v, k, sh) (
   k = 0; loop(vl_n, v[12 + k] = VL[k] + sh; k += 1; );
   v[7] = t;
   v[8] = src >= 0 ? -1 : t + max(len - 0.003 * srate, len * 0.5);
-  strcpy(#nm_disp, #b_name); strcpy(#sp_disp, #b_spell);
+  strcpy(#nm_disp, #b_name); strcpy(#sp_disp, #b_spell); fire_n_d += 1;
 );
 function v_release(ch, p, t) local(i, v) (
   i = 0;
@@ -334,21 +333,191 @@ function v_run(tend) local(i, v, k, n) (
   snd_disp = n;
 );
 
-// ---------- WRITE: hand chords to the companion script through gmem ----------
+// ---------- WRITE: the panel hands chords to the companion script through gmem ----------
+// The panel does this itself (REAPER may not run the audio side while the transport is stopped), with its own copy
+// of the chord brain above (the w_ functions: the audio side and the panel never share a function) and its own
+// voice leading, so the written chords are voice-led one to the next just as they play.
 // gmem: 0 request counter (bumped when a request is complete), 1 note count, 2 total length (quarter notes),
-//       3 channel, 16.. notes: start (qn from the cursor), length (qn), pitch, velocity
+//       3 channel, 4 the script's heartbeat (a counter, so the panel can show whether it's listening),
+//       16.. notes: start (qn from the cursor), length (qn), pitch, velocity
+WIVS = 400; WIVD = 410; WCHD = 420; WVL = 430; WPRV = 440; WCAN = 450;
+w_prv_n = 0; w_vl_lo = 0; w_vl_hi = REG_HI;
+function w_letter_s(i) ( i == 0 ? "C" : i == 1 ? "D" : i == 2 ? "E" : i == 3 ? "F" : i == 4 ? "G" : i == 5 ? "A" : "B"; );
+function w_acc_s(a) ( a == 1 ? "#" : a == 2 ? "x" : a == -1 ? "b" : a == -2 ? "bb" : ""; );
+function w_iv_add(semi, deg) ( WIVS[w_ch_n] = semi; WIVD[w_ch_n] = deg; w_ch_n += 1; );
+
+function w_ch_build(rl, acc, q, sev, ext) local(triad, s7, i, li, tgt, a) (
+  sev == 3 && q == 0 ? q = 2;                         // the m7 key implies a minor triad
+  triad = q == 0 ? 1 : q;
+  w_ch_n = 0;
+  w_iv_add(0, 1);
+  triad == 1 ? ( w_iv_add(4, 3); w_iv_add(7, 5); ) :
+  triad == 2 ? ( w_iv_add(3, 3); w_iv_add(7, 5); ) :
+  triad == 3 ? ( w_iv_add(3, 3); w_iv_add(6, 5); ) :
+  triad == 4 ? ( w_iv_add(4, 3); w_iv_add(8, 5); ) :
+               ( w_iv_add(5, 4); w_iv_add(7, 5); );
+  s7 = 0;
+  sev == 1 ? s7 = (q == 1 ? 11 : q == 3 ? 9 : 10) :   // maj + 7 = maj7, dim + 7 = dim7
+  sev == 2 ? s7 = 11 :
+  sev == 3 ? s7 = 10 :
+  ext ? s7 = (q == 1 ? 11 : 10);
+  s7 ? w_iv_add(s7, 7);
+  ext ? (
+    w_iv_add(14, 9);
+    ext == 11 ? (
+      w_iv_add(17, 11);
+      triad == 1 ? (                                  // 11ths drop the major 3rd (it clashes with the 11th)
+        i = 1; loop(w_ch_n - 2, WIVS[i] = WIVS[i + 1]; WIVD[i] = WIVD[i + 1]; i += 1; );
+        w_ch_n -= 1;
+      );
+    ) : ext == 13 ? w_iv_add(21, 13);
+  );
+  // name
+  ext ? sprintf(#w_bn, "%d", ext) : strcpy(#w_bn, "7");
+  strcpy(#w_name, w_letter_s(rl)); strcat(#w_name, w_acc_s(acc));
+  !s7 ? (
+    strcat(#w_name, triad == 1 ? "" : triad == 2 ? "m" : triad == 3 ? "dim" : triad == 4 ? "aug" : "sus4");
+  ) : triad == 3 ? (
+    strcat(#w_name, s7 == 9 ? "dim7" : s7 == 10 ? "m7b5" : "dim(maj7)");
+  ) : s7 == 11 ? (
+    triad == 1 ? ( strcat(#w_name, "maj"); strcat(#w_name, #w_bn); ) :
+    triad == 2 ? ( strcat(#w_name, "m(maj"); strcat(#w_name, #w_bn); strcat(#w_name, ")"); ) :
+    triad == 4 ? ( strcat(#w_name, "aug(maj"); strcat(#w_name, #w_bn); strcat(#w_name, ")"); ) :
+                 ( strcat(#w_name, "maj"); strcat(#w_name, #w_bn); strcat(#w_name, "sus4"); );
+  ) : (
+    triad == 1 ? strcat(#w_name, #w_bn) :
+    triad == 2 ? ( strcat(#w_name, "m"); strcat(#w_name, #w_bn); ) :
+    triad == 4 ? ( strcat(#w_name, "aug"); strcat(#w_name, #w_bn); ) :
+                 ( strcat(#w_name, #w_bn); strcat(#w_name, "sus4"); );
+  );
+  // spelling by letter, and the pitch classes
+  w_rpc = (LPC[rl] + acc + 12) % 12; w_rl = rl; w_s7 = s7; w_tri = triad;
+  strcpy(#w_spell, "");
+  i = 0;
+  loop(w_ch_n,
+    li = (rl + WIVD[i] - 1) % 7;
+    tgt = (w_rpc + WIVS[i]) % 12;
+    a = (tgt - LPC[li] + 12) % 12; a > 6 ? a -= 12;
+    i > 0 ? strcat(#w_spell, " - ");
+    strcat(#w_spell, w_letter_s(li)); strcat(#w_spell, w_acc_s(a));
+    WCHD[i] = tgt;
+    i += 1;
+  );
+);
+
+function w_vlead() local(inv, base, k, p, pc, c, best, i, j, m, mean) (
+  best = 1000000; w_vl_n = w_ch_n;
+  inv = 0;
+  loop(w_ch_n,
+    base = REG_LO;
+    loop(31,
+      base % 12 == WCHD[inv] ? (
+        WCAN[0] = base; p = base; k = 1;
+        loop(w_ch_n - 1,
+          pc = WCHD[(inv + k) % w_ch_n];
+          p += 1; loop(11, p % 12 != pc ? p += 1; );
+          WCAN[k] = p; k += 1;
+        );
+        WCAN[w_ch_n - 1] <= w_vl_hi && WCAN[w_ch_n - 1] >= w_vl_lo ? (
+          c = 0; k = 1;
+          loop(w_ch_n - 1, WCAN[k - 1] < 52 && WCAN[k] - WCAN[k - 1] < 3 ? c += 4; k += 1; );
+          mean = 0; k = 0; loop(w_ch_n, mean += WCAN[k]; k += 1; ); mean /= w_ch_n;
+          w_prv_n == 0 ? (
+            c += abs(mean - CENTRE) + (inv > 0 ? 3 : 0);
+          ) : (
+            i = 0;
+            loop(w_ch_n, m = 99; j = 0; loop(w_prv_n, m = min(m, abs(WCAN[i] - WPRV[j])); j += 1; ); c += m; i += 1; );
+            j = 0;
+            loop(w_prv_n, m = 99; i = 0; loop(w_ch_n, m = min(m, abs(WCAN[i] - WPRV[j])); i += 1; ); c += m; j += 1; );
+            c += 0.3 * abs(mean - CENTRE);
+          );
+          c < best ? ( best = c; k = 0; loop(w_ch_n, WVL[k] = WCAN[k]; k += 1; ); );
+        );
+      );
+      base += 1;
+    );
+    inv += 1;
+  );
+  best;
+);
+
+function w_top_add() local(has, iv, k, L, deg, li, a) (
+  s_lead ? (
+    has = 0; k = 0; loop(w_ch_n, WCHD[k] == s_top ? has = 1; k += 1; );
+    !has ? (
+      iv = (s_top - w_rpc + 12) % 12;
+      WIVS[w_ch_n] = iv; WCHD[w_ch_n] = s_top; w_ch_n += 1;
+      L = strlen(#w_name);
+      w_s7 ? (
+        (iv == 2 || iv == 5 || iv == 9) && str_getchar(#w_name, L - 1) == '7' ? (
+          strcpy_substr(#w_name, #w_name, 0, L - 1);
+          strcat(#w_name, iv == 2 ? "9" : iv == 5 ? "11" : "13");
+        ) : strcat(#w_name, iv == 1 ? "(b9)" : iv == 2 ? "(9)" : iv == 3 ? "(#9)" : iv == 5 ? "(11)" : iv == 6 ? "(#11)" :
+                            iv == 8 ? "(b13)" : iv == 9 ? "(13)" : iv == 4 ? "(add3)" : "(add5)");
+      ) : w_tri == 5 && iv == 10 ? (
+        strcpy_substr(#w_name, #w_name, 0, L - 4); strcat(#w_name, "7sus4");
+      ) : (
+        strcat(#w_name, iv == 2 ? "add9" : iv == 5 ? "add11" : iv == 9 ? "6" : iv == 10 ? "7" :
+                        iv == 11 ? (w_tri == 1 ? "maj7" : "(maj7)") : iv == 1 ? "(b9)" : iv == 3 ? "(#9)" :
+                        iv == 6 ? "(#11)" : iv == 8 ? "(b13)" : iv == 4 ? "(add3)" : "(add5)");
+      );
+      deg = iv == 1 || iv == 2 || iv == 3 ? 9 : iv == 5 || iv == 6 ? 11 : iv == 8 || iv == 9 ? 13 :
+            iv == 10 || iv == 11 ? 7 : iv == 4 ? 3 : 5;
+      li = (w_rl + deg - 1) % 7;
+      a = (s_top - LPC[li] + 12) % 12; a > 6 ? a -= 12;
+      strcat(#w_spell, " - "); strcat(#w_spell, w_letter_s(li)); strcat(#w_spell, w_acc_s(a));
+    );
+  );
+);
+function w_voice() local(TP, j, k) (
+  s_lead ? (
+    TP = 64 + (s_top + 8) % 12;
+    j = 0; k = 0; loop(w_ch_n, WCHD[k] != s_top ? ( WCHD[j] = WCHD[k]; j += 1; ); k += 1; ); w_ch_n = j;
+    w_ch_n > 0 ? (
+      w_vl_lo = TP - 12; w_vl_hi = TP - 1;
+      w_vlead() >= 1000000 ? ( w_vl_lo = TP - 24; w_vlead(); );
+      w_vl_lo = 0; w_vl_hi = REG_HI;
+    ) : w_vl_n = 0;
+    WVL[w_vl_n] = TP; w_vl_n += 1;
+  ) : w_vlead();
+);
+
 function wr_begin() ( wr_n = 0; );
 function wr_chord(q, len, vel) local(k, sh) (
+  w_voice();
+  k = 0; loop(w_vl_n, WPRV[k] = WVL[k]; k += 1; ); w_prv_n = w_vl_n;
   sh = 12 * s_oct; k = 0;
-  loop(vl_n,
+  loop(w_vl_n,
     wr_n < 1000 ? (
-      gmem[16 + wr_n * 4] = q; gmem[17 + wr_n * 4] = len; gmem[18 + wr_n * 4] = VL[k] + sh; gmem[19 + wr_n * 4] = vel;
+      gmem[16 + wr_n * 4] = q; gmem[17 + wr_n * 4] = len; gmem[18 + wr_n * 4] = WVL[k] + sh; gmem[19 + wr_n * 4] = vel;
       wr_n += 1;
     );
     k += 1;
   );
 );
 function wr_send(total) ( gmem[1] = wr_n; gmem[2] = total; gmem[3] = s_ch - 1; gmem[0] += 1; );
+// = : the chord on the keys
+function wr_play() (
+  wr_begin();
+  w_ch_build(s_root - 1, s_acc == 1 ? -1 : s_acc == 2 ? 1 : 0, s_q, s_sev, s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0);
+  w_top_add(); wr_chord(0, DQN[s_dur], 100);
+  wr_send(DQN[s_dur]);
+);
+// MR : the stored sequence, rests included
+function wr_seq() local(k, m, q) (
+  wr_begin(); q = 0; k = 0;
+  loop(mem_n_d,
+    m = MEM + k * 8;
+    !m[6] ? ( w_ch_build(m[0], m[1], m[2], m[3], m[4]); w_top_add(); wr_chord(q, DQN[m[5]], 100); );
+    q += DQN[m[5]]; k += 1;
+  );
+  wr_send(q);
+);
+// is the companion script running? (it counts gmem[4] up on every pass; seen moving in the last second = yes)
+function wr_live() (
+  gmem[4] != wr_hb ? ( wr_hb = gmem[4]; wr_hb_t = time_precise(); );
+  time_precise() - wr_hb_t < 1;
+);
 
 // the name of memory step k into its string slot
 function mem_name(k) local(m) (
@@ -381,21 +550,6 @@ rest_dirty ? (
 mc_dirty ? ( seq_on = 0; mem_n_d = 0; mc_dirty = 0; );
 mr_dirty ? (
   seq_on ? seq_on = 0 : mem_n_d > 0 ? (
-    s_write ? (                                     // write the whole sequence, then play it with the same voicings
-      k = 0; loop(prv_n, PSV[k] = PRV[k]; k += 1; ); psv_n = prv_n;
-      wr_begin(); q = 0; k = 0;
-      loop(mem_n_d,
-        m = MEM + k * 8;
-        !m[6] ? (
-          ch_build(m[0], m[1], m[2], m[3], m[4]); top_add(); voice();
-          j = 0; loop(vl_n, PRV[j] = VL[j]; j += 1; ); prv_n = vl_n;
-          wr_chord(q, DQN[m[5]], 100);
-        );
-        q += DQN[m[5]]; k += 1;
-      );
-      wr_send(q);
-      k = 0; loop(psv_n, PRV[k] = PSV[k]; k += 1; ); prv_n = psv_n;
-    );
     seq_on = 1; seq_k = 0; seq_t = now;
   );
   mr_dirty = 0;
@@ -405,7 +559,6 @@ play_dirty ? (
     ch_build(s_root - 1, s_acc == 1 ? -1 : s_acc == 2 ? 1 : 0, s_q, s_sev, s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0);
     top_add();
     fire(now, s_ch - 1, 100, -1, DQN[s_dur] * qn_s);
-    s_write ? ( wr_begin(); wr_chord(0, DQN[s_dur], 100); wr_send(DQN[s_dur]); );
     last_sig = -1;
   );
   play_dirty = 0;
@@ -486,6 +639,8 @@ function g_pcname(pc) (
   pc == 0 ? "C" : pc == 1 ? "Db" : pc == 2 ? "D" : pc == 3 ? "Eb" : pc == 4 ? "E" : pc == 5 ? "F" : pc == 6 ? "F#" :
   pc == 7 ? "G" : pc == 8 ? "Ab" : pc == 9 ? "A" : pc == 10 ? "Bb" : "B";
 );
+// after a write: say so, or say the companion script isn't running
+function g_wrote() ( strcpy(#g_st, g_live ? "WRITTEN" : "START SCRIPT"); );
 function g_press(id) (
   // LEAD picks its note: g_pick 1 = waiting for a note key, 2 = b / # may still move it
   g_pick == 1 && id >= 1 && id <= 7 ? (
@@ -507,15 +662,15 @@ function g_press(id) (
   id == 28 ? (                                                                // CLEAR
     s_root || s_q || s_sev || s_ext || s_acc ? (
       g_set(1, 0); g_set(2, 0); g_set(3, 0); g_set(4, 0); g_set(5, 0); strcpy(#g_st, "READY");
-    ) : ( vreset_dirty = 1; strcpy(#g_st, "VOICE RESET"); );
+    ) : ( vreset_dirty = 1; w_prv_n = 0; strcpy(#g_st, "VOICE RESET"); );
     g_err_t = 0;
   ) :
   id == 29 ? ( s_root ? ( mem_n_d < MEMMAX ? ( mplus_dirty = 1; sprintf(#g_st, "M+ %d STORED", mem_n_d + 1); ) : g_err(6); ) : g_err(1); ) :
-  id == 30 ? ( mem_n_d > 0 ? mr_dirty = 1 : g_err(7); ) :
+  id == 30 ? ( mem_n_d > 0 ? ( !seq_on_d && s_write ? ( wr_seq(); g_wrote(); ); mr_dirty = 1; ) : g_err(7); ) :
   id == 31 ? ( mc_dirty = 1; strcpy(#g_st, "MEM CLEAR"); ) :
   id == 32 ? ( mem_n_d < MEMMAX ? ( rest_dirty = 1; strcpy(#g_st, "REST STORED"); ) : g_err(6); ) :
-  id == 33 ? ( s_root ? play_dirty = 1 : g_err(1); ) :
-  id == 34 ? ( g_set(11, 1 - s_write); strcpy(#g_st, s_write ? "WRITE ON" : "WRITE OFF"); );
+  id == 33 ? ( s_root ? ( play_dirty = 1; s_write ? ( wr_play(); g_wrote(); ); ) : g_err(1); ) :
+  id == 34 ? ( g_set(11, 1 - s_write); strcpy(#g_st, !s_write ? "WRITE OFF" : g_live ? "WRITE ON" : "START SCRIPT"); );
 );
 function g_lit(id) (                                   // -1 = a key without an LED
   id >= 1 && id <= 7 ? s_root == id :
@@ -554,6 +709,18 @@ function g_lcd(font, x, y, s, cells) (
 );
 
 ui_begin(440, 560);
+g_live = wr_live();
+// the LCD names the chord on the keys (worked out here, so it reads right with the transport stopped too),
+// or the last chord played from MIDI / MR
+g_sig = s_root + s_acc * 10 + s_q * 100 + s_sev * 1000 + s_ext * 10000 + s_lead * 100000 + s_top * 1000000;
+g_sig != g_lsig ? (
+  g_lsig = g_sig; g_src = 0;
+  s_root > 0 ? (
+    w_ch_build(s_root - 1, s_acc == 1 ? -1 : s_acc == 2 ? 1 : 0, s_q, s_sev, s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0);
+    w_top_add(); strcpy(#g_nm, #w_name); strcpy(#g_sp, #w_spell);
+  ) : ( strcpy(#g_nm, "--"); strcpy(#g_sp, ""); );
+);
+fire_n_d != g_lfire ? ( g_lfire = fire_n_d; g_src = 1; );
 sc != g_sc ? (
   g_sc = sc;
   g_fk = ui_fitfont(10, 15 * sc);                          // key legends
@@ -586,8 +753,8 @@ ly = 56; lh = 114;
 ui_col(0x2A2A2C); lk_rr(x0, ly, w0, lh, 8);
 ui_col(0x9FAE8C); lk_rr(x0 + 8, ly + 8, w0 - 16, lh - 16, 3);
 g_errshow = g_err_t > 0 && time_precise() - g_err_t < 1.4;
-g_lcd(14, x0 + 18, ly + 12, g_errshow ? "ERR" : #nm_disp, 14);
-g_lcd(15, x0 + 18, ly + 54, g_errshow ? #g_err : #sp_disp, 26);
+g_lcd(14, x0 + 18, ly + 12, g_errshow ? "ERR" : g_src ? #nm_disp : #g_nm, 14);
+g_lcd(15, x0 + 18, ly + 54, g_errshow ? #g_err : g_src ? #sp_disp : #g_sp, 26);
 gfx_setfont(16); ui_col(0x1C2416);
 gfx_x = gx(x0 + 18); gfx_y = gx(ly + 84);
 gfx_drawstr(s_dur == 0 ? "1/1 WHOLE" : s_dur == 1 ? "1/2 MINIM" : s_dur == 2 ? "1/4 CROTCHET" : "1/8 QUAVER");

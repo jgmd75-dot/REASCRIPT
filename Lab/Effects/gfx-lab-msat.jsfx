@@ -2,8 +2,8 @@ desc:GFX Lab MSAT [multiband saturation]
 //tags: multiband saturation transient shaper stereo width analogue 1970s mastering mix bus
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel and gfx-lab-dyn (.jsfx-inc) in the
-// same folder.
+// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel, gfx-lab-dyn and gfx-lab-os
+// (.jsfx-inc) in the same folder.
 //
 // MSAT. A three-band analogue saturation unit in the spirit of a mid-70s British design, with a transient
 // shaper and stereo width on every band (the sound is designed from scratch).
@@ -31,6 +31,10 @@ desc:GFX Lab MSAT [multiband saturation]
 //   LINK  (header) lit (the default): each band's transient shaper hears both sides and moves them together, so the
 //          image stays put. Dark: dual mono - each side its own transient detector and gain in every band. A change
 //          crossfades over 10 ms.
+//   OS    (header, left of the size picker) the saturation's oversampling: 1x (as before, the default), 2x, 4x - each
+//          click steps on. The crossover and the transient shapers stay at the base rate; each band goes up after its
+//          shaper, saturates, mixes and widens at the high rate, and the three bands come back down together (one
+//          filter per side). A change dips the output for 5 ms, swaps, comes back. Latency 0 / 31 / 37 samples (reported).
 //   PRESETS  12 (Init + 11) plus Reset all to defaults. A preset sets the crossovers and the three bands; INPUT,
 //          OUTPUT, VFD / MATRIX and DRIFT are left alone (Reset all restores them too).
 
@@ -62,6 +66,7 @@ slider25:0<0,1,1{Off,On}>-Mid mute
 slider26:0<0,1,1{Off,On}>-High solo
 slider27:0<0,1,1{Off,On}>-High mute
 slider28:1<0,1,1{Off,On}>-Link
+slider29:0<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
@@ -74,6 +79,7 @@ import gfx-lab-drift.jsfx-inc
 import gfx-lab-ui.jsfx-inc
 import gfx-lab-panel.jsfx-inc
 import gfx-lab-dyn.jsfx-inc
+import gfx-lab-os.jsfx-inc
 
 @init
 #ui_man = "gfx-msat";                        // the ? pop-up links to this manual
@@ -131,9 +137,10 @@ function bd_set(at, su, dr, mx, wd, bi) instance(tA, tS, tD, tM, tW, bias, heat)
   tA = at; tS = su; tD = 1.0 * 10 ^ ((dr + 1.5 * heat * mt_dm) / 20); tM = mx; tW = wd;
   bias = bi + 0.10 * heat * mt_dm;
 );
-function bd_run(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, eS1, eS2, g, tA, tS, tD, tM, tW,
-                               bdD, bdM, bdW, bias, rest, heat, oL, oR, gmon,
-                               fA1, fA2, fS1, fS2, gf, hA1, hA2, hS1, hS2, gh) local(a, eps, gt, u, sl, sr, mid, sid, wn, b) (
+// the band's transient shaper (and the glides): l, r -> pL, pR
+function bd_pre(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, eS1, eS2, g, tA, tS, tD, tM, tW,
+                               bdD, bdM, bdW, heat, gmon, pL, pR,
+                               fA1, fA2, fS1, fS2, gf, hA1, hA2, hS1, hS2, gh) local(a, eps, gt, u, b) (
   // linked detector
   a = max(abs(l), abs(r));
   eA1 += (a > eA1 ? kAf : kAr) * (a - eA1);                            // fast attack
@@ -169,6 +176,10 @@ function bd_run(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, 
   heat += (a > heat ? kH1 : kH2) * (min(a * 2, 1) - heat);
   // glides (the drive, mix and width ride smoothly)
   bdD += (tD - bdD) * mt_gs; bdM += (tM - bdM) * mt_gs; bdW += (tW - bdW) * mt_gs;
+  pL = l; pR = r;
+);
+// the band's saturation and width (at the base rate, or once per phase at 2x / 4x): l, r -> oL, oR
+function bd_sat(l, r) instance(bdD, bdM, bdW, bias, rest, oL, oR) local(sl, sr, mid, sid, wn) (
   // saturation (level-compensated), in parallel with the clean band
   bdM > 0.0005 ? (
     sl = (mt_sc(l * bdD + bias) - rest) / bdD; sr = (mt_sc(r * bdD + bias) - rest) / bdD;
@@ -181,6 +192,7 @@ function bd_run(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, 
   );
   oL = l; oR = r;
 );
+function bd_run(l, r) ( this.bd_pre(l, r); this.bd_sat(this.pL, this.pR); );
 function bd_rest() instance(bias, rest) ( rest = mt_sc(bias); );
 function bd_tidy() instance(eA1, eA2, eS1, eS2, g, heat, fA1, fA2, fS1, fS2, gf, hA1, hA2, hS1, hS2, gh) (
   eA1 = mt_tn(eA1); eA2 = mt_tn(eA2); eS1 = mt_tn(eS1); eS2 = mt_tn(eS2); g = mt_tn(g); heat = mt_tn(heat);
@@ -224,6 +236,7 @@ function mt_srinit() (
   ost_init(0);
 );
 mt_srinit();
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider29); os_gsetup();
 in_init();
 dL.drift_init(0.8 + rand(0.4)); dM.drift_init(0.8 + rand(0.4)); dH.drift_init(0.8 + rand(0.4));
 drift_macro(50);
@@ -239,9 +252,11 @@ file_var(0, ui_sz);
 file_var(0, pr_cur);
 
 @block
-srate != mt_sr ? mt_srinit();
+srate != mt_sr ? ( mt_srinit(); os_gsetup(); );
+os_tf = os_f2n(slider29);
 in_setup(slider1, 0);
 ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through (a mix tool)
+pdc_delay = os_base + os_lat(os_f);                   // (ost_setup clears it)
 drift_macro(slider21);
 mt_dm = dm_a;
 // crossover corners: glided per block (the upper never below the lower)
@@ -280,6 +295,9 @@ mta_hL = bL.heat; mta_hM = bM.heat; mta_hH = bH.heat;
 
 @sample
 spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+os_gate();
+os_chg ? ( bL.osl.os_clr(); bL.osr.os_clr(); bM.osl.os_clr(); bM.osr.os_clr(); bH.osl.os_clr(); bH.osr.os_clr();
+           mt_dnl.os_clr(); mt_dnr.os_clr(); );                     // the OS swap (at silence)
 in_process(spl0, spl1);
 mt_xl = in_l; mt_xr = in_r;
 lk_s += ((slider28 >= 0.5) - lk_s) * mt_lkc; lk_s > 0.9999 && slider28 >= 0.5 ? lk_s = 1; lk_s < 0.0001 && slider28 < 0.5 ? lk_s = 0;
@@ -288,18 +306,36 @@ mt_pi = max(mt_pi, max(abs(mt_xl), abs(mt_xr)));
 // split
 xL.xo_run(mt_xl); xR.xo_run(mt_xr);
 // the three bands
-bL.bd_run(xL.lo, xR.lo); bM.bd_run(xL.mi, xR.mi); bH.bd_run(xL.hi, xR.hi);
 mt_sL += (mt_tL - mt_sL) * mt_ks; mt_sM += (mt_tM - mt_sM) * mt_ks; mt_sH += (mt_tH - mt_sH) * mt_ks;   // SOLO / MUTE: 10 ms fades
-mt_yl = bL.oL * mt_sL + bM.oL * mt_sM + bH.oL * mt_sH; mt_yr = bL.oR * mt_sL + bM.oR * mt_sM + bH.oR * mt_sH;
-mt_l0 = max(mt_l0, abs(bL.oL)); mt_l1 = max(mt_l1, abs(bL.oR)); mt_m0 = max(mt_m0, abs(bM.oL)); mt_m1 = max(mt_m1, abs(bM.oR));
-mt_h0 = max(mt_h0, abs(bH.oL)); mt_h1 = max(mt_h1, abs(bH.oR));
+os_f == 1 ? (
+  bL.bd_run(xL.lo, xR.lo); bM.bd_run(xL.mi, xR.mi); bH.bd_run(xL.hi, xR.hi);
+  mt_yl = bL.oL * mt_sL + bM.oL * mt_sM + bH.oL * mt_sH; mt_yr = bL.oR * mt_sL + bM.oR * mt_sM + bH.oR * mt_sH;
+  mt_l0 = max(mt_l0, abs(bL.oL)); mt_l1 = max(mt_l1, abs(bL.oR)); mt_m0 = max(mt_m0, abs(bM.oL)); mt_m1 = max(mt_m1, abs(bM.oR));
+  mt_h0 = max(mt_h0, abs(bH.oL)); mt_h1 = max(mt_h1, abs(bH.oR));
+) : (
+  // 2x / 4x: each band up after its shaper; saturation, mix, width and the sum at the high rate; one way down per side
+  bL.bd_pre(xL.lo, xR.lo); bM.bd_pre(xL.mi, xR.mi); bH.bd_pre(xL.hi, xR.hi);
+  bL.osl.os_up(bL.pL); bL.osr.os_up(bL.pR); bM.osl.os_up(bM.pL); bM.osr.os_up(bM.pR); bH.osl.os_up(bH.pL); bH.osr.os_up(bH.pR);
+  mt_i = 0;
+  loop(os_f,
+    bL.bd_sat(bL.osl.os_s(mt_i), bL.osr.os_s(mt_i)); bM.bd_sat(bM.osl.os_s(mt_i), bM.osr.os_s(mt_i));
+    bH.bd_sat(bH.osl.os_s(mt_i), bH.osr.os_s(mt_i));
+    mt_ol = bL.oL * mt_sL + bM.oL * mt_sM + bH.oL * mt_sH; mt_or = bL.oR * mt_sL + bM.oR * mt_sM + bH.oR * mt_sH;
+    mt_i == 0 ? ( mt_p0 = mt_ol; mt_q0 = mt_or; ) : mt_i == 1 ? ( mt_p1 = mt_ol; mt_q1 = mt_or; ) :
+    mt_i == 2 ? ( mt_p2 = mt_ol; mt_q2 = mt_or; ) : ( mt_p3 = mt_ol; mt_q3 = mt_or; );
+    mt_l0 = max(mt_l0, abs(bL.oL)); mt_l1 = max(mt_l1, abs(bL.oR)); mt_m0 = max(mt_m0, abs(bM.oL)); mt_m1 = max(mt_m1, abs(bM.oR));
+    mt_h0 = max(mt_h0, abs(bH.oL)); mt_h1 = max(mt_h1, abs(bH.oR));
+    mt_i += 1;
+  );
+  mt_yl = mt_dnl.os_dn(mt_p0, mt_p1, mt_p2, mt_p3); mt_yr = mt_dnr.os_dn(mt_q0, mt_q1, mt_q2, mt_q3);
+);
 // OUTPUT
 mt_outs += (mt_outt - mt_outs) * mt_gs;
 mt_yl *= mt_outs; mt_yr *= mt_outs;
 mt_yl != mt_yl ? mt_yl = 0; mt_yr != mt_yr ? mt_yr = 0;
 ost_out(mt_yl, mt_yr);
-spl0 = max(-4, min(4, ost_l));
-spl1 = max(-4, min(4, ost_r));
+spl0 = max(-4, min(4, ost_l)) * os_g;
+spl1 = max(-4, min(4, ost_r)) * os_g;
 mt_po = max(mt_po, max(abs(spl0), abs(spl1)));
 
 @gfx 1080 430
@@ -521,6 +557,7 @@ k_ > 0 ? load_preset(k_);
 kr_key(398, 25, 62, 28, "LINK", slider28 >= 0.5) ? ( slider28 = slider28 >= 0.5 ? 0 : 1; ui_auto(28); );
 kr_key(796, 25, 56, 28, "VFD", krv_mx == 0) ? ( slider19 = 0; ui_auto(19); );
 kr_key(856, 25, 66, 28, "MATRIX", krv_mx == 1) ? ( slider19 = 1; ui_auto(19); );
+os_key(966, 28, 29, KRI, 7);
 ui_size_picker(1000 * sc, 30 * sc);
 
 // =====================================================================
