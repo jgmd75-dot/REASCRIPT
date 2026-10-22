@@ -1,0 +1,620 @@
+desc:GFX Lab ORCHD [MIDI chords]
+//tags: MIDI chord generator utility
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-lab-ui (.jsfx-inc) in the same folder.
+//
+// ORCHD - a pocket-calculator chord box that plays. Put it before a GFX instrument (or any synth) on the same track.
+// It grew out of the CC-80 chord-writing script: the same keys and the same chord brain, now live MIDI.
+//
+// PLAYING
+//   Build a chord on the keys: a root (C - B, then b / #), a quality (maj min dim aug sus4), a seventh
+//   (7 M7 m7) and an extension (9 11 13). Press = and the chord sounds for the chosen length (1/1 1/2 1/4 1/8
+//   at the project tempo). Or play notes on a MIDI keyboard: each note you hold plays the chord built on the
+//   keys, on that note's root (the keyboard picks the root, the keys pick the colour), for as long as you hold
+//   it, at the note's velocity and on its channel. Other MIDI (pedal, bend, controllers) passes straight through.
+//   Voice leading: each new chord takes the inversion and octave closest to the last one, so the voices move as
+//   little as they can. CLEAR empties the keys; press CLEAR again on an empty display to start the voice leading
+//   afresh.
+// OCTAVE (OCT - / OCT +): moves everything ORCHD plays down or up an octave at a time, two each way.
+// LEAD: the leading note - one note held on top of every chord, the way a melody note sits on top of a run of
+//   chords. Press LEAD, then a note key (C - B, then b / # if you want it): with G as the leading note, Eb has G
+//   on top, Cm has the same G on top, and F gets the G added (F becomes Fadd9, F7 becomes F9, Fmaj7 becomes
+//   Fmaj9). A leading note that isn't in the chord is added as the 9, 11, 13, 6, 7 ... and named that way.
+//   The leading note sits between E4 and Eb5 (OCTAVE moves it with the rest); the other notes are voice-led
+//   underneath it. Press LEAD again to turn it off.
+// MEMORY: M+ stores the chord on the keys (with its length), REST stores a rest of the chosen length, MR plays
+//   the stored sequence at the project tempo (press MR again to stop), MC clears it. The sequence is saved
+//   with the project (up to 32 steps).
+// No drift (John, Oct 2026): ORCHD plays exactly what you ask.
+// GUI: CC-80's pocket calculator - cream case, solar cell, green LCD, rubber keys with small LEDs on the keys that
+//   hold a setting. The LCD shows the chord name and its spelling (by letter, so Cdim7 = C - Eb - Gb - Bbb), the
+//   length, the memory count, octave, LEAD and the status (MR 2/4 while the sequence plays). Computer keys while
+//   the window has focus: A - G root, Enter =, Space REST, Backspace CLEAR, 1 2 4 8 length, - + octave.
+// Latency: 0 samples. Audio passes through untouched.
+
+import gfx-lab-ui.jsfx-inc
+
+slider1:s_root=0<0,7,1{None,C,D,E,F,G,A,B}>-Root
+slider2:s_acc=0<0,2,1{Natural,Flat,Sharp}>-Accidental
+slider3:s_q=0<0,5,1{None,maj,min,dim,aug,sus4}>-Quality
+slider4:s_sev=0<0,3,1{None,7,M7,m7}>-Seventh
+slider5:s_ext=0<0,3,1{None,9,11,13}>-Extension
+slider6:s_dur=2<0,3,1{1/1,1/2,1/4,1/8}>-Length
+slider7:s_oct=0<-2,2,1>-Octave
+slider8:s_lead=0<0,1,1{Off,On}>-Leading note
+slider9:s_ch=1<1,16,1>-MIDI channel for = and MR
+slider10:s_top=7<0,11,1{C,Db,D,Eb,E,F,F#,G,Ab,A,Bb,B}>-Leading note (top)
+
+@init
+#ui_man = "gfx-lab-orchd";
+ext_noinit = 1;
+!ui_dflt ? ( ui_sz = 0; ); ui_dflt = 1;
+
+// ---------- memory map ----------
+LPC = 0;         // letter pitch classes C D E F G A B
+IVS = 10;        // chord intervals (semitones) and scale degrees
+IVD = 20;
+CHD  = 30;        // chord pitch classes, ch_n of them
+VL  = 40;        // the chosen voicing
+PRV = 50;        // the last voicing (voice leading), prv_n notes
+CAN = 60;        // candidate voicing
+PCL = 70;        // MIDI pitch class -> letter / accidental (flats, F#)
+PCA = 82;
+DQN = 94;        // lengths in quarter notes
+MEM = 1000;      // stored sequence: 32 steps x 8 (letter, acc, q, sev, ext, length, rest)
+MEMMAX = 32;
+VX  = 2000;      // voices: NV x VS
+NV  = 16; VS = 24;
+RC  = 3000;      // note-on reference counts per channel x pitch (2048)
+OB  = 6000;      // outgoing MIDI this block: 4 per event (offset, status, data1, data2)
+OBMAX = 480;
+REG_LO = 40; REG_HI = 84; CENTRE = 62;
+vl_lo = 0; vl_hi = REG_HI;
+MSTR = 200;      // string slots for the memory step names (200 - 231)
+
+LPC[0] = 0; LPC[1] = 2; LPC[2] = 4; LPC[3] = 5; LPC[4] = 7; LPC[5] = 9; LPC[6] = 11;
+PCL[0] = 0; PCL[1] = 1; PCL[2] = 1; PCL[3] = 2; PCL[4] = 2; PCL[5] = 3; PCL[6] = 3; PCL[7] = 4; PCL[8] = 5;
+PCL[9] = 5; PCL[10] = 6; PCL[11] = 6;
+PCA[0] = 0; PCA[1] = -1; PCA[2] = 0; PCA[3] = -1; PCA[4] = 0; PCA[5] = 0; PCA[6] = 1; PCA[7] = 0; PCA[8] = -1;
+PCA[9] = 0; PCA[10] = -1; PCA[11] = 0;
+DQN[0] = 4; DQN[1] = 2; DQN[2] = 1; DQN[3] = 0.5;
+
+memset(VX, 0, NV * VS); memset(RC, 0, 2048);
+now = 0; seq_on = 0; prv_n = 0; ob_n = 0;
+names_dirty = 1; last_sig = -1;
+#nm_disp = "--"; #sp_disp = "";
+
+function letter_s(i) ( i == 0 ? "C" : i == 1 ? "D" : i == 2 ? "E" : i == 3 ? "F" : i == 4 ? "G" : i == 5 ? "A" : "B"; );
+function acc_s(a) ( a == 1 ? "#" : a == 2 ? "x" : a == -1 ? "b" : a == -2 ? "bb" : ""; );
+function iv_add(semi, deg) ( IVS[ch_n] = semi; IVD[ch_n] = deg; ch_n += 1; );
+
+// Build a chord: rl letter 0-6, acc -1/0/1, q 0 none 1 maj 2 min 3 dim 4 aug 5 sus4, sev 0 none 1 "7" 2 M7 3 m7,
+// ext 0 / 9 / 11 / 13. Fills CHD (pitch classes, ch_n), b_rpc (root pitch class), #b_name and #b_spell.
+function ch_build(rl, acc, q, sev, ext) local(triad, s7, i, li, tgt, a) (
+  sev == 3 && q == 0 ? q = 2;                         // the m7 key implies a minor triad
+  triad = q == 0 ? 1 : q;
+  ch_n = 0;
+  iv_add(0, 1);
+  triad == 1 ? ( iv_add(4, 3); iv_add(7, 5); ) :
+  triad == 2 ? ( iv_add(3, 3); iv_add(7, 5); ) :
+  triad == 3 ? ( iv_add(3, 3); iv_add(6, 5); ) :
+  triad == 4 ? ( iv_add(4, 3); iv_add(8, 5); ) :
+               ( iv_add(5, 4); iv_add(7, 5); );
+  s7 = 0;
+  sev == 1 ? s7 = (q == 1 ? 11 : q == 3 ? 9 : 10) :   // maj + 7 = maj7, dim + 7 = dim7
+  sev == 2 ? s7 = 11 :
+  sev == 3 ? s7 = 10 :
+  ext ? s7 = (q == 1 ? 11 : 10);
+  s7 ? iv_add(s7, 7);
+  ext ? (
+    iv_add(14, 9);
+    ext == 11 ? (
+      iv_add(17, 11);
+      triad == 1 ? (                                  // 11ths drop the major 3rd (it clashes with the 11th)
+        i = 1; loop(ch_n - 2, IVS[i] = IVS[i + 1]; IVD[i] = IVD[i + 1]; i += 1; );
+        ch_n -= 1;
+      );
+    ) : ext == 13 ? iv_add(21, 13);
+  );
+  // name
+  ext ? sprintf(#b_n, "%d", ext) : strcpy(#b_n, "7");
+  strcpy(#b_name, letter_s(rl)); strcat(#b_name, acc_s(acc));
+  !s7 ? (
+    strcat(#b_name, triad == 1 ? "" : triad == 2 ? "m" : triad == 3 ? "dim" : triad == 4 ? "aug" : "sus4");
+  ) : triad == 3 ? (
+    strcat(#b_name, s7 == 9 ? "dim7" : s7 == 10 ? "m7b5" : "dim(maj7)");
+  ) : s7 == 11 ? (
+    triad == 1 ? ( strcat(#b_name, "maj"); strcat(#b_name, #b_n); ) :
+    triad == 2 ? ( strcat(#b_name, "m(maj"); strcat(#b_name, #b_n); strcat(#b_name, ")"); ) :
+    triad == 4 ? ( strcat(#b_name, "aug(maj"); strcat(#b_name, #b_n); strcat(#b_name, ")"); ) :
+                 ( strcat(#b_name, "maj"); strcat(#b_name, #b_n); strcat(#b_name, "sus4"); );
+  ) : (
+    triad == 1 ? strcat(#b_name, #b_n) :
+    triad == 2 ? ( strcat(#b_name, "m"); strcat(#b_name, #b_n); ) :
+    triad == 4 ? ( strcat(#b_name, "aug"); strcat(#b_name, #b_n); ) :
+                 ( strcat(#b_name, #b_n); strcat(#b_name, "sus4"); );
+  );
+  // spelling by letter, and the pitch classes
+  b_rpc = (LPC[rl] + acc + 12) % 12; b_rl = rl; b_s7 = s7; b_tri = triad;
+  strcpy(#b_spell, "");
+  i = 0;
+  loop(ch_n,
+    li = (rl + IVD[i] - 1) % 7;
+    tgt = (b_rpc + IVS[i]) % 12;
+    a = (tgt - LPC[li] + 12) % 12; a > 6 ? a -= 12;
+    i > 0 ? strcat(#b_spell, " - ");
+    strcat(#b_spell, letter_s(li)); strcat(#b_spell, acc_s(a));
+    CHD[i] = tgt;
+    i += 1;
+  );
+);
+
+// Voice leading: try every inversion at every octave in the register; keep the cheapest
+// (fewest semitones moved from the last voicing, no close intervals low down, a gentle pull to the centre).
+function vlead() local(inv, base, k, p, pc, c, best, i, j, m, mean) (
+  best = 1000000; vl_n = ch_n;
+  inv = 0;
+  loop(ch_n,
+    base = REG_LO;
+    loop(31,
+      base % 12 == CHD[inv] ? (
+        CAN[0] = base; p = base; k = 1;
+        loop(ch_n - 1,
+          pc = CHD[(inv + k) % ch_n];
+          p += 1; loop(11, p % 12 != pc ? p += 1; );
+          CAN[k] = p; k += 1;
+        );
+        CAN[ch_n - 1] <= vl_hi && CAN[ch_n - 1] >= vl_lo ? (
+          c = 0; k = 1;
+          loop(ch_n - 1, CAN[k - 1] < 52 && CAN[k] - CAN[k - 1] < 3 ? c += 4; k += 1; );
+          mean = 0; k = 0; loop(ch_n, mean += CAN[k]; k += 1; ); mean /= ch_n;
+          prv_n == 0 ? (
+            c += abs(mean - CENTRE) + (inv > 0 ? 3 : 0);
+          ) : (
+            i = 0;
+            loop(ch_n, m = 99; j = 0; loop(prv_n, m = min(m, abs(CAN[i] - PRV[j])); j += 1; ); c += m; i += 1; );
+            j = 0;
+            loop(prv_n, m = 99; i = 0; loop(ch_n, m = min(m, abs(CAN[i] - PRV[j])); i += 1; ); c += m; j += 1; );
+            c += 0.3 * abs(mean - CENTRE);
+          );
+          c < best ? ( best = c; k = 0; loop(ch_n, VL[k] = CAN[k]; k += 1; ); );
+        );
+      );
+      base += 1;
+    );
+    inv += 1;
+  );
+  best;
+);
+
+// LEAD: add the leading note (s_top) to the chord in CHD if it isn't there, and name it (Fadd9, F9, Fmaj9 ...)
+function top_add() local(has, iv, k, L, deg, li, a) (
+  s_lead ? (
+    has = 0; k = 0; loop(ch_n, CHD[k] == s_top ? has = 1; k += 1; );
+    !has ? (
+      iv = (s_top - b_rpc + 12) % 12;
+      IVS[ch_n] = iv; CHD[ch_n] = s_top; ch_n += 1;
+      L = strlen(#b_name);
+      b_s7 ? (
+        (iv == 2 || iv == 5 || iv == 9) && str_getchar(#b_name, L - 1) == '7' ? (
+          strcpy_substr(#b_name, #b_name, 0, L - 1);
+          strcat(#b_name, iv == 2 ? "9" : iv == 5 ? "11" : "13");
+        ) : strcat(#b_name, iv == 1 ? "(b9)" : iv == 2 ? "(9)" : iv == 3 ? "(#9)" : iv == 5 ? "(11)" : iv == 6 ? "(#11)" :
+                            iv == 8 ? "(b13)" : iv == 9 ? "(13)" : iv == 4 ? "(add3)" : "(add5)");
+      ) : b_tri == 5 && iv == 10 ? (
+        strcpy_substr(#b_name, #b_name, 0, L - 4); strcat(#b_name, "7sus4");
+      ) : (
+        strcat(#b_name, iv == 2 ? "add9" : iv == 5 ? "add11" : iv == 9 ? "6" : iv == 10 ? "7" :
+                        iv == 11 ? (b_tri == 1 ? "maj7" : "(maj7)") : iv == 1 ? "(b9)" : iv == 3 ? "(#9)" :
+                        iv == 6 ? "(#11)" : iv == 8 ? "(b13)" : iv == 4 ? "(add3)" : "(add5)");
+      );
+      deg = iv == 1 || iv == 2 || iv == 3 ? 9 : iv == 5 || iv == 6 ? 11 : iv == 8 || iv == 9 ? 13 :
+            iv == 10 || iv == 11 ? 7 : iv == 4 ? 3 : 5;
+      li = (b_rl + deg - 1) % 7;
+      a = (s_top - LPC[li] + 12) % 12; a > 6 ? a -= 12;
+      strcat(#b_spell, " - "); strcat(#b_spell, letter_s(li)); strcat(#b_spell, acc_s(a));
+    );
+  );
+);
+// The voicing: plain voice leading, or with LEAD the leading note on top (between E4 and Eb5) and the rest of the
+// chord voice-led within the octave under it
+function voice() local(T, j, k) (
+  s_lead ? (
+    T = 64 + (s_top + 8) % 12;
+    j = 0; k = 0; loop(ch_n, CHD[k] != s_top ? ( CHD[j] = CHD[k]; j += 1; ); k += 1; ); ch_n = j;
+    ch_n > 0 ? (
+      vl_lo = T - 12; vl_hi = T - 1;
+      vlead() >= 1000000 ? ( vl_lo = T - 24; vlead(); );
+      vl_lo = 0; vl_hi = REG_HI;
+    ) : vl_n = 0;
+    VL[vl_n] = T; vl_n += 1;
+  ) : vlead();
+);
+
+// ---------- outgoing MIDI, collected per block, sorted by offset, then sent ----------
+function ob_push(ofs, a, b, c) (
+  ob_n < OBMAX ? ( OB[ob_n * 4] = ofs; OB[ob_n * 4 + 1] = a; OB[ob_n * 4 + 2] = b; OB[ob_n * 4 + 3] = c; ob_n += 1; );
+);
+function tofs(t) ( max(0, min(samplesblock - 1, floor(t - now))); );
+function out_on(ofs, ch, p, vel) (
+  p >= 0 && p <= 127 ? (
+    RC[ch * 128 + p] == 0 ? ob_push(ofs, 0x90 | ch, p, max(1, min(127, floor(vel + 0.5))));
+    RC[ch * 128 + p] += 1;
+  );
+);
+function out_off(ofs, ch, p) (
+  p >= 0 && p <= 127 && RC[ch * 128 + p] > 0 ? (
+    RC[ch * 128 + p] -= 1;
+    RC[ch * 128 + p] == 0 ? ob_push(ofs, 0x80 | ch, p, 0);
+  );
+);
+function ob_flush() local(i, j, a, b, c, d) (
+  i = 1;
+  loop(ob_n - 1,                                     // insertion sort (stable) by offset
+    a = OB[i * 4]; b = OB[i * 4 + 1]; c = OB[i * 4 + 2]; d = OB[i * 4 + 3];
+    j = i - 1;
+    loop(i, j >= 0 && OB[j * 4] > a ? (
+      OB[j * 4 + 4] = OB[j * 4]; OB[j * 4 + 5] = OB[j * 4 + 1]; OB[j * 4 + 6] = OB[j * 4 + 2]; OB[j * 4 + 7] = OB[j * 4 + 3];
+      j -= 1; ); );
+    OB[j * 4 + 4] = a; OB[j * 4 + 5] = b; OB[j * 4 + 6] = c; OB[j * 4 + 7] = d;
+    i += 1;
+  );
+  i = 0; loop(ob_n, midisend(OB[i * 4], OB[i * 4 + 1], OB[i * 4 + 2], OB[i * 4 + 3]); i += 1; );
+  ob_n = 0;
+);
+
+// ---------- voices: one chord each ----------
+// fields: 0 used, 1 channel, 2 velocity, 7 chord on, 8 chord off (-1 = while the key is held), 9 chord state (0 waiting, 1 sounding, 2 skipped),
+//         10 source note (-1 = = / MR), 11 note count, 12.. notes
+function v_kill(v, ofs) local(k) (
+  v[9] == 1 ? ( k = 0; loop(v[11], out_off(ofs, v[1], v[12 + k]); k += 1; ); );
+  v[0] = 0;
+);
+function v_alloc() local(i, v, old, ot) (
+  v = -1; i = 0; ot = 10000000000;
+  loop(NV, !VX[i * VS] && v < 0 ? v = VX + i * VS; VX[i * VS] && VX[i * VS + 7] < ot ? ( ot = VX[i * VS + 7]; old = VX + i * VS; ); i += 1; );
+  v < 0 ? ( v_kill(old, 0); v = old; );
+  memset(v, 0, VS);
+  v;
+);
+// Play the chord in CHD: t = when (absolute samples), src = held MIDI note (-1 = timed), len = length in samples
+function fire(t, ch, vel, src, len) local(v, k, sh) (
+  voice();
+  k = 0; loop(vl_n, PRV[k] = VL[k]; k += 1; ); prv_n = vl_n;
+  v = v_alloc();
+  sh = 12 * s_oct;
+  v[0] = 1; v[1] = ch; v[2] = vel; v[10] = src; v[11] = vl_n;
+  k = 0; loop(vl_n, v[12 + k] = VL[k] + sh; k += 1; );
+  v[7] = t;
+  v[8] = src >= 0 ? -1 : t + max(len - 0.003 * srate, len * 0.5);
+  strcpy(#nm_disp, #b_name); strcpy(#sp_disp, #b_spell);
+);
+function v_release(ch, p, t) local(i, v) (
+  i = 0;
+  loop(NV, v = VX + i * VS;
+    v[0] && v[10] == p && v[1] == ch && v[8] < 0 ? v[8] = t;
+    i += 1;
+  );
+);
+function v_all_off(t) local(i, v) (
+  i = 0;
+  loop(NV, v = VX + i * VS;
+    v[0] ? ( v[8] < 0 || v[8] > t ? v[8] = t; v[7] > t ? v[9] = 2; );
+    i += 1;
+  );
+  seq_on = 0;
+);
+function v_run(tend) local(i, v, k, n) (
+  i = 0; n = 0;
+  loop(NV, v = VX + i * VS;
+    v[0] ? (
+      v[9] == 0 && v[7] < tend ? (
+        v[8] >= 0 && v[8] <= v[7] ? v[9] = 2 : (
+          k = 0; loop(v[11], out_on(tofs(v[7]), v[1], v[12 + k], v[2]); k += 1; ); v[9] = 1;
+        );
+      );
+      v[8] >= 0 && v[8] < tend && v[9] > 0 ? (
+        v[9] == 1 ? ( k = 0; loop(v[11], out_off(tofs(v[8]), v[1], v[12 + k]); k += 1; ); );
+        v[0] = 0;
+      );
+      v[0] && v[10] < 0 && v[9] == 1 ? n += 1;
+    );
+    i += 1;
+  );
+  snd_disp = n;
+);
+
+// the name of memory step k into its string slot
+function mem_name(k) local(m) (
+  m = MEM + k * 8;
+  m[6] ? strcpy(MSTR + k, "--") : ( ch_build(m[0], m[1], m[2], m[3], m[4]); strcpy(MSTR + k, #b_name); );
+);
+
+@slider
+
+@block
+// ---------- requests from the panel ----------
+tend = now + samplesblock;
+qn_s = 60 / max(tempo, 20) * srate;
+
+vreset_dirty ? ( prv_n = 0; vreset_dirty = 0; );
+names_dirty ? ( k = 0; loop(min(mem_n_d, MEMMAX), mem_name(k); k += 1; ); names_dirty = 0; last_sig = -1; );
+mplus_dirty ? (
+  mem_n_d < MEMMAX && s_root > 0 ? (
+    m = MEM + mem_n_d * 8;
+    m[0] = s_root - 1; m[1] = s_acc == 1 ? -1 : s_acc == 2 ? 1 : 0; m[2] = s_q; m[3] = s_sev;
+    m[4] = s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0; m[5] = s_dur; m[6] = 0;
+    mem_name(mem_n_d); mem_n_d += 1; last_sig = -1;
+  );
+  mplus_dirty = 0;
+);
+rest_dirty ? (
+  mem_n_d < MEMMAX ? ( m = MEM + mem_n_d * 8; memset(m, 0, 8); m[5] = s_dur; m[6] = 1; mem_name(mem_n_d); mem_n_d += 1; );
+  rest_dirty = 0;
+);
+mc_dirty ? ( seq_on = 0; mem_n_d = 0; mc_dirty = 0; );
+mr_dirty ? (
+  seq_on ? seq_on = 0 : mem_n_d > 0 ? ( seq_on = 1; seq_k = 0; seq_t = now; );
+  mr_dirty = 0;
+);
+play_dirty ? (
+  s_root > 0 ? (
+    ch_build(s_root - 1, s_acc == 1 ? -1 : s_acc == 2 ? 1 : 0, s_q, s_sev, s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0);
+    top_add();
+    fire(now, s_ch - 1, 100, -1, DQN[s_dur] * qn_s);
+    last_sig = -1;
+  );
+  play_dirty = 0;
+);
+
+// ---------- the panel's chord on the LCD (when the keys change) ----------
+sig = s_root + s_acc * 10 + s_q * 100 + s_sev * 1000 + s_ext * 10000 + s_lead * 100000 + s_top * 1000000;
+sig != last_sig ? (
+  last_sig = sig;
+  s_root > 0 ? (
+    ch_build(s_root - 1, s_acc == 1 ? -1 : s_acc == 2 ? 1 : 0, s_q, s_sev, s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0);
+    top_add();
+    strcpy(#nm_disp, #b_name); strcpy(#sp_disp, #b_spell);
+  ) : ( strcpy(#nm_disp, "--"); strcpy(#sp_disp, ""); );
+);
+
+// ---------- MIDI in: notes play chords, everything else passes through ----------
+while (midirecv(ofs, m1, m2, m3)) (
+  st = m1 & 0xF0; mch = m1 & 15;
+  st == 0x90 && m3 > 0 ? (
+    rl = PCL[m2 % 12];
+    ch_build(rl, PCA[m2 % 12], s_q, s_sev, s_ext == 1 ? 9 : s_ext == 2 ? 11 : s_ext == 3 ? 13 : 0);
+    top_add();
+    fire(now + ofs, mch, m3, m2, 0);
+  ) : st == 0x80 || st == 0x90 ? (
+    v_release(mch, m2, now + ofs);
+  ) : (
+    st == 0xB0 && (m2 == 123 || m2 == 120) ? v_all_off(now + ofs);
+    ob_push(ofs, m1, m2, m3);
+  );
+);
+
+// ---------- MR: the stored sequence at the project tempo ----------
+loop(MEMMAX,
+  seq_on && seq_t < tend ? (
+    seq_k >= mem_n_d ? seq_on = 0 : (
+      m = MEM + seq_k * 8;
+      len = DQN[m[5]] * qn_s;
+      !m[6] ? ( ch_build(m[0], m[1], m[2], m[3], m[4]); top_add(); fire(seq_t, s_ch - 1, 100, -1, len); );
+      seq_step_d = seq_k;
+      seq_t += len; seq_k += 1;
+    );
+  );
+);
+seq_on_d = seq_on;
+
+v_run(tend);
+ob_flush();
+now = tend;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, mem_n_d);
+mem_n_d = max(0, min(MEMMAX, floor(mem_n_d)));
+file_mem(0, MEM, MEMMAX * 8);
+names_dirty = 1;
+
+@gfx 440 560
+// ---------- panel ----------
+function gx(v) ( v * sc; );
+function g_err(code) (
+  strcpy(#g_err, code == 1 ? "NO ROOT" : code == 2 ? "m7 CLASH" : code == 3 ? "DIM EXT" : code == 4 ? "SUS4 11" :
+                 code == 5 ? "AUG 11" : code == 6 ? "MEM FULL" : code == 7 ? "MEM EMPTY" : "ERR");
+  g_err_t = time_precise();
+);
+// the chord rules the keys must keep (CC-80's): returns 0 or an error code
+function g_check(q, sev, ext) (
+  sev == 3 && q != 0 && q != 2 && q != 3 ? 2 :
+  q == 3 && ext ? 3 :
+  q == 5 && ext == 2 ? 4 :
+  q == 4 && ext == 2 ? 5 : 0;
+);
+function g_set(idx, v) ( slider(idx) = v; ui_auto(idx); );
+function g_quality(k) local(n, e) ( n = s_q == k ? 0 : k; e = g_check(n, s_sev, s_ext); e ? g_err(e) : g_set(3, n); );
+function g_seventh(k) local(n, e) ( n = s_sev == k ? 0 : k; e = g_check(s_q, n, s_ext); e ? g_err(e) : g_set(4, n); );
+function g_extn(k) local(n, e) ( n = s_ext == k ? 0 : k; e = g_check(s_q, s_sev, n); e ? g_err(e) : g_set(5, n); );
+function g_pcname(pc) (
+  pc == 0 ? "C" : pc == 1 ? "Db" : pc == 2 ? "D" : pc == 3 ? "Eb" : pc == 4 ? "E" : pc == 5 ? "F" : pc == 6 ? "F#" :
+  pc == 7 ? "G" : pc == 8 ? "Ab" : pc == 9 ? "A" : pc == 10 ? "Bb" : "B";
+);
+function g_press(id) (
+  // LEAD picks its note: g_pick 1 = waiting for a note key, 2 = b / # may still move it
+  g_pick == 1 && id >= 1 && id <= 7 ? (
+    g_tnat = id == 1 ? 0 : id == 2 ? 2 : id == 3 ? 4 : id == 4 ? 5 : id == 5 ? 7 : id == 6 ? 9 : 11;
+    g_set(10, g_tnat); g_pick = 2; sprintf(#g_st, "TOP %s", g_pcname(g_tnat)); id = 0;
+  ) : g_pick == 2 && (id == 8 || id == 9) ? (
+    g_set(10, (g_tnat + (id == 8 ? 11 : 1)) % 12); g_pick = 0; sprintf(#g_st, "TOP %s", g_pcname(s_top)); id = 0;
+  ) : g_pick ? g_pick = 0;
+  id >= 1 && id <= 7 ? g_set(1, id) :                                         // roots C - B
+  id == 8 ? ( s_root ? g_set(2, s_acc == 1 ? 0 : 1) : g_err(1); ) :           // b
+  id == 9 ? ( s_root ? g_set(2, s_acc == 2 ? 0 : 2) : g_err(1); ) :           // #
+  id >= 10 && id <= 14 ? g_quality(id - 9) :
+  id >= 15 && id <= 17 ? g_seventh(id - 14) :
+  id >= 18 && id <= 20 ? g_extn(id - 17) :
+  id >= 21 && id <= 24 ? g_set(6, id - 21) :
+  id == 25 ? ( s_oct > -2 ? g_set(7, s_oct - 1); ) :
+  id == 26 ? ( s_oct < 2 ? g_set(7, s_oct + 1); ) :
+  id == 27 ? ( s_lead ? ( g_set(8, 0); g_pick = 0; strcpy(#g_st, "LEAD OFF"); ) : ( g_set(8, 1); g_pick = 1; strcpy(#g_st, "PICK A NOTE"); ); ) :
+  id == 28 ? (                                                                // CLEAR
+    s_root || s_q || s_sev || s_ext || s_acc ? (
+      g_set(1, 0); g_set(2, 0); g_set(3, 0); g_set(4, 0); g_set(5, 0); strcpy(#g_st, "READY");
+    ) : ( vreset_dirty = 1; strcpy(#g_st, "VOICE RESET"); );
+    g_err_t = 0;
+  ) :
+  id == 29 ? ( s_root ? ( mem_n_d < MEMMAX ? ( mplus_dirty = 1; sprintf(#g_st, "M+ %d STORED", mem_n_d + 1); ) : g_err(6); ) : g_err(1); ) :
+  id == 30 ? ( mem_n_d > 0 ? mr_dirty = 1 : g_err(7); ) :
+  id == 31 ? ( mc_dirty = 1; strcpy(#g_st, "MEM CLEAR"); ) :
+  id == 32 ? ( mem_n_d < MEMMAX ? ( rest_dirty = 1; strcpy(#g_st, "REST STORED"); ) : g_err(6); ) :
+  id == 33 ? ( s_root ? play_dirty = 1 : g_err(1); );
+);
+function g_lit(id) (                                   // -1 = a key without an LED
+  id >= 1 && id <= 7 ? s_root == id :
+  id == 8 ? s_acc == 1 : id == 9 ? s_acc == 2 :
+  id >= 10 && id <= 14 ? s_q == id - 9 :
+  id >= 15 && id <= 17 ? s_sev == id - 14 :
+  id >= 18 && id <= 20 ? s_ext == id - 17 :
+  id >= 21 && id <= 24 ? s_dur == id - 21 :
+  id == 25 ? s_oct < 0 : id == 26 ? s_oct > 0 :
+  id == 27 ? s_lead :
+  id == 30 ? mem_n_d > 0 : -1;
+);
+// CC-80's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
+// The cap sinks 2 px while held. Design units; a click presses the key.
+function g_key(x, y, w, h, id, bg, fg, s) local(hov, dn, dy, lit, tw, th) (
+  hov = mouse_x >= gx(x) && mouse_x < gx(x + w) && mouse_y >= gx(y) && mouse_y < gx(y + h);
+  pressed && hov && drag_id == 0 ? ( drag_id = -1; g_press(id); );
+  dn = hov && mdown; dy = dn ? 2 : 0;
+  ui_cola(0x000000, 0.33); lk_rr(x + 1, y + 3, w, h, 7);
+  ui_col(lk_mul(bg, 0.72)); lk_rr(x, y + dy, w, h, 7);
+  ui_col(hov ? lk_mul(bg, 1.08) : bg); lk_rr(x + 2, y + dy + 1, w - 4, h - 5, 6);
+  gfx_setfont(10); ui_col(fg);
+  gfx_measurestr(s, tw, th); gfx_x = gx(x + w * 0.5) - tw * 0.5; gfx_y = gx(y + dy + (h - 4) * 0.5) - th * 0.5; gfx_drawstr(s);
+  lit = g_lit(id);
+  lit >= 0 ? (
+    lit ? ui_col(0xFF5A2A) : ui_cola(0x000000, 0.2);
+    gfx_circle(gx(x + w - 8), gx(y + dy + 7), gx(3), 1, 1);
+  );
+);
+// LCD text with faint "ghost" segments behind it
+function g_lcd(font, x, y, s, cells) (
+  gfx_setfont(font);
+  strcpy(#g_gh, ""); loop(cells, strcat(#g_gh, "8"); );
+  ui_cola(0x1C2416, 0.06); gfx_x = gx(x); gfx_y = gx(y); gfx_drawstr(#g_gh);
+  ui_col(0x1C2416); gfx_x = gx(x); gfx_y = gx(y); gfx_drawstr(s);
+);
+
+ui_begin(440, 560);
+sc != g_sc ? (
+  g_sc = sc;
+  g_fk = ui_fitfont(10, 15 * sc);                          // key legends
+  g_fb = ui_fitfont(11, 13 * sc);                          // brand / footer
+  g_ft = ui_fitfont(13, 19 * sc);                          // ORCHD
+);
+gfx_setfont(10, "Trebuchet MS", g_fk, 'b');
+gfx_setfont(11, "Trebuchet MS", g_fb, 'b');
+gfx_setfont(13, "Trebuchet MS", g_ft, 'b');
+gfx_setfont(14, "Courier New", 34 * sc, 'b');              // LCD: chord name
+gfx_setfont(15, "Courier New", 19 * sc, 'b');              // LCD: spelling
+gfx_setfont(16, "Courier New", 14 * sc, 'b');              // LCD: status row
+
+// the case
+ui_col(0xE6DECA); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(0xB8AE96); gfx_rect(0, gfx_h - gx(3), gfx_w, gx(3)); gfx_rect(gfx_w - gx(3), 0, gx(3), gfx_h - gx(3));
+x0 = 16; w0 = 408;
+
+// brand strip + solar cell
+gfx_setfont(11); ui_col(0x3B3B3F); gfx_x = gx(x0); gfx_y = gx(12); gfx_drawstr("GFX");
+gfx_setfont(13); ui_col(0xC0392B); gfx_x = gx(x0); gfx_y = gx(28); gfx_drawstr("ORCHD");
+gfx_setfont(11); ui_col(0x3B3B3F); gfx_x += gx(10); gfx_y = gx(33); gfx_drawstr("CHORD CALCULATOR");
+sx = x0 + w0 - 112;
+ui_col(0x3A2A1E); lk_rr(sx, 10, 112, 34, 3);
+ui_col(0x5A4636); gi = 1; loop(3, gfx_rect(gx(sx + gi * 28), gx(12), max(1, gx(1)), gx(30)); gi += 1; );
+ui_size_picker(gx(sx - 68), gx(18));
+
+// LCD (recessed)
+ly = 56; lh = 114;
+ui_col(0x2A2A2C); lk_rr(x0, ly, w0, lh, 8);
+ui_col(0x9FAE8C); lk_rr(x0 + 8, ly + 8, w0 - 16, lh - 16, 3);
+g_errshow = g_err_t > 0 && time_precise() - g_err_t < 1.4;
+g_lcd(14, x0 + 18, ly + 12, g_errshow ? "ERR" : #nm_disp, 14);
+g_lcd(15, x0 + 18, ly + 54, g_errshow ? #g_err : #sp_disp, 26);
+gfx_setfont(16); ui_col(0x1C2416);
+gfx_x = gx(x0 + 18); gfx_y = gx(ly + 84);
+gfx_drawstr(s_dur == 0 ? "1/1 WHOLE" : s_dur == 1 ? "1/2 MINIM" : s_dur == 2 ? "1/4 CROTCHET" : "1/8 QUAVER");
+strcpy(#g_mid, "");
+mem_n_d > 0 ? ( sprintf(#g_mid, "M%d", mem_n_d); );
+s_oct ? ( sprintf(#g_oc, " OCT%+d", s_oct); strcat(#g_mid, #g_oc); );
+s_lead ? ( strcat(#g_mid, " TOP "); strcat(#g_mid, g_pcname(s_top)); );
+gfx_measurestr(#g_mid, tw, th); gfx_x = gx(x0 + w0 * 0.5 + 18) - tw * 0.5; gfx_drawstr(#g_mid);
+strlen(#g_st) == 0 ? strcpy(#g_st, "READY");
+seq_on_d ? sprintf(#g_st2, "MR %d/%d", seq_step_d + 1, mem_n_d) : strcpy(#g_st2, g_errshow ? "ERR" : #g_st);
+gfx_measurestr(#g_st2, tw, th); gfx_x = gx(x0 + w0 - 18) - tw; gfx_drawstr(#g_st2);
+
+// keypad: each row shares the width evenly
+y = ly + lh + 16; kh = 44; gap = 8;
+u = (w0 - gap * 4) / 5;
+g_key(x0,               y, u, kh, 28, 0xC8452E, 0xF4F1E8, "CLEAR");
+g_key(x0 + (u + gap),   y, u, kh, 29, 0x6F6F76, 0xF4F1E8, "M+");
+g_key(x0 + (u + gap)*2, y, u, kh, 30, 0x6F6F76, 0xF4F1E8, "MR");
+g_key(x0 + (u + gap)*3, y, u, kh, 31, 0x6F6F76, 0xF4F1E8, "MC");
+g_key(x0 + (u + gap)*4, y, u, kh, 27, 0x6F6F76, 0xF4F1E8, "LEAD");
+y += kh + gap + 6;
+g_key(x0,               y, u, kh, 21, 0x5D7088, 0xF4F1E8, "1/1");
+g_key(x0 + (u + gap),   y, u, kh, 22, 0x5D7088, 0xF4F1E8, "1/2");
+g_key(x0 + (u + gap)*2, y, u, kh, 23, 0x5D7088, 0xF4F1E8, "1/4");
+g_key(x0 + (u + gap)*3, y, u, kh, 24, 0x5D7088, 0xF4F1E8, "1/8");
+g_key(x0 + (u + gap)*4, y, u, kh, 32, 0x6F6F76, 0xF4F1E8, "REST");
+y += kh + gap + 6;
+g_key(x0,               y, u, kh, 10, 0xF1ECDD, 0x2A2A2C, "maj");
+g_key(x0 + (u + gap),   y, u, kh, 11, 0xF1ECDD, 0x2A2A2C, "min");
+g_key(x0 + (u + gap)*2, y, u, kh, 12, 0xF1ECDD, 0x2A2A2C, "dim");
+g_key(x0 + (u + gap)*3, y, u, kh, 13, 0xF1ECDD, 0x2A2A2C, "aug");
+g_key(x0 + (u + gap)*4, y, u, kh, 14, 0xF1ECDD, 0x2A2A2C, "sus4");
+y += kh + gap;
+u = (w0 - gap * 5) / 6;
+g_key(x0,               y, u, kh, 15, 0xF1ECDD, 0x2A2A2C, "7");
+g_key(x0 + (u + gap),   y, u, kh, 16, 0xF1ECDD, 0x2A2A2C, "M7");
+g_key(x0 + (u + gap)*2, y, u, kh, 17, 0xF1ECDD, 0x2A2A2C, "m7");
+g_key(x0 + (u + gap)*3, y, u, kh, 18, 0xF1ECDD, 0x2A2A2C, "9");
+g_key(x0 + (u + gap)*4, y, u, kh, 19, 0xF1ECDD, 0x2A2A2C, "11");
+g_key(x0 + (u + gap)*5, y, u, kh, 20, 0xF1ECDD, 0x2A2A2C, "13");
+y += kh + gap + 6;
+u = (w0 - gap * 6) / 7;
+gi = 0;
+loop(7,
+  g_key(x0 + (u + gap) * gi, y, u, kh, gi + 1, 0x2E2E32, 0xF4F1E8,
+        gi == 0 ? "C" : gi == 1 ? "D" : gi == 2 ? "E" : gi == 3 ? "F" : gi == 4 ? "G" : gi == 5 ? "A" : "B");
+  gi += 1;
+);
+y += kh + gap;
+g_key(x0,               y, u, kh, 8,  0x2E2E32, 0xF4F1E8, "b");
+g_key(x0 + (u + gap),   y, u, kh, 9,  0x2E2E32, 0xF4F1E8, "#");
+g_key(x0 + (u + gap)*2, y, u, kh, 25, 0x6F6F76, 0xF4F1E8, "OCT-");
+g_key(x0 + (u + gap)*3, y, u, kh, 26, 0x6F6F76, 0xF4F1E8, "OCT+");
+g_key(x0 + (u + gap)*4, y, u * 3 + gap * 2, kh, 33, 0xE48A2A, 0x1E1E1E, "=");
+y += kh + gap;
+
+// footer: computer keys
+gfx_setfont(11); ui_col(0x8E8570);
+gfx_x = gx(x0); gfx_y = gx(y + 4);  gfx_drawstr("KEYS   A-G ROOT   ENTER =   SPACE REST   BKSP CLEAR");
+gfx_x = gx(x0); gfx_y = gx(y + 22); gfx_drawstr("1 2 4 8 LENGTH   - + OCTAVE");
+
+// computer keys while the window has focus
+loop(8,
+  c = gfx_getchar();
+  c > 0 ? (
+    c >= 'a' && c <= 'g' ? c -= 32;
+    c >= 'A' && c <= 'G' ? g_press(c == 'A' ? 6 : c == 'B' ? 7 : c - 'C' + 1) :
+    c == 13 ? g_press(33) : c == 8 ? g_press(28) : c == 32 ? g_press(32) :
+    c == '1' ? g_press(21) : c == '2' ? g_press(22) : c == '4' ? g_press(23) : c == '8' ? g_press(24) :
+    c == '-' ? g_press(25) : c == '+' || c == '=' ? g_press(26);
+  );
+);
+
+ui_end();
