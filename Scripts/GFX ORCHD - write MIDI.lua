@@ -1,6 +1,6 @@
 -- @description GFX ORCHD - write MIDI
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.0
+-- @version 1.1
 -- @about
 --   Companion script for the GFX Lab ORCHD chord calculator (JSFX).
 --   JSFX plugins cannot write MIDI items, so with ORCHD's WRITE key lit, = and MR hand their chords to this script
@@ -8,7 +8,8 @@
 --   the cursor to the end of what it wrote - the way the CC-80 script did:
 --     into the take open in the MIDI editor if there is one, else into the MIDI item on the selected track that
 --     the cursor is in (or that ends no more than two bars before it), else into a new item on the selected track.
---   The chords keep ORCHD's voicing, leading note, octave and lengths (at the project tempo).
+--   The chords keep ORCHD's voicing, leading note, octave and lengths (at the project tempo). It works with the
+--   transport stopped (ORCHD's panel sends the chords itself); ORCHD's LCD says START SCRIPT if this isn't running.
 --
 -- Use: Actions > Load ReaScript, pick this file, run it. It keeps running in the background (its toolbar
 -- button lights) and writes every time ORCHD sends chords. Run it again to stop it.
@@ -97,7 +98,10 @@ reaper.atexit(function()
 end)
 
 local last = reaper.gmem_read(0)            -- requests sent before the script started are not written
+local beat = 0
 local function loop()
+  beat = beat + 1
+  reaper.gmem_write(4, beat)                 -- heartbeat: ORCHD's panel shows START SCRIPT when this stops moving
   local c = reaper.gmem_read(0)
   if c ~= last then
     last = c
