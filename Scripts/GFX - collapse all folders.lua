@@ -1,7 +1,9 @@
 -- @description GFX - collapse / expand all folders
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.0.2
+-- @version 1.0.3
 -- @changelog
+--   KEY, then a key: that key becomes its own action (for a shortcut), working without the window.
+--   SHOW ALL switches on the mixer's "show tracks in folders" option if it is off.
 --   COLLAPSE and EXPAND are now one toggle key (COLLAPSE / SHOW ALL).
 --   The mixer now hides the folders' children (collapsing there had no effect).
 -- @about
@@ -10,8 +12,9 @@
 --   the folders are open and SHOW ALL while they are collapsed - and three keys choose what else COLLAPSE does:
 --   COLOUR gives each folder its own colour from the GFX palette (in track order) and its children and their items
 --   the same colour, HEIGHTS shrinks the tracks (folders a little taller than loose tracks), ZOOM fits all the
---   items in view. SHOW ALL opens every folder, shows every
---   child (also any hidden by hand in the arrange view or mixer) and puts each track back to the height it had.
+--   items in view. SHOW ALL opens every folder, shows every child (also any hidden by hand in the arrange view or
+--   mixer; it switches on the mixer's own "show tracks in folders" option if it is off) and puts each track back
+--   to the height it had. KEY, then a key, makes that key an action of its own for a shortcut (no window needed).
 --   In the arrange view each folder keeps its own collapse button, so you can still open one by hand; in the mixer
 --   the children are hidden. The LCD shows the state and counts the folders. The three keys are remembered; your
 --   track selection is kept. Needs nothing but REAPER (no SWS).
@@ -105,6 +108,22 @@ local function collapse(opt)
   if opt.zoom then zoom_to_items() end
 end
 
+-- the mixer's own "Mixer: Toggle show tracks in folders in mixer" option: while it is off no child shows there, so
+-- SHOW ALL switches it on. Found by its name (once, then remembered), not by a number that could change.
+local function mixer_folders_on()
+  local NAME = "Mixer: Toggle show tracks in folders in mixer"
+  local id = tonumber(reaper.GetExtState(SECTION, "mcp_cmd"))
+  if not id or reaper.kbd_getTextFromCmd(id, 0) ~= NAME then
+    id = nil
+    for c = 40000, 42999 do
+      if reaper.kbd_getTextFromCmd(c, 0) == NAME then id = c; break end
+    end
+    if not id then return end
+    reaper.SetExtState(SECTION, "mcp_cmd", tostring(id), true)
+  end
+  if reaper.GetToggleCommandState(id) == 0 then reaper.Main_OnCommand(id, 0) end
+end
+
 local function expand(opt)
   local _, s = reaper.GetProjExtState(0, SECTION, "heights")
   local heights = {}
@@ -121,6 +140,7 @@ local function expand(opt)
     if h then reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", h) end
   end
   reaper.SetProjExtState(0, SECTION, "heights", "")
+  mixer_folders_on()
   finish("GFX - expand all folders")
   if opt.zoom then zoom_to_items() end
 end
@@ -198,7 +218,10 @@ local function key(id, label, x, y, w, h, bg, fg, lit)
     if lit then col(0xFF5A2A) else col(0x000000, 0.2) end
     gfx.circle(X(x + w - 8), Y(y + dy + 7), S(3), 1, 1)
   end
-  return K.released and K.held == id and hov
+  if K.remote == id then K.remote = nil; return true end         -- pressed by a shortcut made with KEY
+  local hit = K.released and K.held == id and hov
+  if hit and K.pick and id ~= 'gfx_key' then K.pick = false; K.make(id, label); return false end
+  return hit
 end
 
 local function fonts()
@@ -212,21 +235,50 @@ local function fonts()
   font(8, MONO, 14, true)          -- LCD: status row
 end
 
--- KEY opens REAPER's Action List with this script selected, so a shortcut can be added there (Add... under Shortcuts)
-local KEY_SEC, KEY_CMD = select(3, reaper.get_action_context())
+-- KEY, then any key: that key becomes an action of its own (a small script in "GFX shortcuts" beside this one), so a
+-- keyboard shortcut or toolbar button does what the key does without opening this window. The Action List opens
+-- on the new action: Add... under Shortcuts sets its key. Press KEY again (it reads PICK) to cancel.
+local KEY_NAME, KEY_EXT = 'GFX Folders', SECTION
+local KEY_FILE = GFX_MAIN or select(2, reaper.get_action_context())   -- GFX_MAIN: set when a shortcut runs this
 local key_session = false
-local function key_open()
-  if reaper.PromptForAction then
-    if key_session then reaper.PromptForAction(-1, 0, KEY_SEC) end
-    reaper.PromptForAction(1, KEY_CMD, KEY_SEC); key_session = true
+local function key_poll()           -- end the Action List session once it is closed or an action is picked
+  if key_session and reaper.PromptForAction(0, 0, 0) ~= 0 then
+    reaper.PromptForAction(-1, 0, 0); key_session = false
+  end
+end
+function K.make(id, label)
+  local dir = KEY_FILE:match('^(.*)[/\\]') .. '/GFX shortcuts'
+  reaper.RecursiveCreateDirectory(dir, 0)
+  local nice = ((K.names and K.names[id]) or label):gsub('#', 'sharp'):gsub('=', 'equals'):gsub('/', '-')
+  nice = nice:gsub('[^%w%+%- ]', '')
+  local path = dir .. '/' .. KEY_NAME .. ' - ' .. nice .. '.lua'
+  local f = io.open(path, 'w')
+  if not f then return end
+  f:write(string.format('-- %s: the %s key, made with its KEY button\nGFX_MAIN = %q\n'
+    .. 'reaper.SetExtState(%q, "remote", %q, false)\ndofile(GFX_MAIN)\n', KEY_NAME, nice, KEY_FILE, KEY_EXT, id))
+  f:close()
+  local cmd = reaper.AddRemoveReaScript(true, 0, path, true)
+  if cmd ~= 0 and reaper.PromptForAction then
+    if key_session then reaper.PromptForAction(-1, 0, 0) end
+    reaper.PromptForAction(1, cmd, 0); key_session = true
   else
     reaper.Main_OnCommand(40605, 0)   -- older REAPER: just show the Action List
   end
 end
-local function key_poll()           -- end the Action List session once it is closed or an action is picked
-  if key_session and reaper.PromptForAction(0, 0, KEY_SEC) ~= 0 then
-    reaper.PromptForAction(-1, 0, KEY_SEC); key_session = false
-  end
+-- A shortcut runs this script with its key waiting: hand the key to the open window, or do it here without one
+-- (headless[id]); a key with no quiet version opens the window and is pressed there. True when nothing is left to do.
+function K.remote_start(headless)
+  local id = reaper.GetExtState(KEY_EXT, 'remote')
+  if id == '' then return false end
+  reaper.SetExtState(KEY_EXT, 'remote', '', false)
+  if reaper.GetExtState(KEY_EXT, 'running') == '1' then reaper.SetExtState(KEY_EXT, 'press', id, false); return true end
+  if headless[id] then headless[id](); return true end
+  K.remote = id
+  return false
+end
+function K.remote_poll()            -- in the window's loop: a key sent by a shortcut while the window is open
+  local id = reaper.GetExtState(KEY_EXT, 'press')
+  if id ~= '' then reaper.SetExtState(KEY_EXT, 'press', '', false); K.remote = id end
 end
 
 -- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
@@ -247,7 +299,7 @@ local function case(DW, DH, title, sub)
   local sx = x0 + w0 - 84
   rr(sx, 10, 84, 34, 3, 0x3A2A1E)
   col(0x5A4636); for i = 1, 2 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
-  if key('gfx_key', 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8) then key_open() end
+  if key('gfx_key', K.pick and 'PICK' or 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8, K.pick) then K.pick = not K.pick end
   key_poll()
 end
 
@@ -281,6 +333,13 @@ local function do_expand()
   expand(opt); status = 'ALL OPEN'
 end
 
+local function opt_flip(k) opt[k] = not opt[k]; reaper.SetExtState(SECTION, k, opt[k] and "1" or "0", true) end
+local function toggle()
+  n_all, n_shut, n_tr = count()
+  if n_all > 0 and n_shut == n_all then do_expand() else do_collapse() end
+end
+K.names = { toggle = 'TOGGLE' }
+
 local function draw()
   case(DW, DH, 'FOLDERS', 'COLLAPSE / SHOW ALL')
   local x0, w0 = 16, DW - 32
@@ -300,24 +359,28 @@ local function draw()
   local y, kh, gap = ly + lh + 16, 44, 8
   local shut = n_all > 0 and n_shut == n_all
   -- one toggle key: its legend says what a press does, its light is lit while the folders are collapsed
-  if key('toggle', shut and 'SHOW ALL' or 'COLLAPSE', x0, y, w0, kh, 0xE48A2A, 0x1E1E1E, shut) then
-    if shut then do_expand() else do_collapse() end
-  end
+  if key('toggle', shut and 'SHOW ALL' or 'COLLAPSE', x0, y, w0, kh, 0xE48A2A, 0x1E1E1E, shut) then toggle() end
 
   y = y + kh + 10
   local u = (w0 - gap * 2) / 3
   for i, k in ipairs({ { 'colour', 'COLOUR' }, { 'heights', 'HEIGHTS' }, { 'zoom', 'ZOOM' } }) do
     if key(k[1], k[2], x0 + (u + gap) * (i - 1), y, u, kh, 0x6F6F76, 0xF4F1E8, opt[k[1]]) then
-      opt[k[1]] = not opt[k[1]]; reaper.SetExtState(SECTION, k[1], opt[k[1]] and "1" or "0", true)
+      opt_flip(k[1])
     end
   end
   gfx.setfont(4)
   text(x0, y + kh + 12, 'SPACE toggles too. The three keys set what COLLAPSE does.', mul(FACE, 0.58))
 end
 
+-- a shortcut made with KEY: each key works without the window
+if K.remote_start({ toggle = toggle, colour = function() opt_flip('colour') end,
+                    heights = function() opt_flip('heights') end, zoom = function() opt_flip('zoom') end }) then return end
+
 local _, _, sec, cmd = reaper.get_action_context()
+reaper.SetExtState(SECTION, "running", "1", false)
 reaper.SetToggleCommandState(sec, cmd, 1); reaper.RefreshToolbar2(sec, cmd)
 reaper.atexit(function()
+  reaper.SetExtState(SECTION, "running", "0", false)
   reaper.SetToggleCommandState(sec, cmd, 0); reaper.RefreshToolbar2(sec, cmd)
 end)
 
@@ -334,7 +397,8 @@ local function loop()
     gfx.quit()
     return
   end
-  if c == 32 then if n_all > 0 and n_shut == n_all then do_expand() else do_collapse() end end
+  if c == 32 then toggle() end
+  K.remote_poll()
   mouse_frame()
   draw()
   gfx.update()

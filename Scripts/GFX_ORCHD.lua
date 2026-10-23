@@ -483,7 +483,10 @@ local function key(id, label, x, y, w, h, bg, fg, lit)
     if lit then col(0xFF5A2A) else col(0x000000, 0.2) end
     gfx.circle(X(x + w - 8), Y(y + dy + 7), S(3), 1, 1)
   end
-  return K.released and K.held == id and hov
+  if K.remote == id then K.remote = nil; return true end         -- pressed by a shortcut made with KEY
+  local hit = K.released and K.held == id and hov
+  if hit and K.pick and id ~= 'gfx_key' then K.pick = false; K.make(id, label); return false end
+  return hit
 end
 
 local function fonts()
@@ -497,21 +500,50 @@ local function fonts()
   font(8, MONO, 14, true)          -- LCD: status row
 end
 
--- KEY opens REAPER's Action List with this script selected, so a shortcut can be added there (Add... under Shortcuts)
-local KEY_SEC, KEY_CMD = select(3, reaper.get_action_context())
+-- KEY, then any key: that key becomes an action of its own (a small script in "GFX shortcuts" beside this one), so a
+-- keyboard shortcut or toolbar button does what the key does without opening this window. The Action List opens
+-- on the new action: Add... under Shortcuts sets its key. Press KEY again (it reads PICK) to cancel.
+local KEY_NAME, KEY_EXT = 'GFX ORCHD', EXT_SECTION
+local KEY_FILE = GFX_MAIN or select(2, reaper.get_action_context())   -- GFX_MAIN: set when a shortcut runs this
 local key_session = false
-local function key_open()
-  if reaper.PromptForAction then
-    if key_session then reaper.PromptForAction(-1, 0, KEY_SEC) end
-    reaper.PromptForAction(1, KEY_CMD, KEY_SEC); key_session = true
+local function key_poll()           -- end the Action List session once it is closed or an action is picked
+  if key_session and reaper.PromptForAction(0, 0, 0) ~= 0 then
+    reaper.PromptForAction(-1, 0, 0); key_session = false
+  end
+end
+function K.make(id, label)
+  local dir = KEY_FILE:match('^(.*)[/\\]') .. '/GFX shortcuts'
+  reaper.RecursiveCreateDirectory(dir, 0)
+  local nice = ((K.names and K.names[id]) or label):gsub('#', 'sharp'):gsub('=', 'equals'):gsub('/', '-')
+  nice = nice:gsub('[^%w%+%- ]', '')
+  local path = dir .. '/' .. KEY_NAME .. ' - ' .. nice .. '.lua'
+  local f = io.open(path, 'w')
+  if not f then return end
+  f:write(string.format('-- %s: the %s key, made with its KEY button\nGFX_MAIN = %q\n'
+    .. 'reaper.SetExtState(%q, "remote", %q, false)\ndofile(GFX_MAIN)\n', KEY_NAME, nice, KEY_FILE, KEY_EXT, id))
+  f:close()
+  local cmd = reaper.AddRemoveReaScript(true, 0, path, true)
+  if cmd ~= 0 and reaper.PromptForAction then
+    if key_session then reaper.PromptForAction(-1, 0, 0) end
+    reaper.PromptForAction(1, cmd, 0); key_session = true
   else
     reaper.Main_OnCommand(40605, 0)   -- older REAPER: just show the Action List
   end
 end
-local function key_poll()           -- end the Action List session once it is closed or an action is picked
-  if key_session and reaper.PromptForAction(0, 0, KEY_SEC) ~= 0 then
-    reaper.PromptForAction(-1, 0, KEY_SEC); key_session = false
-  end
+-- A shortcut runs this script with its key waiting: hand the key to the open window, or do it here without one
+-- (headless[id]); a key with no quiet version opens the window and is pressed there. True when nothing is left to do.
+function K.remote_start(headless)
+  local id = reaper.GetExtState(KEY_EXT, 'remote')
+  if id == '' then return false end
+  reaper.SetExtState(KEY_EXT, 'remote', '', false)
+  if reaper.GetExtState(KEY_EXT, 'running') == '1' then reaper.SetExtState(KEY_EXT, 'press', id, false); return true end
+  if headless[id] then headless[id](); return true end
+  K.remote = id
+  return false
+end
+function K.remote_poll()            -- in the window's loop: a key sent by a shortcut while the window is open
+  local id = reaper.GetExtState(KEY_EXT, 'press')
+  if id ~= '' then reaper.SetExtState(KEY_EXT, 'press', '', false); K.remote = id end
 end
 
 -- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
@@ -532,7 +564,7 @@ local function case(DW, DH, title, sub)
   local sx = x0 + w0 - 84
   rr(sx, 10, 84, 34, 3, 0x3A2A1E)
   col(0x5A4636); for i = 1, 2 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
-  if key('gfx_key', 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8) then key_open() end
+  if key('gfx_key', K.pick and 'PICK' or 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8, K.pick) then K.pick = not K.pick end
   key_poll()
 end
 
@@ -642,14 +674,20 @@ local function loop()
     elseif CHARS[c] then press(CHARS[c]) end
     c = gfx.getchar()
   end
+  K.remote_poll()
   mouse_frame()
   draw()
   gfx.update()
   reaper.defer(loop)
 end
 
+-- a shortcut made with KEY: ORCHD's keys build chords in the window, so it opens (if it isn't) and presses the key
+if K.remote_start({}) then return end
+
 load_state()
 math.randomseed(math.floor(reaper.time_precise() * 1000))
+reaper.SetExtState(EXT_SECTION, 'running', '1', false)
+reaper.atexit(function() reaper.SetExtState(EXT_SECTION, 'running', '0', false) end)
 gfx.ext_retina = 1
 gfx.init(SCRIPT_NAME, DW, DH, tonumber(reaper.GetExtState(EXT_SECTION, 'dock')) or 0)
 reaper.defer(loop)
