@@ -1,0 +1,324 @@
+-- @description GFX - collapse / expand all folders
+-- @author JGWizrad / Garden FX (GFX)
+-- @version 1.0
+-- @about
+--   Collapses every folder in the arrange view and the mixer together, so only the folder tracks and loose tracks
+--   show, then opens them all again. It opens a small window: COLLAPSE and EXPAND do the work (SPACE swaps between
+--   them), and three keys choose what else COLLAPSE does - COLOUR gives each folder its own colour from the GFX
+--   palette (in track order) and its children and their items the same colour, HEIGHTS shrinks the tracks (folders
+--   a little taller than loose tracks), ZOOM fits all the items in view. EXPAND opens every folder, shows every
+--   child (also any hidden by hand in the arrange view or mixer) and puts each track back to the height it had.
+--   Each folder keeps its own collapse button, so you can still open one by hand. The LCD shows the state and counts
+--   the folders. The three keys are remembered; your track selection is kept. Needs nothing but REAPER (no SWS).
+
+local SECTION = "GFX_folders"
+local FOLDER_H, TRACK_H = 40, 24   -- track heights while collapsed (pixels)
+local PALETTE = { 0xC0504D, 0xD9844A, 0xD8B44A, 0x9BBB59, 0x4BACA6, 0x4F81BD, 0x7B6AB0, 0xB0609A,
+                  0x8C6D4F, 0x6E8C5A, 0x5A7C8C, 0x8C5A6E }
+
+local function tracks()
+  local t = {}
+  for i = 0, reaper.CountTracks(0) - 1 do t[#t + 1] = reaper.GetTrack(0, i) end
+  return t
+end
+local function is_folder(tr) return reaper.GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH") == 1 end
+
+-- folders in the project, and how many of them are collapsed
+local function count()
+  local all, shut, n = 0, 0, reaper.CountTracks(0)
+  for _, tr in ipairs(tracks()) do
+    if is_folder(tr) then
+      all = all + 1
+      if reaper.GetMediaTrackInfo_Value(tr, "I_FOLDERCOMPACT") == 2 then shut = shut + 1 end
+    end
+  end
+  return all, shut, n
+end
+
+-- the mixer's collapse has no API value: it is the 2nd figure of the track's BUSCOMP line (0 = open, 1 = collapsed)
+local function set_mixer(tr, collapsed)
+  local ok, chunk = reaper.GetTrackStateChunk(tr, "", false)
+  if not ok then return end
+  local new = chunk:gsub("\nBUSCOMP (%-?%d+) %-?%d+", "\nBUSCOMP %1 " .. (collapsed and 1 or 0), 1)
+  if new ~= chunk then reaper.SetTrackStateChunk(tr, new, false) end
+end
+
+local function zoom_to_items()
+  local t0, t1 = math.huge, -math.huge
+  for i = 0, reaper.CountMediaItems(0) - 1 do
+    local it = reaper.GetMediaItem(0, i)
+    local p = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+    t0 = math.min(t0, p)
+    t1 = math.max(t1, p + reaper.GetMediaItemInfo_Value(it, "D_LENGTH"))
+  end
+  if t1 > t0 then
+    local pad = (t1 - t0) * 0.02
+    reaper.GetSet_ArrangeView2(0, true, 0, 0, math.max(0, t0 - pad), t1 + pad)
+  end
+  reaper.CSurf_OnScroll(0, -100000)   -- back to the top track
+end
+
+local function finish(name)
+  reaper.PreventUIRefresh(-1)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock(name, -1)
+end
+
+local function collapse(opt)
+  local all = tracks()
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+  -- remember each track's height for EXPAND (not again while still collapsed, or it would keep the small ones)
+  if opt.heights and select(2, reaper.GetProjExtState(0, SECTION, "heights")) == "" then
+    local saved = {}
+    for _, tr in ipairs(all) do
+      saved[#saved + 1] = reaper.GetTrackGUID(tr) .. "=" .. reaper.GetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE")
+    end
+    reaper.SetProjExtState(0, SECTION, "heights", table.concat(saved, ";"))
+  end
+  -- folders: next palette colour; other tracks: their nearest folder's colour (loose tracks keep theirs)
+  local stack, n = {}, 0
+  for _, tr in ipairs(all) do
+    local fd = reaper.GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH")
+    if fd == 1 then
+      local c = PALETTE[n % #PALETTE + 1]
+      n = n + 1
+      local cn = reaper.ColorToNative(c >> 16 & 255, c >> 8 & 255, c & 255) | 0x1000000
+      if opt.colour then reaper.SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", cn) end
+      reaper.SetMediaTrackInfo_Value(tr, "I_FOLDERCOMPACT", 2)
+      set_mixer(tr, true)
+      if opt.heights then reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", FOLDER_H) end
+      stack[#stack + 1] = cn
+    else
+      if opt.colour and stack[#stack] then reaper.SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", stack[#stack]) end
+      if opt.heights then reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", TRACK_H) end
+      if fd < 0 then for _ = 1, -fd do stack[#stack] = nil end end
+    end
+    if opt.colour then   -- every item on the track takes the track's colour
+      local tc = reaper.GetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR")
+      for j = 0, reaper.CountTrackMediaItems(tr) - 1 do
+        reaper.SetMediaItemInfo_Value(reaper.GetTrackMediaItem(tr, j), "I_CUSTOMCOLOR", tc)
+      end
+    end
+  end
+  finish("GFX - collapse all folders")
+  if opt.zoom then zoom_to_items() end
+end
+
+local function expand(opt)
+  local _, s = reaper.GetProjExtState(0, SECTION, "heights")
+  local heights = {}
+  for g, h in s:gmatch("([^=;]+)=([%d%.]+)") do heights[g] = tonumber(h) end
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+  for _, tr in ipairs(tracks()) do
+    if is_folder(tr) then
+      reaper.SetMediaTrackInfo_Value(tr, "I_FOLDERCOMPACT", 0)
+      set_mixer(tr, false)
+    end
+    reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINTCP", 1)
+    reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINMIXER", 1)
+    local h = heights[reaper.GetTrackGUID(tr)]
+    if h then reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", h) end
+  end
+  reaper.SetProjExtState(0, SECTION, "heights", "")
+  finish("GFX - expand all folders")
+  if opt.zoom then zoom_to_items() end
+end
+
+-- =====================================================================
+-- Drawing kit: REAPER's own graphics window (no extensions needed), in design units scaled to the window
+-- =====================================================================
+local K = { s = 1, ox = 0, oy = 0, down = false, was = false, clicked = false, held = nil }
+
+local function col(c, a)            -- 0xRRGGBB, alpha 0..1
+  gfx.set(((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255, a or 1)
+end
+local function mul(c, f)            -- darken / lighten a colour
+  local r = math.min(255, math.floor(((c >> 16) & 255) * f))
+  local g = math.min(255, math.floor(((c >> 8) & 255) * f))
+  local b = math.min(255, math.floor((c & 255) * f))
+  return (r << 16) | (g << 8) | b
+end
+local function X(v) return K.ox + v * K.s end
+local function Y(v) return K.oy + v * K.s end
+local function S(v) return v * K.s end
+
+-- filled rounded rectangle (each pixel drawn once, so translucent shadows stay even)
+local function rr(x, y, w, h, r, c, a)
+  col(c, a)
+  x, y, w, h, r = X(x), Y(y), S(w), S(h), math.max(1, S(r))
+  r = math.min(r, w / 2, h / 2)
+  local yy = math.floor(y)
+  local y1, y2 = math.floor(y + h + 0.5), math.floor(y + r)
+  while yy < y1 do                               -- scanlines: rounded corners top and bottom
+    local d = 0
+    local cy = yy + 0.5
+    if cy < y + r then local t = y + r - cy; d = r - math.sqrt(math.max(0, r * r - t * t))
+    elseif cy > y + h - r then local t = cy - (y + h - r); d = r - math.sqrt(math.max(0, r * r - t * t)) end
+    gfx.rect(math.floor(x + d + 0.5), yy, math.floor(w - 2 * d + 0.5), 1, 1)
+    yy = yy + 1
+  end
+end
+
+local FONT = 'Trebuchet MS'
+local MONO = 'Courier New'
+local function font(slot, face, size, bold) gfx.setfont(slot, face, math.max(6, math.floor(S(size) + 0.5)), bold and string.byte('b') or 0) end
+local function text(x, y, s, c, align, a)    -- align: 0 left, 1 centre, 2 right (x is that edge / centre)
+  col(c, a)
+  local w = gfx.measurestr(s)
+  gfx.x = X(x) - (align == 1 and w / 2 or align == 2 and w or 0); gfx.y = Y(y)
+  gfx.drawstr(s)
+end
+local function text_h() local _, h = gfx.measurestr('Ag'); return h / K.s end
+
+-- the mouse in design units, and a click = button released over the key it was pressed on
+local function mouse_frame()
+  K.mx, K.my = (gfx.mouse_x - K.ox) / K.s, (gfx.mouse_y - K.oy) / K.s
+  K.was, K.down = K.down, (gfx.mouse_cap & 1) == 1
+  K.pressed = K.down and not K.was
+  K.released = K.was and not K.down
+  if not K.down and not K.released then K.held = nil end
+end
+local function over(x, y, w, h) return K.mx >= x and K.mx < x + w and K.my >= y and K.my < y + h end
+
+-- CC-80's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
+-- The cap sinks 2 px while held. Returns true when clicked.
+local function key(id, label, x, y, w, h, bg, fg, lit)
+  local hov = over(x, y, w, h)
+  if hov and K.pressed then K.held = id end
+  local dn = K.held == id and K.down and hov
+  local dy = dn and 2 or 0
+  rr(x + 1, y + 3, w, h, 7, 0x000000, 0.33)
+  rr(x, y + dy, w, h, 7, mul(bg, 0.72))
+  rr(x + 2, y + dy + 1, w - 4, h - 5, 6, hov and mul(bg, 1.08) or bg)
+  gfx.setfont(2)
+  local _, th = gfx.measurestr(label)
+  text(x + w / 2, y + dy + (h - 4) / 2 - th / K.s / 2, label, fg, 1)
+  if lit ~= nil then
+    if lit then col(0xFF5A2A) else col(0x000000, 0.2) end
+    gfx.circle(X(x + w - 8), Y(y + dy + 7), S(3), 1, 1)
+  end
+  return K.released and K.held == id and hov
+end
+
+local function fonts()
+  if K.fs == K.s then return end
+  K.fs = K.s
+  font(2, FONT, 15, true)          -- key legends
+  font(4, FONT, 13, true)          -- brand / small print
+  font(5, FONT, 19, true)          -- title
+  font(6, MONO, 34, true)          -- LCD: big
+  font(7, MONO, 19, true)          -- LCD: middle
+  font(8, MONO, 14, true)          -- LCD: status row
+end
+
+-- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
+-- each GFX script has its own pastel case (this one powder blue)
+local FACE = 0xD3E3F1
+local function case(DW, DH, title, sub)
+  col(FACE); gfx.rect(0, 0, gfx.w, gfx.h, 1)
+  -- fit the design into the window, centred
+  K.s = math.max(0.5, math.min(gfx.w / DW, gfx.h / DH))
+  K.ox, K.oy = math.floor((gfx.w - DW * K.s) / 2), math.floor((gfx.h - DH * K.s) / 2)
+  fonts()
+  col(mul(FACE, 0.8)); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
+  local x0, w0 = 16, DW - 32
+  gfx.setfont(4); text(x0, 12, 'GFX', 0x3B3B3F)
+  gfx.setfont(5); text(x0, 28, title, 0xC0392B)
+  local tw = gfx.measurestr(title) / K.s
+  gfx.setfont(4); text(x0 + tw + 10, 33, sub, 0x3B3B3F)
+  local sx = x0 + w0 - 112
+  rr(sx, 10, 112, 34, 3, 0x3A2A1E)
+  col(0x5A4636); for i = 1, 3 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
+end
+
+-- the recessed green LCD
+local function lcd(x, y, w, h)
+  rr(x, y, w, h, 8, 0x2A2A2C)
+  rr(x + 8, y + 8, w - 16, h - 16, 3, 0x9FAE8C)
+end
+local function lcd_text(slot, x, y, s, cells)
+  gfx.setfont(slot)
+  text(x, y, string.rep('8', cells), 0x1C2416, 0, 0.06)
+  text(x, y, s, 0x1C2416)
+end
+
+
+-- =====================================================================
+-- The window
+-- =====================================================================
+local DW, DH = 440, 322
+local function opt_get(k) return reaper.GetExtState(SECTION, k) ~= "0" end   -- all three lit unless switched off
+local opt = { colour = opt_get("colour"), heights = opt_get("heights"), zoom = opt_get("zoom") }
+local status = "READY"
+local n_all, n_shut, n_tr = 0, 0, 0
+
+local function do_collapse()
+  if n_all == 0 then status = 'NO FOLDERS'; return end
+  collapse(opt); status = 'COLLAPSED'
+end
+local function do_expand()
+  if n_all == 0 then status = 'NO FOLDERS'; return end
+  expand(opt); status = 'ALL OPEN'
+end
+
+local function draw()
+  case(DW, DH, 'FOLDERS', 'COLLAPSE / EXPAND')
+  local x0, w0 = 16, DW - 32
+  local ly, lh = 56, 114
+  lcd(x0, ly, w0, lh)
+  lcd_text(6, x0 + 18, ly + 12, n_all == 0 and 'NO FOLDERS' or n_shut == n_all and 'COLLAPSED'
+           or n_shut == 0 and 'ALL OPEN' or string.format('%d OPEN', n_all - n_shut), 14)
+  lcd_text(7, x0 + 18, ly + 54, string.format('%d FOLDER%s, %d TRACKS', n_all, n_all == 1 and '' or 'S', n_tr), 26)
+  gfx.setfont(8)
+  local on = {}
+  if opt.colour then on[#on + 1] = 'COLOUR' end
+  if opt.heights then on[#on + 1] = 'HEIGHTS' end
+  if opt.zoom then on[#on + 1] = 'ZOOM' end
+  text(x0 + 18, ly + 84, #on > 0 and table.concat(on, ' ') or 'COLLAPSE ONLY', 0x1C2416)
+  text(x0 + w0 - 18, ly + 84, status, 0x1C2416, 2)
+
+  local y, kh, gap = ly + lh + 16, 44, 8
+  local h2 = (w0 - gap) / 2
+  if key('collapse', 'COLLAPSE', x0, y, h2, kh, 0xE48A2A, 0x1E1E1E, n_all > 0 and n_shut == n_all) then do_collapse() end
+  if key('expand', 'EXPAND', x0 + h2 + gap, y, h2, kh, 0x5B7FA6, 0xF4F1E8, n_all > 0 and n_shut == 0) then do_expand() end
+
+  y = y + kh + 10
+  local u = (w0 - gap * 2) / 3
+  for i, k in ipairs({ { 'colour', 'COLOUR' }, { 'heights', 'HEIGHTS' }, { 'zoom', 'ZOOM' } }) do
+    if key(k[1], k[2], x0 + (u + gap) * (i - 1), y, u, kh, 0x6F6F76, 0xF4F1E8, opt[k[1]]) then
+      opt[k[1]] = not opt[k[1]]; reaper.SetExtState(SECTION, k[1], opt[k[1]] and "1" or "0", true)
+    end
+  end
+  gfx.setfont(4)
+  text(x0, y + kh + 12, 'SPACE swaps. The three keys choose what COLLAPSE also does.', mul(FACE, 0.58))
+end
+
+local _, _, sec, cmd = reaper.get_action_context()
+reaper.SetToggleCommandState(sec, cmd, 1); reaper.RefreshToolbar2(sec, cmd)
+reaper.atexit(function()
+  reaper.SetToggleCommandState(sec, cmd, 0); reaper.RefreshToolbar2(sec, cmd)
+end)
+
+gfx.ext_retina = 1
+gfx.init("GFX folders", DW, DH, tonumber(reaper.GetExtState(SECTION, "dock")) or 0)
+
+local last_state = -1
+local function loop()
+  local st = reaper.GetProjectStateChangeCount(0)
+  if st ~= last_state then last_state = st; n_all, n_shut, n_tr = count() end
+  local c = gfx.getchar()
+  if c < 0 or c == 27 then   -- closed, or Esc
+    reaper.SetExtState(SECTION, "dock", tostring(gfx.dock(-1)), true)
+    gfx.quit()
+    return
+  end
+  if c == 32 then if n_all > 0 and n_shut == n_all then do_expand() else do_collapse() end end
+  mouse_frame()
+  draw()
+  gfx.update()
+  reaper.defer(loop)
+end
+loop()
