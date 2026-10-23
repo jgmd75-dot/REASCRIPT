@@ -1,12 +1,16 @@
 -- @description GFX CC-80 - pocket-calculator chord generator
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.0
+-- @version 1.1
+-- @changelog
+--   OCT- / OCT+ keys: move the chords you write down or up an octave at a time, two each way
+--   (keyboard - and +). The LCD shows OCT+1 etc.; the setting is remembered.
 -- @about
 --   An 80s pocket-calculator style chord scratchpad. Build a chord from a root (A-G, flat/sharp),
 --   a quality (maj/min/dim/aug/sus4) and an extension (7/M7/m7/9/11/13), pick a duration and
 --   press = to write it into the active MIDI take at the edit cursor. Voice leading keeps each
 --   new chord close to the last. REST skips time. M+ stores chords, MR writes the stored
---   sequence, MC clears it. DRIFT humanises velocity and timing.
+--   sequence, MC clears it. OCT- / OCT+ move the chords down or up an octave (two each way).
+--   DRIFT humanises velocity and timing.
 --   Requires ReaImGui (ReaPack > ReaTeam Extensions > ReaImGui).
 
 -- =====================================================================
@@ -181,6 +185,7 @@ local st = {
   root = nil, acc = 0, quality = nil, seventh = nil, ext = nil,
   dur = 3,               -- index into DURATIONS (1/4)
   drift = 1,             -- index into DRIFT_STEPS
+  oct = 0,               -- octave shift of the written notes, -2 .. +2
   memory = {},           -- { {root, acc, quality, seventh, ext, dur}, ... }
   prev = nil,            -- last voicing written (for voice leading)
   status = 'READY',
@@ -203,6 +208,7 @@ end
 local function save_state()
   reaper.SetExtState(EXT_SECTION, 'dur', tostring(st.dur), true)
   reaper.SetExtState(EXT_SECTION, 'drift', tostring(st.drift), true)
+  reaper.SetExtState(EXT_SECTION, 'oct', tostring(st.oct), true)
   local lines = {}
   for _, m in ipairs(st.memory) do
     lines[#lines + 1] = table.concat({ m.root, m.acc, m.quality or '-', m.seventh or '-', m.ext or '-', m.dur }, ',')
@@ -213,6 +219,7 @@ end
 local function load_state()
   st.dur = tonumber(reaper.GetExtState(EXT_SECTION, 'dur')) or st.dur
   st.drift = tonumber(reaper.GetExtState(EXT_SECTION, 'drift')) or st.drift
+  st.oct = math.max(-2, math.min(2, tonumber(reaper.GetExtState(EXT_SECTION, 'oct')) or st.oct))
   local mem = reaper.GetExtState(EXT_SECTION, 'memory')
   for entry in mem:gmatch('[^;]+') do
     local f = {}
@@ -303,7 +310,9 @@ local function insert_events(events, undo_name)
           local off = (math.random() * 2 - 1) * 0.012 * d
           local ppq_s = reaper.MIDI_GetPPQPosFromProjTime(take, ts + off)
           if ppq_s >= ppq_e - 1 then ppq_s = ppq_e - 2 end
-          reaper.MIDI_InsertNote(take, false, false, ppq_s, ppq_e, 0, pitch, vel, true)
+          -- voice leading works on the unshifted voicing; OCT- / OCT+ move the written notes
+          local p = math.max(0, math.min(127, pitch + 12 * st.oct))
+          reaper.MIDI_InsertNote(take, false, false, ppq_s, ppq_e, 0, p, vel, true)
         end
         st.prev = notes
       end
@@ -387,6 +396,9 @@ local function press(key)
     if insert_events(evs, 'memory recall') then st.status = 'MR ' .. #evs .. ' CHORDS' end
   elseif key == 'MC' then
     st.memory = {}; save_state(); st.status = 'MEM CLEAR'
+  elseif key == 'OCT-' or key == 'OCT+' then
+    st.oct = math.max(-2, math.min(2, st.oct + (key == 'OCT+' and 1 or -1))); save_state()
+    st.status = 'OCTAVE ' .. string.format('%+d', st.oct)
   elseif key == 'DRIFT' then
     st.drift = st.drift % #DRIFT_STEPS + 1; save_state()
     st.status = 'DRIFT ' .. DRIFT_STEPS[st.drift] .. '%'
@@ -502,6 +514,7 @@ local function draw(dl, x0, y0, W)
   local rw = ImGui.CalcTextSize(ctx, right)
   ImGui.DrawList_AddText(dl, x + w - 18 - rw, y + 76, C.lcd_ink, right)
   local mid = (#st.memory > 0 and ('M' .. #st.memory) or '') .. (st.drift > 1 and ('  D' .. DRIFT_STEPS[st.drift]) or '')
+           .. (st.oct ~= 0 and string.format('  OCT%+d', st.oct) or '')
   local mw = ImGui.CalcTextSize(ctx, mid)
   ImGui.DrawList_AddText(dl, x + w * 0.5 - mw * 0.5 + 10, y + 76, C.lcd_ink, mid)
   ImGui.PopFont(ctx)
@@ -522,6 +535,7 @@ local function draw(dl, x0, y0, W)
       { 'F', C.k_root, C.k_root_t }, { 'G', C.k_root, C.k_root_t }, { 'A', C.k_root, C.k_root_t },
       { 'B', C.k_root, C.k_root_t } },
     { { 'b', C.k_root, C.k_root_t }, { '#', C.k_root, C.k_root_t },
+      { 'OCT-', C.k_func, C.k_func_t }, { 'OCT+', C.k_func, C.k_func_t },
       { '=', C.k_eq, C.k_eq_t, span = 3 } },
   }
   for r, row in ipairs(rows) do
@@ -541,6 +555,7 @@ local function draw(dl, x0, y0, W)
       if LETTER_PC[id] then lit = (st.root == id) end
       if id == 'b' then lit = (st.acc == -1) elseif id == '#' then lit = (st.acc == 1) end
       if id == 'DRIFT' then lit = (st.drift > 1) end
+      if id == 'OCT-' then lit = (st.oct < 0) elseif id == 'OCT+' then lit = (st.oct > 0) end
       if id == 'MR' then lit = (#st.memory > 0) end
       if key(dl, 'k' .. r .. '_' .. id, k.label or id, kx, y, kw, kh, bg, fg, lit) then press(id) end
       kx = kx + kw + gap
@@ -551,9 +566,10 @@ local function draw(dl, x0, y0, W)
 
   -- footer
   ImGui.PushFont(ctx, F_BRAND)
-  ImGui.DrawList_AddText(dl, x, y + 4, C.case_dark, 'KEYS  A-G ROOT  ENTER =  SPACE REST  BKSP CLR  1248 DUR')
+  ImGui.DrawList_AddText(dl, x, y + 4, C.case_dark, 'KEYS  A-G ROOT  ENTER =  SPACE REST  BKSP CLR')
+  ImGui.DrawList_AddText(dl, x, y + 20, C.case_dark, '1 2 4 8 DURATION   - + OCTAVE')
   ImGui.PopFont(ctx)
-  return y + 24 - y0
+  return y + 40 - y0
 end
 
 -- Keyboard shortcuts while the window has focus
@@ -563,10 +579,12 @@ local KEYS = {
   { ImGui.Key_Enter, '=' }, { ImGui.Key_KeypadEnter, '=' }, { ImGui.Key_Space, 'REST' },
   { ImGui.Key_Backspace, 'CLEAR' }, { ImGui.Key_1, '1/1' }, { ImGui.Key_2, '1/2' },
   { ImGui.Key_4, '1/4' }, { ImGui.Key_8, '1/8' },
+  { ImGui.Key_Minus, 'OCT-' }, { ImGui.Key_KeypadSubtract, 'OCT-' },
+  { ImGui.Key_Equal, 'OCT+' }, { ImGui.Key_KeypadAdd, 'OCT+' },
 }
 
 local function loop()
-  ImGui.SetNextWindowSize(ctx, 420, 560, ImGui.Cond_FirstUseEver)
+  ImGui.SetNextWindowSize(ctx, 420, 580, ImGui.Cond_FirstUseEver)
   ImGui.PushStyleColor(ctx, ImGui.Col_WindowBg, C.case)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, 0, 0)
   local visible, open = ImGui.Begin(ctx, SCRIPT_NAME, true, ImGui.WindowFlags_NoScrollbar | ImGui.WindowFlags_NoScrollWithMouse)
