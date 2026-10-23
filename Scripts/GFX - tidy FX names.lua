@@ -176,6 +176,23 @@ local function fonts()
   font(8, MONO, 14, true)          -- LCD: status row
 end
 
+-- KEY opens REAPER's Action List with this script selected, so a shortcut can be added there (Add... under Shortcuts)
+local KEY_SEC, KEY_CMD = select(3, reaper.get_action_context())
+local key_session = false
+local function key_open()
+  if reaper.PromptForAction then
+    if key_session then reaper.PromptForAction(-1, 0, KEY_SEC) end
+    reaper.PromptForAction(1, KEY_CMD, KEY_SEC); key_session = true
+  else
+    reaper.Main_OnCommand(40605, 0)   -- older REAPER: just show the Action List
+  end
+end
+local function key_poll()           -- end the Action List session once it is closed or an action is picked
+  if key_session and reaper.PromptForAction(0, 0, KEY_SEC) ~= 0 then
+    reaper.PromptForAction(-1, 0, KEY_SEC); key_session = false
+  end
+end
+
 -- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
 -- each GFX script has its own pastel case (this one lavender)
 local FACE = 0xDDD5EE
@@ -191,9 +208,11 @@ local function case(DW, DH, title, sub)
   gfx.setfont(5); text(x0, 28, title, 0xC0392B)
   local tw = gfx.measurestr(title) / K.s
   gfx.setfont(4); text(x0 + tw + 10, 33, sub, 0x3B3B3F)
-  local sx = x0 + w0 - 112
-  rr(sx, 10, 112, 34, 3, 0x3A2A1E)
-  col(0x5A4636); for i = 1, 3 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
+  local sx = x0 + w0 - 84
+  rr(sx, 10, 84, 34, 3, 0x3A2A1E)
+  col(0x5A4636); for i = 1, 2 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
+  if key('gfx_key', 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8) then key_open() end
+  key_poll()
 end
 
 -- the recessed green LCD
