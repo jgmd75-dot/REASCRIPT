@@ -145,7 +145,7 @@ local function mouse_frame()
 end
 local function over(x, y, w, h) return K.mx >= x and K.mx < x + w and K.my >= y and K.my < y + h end
 
--- CC-80's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
+-- ORCHD's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
 -- The cap sinks 2 px while held. Returns true when clicked.
 local function key(id, label, x, y, w, h, bg, fg, lit)
   local hov = over(x, y, w, h)

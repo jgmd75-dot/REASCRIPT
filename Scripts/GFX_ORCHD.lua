@@ -1,9 +1,9 @@
--- @description GFX CC-80 - pocket-calculator chord generator
+-- @description GFX ORCHD - pocket-calculator chord generator (was CC-80)
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.2
+-- @version 1.3
 -- @changelog
---   The calculator is now drawn in REAPER's own window, the same panel as ORCHD: no ReaImGui needed.
---   The window can be resized and docked (it remembers where it was docked).
+--   Renamed ORCHD (was CC-80). Same keys, sound and memory; the calculator says ORCHD.
+--   1.2: drawn in REAPER's own window (no ReaImGui needed), resizable and dockable.
 -- @about
 --   An 80s pocket-calculator style chord scratchpad. Build a chord from a root (A-G, flat/sharp),
 --   a quality (maj/min/dim/aug/sus4) and an extension (7/M7/m7/9/11/13), pick a duration and
@@ -15,8 +15,8 @@
 -- =====================================================================
 -- Configuration
 -- =====================================================================
-local SCRIPT_NAME  = 'GFX CC-80'
-local EXT_SECTION  = 'GFX_CC80'
+local SCRIPT_NAME  = 'GFX ORCHD'
+local EXT_SECTION  = 'GFX_CC80'            -- (kept from CC-80, so its memory and settings carry over)
 local BASE_VEL     = 100            -- note velocity before humanising
 local REG_LO, REG_HI = 40, 84       -- voicing register limits (MIDI notes)
 local CENTRE       = 62             -- voicings gravitate towards this pitch
@@ -466,7 +466,7 @@ local function mouse_frame()
 end
 local function over(x, y, w, h) return K.mx >= x and K.mx < x + w and K.my >= y and K.my < y + h end
 
--- CC-80's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
+-- ORCHD's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
 -- The cap sinks 2 px while held. Returns true when clicked.
 local function key(id, label, x, y, w, h, bg, fg, lit)
   local hov = over(x, y, w, h)
@@ -582,7 +582,7 @@ local function key_lit(id)
 end
 
 local function draw()
-  case(DW, DH, 'CC-80', 'CHORD CALCULATOR')
+  case(DW, DH, 'ORCHD', 'CHORD CALCULATOR')
   local x0, w0 = 16, DW - 32
 
   -- LCD
