@@ -1,17 +1,16 @@
 -- @description GFX CC-80 - pocket-calculator chord generator
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.1
+-- @version 1.2
 -- @changelog
---   OCT- / OCT+ keys: move the chords you write down or up an octave at a time, two each way
---   (keyboard - and +). The LCD shows OCT+1 etc.; the setting is remembered.
+--   The calculator is now drawn in REAPER's own window, the same panel as ORCHD: no ReaImGui needed.
+--   The window can be resized and docked (it remembers where it was docked).
 -- @about
 --   An 80s pocket-calculator style chord scratchpad. Build a chord from a root (A-G, flat/sharp),
 --   a quality (maj/min/dim/aug/sus4) and an extension (7/M7/m7/9/11/13), pick a duration and
 --   press = to write it into the active MIDI take at the edit cursor. Voice leading keeps each
 --   new chord close to the last. REST skips time. M+ stores chords, MR writes the stored
 --   sequence, MC clears it. OCT- / OCT+ move the chords down or up an octave (two each way).
---   DRIFT humanises velocity and timing.
---   Requires ReaImGui (ReaPack > ReaTeam Extensions > ReaImGui).
+--   DRIFT humanises velocity and timing. Needs nothing but REAPER.
 
 -- =====================================================================
 -- Configuration
@@ -412,201 +411,224 @@ if CC80_TEST then
 end
 
 -- =====================================================================
--- UI (ReaImGui)
+-- Drawing kit: REAPER's own graphics window (no extensions needed), in design units scaled to the window
 -- =====================================================================
-if not reaper.ImGui_GetBuiltinPath then
-  reaper.MB('GFX CC-80 needs ReaImGui 0.9 or newer.\nInstall it from ReaPack: Extensions > ReaImGui.', SCRIPT_NAME, 0)
-  return
+local K = { s = 1, ox = 0, oy = 0, down = false, was = false, clicked = false, held = nil }
+
+local function col(c, a)            -- 0xRRGGBB, alpha 0..1
+  gfx.set(((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255, a or 1)
 end
-package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua'
-local ImGui = require 'imgui' '0.9'
+local function mul(c, f)            -- darken / lighten a colour
+  local r = math.min(255, math.floor(((c >> 16) & 255) * f))
+  local g = math.min(255, math.floor(((c >> 8) & 255) * f))
+  local b = math.min(255, math.floor((c & 255) * f))
+  return (r << 16) | (g << 8) | b
+end
+local function X(v) return K.ox + v * K.s end
+local function Y(v) return K.oy + v * K.s end
+local function S(v) return v * K.s end
 
-local ctx = ImGui.CreateContext(SCRIPT_NAME)
-local F_BIG   = ImGui.CreateFont('monospace', 30, ImGui.FontFlags_Bold)
-local F_MID   = ImGui.CreateFont('monospace', 17, ImGui.FontFlags_Bold)
-local F_SMALL = ImGui.CreateFont('monospace', 13, ImGui.FontFlags_Bold)
-local F_KEY   = ImGui.CreateFont('sans-serif', 15, ImGui.FontFlags_Bold)
-local F_BRAND = ImGui.CreateFont('sans-serif', 12, ImGui.FontFlags_Bold)
-for _, f in ipairs({ F_BIG, F_MID, F_SMALL, F_KEY, F_BRAND }) do ImGui.Attach(ctx, f) end
+-- filled rounded rectangle (each pixel drawn once, so translucent shadows stay even)
+local function rr(x, y, w, h, r, c, a)
+  col(c, a)
+  x, y, w, h, r = X(x), Y(y), S(w), S(h), math.max(1, S(r))
+  r = math.min(r, w / 2, h / 2)
+  local yy = math.floor(y)
+  local y1, y2 = math.floor(y + h + 0.5), math.floor(y + r)
+  while yy < y1 do                               -- scanlines: rounded corners top and bottom
+    local d = 0
+    local cy = yy + 0.5
+    if cy < y + r then local t = y + r - cy; d = r - math.sqrt(math.max(0, r * r - t * t))
+    elseif cy > y + h - r then local t = cy - (y + h - r); d = r - math.sqrt(math.max(0, r * r - t * t)) end
+    gfx.rect(math.floor(x + d + 0.5), yy, math.floor(w - 2 * d + 0.5), 1, 1)
+    yy = yy + 1
+  end
+end
 
--- Colours (0xRRGGBBAA)
-local C = {
-  case      = 0xE6DECAFF, case_edge = 0xB8AE96FF, case_dark = 0x8E8570FF,
-  bezel     = 0x2A2A2CFF, lcd = 0x9FAE8CFF, lcd_ink = 0x1C2416FF, lcd_ghost = 0x1C24160F,
-  solar     = 0x3A2A1EFF, solar_line = 0x5A4636FF,
-  brand     = 0x3B3B3FFF, brand_hi = 0xC0392BFF,
-  k_root    = 0x2E2E32FF, k_root_t = 0xF4F1E8FF,
-  k_func    = 0x6F6F76FF, k_func_t = 0xF4F1E8FF,
-  k_mod     = 0xF1ECDDFF, k_mod_t = 0x2A2A2CFF,
-  k_dur     = 0x5D7088FF, k_dur_t = 0xF4F1E8FF,
-  k_clear   = 0xC8452EFF, k_eq = 0xE48A2AFF, k_eq_t = 0x1E1E1EFF,
-  led       = 0xFF5A2AFF, led_off = 0x00000033, shadow = 0x00000055,
+local FONT = 'Trebuchet MS'
+local MONO = 'Courier New'
+local function font(slot, face, size, bold) gfx.setfont(slot, face, math.max(6, math.floor(S(size) + 0.5)), bold and string.byte('b') or 0) end
+local function text(x, y, s, c, align, a)    -- align: 0 left, 1 centre, 2 right (x is that edge / centre)
+  col(c, a)
+  local w = gfx.measurestr(s)
+  gfx.x = X(x) - (align == 1 and w / 2 or align == 2 and w or 0); gfx.y = Y(y)
+  gfx.drawstr(s)
+end
+local function text_h() local _, h = gfx.measurestr('Ag'); return h / K.s end
+
+-- the mouse in design units, and a click = button released over the key it was pressed on
+local function mouse_frame()
+  K.mx, K.my = (gfx.mouse_x - K.ox) / K.s, (gfx.mouse_y - K.oy) / K.s
+  K.was, K.down = K.down, (gfx.mouse_cap & 1) == 1
+  K.pressed = K.down and not K.was
+  K.released = K.was and not K.down
+  if not K.down and not K.released then K.held = nil end
+end
+local function over(x, y, w, h) return K.mx >= x and K.mx < x + w and K.my >= y and K.my < y + h end
+
+-- CC-80's rubber key: shadow, darker skirt, top (lighter on hover), legend, a small status LED top right.
+-- The cap sinks 2 px while held. Returns true when clicked.
+local function key(id, label, x, y, w, h, bg, fg, lit)
+  local hov = over(x, y, w, h)
+  if hov and K.pressed then K.held = id end
+  local dn = K.held == id and K.down and hov
+  local dy = dn and 2 or 0
+  rr(x + 1, y + 3, w, h, 7, 0x000000, 0.33)
+  rr(x, y + dy, w, h, 7, mul(bg, 0.72))
+  rr(x + 2, y + dy + 1, w - 4, h - 5, 6, hov and mul(bg, 1.08) or bg)
+  gfx.setfont(2)
+  local _, th = gfx.measurestr(label)
+  text(x + w / 2, y + dy + (h - 4) / 2 - th / K.s / 2, label, fg, 1)
+  if lit ~= nil then
+    if lit then col(0xFF5A2A) else col(0x000000, 0.2) end
+    gfx.circle(X(x + w - 8), Y(y + dy + 7), S(3), 1, 1)
+  end
+  return K.released and K.held == id and hov
+end
+
+local function fonts()
+  if K.fs == K.s then return end
+  K.fs = K.s
+  font(2, FONT, 15, true)          -- key legends
+  font(4, FONT, 13, true)          -- brand / small print
+  font(5, FONT, 19, true)          -- title
+  font(6, MONO, 34, true)          -- LCD: big
+  font(7, MONO, 19, true)          -- LCD: middle
+  font(8, MONO, 14, true)          -- LCD: status row
+end
+
+-- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
+local function case(DW, DH, title, sub)
+  col(0xE6DECA); gfx.rect(0, 0, gfx.w, gfx.h, 1)
+  -- fit the design into the window, centred
+  K.s = math.max(0.5, math.min(gfx.w / DW, gfx.h / DH))
+  K.ox, K.oy = math.floor((gfx.w - DW * K.s) / 2), math.floor((gfx.h - DH * K.s) / 2)
+  fonts()
+  col(0xB8AE96); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
+  local x0, w0 = 16, DW - 32
+  gfx.setfont(4); text(x0, 12, 'GFX', 0x3B3B3F)
+  gfx.setfont(5); text(x0, 28, title, 0xC0392B)
+  local tw = gfx.measurestr(title) / K.s
+  gfx.setfont(4); text(x0 + tw + 10, 33, sub, 0x3B3B3F)
+  local sx = x0 + w0 - 112
+  rr(sx, 10, 112, 34, 3, 0x3A2A1E)
+  col(0x5A4636); for i = 1, 3 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
+end
+
+-- the recessed green LCD
+local function lcd(x, y, w, h)
+  rr(x, y, w, h, 8, 0x2A2A2C)
+  rr(x + 8, y + 8, w - 16, h - 16, 3, 0x9FAE8C)
+end
+local function lcd_text(slot, x, y, s, cells)
+  gfx.setfont(slot)
+  text(x, y, string.rep('8', cells), 0x1C2416, 0, 0.06)
+  text(x, y, s, 0x1C2416)
+end
+
+
+-- =====================================================================
+-- Panel: ORCHD's pocket calculator, drawn in REAPER's own graphics window
+-- =====================================================================
+local DW, DH = 440, 560
+
+local KC = {
+  root = { 0x2E2E32, 0xF4F1E8 }, func = { 0x6F6F76, 0xF4F1E8 }, mod = { 0xF1ECDD, 0x2A2A2C },
+  dur = { 0x5D7088, 0xF4F1E8 }, clear = { 0xC8452E, 0xF4F1E8 }, eq = { 0xE48A2A, 0x1E1E1E },
+}
+local ROWS = {
+  { { 'CLEAR', KC.clear }, { 'M+', KC.func }, { 'MR', KC.func }, { 'MC', KC.func }, { 'DRIFT', KC.func } },
+  { { '1/1', KC.dur }, { '1/2', KC.dur }, { '1/4', KC.dur }, { '1/8', KC.dur }, { 'REST', KC.func } },
+  { { 'maj', KC.mod }, { 'min', KC.mod }, { 'dim', KC.mod }, { 'aug', KC.mod }, { 'sus4', KC.mod } },
+  { { '7', KC.mod }, { 'M7', KC.mod }, { 'm7', KC.mod }, { '9', KC.mod }, { '11', KC.mod }, { '13', KC.mod } },
+  { { 'C', KC.root }, { 'D', KC.root }, { 'E', KC.root }, { 'F', KC.root }, { 'G', KC.root }, { 'A', KC.root },
+    { 'B', KC.root } },
+  { { 'b', KC.root }, { '#', KC.root }, { 'OCT-', KC.func }, { 'OCT+', KC.func }, { '=', KC.eq, span = 3 } },
 }
 
-local function shade(col, f)        -- darken/lighten an 0xRRGGBBAA colour
-  local r = math.min(255, math.floor(((col >> 24) & 255) * f))
-  local g = math.min(255, math.floor(((col >> 16) & 255) * f))
-  local b = math.min(255, math.floor(((col >> 8) & 255) * f))
-  return (r << 24) | (g << 16) | (b << 8) | (col & 255)
+-- the LED on a key that holds a setting (nil = no LED)
+local function key_lit(id)
+  for i, d in ipairs(DURATIONS) do if id == d.key then return st.dur == i end end
+  if TRIADS[id] then return st.quality == id end
+  if id == '7' or id == 'M7' or id == 'm7' then return st.seventh == id end
+  if id == '9' or id == '11' or id == '13' then return st.ext == tonumber(id) end
+  if LETTER_PC[id] then return st.root == id end
+  if id == 'b' then return st.acc == -1 elseif id == '#' then return st.acc == 1 end
+  if id == 'DRIFT' then return st.drift > 1 end
+  if id == 'OCT-' then return st.oct < 0 elseif id == 'OCT+' then return st.oct > 0 end
+  if id == 'MR' then return #st.memory > 0 end
+  return nil
 end
 
--- One rubber key. Returns true when clicked.
-local function key(dl, id, label, x, y, w, h, bg, fg, lit)
-  ImGui.SetCursorScreenPos(ctx, x, y)
-  local clicked = ImGui.InvisibleButton(ctx, id, w, h)
-  local held, hover = ImGui.IsItemActive(ctx), ImGui.IsItemHovered(ctx)
-  local dy = held and 2 or 0
-  ImGui.DrawList_AddRectFilled(dl, x + 1, y + 3, x + w + 1, y + h + 3, C.shadow, 7)     -- shadow
-  ImGui.DrawList_AddRectFilled(dl, x, y + dy, x + w, y + h + dy, shade(bg, 0.72), 7)   -- skirt
-  ImGui.DrawList_AddRectFilled(dl, x + 2, y + dy + 1, x + w - 2, y + h + dy - 4,
-                               hover and shade(bg, 1.08) or bg, 6)                     -- top
-  ImGui.PushFont(ctx, F_KEY)
-  local tw, th = ImGui.CalcTextSize(ctx, label)
-  ImGui.DrawList_AddText(dl, x + (w - tw) / 2, y + dy + (h - 4 - th) / 2, fg, label)
-  ImGui.PopFont(ctx)
-  if lit ~= nil then                                                                     -- status LED
-    ImGui.DrawList_AddCircleFilled(dl, x + w - 8, y + dy + 7, 3, lit and C.led or C.led_off)
-  end
-  return clicked
-end
+local function draw()
+  case(DW, DH, 'CC-80', 'CHORD CALCULATOR')
+  local x0, w0 = 16, DW - 32
 
--- LCD text with faint "ghost" segments behind it
-local function lcd_text(dl, font, x, y, text, cells)
-  ImGui.PushFont(ctx, font)
-  ImGui.DrawList_AddText(dl, x, y, C.lcd_ghost, string.rep('8', cells))
-  ImGui.DrawList_AddText(dl, x, y, C.lcd_ink, text)
-  ImGui.PopFont(ctx)
-end
-
-local function draw(dl, x0, y0, W)
-  local pad = 16
-  local x, w = x0 + pad, W - pad * 2
-  local y = y0 + 10
-
-  -- brand strip + solar cell
-  ImGui.PushFont(ctx, F_BRAND)
-  ImGui.DrawList_AddText(dl, x, y + 4, C.brand, 'GARDEN FX')
-  ImGui.DrawList_AddText(dl, x, y + 20, C.brand_hi, 'CC-80')
-  ImGui.DrawList_AddText(dl, x + 46, y + 20, C.brand, 'CHORD CALCULATOR')
-  ImGui.PopFont(ctx)
-  local sx = x + w - 112
-  ImGui.DrawList_AddRectFilled(dl, sx, y, sx + 112, y + 34, C.solar, 3)
-  for i = 1, 3 do ImGui.DrawList_AddLine(dl, sx + i * 28, y + 2, sx + i * 28, y + 32, C.solar_line, 1) end
-  y = y + 46
-
-  -- LCD (recessed)
-  local lh = 104
-  ImGui.DrawList_AddRectFilled(dl, x, y, x + w, y + lh, C.bezel, 8)
-  ImGui.DrawList_AddRectFilled(dl, x + 8, y + 8, x + w - 8, y + lh - 8, C.lcd, 3)
+  -- LCD
+  local ly, lh = 56, 114
+  lcd(x0, ly, w0, lh)
   local err = st.err and (reaper.time_precise() - st.err_t) < ERR_TIME
-  local ch, cerr = current_chord()
+  local ch = current_chord()
   local l1, l2
   if err then l1, l2 = 'ERR', st.err
   elseif ch then l1, l2 = ch.name, ch.spelling
   else l1, l2 = '--', '' end
-  lcd_text(dl, F_BIG, x + 18, y + 12, l1, 14)
-  lcd_text(dl, F_MID, x + 18, y + 48, l2, 26)
+  lcd_text(6, x0 + 18, ly + 12, l1, 14)
+  lcd_text(7, x0 + 18, ly + 54, l2, 26)
+  gfx.setfont(8)
   local dur = DURATIONS[st.dur]
-  local left = dur.key .. ' ' .. dur.name
-  local right = err and 'ERR' or st.status
-  ImGui.PushFont(ctx, F_SMALL)
-  ImGui.DrawList_AddText(dl, x + 18, y + 76, C.lcd_ink, left)
-  local rw = ImGui.CalcTextSize(ctx, right)
-  ImGui.DrawList_AddText(dl, x + w - 18 - rw, y + 76, C.lcd_ink, right)
+  text(x0 + 18, ly + 84, dur.key .. ' ' .. dur.name, 0x1C2416)
   local mid = (#st.memory > 0 and ('M' .. #st.memory) or '') .. (st.drift > 1 and ('  D' .. DRIFT_STEPS[st.drift]) or '')
            .. (st.oct ~= 0 and string.format('  OCT%+d', st.oct) or '')
-  local mw = ImGui.CalcTextSize(ctx, mid)
-  ImGui.DrawList_AddText(dl, x + w * 0.5 - mw * 0.5 + 10, y + 76, C.lcd_ink, mid)
-  ImGui.PopFont(ctx)
-  y = y + lh + 16
+  text(x0 + w0 * 0.5 + 18, ly + 84, mid, 0x1C2416, 1)
+  text(x0 + w0 - 18, ly + 84, err and 'ERR' or st.status, 0x1C2416, 2)
 
-  -- keypad rows: each row shares the width evenly (span = key width in units)
-  local gap, kh = 8, 42
-  local rows = {
-    { { 'CLEAR', C.k_clear, C.k_func_t }, { 'M+', C.k_func, C.k_func_t }, { 'MR', C.k_func, C.k_func_t },
-      { 'MC', C.k_func, C.k_func_t }, { 'DRIFT', C.k_func, C.k_func_t } },
-    { { '1/1', C.k_dur, C.k_dur_t }, { '1/2', C.k_dur, C.k_dur_t }, { '1/4', C.k_dur, C.k_dur_t },
-      { '1/8', C.k_dur, C.k_dur_t }, { 'REST', C.k_func, C.k_func_t } },
-    { { 'maj', C.k_mod, C.k_mod_t }, { 'min', C.k_mod, C.k_mod_t }, { 'dim', C.k_mod, C.k_mod_t },
-      { 'aug', C.k_mod, C.k_mod_t }, { 'sus4', C.k_mod, C.k_mod_t } },
-    { { '7', C.k_mod, C.k_mod_t }, { 'M7', C.k_mod, C.k_mod_t }, { 'm7', C.k_mod, C.k_mod_t },
-      { '9', C.k_mod, C.k_mod_t }, { '11', C.k_mod, C.k_mod_t }, { '13', C.k_mod, C.k_mod_t } },
-    { { 'C', C.k_root, C.k_root_t }, { 'D', C.k_root, C.k_root_t }, { 'E', C.k_root, C.k_root_t },
-      { 'F', C.k_root, C.k_root_t }, { 'G', C.k_root, C.k_root_t }, { 'A', C.k_root, C.k_root_t },
-      { 'B', C.k_root, C.k_root_t } },
-    { { 'b', C.k_root, C.k_root_t }, { '#', C.k_root, C.k_root_t },
-      { 'OCT-', C.k_func, C.k_func_t }, { 'OCT+', C.k_func, C.k_func_t },
-      { '=', C.k_eq, C.k_eq_t, span = 3 } },
-  }
-  for r, row in ipairs(rows) do
+  -- keypad: each row shares the width evenly
+  local y, kh, gap = ly + lh + 16, 44, 8
+  for r, row in ipairs(ROWS) do
     local units = 0
     for _, k in ipairs(row) do units = units + (k.span or 1) end
-    local uw = (w - gap * (units - 1)) / units
-    local kx = x
+    local u = (w0 - gap * (units - 1)) / units
+    local kx = x0
     for _, k in ipairs(row) do
-      local id, bg, fg = k[1], k[2], k[3]
-      local kw = uw * (k.span or 1) + gap * ((k.span or 1) - 1)
-      -- status LEDs on keys that hold state
-      local lit = nil
-      for i, d in ipairs(DURATIONS) do if id == d.key then lit = (st.dur == i) end end
-      if TRIADS[id] then lit = (st.quality == id) end
-      if id == '7' or id == 'M7' or id == 'm7' then lit = (st.seventh == id) end
-      if id == '9' or id == '11' or id == '13' then lit = (st.ext == tonumber(id)) end
-      if LETTER_PC[id] then lit = (st.root == id) end
-      if id == 'b' then lit = (st.acc == -1) elseif id == '#' then lit = (st.acc == 1) end
-      if id == 'DRIFT' then lit = (st.drift > 1) end
-      if id == 'OCT-' then lit = (st.oct < 0) elseif id == 'OCT+' then lit = (st.oct > 0) end
-      if id == 'MR' then lit = (#st.memory > 0) end
-      if key(dl, 'k' .. r .. '_' .. id, k.label or id, kx, y, kw, kh, bg, fg, lit) then press(id) end
+      local kw = u * (k.span or 1) + gap * ((k.span or 1) - 1)
+      if key(k[1], k[1], kx, y, kw, kh, k[2][1], k[2][2], key_lit(k[1])) then press(k[1]) end
       kx = kx + kw + gap
     end
     y = y + kh + gap
     if r == 1 or r == 2 or r == 4 then y = y + 6 end            -- breathing space between groups
   end
 
-  -- footer
-  ImGui.PushFont(ctx, F_BRAND)
-  ImGui.DrawList_AddText(dl, x, y + 4, C.case_dark, 'KEYS  A-G ROOT  ENTER =  SPACE REST  BKSP CLR')
-  ImGui.DrawList_AddText(dl, x, y + 20, C.case_dark, '1 2 4 8 DURATION   - + OCTAVE')
-  ImGui.PopFont(ctx)
-  return y + 40 - y0
+  -- footer: computer keys
+  gfx.setfont(4)
+  text(x0, y + 4, 'KEYS   A-G ROOT   ENTER =   SPACE REST   BKSP CLEAR', 0x8E8570)
+  text(x0, y + 22, '1 2 4 8 LENGTH   - + OCTAVE', 0x8E8570)
 end
 
--- Keyboard shortcuts while the window has focus
-local KEYS = {
-  { ImGui.Key_A, 'A' }, { ImGui.Key_B, 'B' }, { ImGui.Key_C, 'C' }, { ImGui.Key_D, 'D' },
-  { ImGui.Key_E, 'E' }, { ImGui.Key_F, 'F' }, { ImGui.Key_G, 'G' },
-  { ImGui.Key_Enter, '=' }, { ImGui.Key_KeypadEnter, '=' }, { ImGui.Key_Space, 'REST' },
-  { ImGui.Key_Backspace, 'CLEAR' }, { ImGui.Key_1, '1/1' }, { ImGui.Key_2, '1/2' },
-  { ImGui.Key_4, '1/4' }, { ImGui.Key_8, '1/8' },
-  { ImGui.Key_Minus, 'OCT-' }, { ImGui.Key_KeypadSubtract, 'OCT-' },
-  { ImGui.Key_Equal, 'OCT+' }, { ImGui.Key_KeypadAdd, 'OCT+' },
-}
+-- computer keys while the window has focus
+local CHARS = { [13] = '=', [32] = 'REST', [8] = 'CLEAR', [49] = '1/1', [50] = '1/2', [52] = '1/4', [56] = '1/8',
+                [45] = 'OCT-', [43] = 'OCT+', [61] = 'OCT+' }
 
 local function loop()
-  ImGui.SetNextWindowSize(ctx, 420, 580, ImGui.Cond_FirstUseEver)
-  ImGui.PushStyleColor(ctx, ImGui.Col_WindowBg, C.case)
-  ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, 0, 0)
-  local visible, open = ImGui.Begin(ctx, SCRIPT_NAME, true, ImGui.WindowFlags_NoScrollbar | ImGui.WindowFlags_NoScrollWithMouse)
-  ImGui.PopStyleVar(ctx)
-  ImGui.PopStyleColor(ctx)
-  if visible then
-    local dl = ImGui.GetWindowDrawList(ctx)
-    local x0, y0 = ImGui.GetCursorScreenPos(ctx)
-    local W = ImGui.GetContentRegionAvail(ctx)
-    local h = draw(dl, x0, y0, math.max(320, W))
-    ImGui.SetCursorScreenPos(ctx, x0, y0)
-    ImGui.Dummy(ctx, math.max(320, W), h)
-    if ImGui.IsWindowFocused(ctx) then
-      for _, k in ipairs(KEYS) do
-        if ImGui.IsKeyPressed(ctx, k[1], false) then press(k[2]) end
-      end
-    end
-    ImGui.End(ctx)
+  local c = gfx.getchar()
+  if c < 0 then
+    reaper.SetExtState(EXT_SECTION, 'dock', tostring(gfx.dock(-1)), true)
+    gfx.quit(); return
   end
-  if open then reaper.defer(loop) end
+  while c > 0 do
+    if c >= 97 and c <= 103 then c = c - 32 end
+    if c >= 65 and c <= 71 then press(string.char(c))
+    elseif CHARS[c] then press(CHARS[c]) end
+    c = gfx.getchar()
+  end
+  mouse_frame()
+  draw()
+  gfx.update()
+  reaper.defer(loop)
 end
 
 load_state()
 math.randomseed(math.floor(reaper.time_precise() * 1000))
+gfx.ext_retina = 1
+gfx.init(SCRIPT_NAME, DW, DH, tonumber(reaper.GetExtState(EXT_SECTION, 'dock')) or 0)
 reaper.defer(loop)
