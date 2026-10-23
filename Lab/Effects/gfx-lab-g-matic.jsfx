@@ -21,9 +21,10 @@ desc:GFX Lab G-Matic [lo-fi tape]
 //   tape warps (an irregular slow wow, about +/- 0.15 %). 0 = a perfect machine, 100 % = twice the standard.
 // DROPOUTS (0 - 100 %): how often and how deep. Each dropout lasts 15 - 150 ms, dips 3 - 30 dB with a 3 ms edge, and
 //   its top end falls towards 1.2 kHz. About one every 8 s at 20 %, 1.3 a second at 50 %, 3 a second at 100 %.
-// STUTTER (key): grabs the last SLICE (50 - 250 ms) and loops it until the key is let go. GLITCH (0 - 100 %): the
-//   deck does it by itself - at each slice's end there is that chance (squared: gentle low down) of a stutter of
-//   2 - 5 repeats of a full or half slice. The loop's seam is crossfaded (4 ms); in and out fade over 5 ms.
+// STUTTER (key): grabs the last SLICE (50 - 250 ms) and loops it until the key is let go; it waits for sound first
+//   (a whole slice of it after silence), so a project saved with STUTTER lit starts looping once the audio arrives.
+//   GLITCH (0 - 100 %): the deck does it by itself - at each slice's end there is that chance (squared: gentle low
+//   down) of a stutter of 2 - 5 repeats of a full or half slice. The loop's seam is crossfaded (4 ms); in and out fade over 5 ms.
 // GUI: a cream broadcast video deck (1080 x 560). Top: the INPUT / OUTPUT VU pair (0 VU = -18 dBFS) and the smoked
 //   tape window - two reels that turn at the tape's speed and a red tape counter (h:mm:ss:ff, 25 frames) that runs
 //   with REAPER's transport at the VARISPEED rate and holds while the deck stutters; STUTTER and DROPOUT lamps.
@@ -100,7 +101,7 @@ memset(GB_L, 0, 2 * GB_N);
 LB_N = ceil(0.3 * srate) + 16;                       // the captured loop (with its 4 ms lead-in for the seam)
 LB_L = 1048576; LB_R = LB_L + LB_N;
 memset(LB_L, 0, 2 * LB_N);
-gb_w = 0; st_act = 0; st_mix = 0; st_p = 0; st_len = 1; st_left = 0; st_key = 0;
+gb_w = 0; st_act = 0; st_mix = 0; st_p = 0; st_len = 1; st_left = 0; st_key = 0; st_q = 0; st_au = 0;
 st_sx = ceil(0.004 * srate);                         // seam crossfade
 st_rmp = 1 / (0.005 * srate);                        // in / out
 gl_cnt = ceil(slice_ms * 0.001 * srate);
@@ -249,6 +250,9 @@ m_radio += (radio_on - m_radio) * k15;
 // ---------- input ----------
 in_process(spl0, spl1); l = in_l; r = in_r;
 vin_s_d += 0.5 * (l * l + r * r); vin_n_d += 1;
+// STUTTER waits for audio: how long the input has carried sound (above -80 dBFS; a slice of silence starts it again)
+abs(l) + abs(r) > 0.0001 ? st_q = 0 : st_q += 1;
+st_q > st_n ? st_au = 0 : st_au += 1;
 
 // ---------- DRIVE: the record amp ----------
 // asymmetric soft curve (limits +1 / -0.8: even harmonics), level-matched on programme
@@ -326,9 +330,14 @@ dr_e > 0.00001 ? (
 
 // ---------- STUTTER / GLITCH ----------
 GB_L[gb_w] = l; GB_R[gb_w] = r; gb_w += 1; gb_w >= GB_N ? gb_w = 0;
-stut_on && !st_key ? ( st_grab(st_n); st_left = -1; );        // the key: loop until let go
-!stut_on && st_key && st_left < 0 ? st_act = 0;
-st_key = stut_on;
+// the key: loop until let go. It grabs only once a whole slice of sound has reached the slice buffer (through the
+// drive and the tape), so a project saved with STUTTER lit doesn't loop silence when it opens
+stut_on && !st_key ? (
+  st_au >= st_n + st_sx + pdc_delay + tp_win ? ( st_grab(st_n); st_left = -1; st_key = 1; );
+) : (
+  !stut_on && st_key && st_left < 0 ? st_act = 0;
+  st_key = stut_on;
+);
 // GLITCH: at each slice's end, a chance of 2 - 5 repeats of a full or half slice (never over a loop still fading)
 gl_cnt -= 1;
 gl_cnt <= 0 ? (
