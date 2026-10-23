@@ -498,13 +498,15 @@ local function fonts()
 end
 
 -- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
+-- each GFX script has its own pastel case (this one mint)
+local FACE = 0xCDE8D8
 local function case(DW, DH, title, sub)
-  col(0xE6DECA); gfx.rect(0, 0, gfx.w, gfx.h, 1)
+  col(FACE); gfx.rect(0, 0, gfx.w, gfx.h, 1)
   -- fit the design into the window, centred
   K.s = math.max(0.5, math.min(gfx.w / DW, gfx.h / DH))
   K.ox, K.oy = math.floor((gfx.w - DW * K.s) / 2), math.floor((gfx.h - DH * K.s) / 2)
   fonts()
-  col(0xB8AE96); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
+  col(mul(FACE, 0.8)); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
   local x0, w0 = 16, DW - 32
   gfx.setfont(4); text(x0, 12, 'GFX', 0x3B3B3F)
   gfx.setfont(5); text(x0, 28, title, 0xC0392B)
@@ -601,8 +603,8 @@ local function draw()
 
   -- footer: computer keys
   gfx.setfont(4)
-  text(x0, y + 4, 'KEYS   A-G ROOT   ENTER =   SPACE REST   BKSP CLEAR', 0x8E8570)
-  text(x0, y + 22, '1 2 4 8 LENGTH   - + OCTAVE', 0x8E8570)
+  text(x0, y + 4, 'KEYS   A-G ROOT   ENTER =   SPACE REST   BKSP CLEAR', mul(FACE, 0.58))
+  text(x0, y + 22, '1 2 4 8 LENGTH   - + OCTAVE', mul(FACE, 0.58))
 end
 
 -- computer keys while the window has focus

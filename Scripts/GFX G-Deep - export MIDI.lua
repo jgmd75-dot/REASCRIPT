@@ -173,13 +173,15 @@ local function fonts()
 end
 
 -- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
+-- each GFX script has its own pastel case (this one peach)
+local FACE = 0xF5DCC8
 local function case(DW, DH, title, sub)
-  col(0xE6DECA); gfx.rect(0, 0, gfx.w, gfx.h, 1)
+  col(FACE); gfx.rect(0, 0, gfx.w, gfx.h, 1)
   -- fit the design into the window, centred
   K.s = math.max(0.5, math.min(gfx.w / DW, gfx.h / DH))
   K.ox, K.oy = math.floor((gfx.w - DW * K.s) / 2), math.floor((gfx.h - DH * K.s) / 2)
   fonts()
-  col(0xB8AE96); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
+  col(mul(FACE, 0.8)); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
   local x0, w0 = 16, DW - 32
   gfx.setfont(4); text(x0, 12, 'GFX', 0x3B3B3F)
   gfx.setfont(5); text(x0, 28, title, 0xC0392B)
@@ -235,8 +237,8 @@ local function draw()
   if key('again', 'EXPORT AGAIN', x0, y, u, kh, 0xE48A2A, 0x1E1E1E) then export() end
   if key('stop', 'STOP', x0 + u + gap, y, u, kh, 0xC8452E, 0xF4F1E8) then running = false end
   gfx.setfont(4)
-  text(x0, y + kh + 14, 'Close this window and it keeps listening; run the', 0x8E8570)
-  text(x0, y + kh + 32, 'script again to bring it back. STOP ends it.', 0x8E8570)
+  text(x0, y + kh + 14, 'Close this window and it keeps listening; run the', mul(FACE, 0.58))
+  text(x0, y + kh + 32, 'script again to bring it back. STOP ends it.', mul(FACE, 0.58))
 end
 
 local function open_window()

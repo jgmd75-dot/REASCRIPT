@@ -177,13 +177,15 @@ local function fonts()
 end
 
 -- the cream case, a darker edge bottom and right, and the brand strip with its solar cell
+-- each GFX script has its own pastel case (this one lavender)
+local FACE = 0xDDD5EE
 local function case(DW, DH, title, sub)
-  col(0xE6DECA); gfx.rect(0, 0, gfx.w, gfx.h, 1)
+  col(FACE); gfx.rect(0, 0, gfx.w, gfx.h, 1)
   -- fit the design into the window, centred
   K.s = math.max(0.5, math.min(gfx.w / DW, gfx.h / DH))
   K.ox, K.oy = math.floor((gfx.w - DW * K.s) / 2), math.floor((gfx.h - DH * K.s) / 2)
   fonts()
-  col(0xB8AE96); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
+  col(mul(FACE, 0.8)); gfx.rect(0, gfx.h - S(3), gfx.w, S(3), 1); gfx.rect(gfx.w - S(3), 0, S(3), gfx.h - S(3), 1)
   local x0, w0 = 16, DW - 32
   gfx.setfont(4); text(x0, 12, 'GFX', 0x3B3B3F)
   gfx.setfont(5); text(x0, 28, title, 0xC0392B)
@@ -244,8 +246,8 @@ local function draw()
     status = auto and 'AUTO ON' or 'AUTO OFF'
   end
   gfx.setfont(4)
-  text(x0, y + kh + 14, 'AUTO tidies new GFX plug-ins as you add them, even with', 0x8E8570)
-  text(x0, y + kh + 32, 'this window closed. Names you typed yourself are kept.', 0x8E8570)
+  text(x0, y + kh + 14, 'AUTO tidies new GFX plug-ins as you add them, even with', mul(FACE, 0.58))
+  text(x0, y + kh + 32, 'this window closed. Names you typed yourself are kept.', mul(FACE, 0.58))
 end
 
 local function open_window()
