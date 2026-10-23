@@ -1,6 +1,8 @@
 -- @description GFX - collapse / expand all folders
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.0
+-- @version 1.0.1
+-- @changelog
+--   The mixer now hides the folders' children (collapsing there had no effect).
 -- @about
 --   Collapses every folder in the arrange view and the mixer together, so only the folder tracks and loose tracks
 --   show, then opens them all again. It opens a small window: COLLAPSE and EXPAND do the work (SPACE swaps between
@@ -8,8 +10,8 @@
 --   palette (in track order) and its children and their items the same colour, HEIGHTS shrinks the tracks (folders
 --   a little taller than loose tracks), ZOOM fits all the items in view. EXPAND opens every folder, shows every
 --   child (also any hidden by hand in the arrange view or mixer) and puts each track back to the height it had.
---   Each folder keeps its own collapse button, so you can still open one by hand. The LCD shows the state and counts
---   the folders. The three keys are remembered; your track selection is kept. Needs nothing but REAPER (no SWS).
+--   In the arrange view each folder keeps its own collapse button, so you can still open one by hand; in the mixer
+--   the children are hidden. The LCD shows the state and counts the folders. The three keys are remembered; your track selection is kept. Needs nothing but REAPER (no SWS).
 
 local SECTION = "GFX_folders"
 local FOLDER_H, TRACK_H = 40, 24   -- track heights while collapsed (pixels)
@@ -33,14 +35,6 @@ local function count()
     end
   end
   return all, shut, n
-end
-
--- the mixer's collapse has no API value: it is the 2nd figure of the track's BUSCOMP line (0 = open, 1 = collapsed)
-local function set_mixer(tr, collapsed)
-  local ok, chunk = reaper.GetTrackStateChunk(tr, "", false)
-  if not ok then return end
-  local new = chunk:gsub("\nBUSCOMP (%-?%d+) %-?%d+", "\nBUSCOMP %1 " .. (collapsed and 1 or 0), 1)
-  if new ~= chunk then reaper.SetTrackStateChunk(tr, new, false) end
 end
 
 local function zoom_to_items()
@@ -87,10 +81,12 @@ local function collapse(opt)
       local cn = reaper.ColorToNative(c >> 16 & 255, c >> 8 & 255, c & 255) | 0x1000000
       if opt.colour then reaper.SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", cn) end
       reaper.SetMediaTrackInfo_Value(tr, "I_FOLDERCOMPACT", 2)
-      set_mixer(tr, true)
       if opt.heights then reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", FOLDER_H) end
       stack[#stack + 1] = cn
-    else
+    end
+    -- in the mixer a folder's children are hidden (the mixer's own folder collapse can't be set from a script)
+    if reaper.GetTrackDepth(tr) > 0 then reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINMIXER", 0) end
+    if fd ~= 1 then
       if opt.colour and stack[#stack] then reaper.SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", stack[#stack]) end
       if opt.heights then reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", TRACK_H) end
       if fd < 0 then for _ = 1, -fd do stack[#stack] = nil end end
@@ -115,7 +111,6 @@ local function expand(opt)
   for _, tr in ipairs(tracks()) do
     if is_folder(tr) then
       reaper.SetMediaTrackInfo_Value(tr, "I_FOLDERCOMPACT", 0)
-      set_mixer(tr, false)
     end
     reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINTCP", 1)
     reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINMIXER", 1)
