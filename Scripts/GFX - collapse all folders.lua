@@ -1,17 +1,20 @@
 -- @description GFX - collapse / expand all folders
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.0.1
+-- @version 1.0.2
 -- @changelog
+--   COLLAPSE and EXPAND are now one toggle key (COLLAPSE / SHOW ALL).
 --   The mixer now hides the folders' children (collapsing there had no effect).
 -- @about
 --   Collapses every folder in the arrange view and the mixer together, so only the folder tracks and loose tracks
---   show, then opens them all again. It opens a small window: COLLAPSE and EXPAND do the work (SPACE swaps between
---   them), and three keys choose what else COLLAPSE does - COLOUR gives each folder its own colour from the GFX
---   palette (in track order) and its children and their items the same colour, HEIGHTS shrinks the tracks (folders
---   a little taller than loose tracks), ZOOM fits all the items in view. EXPAND opens every folder, shows every
+--   show, then opens them all again. It opens a small window: one key (or SPACE) toggles - it reads COLLAPSE while
+--   the folders are open and SHOW ALL while they are collapsed - and three keys choose what else COLLAPSE does:
+--   COLOUR gives each folder its own colour from the GFX palette (in track order) and its children and their items
+--   the same colour, HEIGHTS shrinks the tracks (folders a little taller than loose tracks), ZOOM fits all the
+--   items in view. SHOW ALL opens every folder, shows every
 --   child (also any hidden by hand in the arrange view or mixer) and puts each track back to the height it had.
 --   In the arrange view each folder keeps its own collapse button, so you can still open one by hand; in the mixer
---   the children are hidden. The LCD shows the state and counts the folders. The three keys are remembered; your track selection is kept. Needs nothing but REAPER (no SWS).
+--   the children are hidden. The LCD shows the state and counts the folders. The three keys are remembered; your
+--   track selection is kept. Needs nothing but REAPER (no SWS).
 
 local SECTION = "GFX_folders"
 local FOLDER_H, TRACK_H = 40, 24   -- track heights while collapsed (pixels)
@@ -63,7 +66,7 @@ local function collapse(opt)
   local all = tracks()
   reaper.Undo_BeginBlock()
   reaper.PreventUIRefresh(1)
-  -- remember each track's height for EXPAND (not again while still collapsed, or it would keep the small ones)
+  -- remember each track's height for SHOW ALL (not again while still collapsed, or it would keep the small ones)
   if opt.heights and select(2, reaper.GetProjExtState(0, SECTION, "heights")) == "" then
     local saved = {}
     for _, tr in ipairs(all) do
@@ -279,7 +282,7 @@ local function do_expand()
 end
 
 local function draw()
-  case(DW, DH, 'FOLDERS', 'COLLAPSE / EXPAND')
+  case(DW, DH, 'FOLDERS', 'COLLAPSE / SHOW ALL')
   local x0, w0 = 16, DW - 32
   local ly, lh = 56, 114
   lcd(x0, ly, w0, lh)
@@ -295,9 +298,11 @@ local function draw()
   text(x0 + w0 - 18, ly + 84, status, 0x1C2416, 2)
 
   local y, kh, gap = ly + lh + 16, 44, 8
-  local h2 = (w0 - gap) / 2
-  if key('collapse', 'COLLAPSE', x0, y, h2, kh, 0xE48A2A, 0x1E1E1E, n_all > 0 and n_shut == n_all) then do_collapse() end
-  if key('expand', 'EXPAND', x0 + h2 + gap, y, h2, kh, 0x5B7FA6, 0xF4F1E8, n_all > 0 and n_shut == 0) then do_expand() end
+  local shut = n_all > 0 and n_shut == n_all
+  -- one toggle key: its legend says what a press does, its light is lit while the folders are collapsed
+  if key('toggle', shut and 'SHOW ALL' or 'COLLAPSE', x0, y, w0, kh, 0xE48A2A, 0x1E1E1E, shut) then
+    if shut then do_expand() else do_collapse() end
+  end
 
   y = y + kh + 10
   local u = (w0 - gap * 2) / 3
@@ -307,7 +312,7 @@ local function draw()
     end
   end
   gfx.setfont(4)
-  text(x0, y + kh + 12, 'SPACE swaps. The three keys choose what COLLAPSE also does.', mul(FACE, 0.58))
+  text(x0, y + kh + 12, 'SPACE toggles too. The three keys set what COLLAPSE does.', mul(FACE, 0.58))
 end
 
 local _, _, sec, cmd = reaper.get_action_context()
