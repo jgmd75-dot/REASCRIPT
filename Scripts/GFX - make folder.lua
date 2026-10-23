@@ -159,7 +159,8 @@ end
 
 -- KEY, then any key: that key becomes an action of its own (a small script in "GFX shortcuts" beside this one), so a
 -- keyboard shortcut or toolbar button does what the key does without opening this window. The Action List opens
--- on the new action: Add... under Shortcuts sets its key. Press KEY again (it reads PICK) to cancel.
+-- on the new action: Add... under Shortcuts sets its key. Press KEY again (it reads PICK) to cancel. A script with
+-- one main job sets K.key_default: KEY then makes that job's action straight away (using the window's settings).
 local KEY_NAME, KEY_EXT = 'GFX Make folder', SECTION
 local KEY_FILE = GFX_MAIN or select(2, reaper.get_action_context())   -- GFX_MAIN: set when a shortcut runs this
 local key_session = false
@@ -221,7 +222,9 @@ local function case(DW, DH, title, sub)
   local sx = x0 + w0 - 84
   rr(sx, 10, 84, 34, 3, 0x3A2A1E)
   col(0x5A4636); for i = 1, 2 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
-  if key('gfx_key', K.pick and 'PICK' or 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8, K.pick) then K.pick = not K.pick end
+  if key('gfx_key', K.pick and 'PICK' or 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8, K.pick) then
+    if K.key_default then K.make(K.key_default, K.key_default) else K.pick = not K.pick end
+  end
   key_poll()
 end
 
@@ -253,6 +256,8 @@ local function make()
   status = 'MADE ' .. n:upper():sub(1, 14)
   name = ""
 end
+K.names = { make = 'MAKE FOLDER' }
+K.key_default = 'make'     -- KEY makes the make-folder action at once (it asks for the name)
 local function opt_flip(k) opt[k] = not opt[k]; reaper.SetExtState(SECTION, k, opt[k] and "1" or "0", true) end
 
 local function draw()

@@ -14,7 +14,8 @@
 --   the same colour, HEIGHTS shrinks the tracks (folders a little taller than loose tracks), ZOOM fits all the
 --   items in view. SHOW ALL opens every folder, shows every child (also any hidden by hand in the arrange view or
 --   mixer; it switches on the mixer's own "show tracks in folders" option if it is off) and puts each track back
---   to the height it had. KEY, then a key, makes that key an action of its own for a shortcut (no window needed).
+--   to the height it had. KEY makes the toggle an action of its own, for a shortcut such as J: it toggles with the window's settings,
+--   without opening the window.
 --   In the arrange view each folder keeps its own collapse button, so you can still open one by hand; in the mixer
 --   the children are hidden. The LCD shows the state and counts the folders. The three keys are remembered; your
 --   track selection is kept. Needs nothing but REAPER (no SWS).
@@ -237,7 +238,8 @@ end
 
 -- KEY, then any key: that key becomes an action of its own (a small script in "GFX shortcuts" beside this one), so a
 -- keyboard shortcut or toolbar button does what the key does without opening this window. The Action List opens
--- on the new action: Add... under Shortcuts sets its key. Press KEY again (it reads PICK) to cancel.
+-- on the new action: Add... under Shortcuts sets its key. Press KEY again (it reads PICK) to cancel. A script with
+-- one main job sets K.key_default: KEY then makes that job's action straight away (using the window's settings).
 local KEY_NAME, KEY_EXT = 'GFX Folders', SECTION
 local KEY_FILE = GFX_MAIN or select(2, reaper.get_action_context())   -- GFX_MAIN: set when a shortcut runs this
 local key_session = false
@@ -299,7 +301,9 @@ local function case(DW, DH, title, sub)
   local sx = x0 + w0 - 84
   rr(sx, 10, 84, 34, 3, 0x3A2A1E)
   col(0x5A4636); for i = 1, 2 do gfx.rect(X(sx + i * 28), Y(12), math.max(1, S(1)), S(30), 1) end
-  if key('gfx_key', K.pick and 'PICK' or 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8, K.pick) then K.pick = not K.pick end
+  if key('gfx_key', K.pick and 'PICK' or 'KEY', sx - 60, 11, 52, 32, 0x6F6F76, 0xF4F1E8, K.pick) then
+    if K.key_default then K.make(K.key_default, K.key_default) else K.pick = not K.pick end
+  end
   key_poll()
 end
 
@@ -339,6 +343,7 @@ local function toggle()
   if n_all > 0 and n_shut == n_all then do_expand() else do_collapse() end
 end
 K.names = { toggle = 'TOGGLE' }
+K.key_default = 'toggle'   -- KEY makes the toggle action at once (e.g. for J)
 
 local function draw()
   case(DW, DH, 'FOLDERS', 'COLLAPSE / SHOW ALL')
@@ -369,7 +374,7 @@ local function draw()
     end
   end
   gfx.setfont(4)
-  text(x0, y + kh + 12, 'SPACE toggles too. The three keys set what COLLAPSE does.', mul(FACE, 0.58))
+  text(x0, y + kh + 12, 'KEY: a shortcut that toggles with these settings.', mul(FACE, 0.58))
 end
 
 -- a shortcut made with KEY: each key works without the window
