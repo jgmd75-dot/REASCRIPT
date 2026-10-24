@@ -35,6 +35,13 @@ desc:GFX Lab MSAT [multiband saturation]
 //          click steps on. The crossover and the transient shapers stay at the base rate; each band goes up after its
 //          shaper, saturates, mixes and widens at the high rate, and the three bands come back down together (one
 //          filter per side). A change dips the output for 5 ms, swaps, comes back. Latency 0 / 31 / 37 samples (reported).
+//   LIN PHASE  (in CROSSOVER) off (the default): the crossover turns the phase round its two splits, as an analogue
+//          one does (inaudible on its own). Lit: the signal first goes through a mirror image of that phase turn (the
+//          crossover's all-pass response, time-reversed: a 2048-tap filter at 44.1 / 48 kHz, 4096 at 88.2 / 96, 8192
+//          above, run as an FFT convolution in 256-sample blocks), so every band comes out in time and MSAT can run in
+//          parallel with a clean copy of the same tracks (a parallel bus, the dry tracks) without combing. It follows
+//          the crossover knobs. Latency 2303 samples at 48 kHz (about 48 ms; 4351 / 8447 at the higher rates), on top
+//          of the OS key's, reported. A change dips the output, swaps in silence and comes back, as the OS key.
 //   PRESETS  12 (Init + 11) plus Reset all to defaults. A preset sets the crossovers and the three bands; INPUT,
 //          OUTPUT, VFD / MATRIX and DRIFT are left alone (Reset all restores them too).
 
@@ -67,6 +74,7 @@ slider26:0<0,1,1{Off,On}>-High solo
 slider27:0<0,1,1{Off,On}>-High mute
 slider28:1<0,1,1{Off,On}>-Link
 slider29:0<0,2,1{1x,2x,4x}>-Oversampling
+slider30:0<0,1,1{Off,On}>-Linear phase crossover
 
 in_pin:left input
 in_pin:right input
@@ -123,6 +131,95 @@ function xo_cfg() (
 function xo_tidy() (
   this.l1.bq_tidy(); this.l2.bq_tidy(); this.h1.bq_tidy(); this.h2.bq_tidy();
   this.m1.bq_tidy(); this.m2.bq_tidy(); this.u1.bq_tidy(); this.u2.bq_tidy(); this.ap.bq_tidy();
+);
+
+// ---------- LIN PHASE: the crossover's all-pass, time-reversed, as an FFT convolution (uniform partitions) ----------
+// Both sides ride in one complex FFT (left = real, right = imaginary: the kernel is real). Memory from 1048576, every
+// FFT buffer 1024-aligned (none crosses a 65536 boundary): kernel spectra MLP_H (up to 32 x 1024), the input
+// spectra ring MLP_X (32 x 1024), the work buffer MLP_W, the sums MLP_Y / MLP_Y2 (new / old kernel), the previous /
+// current block MLP_PV / MLP_CU, the output block MLP_O, the all-pass impulse response MLP_G (up to 8192), the
+// previous kernel MLP_HO (a kernel change crossfades over one block: the crossover knobs never click).
+MLP_B = 256;
+MLP_H = 1048576; MLP_X = MLP_H + 32768; MLP_W = MLP_X + 32768; MLP_Y = MLP_W + 1024; MLP_PV = MLP_Y + 1024;
+MLP_CU = MLP_PV + 1024; MLP_O = MLP_CU + 1024; MLP_Y2 = MLP_O + 1024; MLP_G = MLP_Y2 + 1024; MLP_HO = MLP_G + 8192;
+function mlp_setup() (
+  mlp_n = srate <= 50000 ? 2048 : srate <= 100000 ? 4096 : 8192;   // about 43 ms of all-pass response at any rate
+  mlp_k = mlp_n / MLP_B;
+  mlp_lat = mlp_n - 1 + MLP_B;                                      // the reversed response's centre + one block
+);
+// the kernel from the crossover's corners (mt_f1, mt_f2): its all-pass impulse response, reversed, the far tail faded
+function mlp_build() local(i, k, x, t, nf, b, d) (
+  mlp_a1.bq_set(2, mt_f1, 0.70710678); mlp_a2.bq_set(2, mt_f2, 0.70710678);
+  mlp_a1.s1 = mlp_a1.s2 = mlp_a2.s1 = mlp_a2.s2 = 0;
+  i = 0; loop(mlp_n, x = i == 0; MLP_G[i] = mlp_a2.bq_run(mlp_a1.bq_run(x)); i += 1; );
+  nf = mlp_n / 8; i = 0;
+  loop(nf, t = 0.5 - 0.5 * cos($pi * i / nf); MLP_G[mlp_n - 1 - i] *= t; i += 1; );   // fade the last eighth out
+  mlp_xf = mlp_on; mlp_xf ? memcpy(MLP_HO, MLP_H, mlp_k * 1024);    // running: the next block fades from the old kernel
+  k = 0;
+  loop(mlp_k,
+    memset(MLP_W, 0, 2 * MLP_B * 2);
+    i = 0; loop(MLP_B, MLP_W[2 * i] = MLP_G[mlp_n - 1 - (k * MLP_B + i)] / (2 * MLP_B); i += 1; );
+    fft(MLP_W, 2 * MLP_B);
+    memcpy(MLP_H + k * 1024, MLP_W, 4 * MLP_B);
+    k += 1;
+  );
+  mlp_dirty = 0;
+);
+function mlp_clr() ( memset(MLP_X, 0, 32768); memset(MLP_PV, 0, 1024); memset(MLP_CU, 0, 1024); memset(MLP_O, 0, 1024);
+  mlp_p = 0; mlp_xi = 0; mlp_xf = 0; );
+// the ring x one kernel's partitions, summed into y, back to time
+function mlp_sum(y, h) local(k, xs, hs, i, ar, am, hr, hm) (
+  memset(y, 0, 4 * MLP_B);
+  k = 0;
+  loop(mlp_k,
+    xs = MLP_X + ((mlp_xi - k + mlp_k) % mlp_k) * 1024; hs = h + k * 1024;
+    i = 0;
+    loop(2 * MLP_B,
+      ar = xs[i]; am = xs[i + 1]; hr = hs[i]; hm = hs[i + 1];
+      y[i] += ar * hr - am * hm; y[i + 1] += ar * hm + am * hr;
+      i += 2;
+    );
+    k += 1;
+  );
+  ifft(y, 2 * MLP_B);
+);
+// one block: [previous, current] -> spectrum into the ring, the sum, the last half out (faded from the old kernel's
+// after a kernel change)
+function mlp_blk() local(i, w) (
+  memcpy(MLP_W, MLP_PV, 2 * MLP_B); memcpy(MLP_W + 2 * MLP_B, MLP_CU, 2 * MLP_B); memcpy(MLP_PV, MLP_CU, 2 * MLP_B);
+  fft(MLP_W, 2 * MLP_B);
+  memcpy(MLP_X + mlp_xi * 1024, MLP_W, 4 * MLP_B);
+  mlp_sum(MLP_Y, MLP_H);
+  mlp_xf ? (
+    mlp_sum(MLP_Y2, MLP_HO);
+    i = 0;
+    loop(MLP_B,
+      w = 0.5 - 0.5 * cos($pi * (i + 0.5) / MLP_B);
+      MLP_O[2 * i] = MLP_Y2[2 * MLP_B + 2 * i] * (1 - w) + MLP_Y[2 * MLP_B + 2 * i] * w;
+      MLP_O[2 * i + 1] = MLP_Y2[2 * MLP_B + 2 * i + 1] * (1 - w) + MLP_Y[2 * MLP_B + 2 * i + 1] * w;
+      i += 1;
+    );
+    mlp_xf = 0;
+  ) : memcpy(MLP_O, MLP_Y + 2 * MLP_B, 2 * MLP_B);
+  mlp_xi = (mlp_xi + 1) % mlp_k;
+);
+// one sample pair through (one block late plus the kernel): -> mlp_l, mlp_r
+function mlp_run(l, r) (
+  MLP_CU[2 * mlp_p] = l; MLP_CU[2 * mlp_p + 1] = r;
+  mlp_l = MLP_O[2 * mlp_p]; mlp_r = MLP_O[2 * mlp_p + 1];
+  mlp_p += 1; mlp_p >= MLP_B ? ( mlp_blk(); mlp_p = 0; );
+);
+// the LIN PHASE key's change: dip (os_gc: 5 ms), swap at silence (clear, new latency), hold until it has come
+// through (and 10 ms for the crossover to settle), back in
+function mlp_gate() (
+  mlp_t != mlp_on ? (
+    mlp_gg = max(mlp_gg - os_gc, 0);
+    mlp_gg == 0 ? (
+      mlp_on = mlp_t; mlp_clr(); mlp_on && mlp_dirty ? ( mlp_build(); mlp_xf = 0; );
+      os_base = mlp_on ? mlp_lat : 0; pdc_delay = os_base + os_lat(os_f);
+      mlp_hold = os_base + os_lat(os_f) + floor(0.01 * srate);
+    );
+  ) : mlp_hold > 0 ? mlp_hold -= 1 : mlp_gg < 1 ? mlp_gg = min(mlp_gg + os_gc, 1);
 );
 
 // ---------- one band: transient detector (linked), gain, saturation, width ----------
@@ -236,7 +333,8 @@ function mt_srinit() (
   ost_init(0);
 );
 mt_srinit();
-os_design(); os_base = 0; os_f = os_tf = os_f2n(slider29); os_gsetup();
+mlp_setup(); mlp_on = mlp_t = slider30 >= 0.5; mlp_gg = 1; mlp_hold = 0; mlp_clr(); mlp_dirty = 1;
+os_design(); os_base = mlp_on ? mlp_lat : 0; os_f = os_tf = os_f2n(slider29); os_gsetup();
 in_init();
 dL.drift_init(0.8 + rand(0.4)); dM.drift_init(0.8 + rand(0.4)); dH.drift_init(0.8 + rand(0.4));
 drift_macro(50);
@@ -252,11 +350,12 @@ file_var(0, ui_sz);
 file_var(0, pr_cur);
 
 @block
-srate != mt_sr ? ( mt_srinit(); os_gsetup(); );
+srate != mt_sr ? ( mt_srinit(); mlp_setup(); mlp_clr(); mlp_dirty = 1; os_base = mlp_on ? mlp_lat : 0; os_gsetup(); );
 os_tf = os_f2n(slider29);
 in_setup(slider1, 0);
 ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through (a mix tool)
-pdc_delay = os_base + os_lat(os_f);                   // (ost_setup clears it)
+pdc_delay = os_base + os_lat(os_f);                   // (ost_setup clears it; os_base = LIN PHASE's latency)
+mlp_t = slider30 >= 0.5;
 drift_macro(slider21);
 mt_dm = dm_a;
 // crossover corners: glided per block (the upper never below the lower)
@@ -267,7 +366,9 @@ mt_f2 = mt_snap ? mt_f2t : mt_f2 * (mt_f2t / mt_f2) ^ mt_k;
 abs(mt_f1 - mt_lf1) > 0.01 || abs(mt_f2 - mt_lf2) > 0.01 ? (
   xL.xo_cfg(); xR.xo_cfg();
   mt_lf1 = mt_f1; mt_lf2 = mt_f2;
+  mlp_dirty = 1;
 );
+(mlp_on || mlp_t) && mlp_dirty ? mlp_build();       // LIN PHASE follows the crossover (rebuilt while it glides)
 // DRIFT: each band's bias wanders on its own path
 mt_n = samplesblock / srate;
 mt_vL = dL.drift_tick(0.05 * dm_s * mt_n); mt_vM = dM.drift_tick(0.06 * dm_s * mt_n); mt_vH = dH.drift_tick(0.07 * dm_s * mt_n);
@@ -295,7 +396,7 @@ mta_hL = bL.heat; mta_hM = bM.heat; mta_hH = bH.heat;
 
 @sample
 spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
-os_gate();
+os_gate(); mlp_gate();
 os_chg ? ( bL.osl.os_clr(); bL.osr.os_clr(); bM.osl.os_clr(); bM.osr.os_clr(); bH.osl.os_clr(); bH.osr.os_clr();
            mt_dnl.os_clr(); mt_dnr.os_clr(); );                     // the OS swap (at silence)
 in_process(spl0, spl1);
@@ -303,6 +404,7 @@ mt_xl = in_l; mt_xr = in_r;
 lk_s += ((slider28 >= 0.5) - lk_s) * mt_lkc; lk_s > 0.9999 && slider28 >= 0.5 ? lk_s = 1; lk_s < 0.0001 && slider28 < 0.5 ? lk_s = 0;
 lk_u = 1 - lk_s;                                      // the dual-mono share (0 = linked, as the Stable unit)
 mt_pi = max(mt_pi, max(abs(mt_xl), abs(mt_xr)));
+mlp_on ? ( mlp_run(mt_xl, mt_xr); mt_xl = mlp_l; mt_xr = mlp_r; );   // LIN PHASE: the mirror-image phase turn first
 // split
 xL.xo_run(mt_xl); xR.xo_run(mt_xr);
 // the three bands
@@ -334,8 +436,8 @@ mt_outs += (mt_outt - mt_outs) * mt_gs;
 mt_yl *= mt_outs; mt_yr *= mt_outs;
 mt_yl != mt_yl ? mt_yl = 0; mt_yr != mt_yr ? mt_yr = 0;
 ost_out(mt_yl, mt_yr);
-spl0 = max(-4, min(4, ost_l)) * os_g;
-spl1 = max(-4, min(4, ost_r)) * os_g;
+spl0 = max(-4, min(4, ost_l)) * os_g * mlp_gg;
+spl1 = max(-4, min(4, ost_r)) * os_g * mlp_gg;
 mt_po = max(mt_po, max(abs(spl0), abs(spl1)));
 
 @gfx 1080 430
@@ -604,6 +706,7 @@ ui_col(KRI2); kr_ctxt(492, 190, "-15"); kr_ctxt(538, 190, "0"); kr_ctxt(582, 190
 
 // ---------- CROSSOVER ----------
 kr_sect(618, 72, 200, 134, "CROSSOVER");
+kr_key(722, 77, 88, 24, "LIN PHASE", slider30 >= 0.5) ? ( slider30 = slider30 >= 0.5 ? 0 : 1; ui_auto(30); );   // LIN PHASE
 krv_lg = 1; kr_small(674, 140, 17, 2, 50, 1000, 250, "LOW / MID", kr_hz(slider2));
 kr_small(762, 140, 17, 3, 1000, 12000, 4000, "MID / HIGH", kr_hz(slider3)); krv_lg = 0;
 gfx_setfont(13); ui_col(KRI2); kr_ctxt(674, 192, kr_hz(slider2)); kr_ctxt(762, 192, kr_hz(max(slider3, slider2 * 1.5)));
