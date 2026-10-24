@@ -89,10 +89,56 @@ function dy_fcap(cx, cy, r, a, cap) local(i, t, rr, ptr, ca, sa) (
 // a smooth round dot (drawn at 2x and filtered down; gfx_circle alone is lumpy at small sizes)
 function dy_ssdot(x, y, rad) ( ui_ss_begin(x - rad, y - rad, x + rad, y + rad); gfx_circle(ui_ssx(x), ui_ssy(y), ui_ssk(rad), 1, 1); ui_ss_end(); );
 // flat knob in the theme colours: a plain face, a value arc in the accent, a pointer line
-// a smooth ring band from REAPER's own anti-aliased arcs, stacked 0.5 px apart (the supersampled blit came out
-// lumpy at small sizes in REAPER - JG, 24 Oct 2026). Angles as gfx_arc (0 = up, clockwise); w = band width (px).
-function dy_ring(cx, cy, r, a1, a2, w) local(k) (
-  a2 - a1 > 0.001 ? ( k = -w * 0.5 + 0.25; while ( k <= w * 0.5 - 0.25 ) ( gfx_arc(cx, cy, r + k, a1, a2, 1); k += 0.5; ); );
+// a smooth ring band, worked out pixel by pixel: each pixel's coverage of the band (radius and both ends) sets
+// its opacity, so it is even at any size on any host (stacked gfx_arc and a supersampled blit both came out lumpy
+// in REAPER - JG, 24 Oct 2026). Current colour and gfx_a; angles 0 = up, clockwise (a1 < a2, within -pi..pi);
+// r = radius to the middle of the band, w = band width, pixel coordinates.
+function dy_ring(cx, cy, r, a1, a2, w) local(x, y, y0, y1, dx, dy, d, th, c, e, ga, ro, ri, xo, xi, xe) (
+  a2 - a1 > 0.001 ? (
+    ga = gfx_a; e = w * 0.5 + 1; ro = r + e; ri = max(0, r - e);
+    y0 = floor(cy - ro); y1 = ceil(cy + ro); y = y0;
+    while ( y <= y1 ) (
+      dy = y + 0.5 - cy;
+      abs(dy) <= ro ? (
+        xo = sqrt(ro * ro - dy * dy) + 1;                         // only the pixels near the band: the row's two spans
+        xi = abs(dy) < ri ? max(0, sqrt(ri * ri - dy * dy) - 1) : 0;
+        x = floor(cx - xo); xe = ceil(cx + xo);
+        while ( x <= xe ) (
+          dx = x + 0.5 - cx;
+          xi > 0 && abs(dx) < xi ? ( x = ceil(cx + xi) - 1; ) : (
+            d = sqrt(dx * dx + dy * dy);
+            c = min(1, max(0, w * 0.5 + 0.5 - abs(d - r)));        // across the band
+            c > 0 ? (
+              th = atan2(dx, -dy);
+              c *= min(1, max(0, (th - a1) * d + 0.5)) * min(1, max(0, (a2 - th) * d + 0.5));   // the two ends
+              c > 0.003 ? ( gfx_a = ga * c; gfx_rect(x, y, 1, 1); );
+            );
+          );
+          x += 1;
+        );
+      );
+      y += 1;
+    );
+    gfx_a = ga;
+  );
+);
+// a smooth pointer line with round ends, worked out per pixel like dy_ring (current colour; pixel coordinates)
+function dy_pline(x1, y1, x2, y2, w) local(x, y, x0, y0, xe, ye, dx, dy, l2, t, px, py, d, c, ga) (
+  ga = gfx_a; dx = x2 - x1; dy = y2 - y1; l2 = max(dx * dx + dy * dy, 0.0001);
+  x0 = floor(min(x1, x2) - w); xe = ceil(max(x1, x2) + w); y0 = floor(min(y1, y2) - w); ye = ceil(max(y1, y2) + w);
+  y = y0;
+  while ( y <= ye ) (
+    x = x0;
+    while ( x <= xe ) (
+      t = min(1, max(0, ((x + 0.5 - x1) * dx + (y + 0.5 - y1) * dy) / l2));
+      px = x + 0.5 - (x1 + t * dx); py = y + 0.5 - (y1 + t * dy); d = sqrt(px * px + py * py);
+      c = min(1, max(0, w * 0.5 + 0.5 - d));
+      c > 0.003 ? ( gfx_a = ga * c; gfx_rect(x, y, 1, 1); );
+      x += 1;
+    );
+    y += 1;
+  );
+  gfx_a = ga;
 );
 function dy_flcap(cx, cy, r, n) local(i, t, a) (
   // the value ring: one even band, track and value the same width (it was a row of dots, then a blit that looked
@@ -103,7 +149,7 @@ function dy_flcap(cx, cy, r, n) local(i, t, a) (
   ui_col(C_KEDGE); gfx_circle(cx, cy, r, 1, 1);
   ui_col(C_KNOB); gfx_circle(cx, cy, r - 1.5 * sc, 1, 1);
   a = -0.75 * $pi + n * 1.5 * $pi;
-  ui_col(C_PTR); ui_ssline(cx + sin(a) * r * 0.2, cy - cos(a) * r * 0.2, cx + sin(a) * r * 0.85, cy - cos(a) * r * 0.85, 1.8 * sc, 1);
+  ui_col(C_PTR); dy_pline(cx + sin(a) * r * 0.2, cy - cos(a) * r * 0.2, cx + sin(a) * r * 0.82, cy - cos(a) * r * 0.82, 2 * sc);
 );
 // laboratory knob: a thin track ring with a glowing value arc (n = 0..1) in col, a brushed silver body, dark line
 function dy_lcap(cx, cy, r, n, col) local(i, t, a, rr, ca, sa, m) (
@@ -160,7 +206,8 @@ dy_ntick = 11;   // ticks round a dy_knob (a panel may print fewer)
 // house white cap: a thin smooth track, an anti-aliased value arc (col), a flat satin cap with one soft highlight on
 // its upper-left edge, a dark pointer line (pixel coordinates). No shading.
 function dy_arcw(cx, cy, r, a1, a2, w) local(k) (
-  ui_ssarc(cx, cy, r, a1, a2, w);   // (supersampled: an even ring)
+  a1 > a2 ? ( k = a1; a1 = a2; a2 = k; );
+  dy_ring(cx, cy, r, a1, a2, w);   // (worked out per pixel: an even ring on any host)
 );
 function dy_wcap(cx, cy, r, n, col) local(rr, a, a0, ca, sa, w, i) (
   rr = r + 6 * sc; w = 3 * sc; a0 = -0.75 * $pi; a = a0 + n * 1.5 * $pi; ca = sin(a); sa = -cos(a);
@@ -188,8 +235,7 @@ function dy_ccap(cx, cy, r, n, col) local(rr, a, a0, ca, sa, w, i) (
   ui_col(ui_mix(col, 0x000000, 0.5)); gfx_circle(cx, cy, r, 1, 1);
   ui_col(col); gfx_circle(cx, cy, r - 1.5 * sc, 1, 1);
   ui_col(ui_mix(col, 0xFFFFFF, 0.35)); dy_arcw(cx, cy, r - 3 * sc, -0.66 * $pi, 0.06 * $pi, 1.4 * sc);
-  ui_col(0xF4F2EE); i = -1;
-  ui_ssline(cx + ca * r * 0.3, cy + sa * r * 0.3, cx + ca * (r - 3 * sc), cy + sa * (r - 3 * sc), 2.4 * sc, 1);
+  ui_col(0xF4F2EE); dy_pline(cx + ca * r * 0.3, cy + sa * r * 0.3, cx + ca * (r - 4 * sc), cy + sa * (r - 4 * sc), 2.4 * sc);
 );
 function dy_knob(cx, cy, r, idx, lo, hi, def, lg, cap, label, val) local(v, n, dx, dy, hov, did, i) (
   did = 1600 + idx; v = slider(idx);
