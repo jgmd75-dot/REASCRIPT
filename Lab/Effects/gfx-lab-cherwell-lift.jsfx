@@ -13,12 +13,19 @@ desc: GFX Lab Cherwell Lift [loudness]
 // above 0 dBFS folds back (as on the original).
 // BAND SPLIT: three Linkwitz-Riley bands (240 Hz / 2.4 kHz), each shaped
 // on its own, so loud lows don't modulate the highs.
-// Anti-aliasing: first-order ADAA on the shaper (house clipper standard);
-// the dry path gets the matching half-sample alignment, so EFFECT blends
-// never comb.
-// Latency: 0 samples. No DRIFT (clinical digital unit).
+// OS (1x / 2x / 4x): the shaper (and the EFFECT blend, so dry and shaped
+// stay in time) runs oversampled; 1x is the plain curve at the base rate,
+// as on the original. Full bandwidth at every setting (v0.1's ADAA averaged
+// neighbouring samples and rolled the top off: -2 dB at 10 kHz, -12 dB at
+// 20 kHz, even with EFFECT at 0).
+// Latency: 0 samples at 1x, 31 at 2x, 37 at 4x (reported). No DRIFT
+// (clinical digital unit).
 //
-// STATUS: Lab (experimental, may change). v0.1.
+// Requires gfx-lab-os (.jsfx-inc) in the same folder.
+//
+// STATUS: Lab (experimental, may change). v0.2.
+
+import gfx-lab-os.jsfx-inc
 
 in_pin:left input
 in_pin:right input
@@ -32,6 +39,7 @@ slider4:clip=1<0,1,1{Off,On}>-Clip 0 dB
 slider5:split=0<0,1,1{Off,On}>-Band Split
 slider6:out_db=0<-12,3,0.1>-Output (dB)
 slider7:lift_on=1<0,1,1{Off,On}>-In
+slider8:0<0,2,1{1x,2x,4x}>-Oversampling
 
 @init
 ext_noinit = 1;
@@ -39,6 +47,9 @@ pr_cur = 1;              // preset shown on the LCD (saved with the project)
 gfx_ext_retina = 1;
 BQ = 0.7071067811865476;   // Butterworth Q (two in series = Linkwitz-Riley 4th order)
 first_run = 1;
+os_design();
+os_base = 0;  os_tf = os_f = os_f2n(slider8);  os_gsetup();
+DRY = 1000;  dl_n = 0;     // 64-frame ring: the dry signal for the IN fade, delayed by the OS latency
 
 // =====================================================================
 // DSP building blocks
@@ -73,28 +84,8 @@ function lift_f(x) local(s, y) (
            ( y = 0; );
   x < 0 ? -y : y;
 );
-// Antiderivative of lift_f (even function), for ADAA
-function lift_P(s) local(s2, s3, s4, s5) (
-  s2 = s * s;  s3 = s2 * s;  s4 = s3 * s;  s5 = s4 * s;
-  iA * s2 / 2 + iB * s3 / 3 + iC * s4 / 4 - iD * (s3 / 3 - s4 / 2 + s5 / 5);
-);
-function lift_ad(x) local(s) (
-  s = abs(x);
-  s <= 1 ? lift_P(s) :
-  clip   ? lift_P1 + s - 1 :
-  s < 2  ? lift_P1 + s * s - s * s * s / 3 - 2 / 3 :
-           lift_P1 + 2 / 3;
-);
-// One shaped path with its own half-sample-aligned dry, blended by EFFECT
-// The previous sample's antiderivative is recomputed on the current curve every sample,
-// so a CURVE move never mixes two different curves in one step (that clicked).
-function lift_path(x) instance(xp) local(F, F1, d, w, dry) (
-  F = lift_ad(x);  F1 = lift_ad(xp);  d = x - xp;
-  abs(d) < 0.00001 ? ( w = lift_f(0.5 * (x + xp)); ) : ( w = (F - F1) / d; );
-  dry = 0.5 * (x + xp);
-  xp = x;
-  dry + eff_s * (w - dry);
-);
+// One sample through the curve, blended with the dry by EFFECT (at the OS rate)
+function lift_b(x) ( x + eff_s * (lift_f(x) - x); );
 
 // ---------- one channel ----------
 function xo_set() instance(l1, l2, h1, h2, m1, m2, n1, n2, a1, a2, a3, a4) (
@@ -105,10 +96,14 @@ function xo_set() instance(l1, l2, h1, h2, m1, m2, n1, n2, a1, a2, a3, a4) (
   a1.svf_set(2400, BQ);  a2.svf_set(2400, BQ);
   a3.svf_set(2400, BQ);  a4.svf_set(2400, BQ);
 );
-function chan(x) instance(full, bl, bm, bh, l1, l2, h1, h2, m1, m2, n1, n2, a1, a2, a3, a4)
-  local(lo, hi, mid, top, loap)
+// The bands are split at the base rate, raised to the OS rate one by one, shaped, summed and brought
+// back down once (the down filter is linear, so one does for the sum). BAND SPLIT crossfades (sp_s, 15 ms)
+// between the full-band and the split paths; only the path(s) in use run, and a path is cleared as its fade
+// starts (it comes in from silence, never from stale state).
+function chan(x) instance(uf, ul, um, uh, dn, l1, l2, h1, h2, m1, m2, n1, n2, a1, a2, a3, a4, o0, o1, o2, o3)
+  local(lo, hi, mid, top, loap, i, y)
 (
-  split ? (
+  sp_s > 0 || split ? (
     // LR4 split at 240 Hz, then the upper part again at 2.4 kHz
     l1.svf_tick(x);   l2.svf_tick(l1.lp);  lo  = l2.lp;
     h1.svf_tick(x);   h2.svf_tick(h1.hp);  hi  = h2.hp;
@@ -117,11 +112,26 @@ function chan(x) instance(full, bl, bm, bh, l1, l2, h1, h2, m1, m2, n1, n2, a1, 
     // matching 2.4 kHz allpass on the low band keeps the bands in phase
     a1.svf_tick(lo);  a2.svf_tick(a1.lp);
     a3.svf_tick(lo);  a4.svf_tick(a3.hp);  loap = a2.lp + a4.hp;
-    bl.lift_path(loap) + bm.lift_path(mid) + bh.lift_path(top);
-  ) : (
-    full.lift_path(x);
+    ul.os_up(loap);  um.os_up(mid);  uh.os_up(top);
   );
+  sp_s < 1 || !split ? uf.os_up(x);
+  i = 0;
+  loop(os_f,
+    y = sp_s < 1 ? (1 - sp_s) * lift_b(uf.os_s(i)) : 0;
+    sp_s > 0 ? y += sp_s * (lift_b(ul.os_s(i)) + lift_b(um.os_s(i)) + lift_b(uh.os_s(i)));
+    i == 0 ? o0 = y : i == 1 ? o1 = y : i == 2 ? o2 = y : o3 = y;
+    i += 1;
+  );
+  dn.os_dn(o0, o1, o2, o3);
 );
+function svf_clr() instance(ic1, ic2) ( ic1 = ic2 = 0; );
+function band_clr() instance(ul, um, uh, l1, l2, h1, h2, m1, m2, n1, n2, a1, a2, a3, a4) (
+  ul.os_clr();  um.os_clr();  uh.os_clr();
+  l1.svf_clr();  l2.svf_clr();  h1.svf_clr();  h2.svf_clr();  m1.svf_clr();  m2.svf_clr();
+  n1.svf_clr();  n2.svf_clr();  a1.svf_clr();  a2.svf_clr();  a3.svf_clr();  a4.svf_clr();
+);
+function full_clr() instance(uf) ( uf.os_clr(); );
+function ch_clr() instance(uf, ul, um, uh, dn) ( uf.os_clr();  ul.os_clr();  um.os_clr();  uh.os_clr();  dn.os_clr(); );
 
 // shaper coefficients from a (smoothed) curve value -0.5 .. +0.5
 function set_curve(cp) (
@@ -129,7 +139,6 @@ function set_curve(cp) (
   iB = -2 * cp;
   iC = cp - 0.5;
   iD = 0.0625 - 0.25 * cp + 0.25 * cp * cp;
-  lift_P1 = lift_P(1);
 );
 
 function update_params() (
@@ -140,11 +149,13 @@ function update_params() (
   eff_t = effect / 100;
   sm    = 1 - exp(-1 / (0.02 * srate));        // 20 ms parameter smoothing
   ramp_step = 1 / (0.010 * srate);
+  sp_step = 1 / (0.015 * srate);
 
   chL.xo_set();  chR.xo_set();
+  os_tf = os_f2n(slider8);
 
   first_run ? (
-    in_s = in_t;  out_s = out_t;  eff_s = eff_t;  on_s = lift_on;  cp_s = cp_t;  set_curve(cp_s);
+    in_s = in_t;  out_s = out_t;  eff_s = eff_t;  on_s = lift_on;  sp_s = split;  cp_s = cp_t;  set_curve(cp_s);
     first_run = 0;
   );
 );
@@ -163,16 +174,23 @@ in_s  += (in_t  - in_s)  * sm;
 out_s += (out_t - out_s) * sm;
 eff_s += (eff_t - eff_s) * sm;
 cp_s != cp_t ? ( cp_s += (cp_t - cp_s) * sm;  abs(cp_t - cp_s) < 0.00001 ? cp_s = cp_t;  set_curve(cp_s); );   // CURVE glides
+os_gate();
+split  && sp_s == 0 ? ( chL.band_clr();  chR.band_clr(); );
+!split && sp_s == 1 ? ( chL.full_clr();  chR.full_clr(); );
+sp_s != split ? ( sp_s = split > sp_s ? min(1, sp_s + sp_step) : max(0, sp_s - sp_step); );   // BAND SPLIT crossfade
+os_chg ? ( chL.ch_clr();  chR.ch_clr();  memset(DRY, 0, 128); );
 on_s != lift_on ? ( on_s = lift_on > on_s ? min(1, on_s + ramp_step) : max(0, on_s - ramp_step); );
 
 xL = spl0 * in_s;  xR = spl1 * in_s;
 inpk = max(inpk, max(abs(xL), abs(xR)));
 
-on_s > 0 ? (
-  yL = chL.chan(xL) * out_s;
-  yR = chR.chan(xR) * out_s;
-  on_s < 1 ? ( yL = spl0 + (yL - spl0) * on_s;  yR = spl1 + (yR - spl1) * on_s; );
-) : ( yL = spl0;  yR = spl1; );
+// the dry, delayed by the OS latency, for the IN fade (the shaped path always runs, so IN never waits for a refill)
+DRY[dl_n * 2] = spl0;  DRY[dl_n * 2 + 1] = spl1;
+dl_r = (dl_n - os_lat(os_f) + 64) % 64;  dryL = DRY[dl_r * 2];  dryR = DRY[dl_r * 2 + 1];  dl_n = (dl_n + 1) % 64;
+yL = chL.chan(xL) * out_s;
+yR = chR.chan(xR) * out_s;
+on_s < 1 ? ( yL = dryL + (yL - dryL) * on_s;  yR = dryR + (yR - dryR) * on_s; );
+yL *= os_g;  yR *= os_g;
 
 outpk = max(outpk, max(abs(yL), abs(yR)));
 spl0 = yL;  spl1 = yR;
@@ -181,6 +199,15 @@ spl0 = yL;  spl1 = yR;
 file_var(0, pr_cur);
 
 @gfx 1000 320
+// GUI copy of lift_f (the threads must not share a function: its locals are shared storage)
+function g_lift(x) local(s, y) (
+  s = abs(x);
+  s <= 1 ? ( y = s * (gA + s * (gB + s * gC)) - gD * s * s * (1 - 2 * s + s * s); ) :
+  clip   ? ( y = 1; ) :
+  s < 2  ? ( y = 2 * s - s * s; ) :
+           ( y = 0; );
+  x < 0 ? -y : y;
+);
 function gdb(x) ( 8.685889638065035 * log(max(x, 0.000000001)); );   // GUI copy of g2db (audio and GUI threads must not share functions)
 // =====================================================================
 // GUI — Cherwell series, "Quad" scheme: viridian faceplate, sage-green accents,
@@ -543,6 +570,7 @@ rivet(12, 18);  rivet(988, 18);  rivet(12, 302);  rivet(988, 302);
 gfx_setfont(1);  col(0xA0AF84, 1);  gfx_x = px(40);  gfx_y = py(9);   gfx_drawstr("CHERWELL");
 gfx_setfont(4);  col(0xE4F0EF, 1);  gfx_x += ps(14);  gfx_y = py(16);  gfx_drawstr("LIFT");
 gfx_setfont(4);  col(0xA0AF84, 1);  gfx_x = px(930); gfx_y = py(16);  gfx_drawstr("GFX");
+os_key(ox / sc + 872, oy / sc + 12, 8, 0xE4F0EF, 7) ? gui_dirty = 1;   // OS 1x / 2x / 4x (font slot 7 is free)
 
 // ---------- preset bar, in the title bar ----------
 pb_k = preset_bar(257, 8, 30, 280, pr_cur, PRESET_MENU);
@@ -574,10 +602,11 @@ gfx_line(px(dx0), py(dy0 + dh), px(dx0 + dw), py(dy0), 1);
 // current transfer: dry + EFFECT * (shaper - dry)
 col(0xE4F0EF, 1);
 e = lift_on ? effect / 100 : 0;
+gc = curve / 100;  gA = 1.5 + gc;  gB = -2 * gc;  gC = gc - 0.5;  gD = 0.0625 - 0.25 * gc + 0.25 * gc * gc;   // set_curve's sums, GUI side
 j = 0;
 loop(101,
   s = 1.25 * j / 100;
-  yv = s + e * (lift_f(s) - s);
+  yv = s + e * (g_lift(s) - s);
   gx = px(dx0 + dw * j / 100);
   gy = py(dy0 + dh - dh * min(1.25, max(0, yv)) / 1.25);
   j == 0 ? ( gfx_x = gx;  gfx_y = gy; ) : gfx_lineto(gx, gy, 1);
