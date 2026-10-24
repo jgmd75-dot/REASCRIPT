@@ -64,6 +64,10 @@ desc:GFX CH92 [channel strip]
 //   originals. FIELD uses its fixed clip at -0.3 dBFS instead (see above).
 // MODEL SWITCH: only the selected model runs (CPU = that model). A change crossfades the outgoing model into the
 //   incoming one over 20 ms (both run for those 20 ms); the incoming model starts from a clean, reset state.
+// LATENCY: 2 ms + 2 samples (98 samples at 48 kHz), reported to the host, the same on every model: the 15's tape runs
+//   through its wow / flutter delay line (centred there), its MIX dry side is delayed to match, and the 44, 12 and
+//   FIELD hear the input through a plain delay of the same length, so a parallel copy lines up and the MODEL crossfade
+//   stays in step.
 // PRESETS: the house preset bar. Every preset of the originals (and five for the 12, three of them Strip 102's), named by model ("44: Rack Punch"); choosing
 //   one also selects its model; each plays at Init's level (OUTPUT / FADER / MAIN MIX). "Init" = the 15 at its defaults. "Reset all to defaults" (in the list) resets
 //   every model, the MODEL and the output stage. Presets leave the output stage alone.
@@ -143,6 +147,11 @@ out_pin:right output
 #ui_man = "gfx-channel-92";                       // the ? pop-up links to this manual
 ext_noinit = 1;                                    // @init runs once; a sample-rate change re-inits from @block
 clp_kt_on = 1;                                     // the house clip kit: Model 12's preamp is a character stage (knee tracks GAIN)
+// the latency match (see LATENCY): a plain delay of s92_lat samples; one instance per signal (b = its 1024-slot line)
+function s92_dl(x) instance(b, p) local(y) ( b[p] = x; y = b[(p - s92_lat) & 1023]; p = (p + 1) & 1023; y; );
+function s92_dlclr() instance(b, p) ( memset(b, 0, 1024); p = 0; );
+s92_dyL.b = 300000; s92_dyR.b = 301024;            // the 15's MIX dry side
+s92_inL.b = 302048; s92_inR.b = 303072;            // the input as the 44, 12 and FIELD hear it (always running)
 // host automation for a run of sliders
 function s92_autor(a, b) local(i) ( i = a; loop(b - a + 1, ui_auto(i); i += 1; ); );
 
@@ -401,7 +410,7 @@ function m15_run() (
   m15_wph += 0.6 / srate; m15_wph -= floor(m15_wph);
   m15_fph += 6.2 / srate; m15_fph -= floor(m15_fph);
   m15_wnd += ((rand(2) - 1) - m15_wnd) * 0.00002;
-  m15_wdel = (2 + m15_wow_a * (0.45 * sin(2 * $pi * m15_wph) + 1.5 * m15_wnd + 0.06 * sin(2 * $pi * m15_fph))) * 0.001 * srate + 2;
+  m15_wdel = s92_lat + m15_wow_a * (0.45 * sin(2 * $pi * m15_wph) + 1.5 * m15_wnd + 0.06 * sin(2 * $pi * m15_fph)) * 0.001 * srate;   // centred on the reported latency
   // dropouts (AGE)
   m15_age > 0 && rand(1) < m15_age * m15_age * 1.2 / srate ? ( m15_drop_t = 10 ^ (-(2 + rand(6)) / 20); m15_drop_n = (0.01 + rand(0.04)) * srate; );
   m15_drop_n > 0 ? m15_drop_n -= 1 : m15_drop_t = 1;
@@ -419,8 +428,9 @@ function m15_run() (
   m15_mix_s += (m15_mix_t - m15_mix_s) * m15_sm;
   m15_out_s += (m15_out_t - m15_out_s) * m15_sm;
 
-  m15_oL = m15_inL * (1 - m15_mix_s) + m15_tL * m15_mix_s * s92_mk15 * m15_amk;
-  m15_oR = m15_inR * (1 - m15_mix_s) + m15_tR * m15_mix_s * s92_mk15 * m15_amk;
+  s92_dyn < 1000000 ? s92_dyn += 1; s92_dyg = min(max((s92_dyn - s92_lat) * s92_dyk, 0), 1);   // after a fresh start the dry fades in once its line has filled
+  m15_oL = s92_dyL.s92_dl(m15_inL) * s92_dyg * (1 - m15_mix_s) + m15_tL * m15_mix_s * s92_mk15 * m15_amk;   // the dry side delayed as the tape
+  m15_oR = s92_dyR.s92_dl(m15_inR) * s92_dyg * (1 - m15_mix_s) + m15_tR * m15_mix_s * s92_mk15 * m15_amk;
 );
 
 // 2x oversampling (Model 12's preamp, Model 44's tape ceiling): the house polyphase IIR half-band (two allpass chains,
@@ -1034,11 +1044,12 @@ s92_mk15 = 10 ^ (-0.6 / 20); s92_mk44 = 10 ^ (-3.65 / 20);
 // MODEL: 0 = 15, 1 = 44, 2 = 12, 3 = FIELD. The selected model: reset (clean state + its own init), settings,
 // per-block work, one sample (result in s92_rL / R, and s92_rg = the gain the original applied after its band
 // saturation). (The 15's settings wait while its preset duck is fading out, as on Model 15.)
-function s92_reset(m) ( m == 0 ? m15_reset() : m == 1 ? m44_reset() : m == 2 ? cs_reset() : f42_reset(); );
+function s92_reset(m) ( m == 0 ? ( m15_reset(); s92_dyL.s92_dlclr(); s92_dyR.s92_dlclr(); s92_dyn = 0; ) : m == 1 ? m44_reset() : m == 2 ? cs_reset() : f42_reset(); );
 function s92_upd(m) ( m == 1 ? m44_update() : m == 2 ? cs_update() : f42_update(); );
 function s92_update(m) ( m == 0 ? ( m15_m15_dst != 1 ? m15_update(); ) : !(s92_dst == 1 && m == s92_cur) ? s92_upd(m); );
 function s92_block(m) ( m == 0 ? ( m15_m15_dst != 1 ? m15_update(); ) : ( !(s92_dst == 1 && m == s92_cur) ? ( m == 3 ? f42_blockrun() : s92_upd(m); ); m == 2 ? cs_blk(); ); );
 function s92_run(m) (
+  spl0 = m ? s92_dxL : s92_xL; spl1 = m ? s92_dxR : s92_xR;   // the 44, 12 and FIELD hear the delayed input (LATENCY)
   m == 0 ? ( m15_run(); s92_rL = m15_oL; s92_rR = m15_oR; s92_rg = m15_out_s; ) :
   m == 1 ? ( m44_run(); s92_rL = m44_oL; s92_rR = m44_oR; s92_rg = m44_out_s; ) :
   m == 2 ? ( cs_run(); s92_rL = cs_ml; s92_rR = cs_mr; s92_rg = 1; ) :
@@ -1062,6 +1073,8 @@ function s92_switch() local(m) (
 // everything that depends on the sample rate
 function s92_srinit() (
   s92_sr = srate;
+  s92_lat = floor(0.002 * srate + 2.5);            // the latency (see LATENCY): the tape's wow line centre, 2 ms + 2 samples
+  s92_inL.s92_dlclr(); s92_inR.s92_dlclr(); s92_dyk = 1 / (0.005 * srate);
   ost_init(40000); s92_ostL.ost_ch_init(); s92_ostR.ost_ch_init();
   s92_cur = min(max(floor(slider1 + 0.5), 0), 3); s92_xf = 0; s92_xt = 0;
   s92_reset(s92_cur);
@@ -1166,6 +1179,7 @@ srate != s92_sr ? s92_srinit();
 s92_switch();
 s92_block(s92_cur);
 s92_ost();
+pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = s92_lat;   // (after ost_setup, which clears it)
 
 @serialize
 file_var(0, ui_sz);
@@ -1176,6 +1190,7 @@ file_avail(0) != 0 ? file_var(0, s92_pr);          // the preset in use
 // short hold, back in
 s92_dst == 1 ? ( s92_dk -= s92_dkr; s92_dk <= 0 ? ( s92_dk = 0; s92_upd(s92_cur); s92_cur == 2 ? ( cs_kset(); cs_pn = cs_mn = cs_mcr = 0; ); s92_hc = floor(0.008 * srate); s92_dst = 2; ); ) :
 s92_dst == 2 ? ( s92_hc > 0 ? s92_hc -= 1 : ( s92_dk += s92_dkr; s92_dk >= 1 ? ( s92_dk = 1; s92_dst = 0; ); ); );
+s92_xL = spl0; s92_xR = spl1; s92_dxL = s92_inL.s92_dl(s92_xL); s92_dxR = s92_inR.s92_dl(s92_xR);   // the input, as heard and delayed
 s92_run(s92_cur); s92_yL = s92_rL; s92_yR = s92_rR; s92_g = s92_rg;
 s92_dst ? ( s92_dkg = s92_dk * s92_dk * (3 - 2 * s92_dk); s92_yL *= s92_dkg; s92_yR *= s92_dkg; );
 s92_xf ? (

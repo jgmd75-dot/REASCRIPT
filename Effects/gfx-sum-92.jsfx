@@ -55,6 +55,9 @@ desc:GFX Sum 92 [summing mixer]
 // MODEL SWITCH: only the selected model runs (CPU = that model). A change crossfades the outgoing model into the
 //   incoming one over 20 ms (both run for those 20 ms); the incoming model starts from a clean, reset state.
 //   (15 <-> 44 also crossfades: each has its own tape engine; they share their settings.)
+// LATENCY: 2 ms + 2 samples (98 samples at 48 kHz), reported to the host, the same on every model: the 15 and 44 tapes
+//   run through their wow / flutter delay lines (centred there), and the 12 and FIELD hear every input through a plain
+//   delay of the same length, so a parallel copy lines up and the MODEL crossfade stays in step.
 // PRESETS: the house preset bar. Every preset of the three originals, named by model ("12: Hot Desk"); choosing
 //   one also selects its model. "Init" = the 15 at its defaults. "Reset all to defaults" (in the list) resets every
 //   model, the MODEL and the output stage (channel names are kept). Presets leave the output stage alone.
@@ -226,6 +229,7 @@ gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 H
 gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0; gdc_x2 = gdc_y2 = 0; gdc_x3 = gdc_y3 = 0; gdc_x4 = gdc_y4 = 0; gdc_x5 = gdc_y5 = 0; gdc_x6 = gdc_y6 = 0; gdc_x7 = gdc_y7 = 0; gdc_x8 = gdc_y8 = 0; gdc_x9 = gdc_y9 = 0; gdc_x10 = gdc_y10 = 0; gdc_x11 = gdc_y11 = 0;
 #ui_man = "gfx-sum-92";                           // the ? pop-up links to this manual
 ext_noinit = 1;                                    // @init runs once; a sample-rate change re-inits from @block
+s92_raw = 300000; s92_dly = 300016; s92_ln = 301024;   // the latency match: the 12 inputs as they came, delayed, and their 12 x 1024 lines
 // host automation (sliders above 128 are passed by name)
 function s92_auto(i) (
   i <= 128 ? ui_auto(i) :
@@ -471,7 +475,7 @@ function ca_run() (
   ca_wph += 0.6 / srate; ca_wph -= floor(ca_wph);
   ca_fph += 6.2 / srate; ca_fph -= floor(ca_fph);
   ca_wnd += ((rand(2) - 1) - ca_wnd) * 0.00002;
-  ca_wdel = (2 + ca_wow_a * (0.45 * sin(2 * $pi * ca_wph) + 1.5 * ca_wnd + 0.06 * sin(2 * $pi * ca_fph))) * 0.001 * srate + 2;
+  ca_wdel = s92_lat + ca_wow_a * (0.45 * sin(2 * $pi * ca_wph) + 1.5 * ca_wnd + 0.06 * sin(2 * $pi * ca_fph)) * 0.001 * srate;   // centred on the reported latency
   // dropouts (AGE): now and then the tape loses contact for a moment
   ca_age > 0 && rand(1) < ca_age * ca_age * 1.2 / srate ? ( ca_drop_t = 10 ^ (-(4 + rand(10)) / 20); ca_drop_n = (0.02 + rand(0.06)) * srate; );
   ca_drop_n > 0 ? ca_drop_n -= 1 : ca_drop_t = 1;
@@ -686,7 +690,7 @@ function cb_run() (
   cb_wph += 0.6 / srate; cb_wph -= floor(cb_wph);
   cb_fph += 6.2 / srate; cb_fph -= floor(cb_fph);
   cb_wnd += ((rand(2) - 1) - cb_wnd) * 0.00002;
-  cb_wdel = (2 + cb_wow_a * (0.45 * sin(2 * $pi * cb_wph) + 1.5 * cb_wnd + 0.06 * sin(2 * $pi * cb_fph))) * 0.001 * srate + 2;
+  cb_wdel = s92_lat + cb_wow_a * (0.45 * sin(2 * $pi * cb_wph) + 1.5 * cb_wnd + 0.06 * sin(2 * $pi * cb_fph)) * 0.001 * srate;   // centred on the reported latency
   // dropouts (AGE): now and then the tape loses contact for a moment
   cb_age > 0 && rand(1) < cb_age * cb_age * 1.2 / srate ? ( cb_drop_t = 10 ^ (-(4 + rand(10)) / 20); cb_drop_n = (0.02 + rand(0.06)) * srate; );
   cb_drop_n > 0 ? cb_drop_n -= 1 : cb_drop_t = 1;
@@ -1017,7 +1021,8 @@ function s92_tchg() local(c) (
 function s92_block(m) ( m == 0 ? ( (s92_tchg() | s92_tfrc) && ca_c4_dst != 1 ? ( ca_update(); s92_tfrc = 0; ); ) :
                          m == 1 ? ( (s92_tchg() | s92_tfrc) && cb_c4_dst != 1 ? ( cb_update(); s92_tfrc = 0; ); ) :
                          !(s92_dst == 1 && m == s92_cur) ? ( m == 3 ? fm_blockrun() : cp_update(); ); );
-function s92_run(m) (
+function s92_run(m) local(i) (
+  i = 0; loop(12, spl(i) = m >= 2 ? s92_dly[i] : s92_raw[i]; i += 1; );   // the 12 and FIELD hear the delayed inputs (LATENCY)
   m == 0 ? ( ca_run(); s92_rL = ca_ml; s92_rR = ca_mr; s92_rg = S92_HR; ) :
   m == 1 ? ( cb_run(); s92_rL = cb_ml; s92_rR = cb_mr; s92_rg = S92_HR; ) :
   m == 2 ? ( cp_run(); s92_rL = cp_ml; s92_rR = cp_mr; s92_rg = S92_HR; ) :
@@ -1034,6 +1039,8 @@ function s92_switch() local(m) (
 );
 function s92_srinit() (
   s92_sr = srate;
+  s92_lat = floor(0.002 * srate + 2.5);            // the latency (see LATENCY): the tapes' wow line centre, 2 ms + 2 samples
+  memset(s92_ln, 0, 12 * 1024); s92_wp = 0;
   s92_cur = min(max(floor(slider1 + 0.5), 0), 3); s92_xf = 0; s92_xt = 0;
   s92_reset(s92_cur);
   ost_init(150000); s92_ostL.ost_ch_init(); s92_ostR.ost_ch_init();
@@ -1214,6 +1221,7 @@ s92_update(s92_cur);          // the outgoing model of a crossfade keeps its set
 srate != s92_sr ? s92_srinit();
 s92_switch();
 s92_block(s92_cur);
+pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = s92_lat;   // (LATENCY; the mix leaves on 1 / 2)
 
 @serialize
 file_var(0, ui_sz);
@@ -1234,6 +1242,10 @@ gdc_y8 = spl8 - gdc_x8 + gdc_r * gdc_y8; gdc_x8 = spl8; spl8 = gdc_y8;
 gdc_y9 = spl9 - gdc_x9 + gdc_r * gdc_y9; gdc_x9 = spl9; spl9 = gdc_y9;
 gdc_y10 = spl10 - gdc_x10 + gdc_r * gdc_y10; gdc_x10 = spl10; spl10 = gdc_y10;
 gdc_y11 = spl11 - gdc_x11 + gdc_r * gdc_y11; gdc_x11 = spl11; spl11 = gdc_y11;
+// the latency match: every input as it came and through a plain delay of s92_lat samples
+s92_i = 0; loop(12, s92_v = spl(s92_i); s92_raw[s92_i] = s92_v; s92_b = s92_ln + s92_i * 1024; s92_b[s92_wp] = s92_v;
+  s92_dly[s92_i] = s92_b[(s92_wp - s92_lat) & 1023]; s92_i += 1; );
+s92_wp = (s92_wp + 1) & 1023;
 // the chassis preset duck: out, the new settings at silence, a short hold, back in
 s92_dst == 1 ? ( s92_dk -= s92_dkr; s92_dk <= 0 ? ( s92_dk = 0; s92_upd(s92_cur); s92_hc = floor(0.008 * srate); s92_dst = 2; ); ) :
 s92_dst == 2 ? ( s92_hc > 0 ? s92_hc -= 1 : ( s92_dk += s92_dkr; s92_dk >= 1 ? ( s92_dk = 1; s92_dst = 0; ); ); );
