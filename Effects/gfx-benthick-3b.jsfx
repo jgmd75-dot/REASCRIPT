@@ -2,7 +2,8 @@ desc:GFX Benthick 3B [bus processor]
 //tags: bus processor saturation transformer transistor compressor limiter width mastering
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate and gfx-instrument (.jsfx-inc) in the same folder.
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate,
+// gfx-instrument and gfx-os (.jsfx-inc) in the same folder.
 //
 // A solid-state iron and transistor bus processor: tight low-end weight, fast transient clamping and
 // dense glue, without woolly tube artefacts. 3B lays the stages out as columns, left to right in signal
@@ -27,12 +28,19 @@ desc:GFX Benthick 3B [bus processor]
 //   5 WIDTH      - M/S width; S SAT drives the Sides into a second discrete saturation stage.
 //     MIX        - wet / dry, OUTPUT. (3B has no IN / OUT strip: input trim, guard and band sat stay at their
 //                  defaults.)
+//   LINK       - lit (the default): the three compressors each hear both sides and turn them down together, so
+//                the image stays put. Dark: dual mono - each side has its own detector and gain, so a loud hit on
+//                one side leaves the other alone. One key for all three; a change crossfades over 10 ms.
 // Every stage has an IN key. No drift: Benthick 3 is clean and repeatable.
 // ANTI-ALIASING (the house drive standard): IRON's upper core, CLASS-A, COMP 2's colour and S SAT are read with
 //   first-order ADAA, its half-sample lag made up (see bt_th), so small signals still pass at unity, phase-true with
 //   the dry for MIX (IRON's low core only sees the band below 160 Hz: nothing of it folds back, so it is read plain).
-//   No oversampling, no latency. The curves are smooth (no knee to track); there is no pre-filter (the front end's
-//   colour - IRON's lows, CLASS-A's upper mids - is what is being driven).
+//   The curves are smooth (no knee to track); there is no pre-filter (the front end's colour - IRON's lows, CLASS-A's
+//   upper mids - is what is being driven).
+// OS (header, left of PRESETS): the FRONT END's oversampling, 1x (as before, the default), 2x, 4x - each click steps
+//   on. The FRONT END is the drive; COMP 2's grit and S SAT are light touches and stay at the base rate (ADAA). The dry
+//   for MIX is delayed to match. A change dips the output for 5 ms, swaps, comes back. Latency 0 / 31 / 37 samples
+//   (reported).
 
 import gfx-drift.jsfx-inc
 import gfx-input.jsfx-inc
@@ -42,6 +50,7 @@ import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
 import gfx-faceplate.jsfx-inc
 import gfx-instrument.jsfx-inc
+import gfx-os.jsfx-inc
 
 slider1:4<0,18,0.1>-Drive (dB)
 slider2:0<0,1,1{Iron,Class-A}>-Front end
@@ -81,6 +90,8 @@ slider35:1<0,1,1{Out,In}>-Comp 2 in
 slider36:1<0,1,1{Out,In}>-Bus comp in
 slider37:4<0,4,1{0.1 s,0.3 s,0.6 s,1.2 s,Auto}>-Bus comp release
 slider38:5<0,18,0.1>-Bus comp makeup (dB)
+slider39:1<0,1,1{Off,On}>-Link
+slider40:0<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
@@ -171,28 +182,39 @@ function fe_dc(x) instance(xm, ym) local(y) (
   min(max(y, -4), 4);
 );
 // a peaking biquad's coefficients (the CLASS-A pre / de-emphasis)
-function pk_coefs(f, q, gdb) local(w0, cw, al, A, n) (
-  w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); al = sin(w0) / (2 * q); A = 10 ^ (gdb / 40);
+function pk_coefs(f, q, gdb, fs) local(w0, cw, al, A, n) (
+  w0 = 2 * $pi * min(f, fs * 0.45) / fs; cw = cos(w0); al = sin(w0) / (2 * q); A = 10 ^ (gdb / 40);
   n = 1 + al / A; pk_b0 = (1 + al * A) / n; pk_b1 = -2 * cw / n; pk_b2 = (1 - al * A) / n; pk_a1 = pk_b1; pk_a2 = (1 - al / A) / n;
 );
 
-ir_lpc = 1 - exp(-2 * $pi * 160 / srate);
+// the FRONT END's rate-dependent coefficients, at its running rate (srate x the OS factor)
+function fe_rate() local(fs) (
+  fs = srate * os_f;
+  ir_lpc = 1 - exp(-2 * $pi * 160 / fs);
+  pk_coefs(2800, 0.8, 4, fs);  ca_b0 = pk_b0; ca_b1 = pk_b1; ca_b2 = pk_b2; ca_a1 = pk_a1; ca_a2 = pk_a2;
+  pk_coefs(2800, 0.8, -4, fs); cd_b0 = pk_b0; cd_b1 = pk_b1; cd_b2 = pk_b2; cd_a1 = pk_a1; cd_a2 = pk_a2;
+  fe_er = 1 - exp(-1 / (0.01 * fs)); fe_es = 1 - exp(-1 / (0.003 * fs));   // the ADAA lag's followers in the FRONT END
+);
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider40); os_gsetup();
+OSD = 70000;                                          // the dry's delay for MIX at 2x / 4x (64 per side)
+fe_rate();
 ir_b = 0.28; ir_tb = ost_tanh(ir_b); ir_sl = 1 - ir_tb * ir_tb;
 dc_c = 1 - 2 * $pi * 5 / srate;
-pk_coefs(2800, 0.8, 4);  ca_b0 = pk_b0; ca_b1 = pk_b1; ca_b2 = pk_b2; ca_a1 = pk_a1; ca_a2 = pk_a2;
-pk_coefs(2800, 0.8, -4); cd_b0 = pk_b0; cd_b1 = pk_b1; cd_b2 = pk_b2; cd_a1 = pk_a1; cd_a2 = pk_a2;
 tl_c = 1 - exp(-2 * $pi * 700 / srate);
 sm = 1 - exp(-1 / (0.03 * srate));
+lk_c = 1 - exp(-1 / (0.01 * srate));   // LINK crossfade
 c1_da = dy_ms(1); c1_dr = dy_ms(30);
 b3_fr = dy_ms(100); b3_sa = dy_ms(500); b3_sr = dy_ms(1200);   // AUTO release: fast and slow halves
 
 function update() local(r) (
   fe_on = slider33; c1_on = slider34; c2_on = slider35; li_on = slider36;
+  lk_t = slider39 >= 0.5;
   drv_t = 10 ^ (slider1 / 20);
   topo_t = slider2;
   ms_on = slider3;
   sdrv_t = ms_on ? 10 ^ (slider4 / 20) : 1;
-  ir_hy = 0.06 * srate / 1000 * (0.4 + 0.6 * slider1 / 18);
+  ir_hy = 0.06 * srate * os_f / 1000 * (0.4 + 0.6 * slider1 / 18);
+  os_tf = os_f2n(slider40);
   slider5 != sc_last ? ( sc_last = slider5;
     h3L.bq_set(1, slider5, 0.707, 0); h3R.bq_set(1, slider5, 0.707, 0);
     h1L.bq_set(1, slider5, 0.707, 0); h1R.bq_set(1, slider5, 0.707, 0);
@@ -218,6 +240,7 @@ function update() local(r) (
   out_t = 10 ^ (slider24 / 20);
   in_setup(slider25, slider26);
   ost_setup(slider27 / 100, slider28 / 100, slider29, slider30, slider31, 0);   // output stage: straight through
+  pdc_delay = os_base + os_lat(os_f);                                          // (ost_setup clears it)
 );
 
 // ---------- presets ----------
@@ -260,11 +283,10 @@ function load_preset(p) (
   p == 11 ? (                                   // Reset all to defaults
     setp(4, 0, 0, 4, 90, -18, 2, 40, 300, 3, 0, -14, 0, 400, 300, 2, 60, -18, 0, 4, 100, 0, 100, 4, 5);
     slider24 = 0; slider25 = 0; slider26 = 1; slider27 = 0; slider28 = 30; slider29 = 120; slider30 = 6000;
-    slider31 = -0.3; slider32 = 1; slider33 = 1; slider34 = 1; slider35 = 1; slider36 = 1;
-    slider_automate(2 ^ 38 - 1);
+    slider31 = -0.3; slider32 = 1; slider33 = 1; slider34 = 1; slider35 = 1; slider36 = 1; slider39 = 1;
+    slider_automate(2 ^ 39 - 1);
   );
-  update();
-);
+);   // (@block picks the new values up with update())
 
 // ---------- state ----------
 ost_init(40000); ostL.ost_ch_init(); ostR.ost_ch_init();
@@ -274,10 +296,36 @@ pr_cur = 1;
 sc_last = -1;
 update();
 drv_s = drv_t; topo_s = topo_t; sdrv_s = sdrv_t; tgl_s = tgl_t; tgh_s = tgh_t; c2_mk = c2_mk_t; pu_s = pu_t;
-b3_mk = b3_mk_t; wid_s = wid_t; mix_s = mix_t; out_s = out_t;
+b3_mk = b3_mk_t; wid_s = wid_t; mix_s = mix_t; out_s = out_t; lk_s = lk_t;
 g1 = 0; g2 = 0; g3 = 0; g3s = 0; e1 = 0; c1_eng = 0;
-gr1 = 0; gr2 = 0; gr3 = 0; pkI = 0; pkL = 0; pkR = 0;
+gr1_d = 0; gr2_d = 0; gr3_d = 0; pkI_d = 0; pkL_d = 0; pkR_d = 0;
 ui_dflt = 1;
+
+// ---------- dual mono (LINK off): one detector and gain per side, the same law as the linked one ----------
+function c1_side(s) instance(e, g, eng) local(l, t) (
+  e += (s - e) * (s > e ? c1_da : c1_dr);
+  l = 20 * log10(max(e, 0.0000001));
+  l > c1_th ? eng = 1 : l < c1_th - c1_hy ? eng = 0;
+  t = dy_curve(l - c1_th, 6) * (1 - 1 / c1_ra);
+  g += (t - g) * (t > g ? c1_at : (eng ? c1_rl * 0.2 : c1_rl));
+);
+function c2_side(s) instance(g) local(l, t) (
+  l = 20 * log10(max(s, 0.0000001));
+  t = dy_curve(l - c2_th, c2_kn) * (1 - 1 / c2_ra);
+  g += (t - g) * (t > g ? c2_at : c2_rl);
+);
+function b3_side(s) instance(g, gs, ge) local(l, t) (
+  l = 20 * log10(max(s, 0.0000001));
+  t = dy_curve(l - b3_th, 4) * (1 - 1 / b3_ra);
+  b3_auto ? (
+    g += (t - g) * (t > g ? b3_at : b3_fr);
+    gs += (g - gs) * (g > gs ? b3_sa : b3_sr);
+    ge = max(g, gs);
+  ) : (
+    g += (t - g) * (t > g ? b3_at : b3_rl);
+    ge = g;
+  );
+);
 
 @slider
 update();
@@ -292,20 +340,55 @@ file_var(0, ui_hw);
 file_var(0, pr_cur);
 
 @sample
+// OS: a change of factor dips the output and swaps at the silent point
+os_gate();
+os_chg ? ( fe_rate(); update(); feUA.os_clr(); feUB.os_clr(); feDA.os_clr(); feDB.os_clr(); memset(OSD, 0, 128);
+           feIA.lo = feIB.lo = feIA.um = feIB.um = 0; );
 // input stage: DC block, trim, guard
 in_process(spl0, spl1);
 xL = in_l; xR = in_r;
-pkI = max(pkI, max(abs(xL), abs(xR)));
+pkI_d = max(pkI_d, max(abs(xL), abs(xR)));
 
 yL = xL; yR = xR;   // the dry, for MIX
+os_f > 1 ? (        // (delayed to match the oversampled FRONT END)
+  osd_w = (osd_w + 1) & 63; OSD[osd_w] = xL; OSD[64 + osd_w] = xR;
+  osd_r = (osd_w - os_lat(os_f)) & 63; yL = OSD[osd_r]; yR = OSD[64 + osd_r];
+);
 
 drv_s += (drv_t - drv_s) * sm; topo_s += (topo_t - topo_s) * sm; sdrv_s += (sdrv_t - sdrv_s) * sm;
 tgl_s += (tgl_t - tgl_s) * sm; tgh_s += (tgh_t - tgh_s) * sm;
 c2_mk += (c2_mk_t - c2_mk) * sm; pu_s += (pu_t - pu_s) * sm; b3_mk += (b3_mk_t - b3_mk) * sm;
 wid_s += (wid_t - wid_s) * sm; mix_s += (mix_t - mix_s) * sm; out_s += (out_t - out_s) * sm;
+lk_s += (lk_t - lk_s) * lk_c; lk_s > 0.9999 && lk_t ? lk_s = 1; lk_s < 0.0001 && !lk_t ? lk_s = 0;
+lk_u = 1 - lk_s;   // the dual-mono share (0 = linked, as v2.0)
 
 // ---------- 1 FRONT END ----------
-fe_on ? (
+os_f > 1 ? (
+  // 2x / 4x: up, the core at the high rate, down (the filters keep running with the FRONT END out: the latency stays)
+  fe_on && ms_on ? ( fa = (xL + xR) * 0.5; fb = (xL - xR) * 0.5; ) : ( fa = xL; fb = xR; );
+  feUA.os_up(fa); feUB.os_up(fb);
+  gb = drv_s * sdrv_s;
+  fe_bs = bt_er; fe_bt = bt_es; bt_er = fe_er; bt_es = fe_es;
+  fe_i = 0;
+  loop(os_f,
+    fa = feUA.os_s(fe_i); fb = feUB.os_s(fe_i);
+    fe_on ? (
+      topo_s < 0.999 ? ( ia = feIA.fe_iron(fa, drv_s); ib = feIB.fe_iron(fb, gb); );
+      topo_s > 0.001 ? ( ca = feCA.fe_classa(fa, drv_s); cb = feCB.fe_classa(fb, gb); );
+      fa = topo_s < 0.001 ? ia : topo_s > 0.999 ? ca : ia + (ca - ia) * topo_s;
+      fb = topo_s < 0.001 ? ib : topo_s > 0.999 ? cb : ib + (cb - ib) * topo_s;
+    );
+    fe_i == 0 ? ( fe_p0 = fa; fe_q0 = fb; ) : fe_i == 1 ? ( fe_p1 = fa; fe_q1 = fb; ) :
+    fe_i == 2 ? ( fe_p2 = fa; fe_q2 = fb; ) : ( fe_p3 = fa; fe_q3 = fb; );
+    fe_i += 1;
+  );
+  bt_er = fe_bs; bt_es = fe_bt;
+  fa = feDA.os_dn(fe_p0, fe_p1, fe_p2, fe_p3); fb = feDB.os_dn(fe_q0, fe_q1, fe_q2, fe_q3);
+  fe_on ? (
+    ms_on ? ( xL = fa + fb; xR = fa - fb; ) : ( xL = fa; xR = fb; );
+    xL = dcL.fe_dc(xL); xR = dcR.fe_dc(xR);
+  ) : ( xL = fa; xR = fb; );
+) : fe_on ? (
   ms_on ? ( fa = (xL + xR) * 0.5; fb = (xL - xR) * 0.5; ) : ( fa = xL; fb = xR; );
   gb = drv_s * sdrv_s;
   // IRON <-> CLASS-A: both run while the key's crossfade is moving, so the switch never clicks
@@ -318,16 +401,25 @@ fe_on ? (
 );
 
 // ---------- 2 COMP 1: the slow window, with the hysteresis gate on its detector ----------
-s1 = max(abs(h1L.bq_run(xL)), abs(h1R.bq_run(xR)));
+d1a = abs(h1L.bq_run(xL)); d1b = abs(h1R.bq_run(xR));
+s1 = max(d1a, d1b);
 c1_on ? (
   e1 += (s1 - e1) * (s1 > e1 ? c1_da : c1_dr);
   l1 = 20 * log10(max(e1, 0.0000001));
   l1 > c1_th ? c1_eng = 1 : l1 < c1_th - c1_hy ? c1_eng = 0;
   t1 = dy_curve(l1 - c1_th, 6) * (1 - 1 / c1_ra);
   g1 += (t1 - g1) * (t1 > g1 ? c1_at : (c1_eng ? c1_rl * 0.2 : c1_rl));
-  k1 = 10 ^ (-g1 / 20); xL *= k1; xR *= k1;
-  gr1 = max(gr1, g1);
-) : ( g1 = 0; e1 = 0; c1_eng = 0; );
+  lk_u > 0 ? (
+    c1a.c1_side(d1a); c1b.c1_side(d1b);
+    lka = g1 + (c1a.g - g1) * lk_u; lkb = g1 + (c1b.g - g1) * lk_u;
+    xL *= 10 ^ (-lka / 20); xR *= 10 ^ (-lkb / 20);
+    gr1_d = max(gr1_d, max(lka, lkb));
+  ) : (
+    c1a.e = c1b.e = e1; c1a.g = c1b.g = g1; c1a.eng = c1b.eng = c1_eng;   // dual mono starts where linked is
+    k1 = 10 ^ (-g1 / 20); xL *= k1; xR *= k1;
+    gr1_d = max(gr1_d, g1);
+  );
+) : ( g1 = 0; e1 = 0; c1_eng = 0; c1a.e = c1b.e = c1a.g = c1b.g = c1a.eng = c1b.eng = 0; );
 
 // ---------- TILT: a seesaw round 700 Hz ----------
 tlL += (xL - tlL) * tl_c; tlR += (xR - tlR) * tl_c;
@@ -335,25 +427,36 @@ xL = tlL * tgl_s + (xL - tlL) * tgh_s;
 xR = tlR * tgl_s + (xR - tlR) * tgh_s;
 
 // ---------- 3 COMP 2: the fast FET grabber, then BALANCE sums it with the untouched COMP 1 path ----------
-s2 = max(abs(h2L.bq_run(xL)), abs(h2R.bq_run(xR)));
+d2a = abs(h2L.bq_run(xL)); d2b = abs(h2R.bq_run(xR));
+s2 = max(d2a, d2b);
 c2_on ? (
   l2 = 20 * log10(max(s2, 0.0000001));
   t2 = dy_curve(l2 - c2_th, c2_kn) * (1 - 1 / c2_ra);
   g2 += (t2 - g2) * (t2 > g2 ? c2_at : c2_rl);
-  k2 = 10 ^ (-g2 / 20) * c2_mk;
-  cL = xL * k2; cR = xR * k2;
-  // the gain cell's own colour: a little odd-order rounding as it works
-  fc = min(g2 / 20, 1) * c2_col;
-  cL += fc * (c2aL.bt_th(cL) - cL); cR += fc * (c2aR.bt_th(cR) - cR);
-  gr2 = max(gr2, g2);
+  lk_u > 0 ? (
+    c2a.c2_side(d2a); c2b.c2_side(d2b);
+    lka = g2 + (c2a.g - g2) * lk_u; lkb = g2 + (c2b.g - g2) * lk_u;
+    cL = xL * 10 ^ (-lka / 20) * c2_mk; cR = xR * 10 ^ (-lkb / 20) * c2_mk;
+    cL += min(lka / 20, 1) * c2_col * (c2aL.bt_th(cL) - cL); cR += min(lkb / 20, 1) * c2_col * (c2aR.bt_th(cR) - cR);
+    gr2_d = max(gr2_d, max(lka, lkb));
+  ) : (
+    c2a.g = c2b.g = g2;
+    k2 = 10 ^ (-g2 / 20) * c2_mk;
+    cL = xL * k2; cR = xR * k2;
+    // the gain cell's own colour: a little odd-order rounding as it works
+    fc = min(g2 / 20, 1) * c2_col;
+    cL += fc * (c2aL.bt_th(cL) - cL); cR += fc * (c2aR.bt_th(cR) - cR);
+    gr2_d = max(gr2_d, g2);
+  );
   xL = cL + (xL - cL) * pu_s;
   xR = cR + (xR - cR) * pu_s;
   // the fast gain cell can leave a little DC on lopsided waveforms: block it
   xL = dc2L.fe_dc(xL); xR = dc2R.fe_dc(xR);
-) : g2 = 0;
+) : ( g2 = 0; c2a.g = c2b.g = 0; );
 
 // ---------- 4 BUS COMP: VCA glue over the summed COMP 1 / COMP 2 signal ----------
-s3 = max(abs(h3L.bq_run(xL)), abs(h3R.bq_run(xR)));
+d3a = abs(h3L.bq_run(xL)); d3b = abs(h3R.bq_run(xR));
+s3 = max(d3a, d3b);
 li_on ? (
   l3 = 20 * log10(max(s3, 0.0000001));
   t3 = dy_curve(l3 - b3_th, 4) * (1 - 1 / b3_ra);
@@ -366,9 +469,17 @@ li_on ? (
     g3 += (t3 - g3) * (t3 > g3 ? b3_at : b3_rl);
     g3e = g3;
   );
-  k3 = 10 ^ (-g3e / 20) * b3_mk; xL *= k3; xR *= k3;
-  gr3 = max(gr3, g3e);
-) : ( g3 = 0; g3s = 0; );
+  lk_u > 0 ? (
+    b3a.b3_side(d3a); b3b.b3_side(d3b);
+    lka = g3e + (b3a.ge - g3e) * lk_u; lkb = g3e + (b3b.ge - g3e) * lk_u;
+    xL *= 10 ^ (-lka / 20) * b3_mk; xR *= 10 ^ (-lkb / 20) * b3_mk;
+    gr3_d = max(gr3_d, max(lka, lkb));
+  ) : (
+    b3a.g = b3b.g = g3; b3a.gs = b3b.gs = g3s; b3a.ge = b3b.ge = g3e;
+    k3 = 10 ^ (-g3e / 20) * b3_mk; xL *= k3; xR *= k3;
+    gr3_d = max(gr3_d, g3e);
+  );
+) : ( g3 = 0; g3s = 0; b3a.g = b3b.g = b3a.gs = b3b.gs = 0; );
 dL = xL; dR = xR;
 
 // ---------- 5 WIDTH: M/S, the Sides into a second discrete stage ----------
@@ -381,9 +492,9 @@ oL = (yL + (dL - yL) * mix_s) * out_s;
 oR = (yR + (dR - yR) * mix_s) * out_s;
 oL = ostL.ost_band(oL); oR = ostR.ost_band(oR);
 ost_out(oL, oR);
-spl0 = ost_l;
-spl1 = ost_r;
-pkL = max(pkL, abs(spl0)); pkR = max(pkR, abs(spl1));
+spl0 = ost_l * os_g;
+spl1 = ost_r * os_g;
+pkL_d = max(pkL_d, abs(spl0)); pkR_d = max(pkR_d, abs(spl1));
 
 @gfx 1180 570
 ui_begin(1180, 570);
@@ -394,7 +505,7 @@ dy_ink = INK; dy_bg = FACE; dy_kst = 7;
 sc != bt_lsc ? ( bt_lsc = sc; gfx_setfont(15, "Trebuchet MS", 12 * sc, 'b'); );   // lamp key legends
 // panel keys: house lamp keys (gfx-ui); the header's preset keys keep their own
 function bt_key(x, y, w, h, on, col, s) ( lk_well = 0x081C20; lk_font = 15; lk_font2 = 15; lk_fit(x, y, w, h, on, col, s); );
-function setv(idx, v) ( slider(idx) = v; ui_auto(idx); update(); );
+function setv(idx, v) ( slider(idx) = v; ui_auto(idx); );   // @block runs update()
 function bt_title(x, y, s, a) ( gfx_setfont(6, "Trebuchet MS", 13 * sc, 'b'); ui_cola(COP, a); gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
 // a stage's IN key: lit amber while the stage is in
 function bt_in(x, y, idx) ( bt_key(x, y, 40, 22, slider(idx) > 0.5, LK_AMB, "IN") ? setv(idx, slider(idx) > 0.5 ? 0 : 1); );
@@ -444,8 +555,11 @@ rd_badge(60, 32, 15, COP, FACE);
 rd_title(84, 14, "BENTHICK 3B", 26, INK);
 rd_sub(282, 30, "IRON  ·  TRANSISTOR  ·  BUS PROCESSOR", DIM, 1);
 pm_ = rd_sq(676, 20, 78, 30, 0, KEYC, "PRESETS");
-rd_sq(760, 20, 30, 30, 0, KEYC, "◄") ? ( pr_cur = pr_cur <= 1 ? PRESET_N : pr_cur - 1; load_preset(pr_cur); );
-rd_sq(794, 20, 30, 30, 0, KEYC, "►") ? ( pr_cur = pr_cur >= PRESET_N ? 1 : pr_cur + 1; load_preset(pr_cur); );
+rd_sq(760, 20, 30, 30, 0, KEYC, "") ? ( pr_cur = pr_cur <= 1 ? PRESET_N : pr_cur - 1; load_preset(pr_cur); );
+rd_sq(794, 20, 30, 30, 0, KEYC, "") ? ( pr_cur = pr_cur >= PRESET_N ? 1 : pr_cur + 1; load_preset(pr_cur); );
+// the arrows as shapes (fonts without the ◄ ► glyphs showed a box)
+ui_col(ui_mix(KEYC, 0xDDDDDD, 0.35));
+ui_sstri(771 * sc, 35 * sc, 779 * sc, 31 * sc, 779 * sc, 39 * sc); ui_sstri(813 * sc, 35 * sc, 805 * sc, 31 * sc, 805 * sc, 39 * sc);
 pk_lcd(832 * sc, 12 * sc, 232 * sc, 46 * sc, 0);
 ui_col(pk_lcdc);
 strcpy(#plcd, pr_cur >= 1 && pr_cur <= PRESET_N ? pname(pr_cur) : "Custom");
@@ -458,6 +572,7 @@ pm_ || (pressed && drag_id == 0 && mouse_x >= 832 * sc && mouse_x < 1064 * sc &&
   k_ = gfx_showmenu(#pmenu);
   k_ > 0 ? ( load_preset(k_); pr_cur = k_ <= PRESET_N ? k_ : 0; );
 );
+os_key(636, 24, 40, INK, 12);
 ui_size_picker(1080 * sc, 26 * sc);
 
 // ---------- the columns, in signal order ----------
@@ -541,6 +656,7 @@ bt_grh(730, 518, d3_gr);
 
 // 5 WIDTH / MIX / OUTPUT + meters
 bt_sect(920, CY, 220, CH, "5  OUTPUT", 1);
+bt_key(1066, CY + 6, 60, 22, slider39 >= 0.5, TEAL, "LINK") ? setv(39, slider39 >= 0.5 ? 0 : 1);
 sprintf(#v, "%.0f%%", slider21); dy_knob(980, 168, 24, 21, 0, 200, 100, 0, TEAL, "WIDTH", #v);
 sprintf(#v, "%.0f%%", slider22); dy_knob(1080, 168, 24, 22, 0, 100, 0, 0, COP, "S SAT", #v);
 sprintf(#v, "%.0f%%", slider23); dy_knob(980, 278, 24, 23, 0, 100, 100, 0, SAND, "MIX", #v);
@@ -551,14 +667,14 @@ sprintf(#gl, "COMP 1  %4.1f dB", d1_gr); gfx_x = 946 * sc; gfx_y = 358 * sc; gfx
 sprintf(#gl, "COMP 2  %4.1f dB", d2_gr); gfx_x = 946 * sc; gfx_y = 376 * sc; gfx_drawstr(#gl);
 sprintf(#gl, "BUS     %4.1f dB", d3_gr); gfx_x = 946 * sc; gfx_y = 394 * sc; gfx_drawstr(#gl);
 ui_col(0x061416); gfx_rect(934 * sc, 428 * sc, 192 * sc, 110 * sc);
-mI.ui_ledm(948 * sc, 434 * sc, 26 * sc, 86 * sc, pkI);
-mL.ui_ledm(1048 * sc, 434 * sc, 26 * sc, 86 * sc, pkL); mR.ui_ledm(1086 * sc, 434 * sc, 26 * sc, 86 * sc, pkR);
+mI.ui_ledm(948 * sc, 434 * sc, 26 * sc, 86 * sc, pkI_d);
+mL.ui_ledm(1048 * sc, 434 * sc, 26 * sc, 86 * sc, pkL_d); mR.ui_ledm(1086 * sc, 434 * sc, 26 * sc, 86 * sc, pkR_d);
 rd_lbl(961, 524, "IN", INK, 0.8); rd_lbl(1080, 524, "OUT", INK, 0.8);
-pkI *= 0.85; pkL *= 0.85; pkR *= 0.85;
+pkI_d *= 0.85; pkL_d *= 0.85; pkR_d *= 0.85;
 
 // the meters fall back smoothly between redraws
-d1_gr = max(gr1, d1_gr * 0.85); d2_gr = max(gr2, d2_gr * 0.85); d3_gr = max(gr3, d3_gr * 0.85);
-gr1 = 0; gr2 = 0; gr3 = 0;
+d1_gr = max(gr1_d, d1_gr * 0.85); d2_gr = max(gr2_d, d2_gr * 0.85); d3_gr = max(gr3_d, d3_gr * 0.85);
+gr1_d = 0; gr2_d = 0; gr3_d = 0;
 
 pk_end();
 ui_end();

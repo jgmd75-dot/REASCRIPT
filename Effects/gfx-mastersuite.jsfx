@@ -18,13 +18,21 @@ desc:GFX MasterSuite [mastering strip]
 // Every stage has its own bypass switch (each crossfades over 10 ms, so switching never clicks).
 // Latency (oversampling + lookahead) is reported to the host.
 //
+// LINK (INPUT, top left): lit (the default) - the VARI-MU, the HF LIMITER and the LIMITER each hear both sides
+// and turn them down together, so the image stays put. Dark: dual mono - each side has its own detector and gain
+// in all three, so a loud hit on one side leaves the other alone. A change crossfades over 10 ms.
+//
 // OUTPUT gain feeds the limiter, so the CEILING always has the final say.
 // INPUT (top left): the input TRIM and the GFX output stage's SAT (band saturation),
 // which sits just before the true-peak limiter.
 // DRIFT (in TUBE): the valve's bias and drive wander a little. The dial scales the drift amount
 // (50% = the Drift amount setting, 100% = twice, 0 = none) and speeds the wander up with it.
 //
-// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel and gfx-instrument (.jsfx-inc) in the same folder.
+// OS (header, left of the size picker): the oversampling - 1x, 2x (the default), 4x; each click steps on (the house
+// OS key). A change ducks the output, swaps at silence and comes back, as a preset does.
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate, gfx-instrument
+// and gfx-os (.jsfx-inc) in the same folder.
 
 import gfx-drift.jsfx-inc
 import gfx-output.jsfx-inc
@@ -33,9 +41,10 @@ import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
 import gfx-faceplate.jsfx-inc
 import gfx-instrument.jsfx-inc
+import gfx-os.jsfx-inc
 
 slider1:0<-12,12,0.1>-Input trim (dB)
-slider2:1<0,2,1{Off,2x,4x}>-Oversampling
+slider2:1<0,2,1{1x,2x,4x}>-Oversampling
 slider3:1<0,1,1{Bypass,On}>-Tube stage
 slider4:-3<-12,12,0.1>-Tube drive (dB)
 slider5:1<0,2,1{Low,Mid,High}>-Tube bias
@@ -72,6 +81,7 @@ slider35:6000<2000,16000,10>-Sat high band (Hz)
 slider36:-0.3<-24,0,0.1>-(unused, was output ceiling)
 slider37:0<0,1,1{Off,Clip}>-(unused, was output stage)
 slider38:50<0,100,1>-Drift (%)
+slider39:1<0,1,1{Off,On}>-Link
 
 in_pin:left input
 in_pin:right input
@@ -247,8 +257,9 @@ LA = max(1, floor(0.0015 * srate));      // lookahead
 LDEL = LA + 3;                           // the audio waits for the lookahead and the detector (4 late, held over LA)
 DLL = 10000; DLR = 12100; GRB = 14200;       // 2048 each, kept apart
 memset(DLL, 0, 2048); memset(DLR, 0, 2048); memset(GRB, 0, 2048);
+lmA.buf = 16400; lmB.buf = 18500;            // LINK off: each side's own lookahead gains, 2048 each
 gi = 0; loop(2048, GRB[gi] = 1; gi += 1; );
-lw = 0; l_sum = LA; l_g = 1; l_gm = 1;
+lw = 0; l_sum = LA; l_g = 1; l_gm_d = 1;
 
 sm10 = coef(10);                        // 10 ms: bypass crossfades, gain changes
 msx_dkr = 1 / (0.012 * srate); msx_dk = 1; msx_dst = 0;   // preset duck: 12 ms out, hold through the latency, 12 ms in
@@ -262,7 +273,8 @@ dcL.bq_set(1, 5, 0.707, 0, srate); dcR.bq_set(1, 5, 0.707, 0, srate);     // the
 // smoothed state (start at their targets)
 function targets() (
   in_t = db2g(slider1);
-  os_n = slider2;
+  // the OS key: a change ducks the output first and is taken at the silent point (as a preset's settings are)
+  mz_osi ? ( slider2 != os_n ? ( msx_dst == 0 ? msx_dst = 1 : msx_dst == 1 && msx_dk <= 0 ? os_n = slider2; ); ) : ( os_n = slider2; mz_osi = 1; );
   tmix_t = slider3;
   bias_b = slider5 == 0 ? 0.05 : slider5 == 1 ? 0.15 : 0.3;                       // asymmetry: more even harmonics
   bias_k = slider5 == 0 ? 0.85 : slider5 == 1 ? 1 : 1.2;                           // and how hard it bites
@@ -285,6 +297,7 @@ function targets() (
   cmix_t = slider24 > 0; clip_mode = slider24 > 0 ? slider24 : clip_mode; cdrv_t = db2g(slider25);
   slider24 > 0 ? clip_last = slider24;
   lim_t = slider26; l_ceil = db2g(slider27); l_relc = coef(slider28);
+  lk_t = slider39 >= 0.5;
 );
 
 
@@ -332,7 +345,7 @@ function load_preset(p) (
   ) : p == 11 ? (   // RESET: the defaults
     p_in(0, 1); p_tube(1, -3, 1); p_tone(1, 0, 0, 0, 0, 0); p_st(1, 20, 100); p_cmp(0, -18, 2, 6, 1, 0, 100);
     p_hf(0, -12); p_clip(0, 0); p_lim(1, -0.3, 80, 0);
-    slider38 = 50; slider_automate(2 ^ 37);
+    slider38 = 50; slider39 = 1; slider_automate(2 ^ 37 + 2 ^ 38);
   );
   p > 0 ? slider_automate(536870911);       // sliders 1-29
 );
@@ -358,9 +371,9 @@ function update() (
   lfA_L.bq_set(0, 6000, 0.7071, 0, srate); lfB_L.bq_set(0, 6000, 0.7071, 0, srate);
   lfA_R.bq_set(0, 6000, 0.7071, 0, srate); lfB_R.bq_set(0, 6000, 0.7071, 0, srate);
   // latency: the oversampler (more stages add their own later)
-  os_lat = os_n == 0 ? 0 : os_n == 1 ? 2 * K1 : 2 * K1 + K2;
+  mz_oslat = os_n == 0 ? 0 : os_n == 1 ? 2 * K1 : 2 * K1 + K2;
   ins_output_straight(32);   // output stage: straight through (it writes pdc_delay: put ours back straight away)
-  lat_t = 2 * os_lat + LDEL;                   // oversamplers, limiters
+  lat_t = 2 * mz_oslat + LDEL;                   // oversamplers, limiters
   pdc_delay = lat_t; pdc_bot_ch = 0; pdc_top_ch = 2;
   // (kept constant whatever is bypassed, so switching a stage never shifts the timing)
 );
@@ -371,9 +384,35 @@ ui_thm = 5; ui_hw = 1;                       // one look: house keycaps for the 
 update();
 in_s = in_t; tmix = tmix_t; tk = tk_t; tmk = tmk_t; tb = bias_b; ttb = tanh(tb); eq_s = eq_t; out_s = out_t;
 st_s = st_t; wid_s = wid_t; cmp_s = cmp_t; c_mk = c_mk_t; c_mix = c_mix_t;
-c_ms = 0; c_gr = 0; c_slow = 0; c_grm = 0;
-hf_s = hf_t; hf_g = 1; hf_grm = 1; cmix = cmix_t; cdrv = cdrv_t; lim_s = lim_t; clip_mode = max(clip_mode, 1);
+c_ms = 0; c_gr = 0; c_slow = 0; c_grm_d = 0;
+lk_s = lk_t; lk_u = 1 - lk_s;
+hf_s = hf_t; hf_g = 1; hf_grm_d = 1; cmix = cmix_t; cdrv = cdrv_t; lim_s = lim_t; clip_mode = max(clip_mode, 1);
 ui_dflt = 1;   // the defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved size
+mz_hL = mz_hR = -100;   // the output meters' peak holds start empty
+
+// ---------- dual mono (LINK off): each side its own detector and gain, the same laws as the linked ones ----------
+function cm_side(x2) instance(ms, cg, slow) local(lv, tg) (
+  ms += (x2 - ms) * c_rmsc;
+  lv = 10 * log10(max(ms, 0.0000000001)) + 3.01;
+  tg = knee_gr(lv, c_thr, c_ratio * (1 + 0.25 * min(-cg / 12, 1)), c_knee);
+  slow += ((cg < -1 ? 1 : 0) - slow) * c_rel2c * 0.5;
+  cg += (tg - cg) * (tg < cg ? c_attc : c_relc + (c_rel2c - c_relc) * slow);
+);
+function hf_side(pk) instance(g) local(tg) (
+  tg = pk > hf_thr ? hf_thr / pk : 1;
+  g += (tg - g) * (tg < g ? hf_att : hf_rel);
+);
+function lm_side(tg, w) instance(buf, sum, g) local(mn, i, k, av) (
+  buf[w] = tg;
+  mn = 1; i = 0; loop(LA, k = w - i; k < 0 ? k += 1024; mn = min(mn, buf[k]); i += 1; );
+  buf[1024 + w] = mn;
+  k = w - LA; k < 0 ? k += 1024;
+  sum += mn - buf[1024 + k];
+  av = sum / LA;
+  g = av < g ? av : g + (av - g) * l_relc;
+);
+// while linked, each side follows the linked state, so LINK off starts from where it is
+function lm_follow(tg, mn, w) instance(buf, sum, g) ( buf[w] = tg; buf[1024 + w] = mn; sum = l_sum; g = l_g; );
 
 @slider
 msx_dst != 1 ? update();                  // during a preset duck the swap applies the new settings
@@ -405,9 +444,11 @@ msx_dst == 2 ? ( msx_hc > 0 ? msx_hc -= 1 : ( msx_dk += msx_dkr; msx_dk >= 1 ? (
 //  STAGE 1: INPUT TRIM
 // ======================================================================
 in_s += (in_t - in_s) * sm10;
+lk_s += (lk_t - lk_s) * sm10; lk_s > 0.9999 && lk_t ? lk_s = 1; lk_s < 0.0001 && !lk_t ? lk_s = 0;
+lk_u = 1 - lk_s;                                           // the dual-mono share (0 = linked, as v2.0)
 xL = spl0 * in_s;
 xR = spl1 * in_s;
-ipL = max(ipL, abs(xL)); ipR = max(ipR, abs(xR));
+ipL_d = max(ipL_d, abs(xL)); ipR_d = max(ipR_d, abs(xR));
 
 // ======================================================================
 //  STAGE 2: TUBE SATURATION (oversampled) + TONE STACK
@@ -454,11 +495,20 @@ cmp_s > 0.0001 ? (
   // attack / release in the dB domain; the release slows the longer it has been working (program-dependent)
   c_slow += ((c_gr < -1 ? 1 : 0) - c_slow) * c_rel2c * 0.5;
   c_gr += (c_tg - c_gr) * (c_tg < c_gr ? c_attc : c_relc + (c_rel2c - c_relc) * c_slow);
-  c_g = db2g(c_gr) * c_mk;
   c_mx = c_mix * cmp_s;                                                      // parallel blend, and the bypass
-  xL += (xL * c_g - xL) * c_mx;
-  xR += (xR * c_g - xR) * c_mx;
-  c_grm = min(c_grm, c_gr);                                                  // for a meter (reset by the display)
+  lk_u > 0 ? (
+    cmA.cm_side(xL * xL); cmB.cm_side(xR * xR);
+    lk_a = c_gr + (cmA.cg - c_gr) * lk_u; lk_b = c_gr + (cmB.cg - c_gr) * lk_u;
+    xL += (xL * db2g(lk_a) * c_mk - xL) * c_mx;
+    xR += (xR * db2g(lk_b) * c_mk - xR) * c_mx;
+    c_grm_d = min(c_grm_d, min(lk_a, lk_b));
+  ) : (
+    cmA.ms = cmB.ms = c_ms; cmA.cg = cmB.cg = c_gr; cmA.slow = cmB.slow = c_slow;
+    c_g = db2g(c_gr) * c_mk;
+    xL += (xL * c_g - xL) * c_mx;
+    xR += (xR * c_g - xR) * c_mx;
+    c_grm_d = min(c_grm_d, c_gr);                                                  // for a meter (reset by the display)
+  );
 );
 
 // ======================================================================
@@ -471,9 +521,18 @@ hf_s > 0.0001 ? (
   hf_pk = max(abs(hL), abs(hR));
   hf_tg = hf_pk > hf_thr ? hf_thr / hf_pk : 1;
   hf_g += (hf_tg - hf_g) * (hf_tg < hf_g ? hf_att : hf_rel);       // fast: 0.3 ms attack, 60 ms release
-  xL += (lL + hL * hf_g - xL) * hf_s;                              // low band + top band x gain
-  xR += (lR + hR * hf_g - xR) * hf_s;
-  hf_grm = min(hf_grm, hf_g);
+  lk_u > 0 ? (
+    hfA.hf_side(abs(hL)); hfB.hf_side(abs(hR));
+    lk_a = hf_g + (hfA.g - hf_g) * lk_u; lk_b = hf_g + (hfB.g - hf_g) * lk_u;
+    xL += (lL + hL * lk_a - xL) * hf_s;
+    xR += (lR + hR * lk_b - xR) * hf_s;
+    hf_grm_d = min(hf_grm_d, min(lk_a, lk_b));
+  ) : (
+    hfA.g = hfB.g = hf_g;
+    xL += (lL + hL * hf_g - xL) * hf_s;                              // low band + top band x gain
+    xR += (lR + hR * hf_g - xR) * hf_s;
+    hf_grm_d = min(hf_grm_d, hf_g);
+  );
 );
 
 // ======================================================================
@@ -492,7 +551,8 @@ ost_out(xL, xR); xL = ost_l; xR = ost_r;
 //  STAGE 7: TRUE-PEAK LOOKAHEAD LIMITER
 // ======================================================================
 lim_s += (lim_t - lim_s) * sm10;
-l_pk = max(tpL.tp_peak(xL), tpR.tp_peak(xR));                   // inter-sample peak of the sample 4 back
+l_pa = tpL.tp_peak(xL); l_pb = tpR.tp_peak(xR);
+l_pk = max(l_pa, l_pb);                                          // inter-sample peak of the sample 4 back
 l_tg = l_pk > l_ceil ? l_ceil / l_pk : 1;
 // hold the lowest gain needed across the lookahead, then average across it: the gain is fully down by the
 // time the peak arrives, with a smooth (box-shaped) fall and no overshoot
@@ -501,23 +561,34 @@ l_mn = 1; l_i = 0; loop(LA, l_k = lw - l_i; l_k < 0 ? l_k += 1024; l_mn = min(l_
 GRB[1024 + lw] = l_mn;                                            // the held gains, for the average
 l_k = lw - LA; l_k < 0 ? l_k += 1024;
 l_sum += l_mn - GRB[1024 + l_k];
+l_w0 = lw;
 lw += 1; lw >= 1024 ? lw = 0;
 l_av = l_sum / LA;
 l_g = l_av < l_g ? l_av : l_g + (l_av - l_g) * l_relc;            // release
+lk_u > 0 ? (
+  lmA.lm_side(l_pa > l_ceil ? l_ceil / l_pa : 1, l_w0); lmB.lm_side(l_pb > l_ceil ? l_ceil / l_pb : 1, l_w0);
+) : (
+  lmA.lm_follow(l_tg, l_mn, l_w0); lmB.lm_follow(l_tg, l_mn, l_w0);
+);
 // the audio, delayed to meet its gain
 DLL[dw] = xL; DLR[dw] = xR;
 dr = dw - LDEL; dr < 0 ? dr += 2048; dw += 1; dw >= 2048 ? dw = 0;   // (EEL2 & does not wrap negatives)
 yL = DLL[dr]; yR = DLR[dr];
-gL = yL * l_g; gR = yR * l_g;
+lk_u > 0 ? (
+  lk_a = l_g + (lmA.g - l_g) * lk_u; lk_b = l_g + (lmB.g - l_g) * lk_u;
+  gL = yL * lk_a; gR = yR * lk_b;
+) : (
+  gL = yL * l_g; gR = yR * l_g;
+);
 gL = min(max(gL, -l_ceil), l_ceil); gR = min(max(gR, -l_ceil), l_ceil);    // last-sample safety
 xL = yL + (gL - yL) * lim_s;
 xR = yR + (gR - yR) * lim_s;
-l_gm = min(l_gm, l_g);
+l_gm_d = min(l_gm_d, lk_u > 0 ? min(lk_a, lk_b) : l_g);
 
 msx_dst ? ( msx_dkg = msx_dk * msx_dk * (3 - 2 * msx_dk); xL *= msx_dkg; xR *= msx_dkg; );
 spl0 = xL;
 spl1 = xR;
-opL = max(opL, abs(spl0)); opR = max(opR, abs(spl1));
+opL_d = max(opL_d, abs(spl0)); opR_d = max(opR_d, abs(spl1));
 
 @gfx 1120 466
 ui_thm = 5; ui_hw = 1;                                // one look (old projects may have saved another theme / flat)
@@ -589,23 +660,27 @@ function mz_grbar(x0, y0, ww, gr, lbl) local(nn, fr, k) (
   loop(nn, ui_col(k / nn < fr ? 0xF2A41E : 0x3A2C12); mz_r(x0 + 2 + k * 6, y0 + 2, 4, 6); k += 1; );
   gfx_setfont(10); ui_col(MZ_DIM); mz_tl(x0, y0 - 14, lbl);
 );
-// an LED level meter row: 34 segments, -48 to +3 dBFS
-function mz_ledrow(x0, y0, pk, lbl) local(db, k, c) (
+// an LED level meter row: 34 segments, -48 to +3 dBFS; hd = a floating peak-hold segment (dB, -100 = none)
+function mz_ledrow(x0, y0, pk, hd, lbl) local(db, k, c, kh) (
   db = g2db(pk); k = 0;
+  kh = hd > -48 ? min(33, floor((hd + 48) / 1.5)) : -1;
   loop(34,
     c = k < 25 ? 0x3CD06A : k < 31 ? 0xF0B030 : 0xF04030;
-    ui_col(db > -48 + k * 1.5 ? c : ui_mix(c, 0x000000, 0.8)); mz_r(x0 + k * 6.2, y0, 5, 9);
+    ui_col(db > -48 + k * 1.5 || k == kh ? c : ui_mix(c, 0x000000, 0.8)); mz_r(x0 + k * 6.2, y0, 5, 9);
     k += 1;
   );
   gfx_setfont(13); ui_col(MZ_DIM); mz_tr(x0 - 8, y0 - 1, lbl);
 );
 
 // meter readings: peaks fall back smoothly, gain reductions recover
-mIL = max(ipL, mIL * 0.85); mIR = max(ipR, mIR * 0.85); ipL = 0; ipR = 0;
-mOL = max(opL, mOL * 0.85); mOR = max(opR, mOR * 0.85); opL = 0; opR = 0;
-dC = min(c_grm, dC * 0.85); c_grm = 0;
-dH = min(g2db(hf_grm), dH * 0.85); hf_grm = 1;
-dL = min(g2db(l_gm), dL * 0.85); l_gm = 1;
+mIL = max(ipL_d, mIL * 0.85); mIR = max(ipR_d, mIR * 0.85); ipL_d = 0; ipR_d = 0;
+mOL = max(opL_d, mOL * 0.85); mOR = max(opR_d, mOR * 0.85); opL_d = 0; opR_d = 0;
+dC = min(c_grm_d, dC * 0.85); c_grm_d = 0;
+dH = min(g2db(hf_grm_d), dH * 0.85); hf_grm_d = 1;
+dL = min(g2db(l_gm_d), dL * 0.85); l_gm_d = 1;
+// the output meters' peak holds: 1.2 s, then fall 0.6 dB a frame
+mz_dL = g2db(mOL); mz_dL >= mz_hL ? ( mz_hL = mz_dL; mz_htl = time_precise(); ) : time_precise() - mz_htl > 1.2 ? mz_hL = max(mz_dL, mz_hL - 0.6);
+mz_dR = g2db(mOR); mz_dR >= mz_hR ? ( mz_hR = mz_dR; mz_htr = time_precise(); ) : time_precise() - mz_htr > 1.2 ? mz_hR = max(mz_dR, mz_hR - 0.6);
 // the output peak read-out holds for 1.5 s, then falls back
 mz_op = max(mOL, mOR);
 mz_op >= mz_ph ? ( mz_ph = mz_op; mz_pt = time_precise(); ) : time_precise() - mz_pt > 1.5 ? mz_ph = max(mz_op, mz_ph * 0.9);
@@ -646,6 +721,7 @@ pr_cur < 1 || pr_cur > 10 ? (
 );
 gfx_setfont(10); ui_col(MZ_DIM); mz_tl(858, 16, "LATENCY");
 sprintf(#mz_lat, "%d smp", lat_t); gfx_setfont(15); ui_col(MZ_INK); mz_tl(858, 28, #mz_lat);
+os_key(1008, 18, 2, MZ_INK, 7);
 ui_size_picker(1046 * sc, 20 * sc);
 mz_rivet(8, 66); mz_rivet(1112, 66); mz_rivet(8, 458); mz_rivet(1112, 458);
 
@@ -653,12 +729,9 @@ mz_rivet(8, 66); mz_rivet(1112, 66); mz_rivet(8, 458); mz_rivet(1112, 458);
 mz_y = 70; mz_h = 190;
 // ---------- 1 INPUT ----------
 mz_sec(16, mz_y, 130, mz_h, "INPUT", "1");
+lk_fit(88, mz_y + 3, 52, 22, slider39 >= 0.5, LK_BLU, "LINK") ? mz_set(39, slider39 >= 0.5 ? 0 : 1);
 sprintf(#mz_v, "%+.1f dB", slider1); mz_knob(60, mz_y + 70, 18, 1, -12, 12, 0, 0, 35, MZ_ACC, "TRIM", #mz_v);
 sprintf(#mz_v, "%.0f%%", slider32); mz_knob(112, mz_y + 70, 18, 32, 0, 100, 0, 0, 36, 0xD8B040, "SAT", #mz_v);
-gfx_setfont(10); ui_col(MZ_DIM); mz_tl(28, mz_y + 118, "OVERSAMPLE");
-ck_key(28, mz_y + 134, 34, 24, slider2 == 0, "OFF") ? mz_set(2, 0);
-ck_key(64, mz_y + 134, 34, 24, slider2 == 1, "2x") ? mz_set(2, 1);
-ck_key(100, mz_y + 134, 34, 24, slider2 == 2, "4x") ? mz_set(2, 2);
 
 // ---------- 2 TUBE ----------
 mz_sec(152, mz_y, 172, mz_h, "TUBE", "2");
@@ -697,8 +770,14 @@ mz_grey(666, mz_y, 172, mz_h, 784, 12);
 
 // ---------- METERS ----------
 mz_sec(844, mz_y, 260, mz_h, "METERS", "");
-mz_ledrow(890, mz_y + 46, max(mIL, mIR), "IN");
-mz_ledrow(890, mz_y + 68, max(mOL, mOR), "OUT");
+mz_ledrow(890, mz_y + 38, max(mIL, mIR), -100, "IN");
+mz_ledrow(890, mz_y + 60, mOL, mz_hL, "OUT L");
+mz_ledrow(890, mz_y + 78, mOR, mz_hR, "R");
+// click the output meters (or the OUT PEAK read-out) to clear their peaks
+pressed && ((mouse_x >= 848 * sc && mouse_x < 1100 * sc && mouse_y >= (mz_y + 56) * sc && mouse_y < (mz_y + 91) * sc) ||
+            (mouse_x >= 822 * sc && mouse_x < 1084 * sc && mouse_y >= 400 * sc && mouse_y < 438 * sc)) ? (
+  mz_hL = mz_hR = -100; mz_ph = 0;
+);
 mz_grbar(862, mz_y + 118, 224, dC, "VARI-MU GR");
 mz_grbar(862, mz_y + 148, 224, dH, "HF LIMIT GR");
 mz_grbar(862, mz_y + 174, 224, dL, "LIMITER GR");

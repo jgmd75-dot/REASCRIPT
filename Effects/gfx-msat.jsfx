@@ -2,7 +2,8 @@ desc:GFX MSAT [multiband saturation]
 //tags: multiband saturation transient shaper stereo width analogue 1970s mastering mix bus
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel and gfx-dyn (.jsfx-inc) in the same folder.
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn and gfx-os
+// (.jsfx-inc) in the same folder.
 //
 // MSAT. A three-band analogue saturation unit in the spirit of a mid-70s British design, with a transient
 // shaper and stereo width on every band (the sound is designed from scratch).
@@ -27,6 +28,20 @@ desc:GFX MSAT [multiband saturation]
 //          a couple of seconds, cooling over about six): its bias leans further (more 2nd) and its drive edges up
 //          (to +1.5 dB), and each band's bias wanders slowly on its own. The panel's HEAT lamps show it.
 //   INPUT  -12 .. +12 dB, OUTPUT -12 .. +12 dB. The house output stage passes straight through (a mix tool: no clip).
+//   LINK  (header) lit (the default): each band's transient shaper hears both sides and moves them together, so the
+//          image stays put. Dark: dual mono - each side its own transient detector and gain in every band. A change
+//          crossfades over 10 ms.
+//   OS    (header, left of the size picker) the saturation's oversampling: 1x (as before, the default), 2x, 4x - each
+//          click steps on. The crossover and the transient shapers stay at the base rate; each band goes up after its
+//          shaper, saturates, mixes and widens at the high rate, and the three bands come back down together (one
+//          filter per side). A change dips the output for 5 ms, swaps, comes back. Latency 0 / 31 / 37 samples (reported).
+//   LIN PHASE  (in CROSSOVER) off (the default): the crossover turns the phase round its two splits, as an analogue
+//          one does (inaudible on its own). Lit: the signal first goes through a mirror image of that phase turn (the
+//          crossover's all-pass response, time-reversed: a 2048-tap filter at 44.1 / 48 kHz, 4096 at 88.2 / 96, 8192
+//          above, run as an FFT convolution in 256-sample blocks), so every band comes out in time and MSAT can run in
+//          parallel with a clean copy of the same tracks (a parallel bus, the dry tracks) without combing. It follows
+//          the crossover knobs. Latency 2303 samples at 48 kHz (about 48 ms; 4351 / 8447 at the higher rates), on top
+//          of the OS key's, reported. A change dips the output, swaps in silence and comes back, as the OS key.
 //   PRESETS  12 (Init + 11) plus Reset all to defaults. A preset sets the crossovers and the three bands; INPUT,
 //          OUTPUT, VFD / MATRIX and DRIFT are left alone (Reset all restores them too).
 
@@ -57,6 +72,9 @@ slider24:0<0,1,1{Off,On}>-Mid solo
 slider25:0<0,1,1{Off,On}>-Mid mute
 slider26:0<0,1,1{Off,On}>-High solo
 slider27:0<0,1,1{Off,On}>-High mute
+slider28:1<0,1,1{Off,On}>-Link
+slider29:0<0,2,1{1x,2x,4x}>-Oversampling
+slider30:0<0,1,1{Off,On}>-Linear phase crossover
 
 in_pin:left input
 in_pin:right input
@@ -69,6 +87,7 @@ import gfx-drift.jsfx-inc
 import gfx-ui.jsfx-inc
 import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
+import gfx-os.jsfx-inc
 
 @init
 #ui_man = "gfx-msat";                        // the ? pop-up links to this manual
@@ -114,6 +133,95 @@ function xo_tidy() (
   this.m1.bq_tidy(); this.m2.bq_tidy(); this.u1.bq_tidy(); this.u2.bq_tidy(); this.ap.bq_tidy();
 );
 
+// ---------- LIN PHASE: the crossover's all-pass, time-reversed, as an FFT convolution (uniform partitions) ----------
+// Both sides ride in one complex FFT (left = real, right = imaginary: the kernel is real). Memory from 1048576, every
+// FFT buffer 1024-aligned (none crosses a 65536 boundary): kernel spectra MLP_H (up to 32 x 1024), the input
+// spectra ring MLP_X (32 x 1024), the work buffer MLP_W, the sums MLP_Y / MLP_Y2 (new / old kernel), the previous /
+// current block MLP_PV / MLP_CU, the output block MLP_O, the all-pass impulse response MLP_G (up to 8192), the
+// previous kernel MLP_HO (a kernel change crossfades over one block: the crossover knobs never click).
+MLP_B = 256;
+MLP_H = 1048576; MLP_X = MLP_H + 32768; MLP_W = MLP_X + 32768; MLP_Y = MLP_W + 1024; MLP_PV = MLP_Y + 1024;
+MLP_CU = MLP_PV + 1024; MLP_O = MLP_CU + 1024; MLP_Y2 = MLP_O + 1024; MLP_G = MLP_Y2 + 1024; MLP_HO = MLP_G + 8192;
+function mlp_setup() (
+  mlp_n = srate <= 50000 ? 2048 : srate <= 100000 ? 4096 : 8192;   // about 43 ms of all-pass response at any rate
+  mlp_k = mlp_n / MLP_B;
+  mlp_lat = mlp_n - 1 + MLP_B;                                      // the reversed response's centre + one block
+);
+// the kernel from the crossover's corners (mt_f1, mt_f2): its all-pass impulse response, reversed, the far tail faded
+function mlp_build() local(i, k, x, t, nf, b, d) (
+  mlp_a1.bq_set(2, mt_f1, 0.70710678); mlp_a2.bq_set(2, mt_f2, 0.70710678);
+  mlp_a1.s1 = mlp_a1.s2 = mlp_a2.s1 = mlp_a2.s2 = 0;
+  i = 0; loop(mlp_n, x = i == 0; MLP_G[i] = mlp_a2.bq_run(mlp_a1.bq_run(x)); i += 1; );
+  nf = mlp_n / 8; i = 0;
+  loop(nf, t = 0.5 - 0.5 * cos($pi * i / nf); MLP_G[mlp_n - 1 - i] *= t; i += 1; );   // fade the last eighth out
+  mlp_xf = mlp_on; mlp_xf ? memcpy(MLP_HO, MLP_H, mlp_k * 1024);    // running: the next block fades from the old kernel
+  k = 0;
+  loop(mlp_k,
+    memset(MLP_W, 0, 2 * MLP_B * 2);
+    i = 0; loop(MLP_B, MLP_W[2 * i] = MLP_G[mlp_n - 1 - (k * MLP_B + i)] / (2 * MLP_B); i += 1; );
+    fft(MLP_W, 2 * MLP_B);
+    memcpy(MLP_H + k * 1024, MLP_W, 4 * MLP_B);
+    k += 1;
+  );
+  mlp_dirty = 0;
+);
+function mlp_clr() ( memset(MLP_X, 0, 32768); memset(MLP_PV, 0, 1024); memset(MLP_CU, 0, 1024); memset(MLP_O, 0, 1024);
+  mlp_p = 0; mlp_xi = 0; mlp_xf = 0; );
+// the ring x one kernel's partitions, summed into y, back to time
+function mlp_sum(y, h) local(k, xs, hs, i, ar, am, hr, hm) (
+  memset(y, 0, 4 * MLP_B);
+  k = 0;
+  loop(mlp_k,
+    xs = MLP_X + ((mlp_xi - k + mlp_k) % mlp_k) * 1024; hs = h + k * 1024;
+    i = 0;
+    loop(2 * MLP_B,
+      ar = xs[i]; am = xs[i + 1]; hr = hs[i]; hm = hs[i + 1];
+      y[i] += ar * hr - am * hm; y[i + 1] += ar * hm + am * hr;
+      i += 2;
+    );
+    k += 1;
+  );
+  ifft(y, 2 * MLP_B);
+);
+// one block: [previous, current] -> spectrum into the ring, the sum, the last half out (faded from the old kernel's
+// after a kernel change)
+function mlp_blk() local(i, w) (
+  memcpy(MLP_W, MLP_PV, 2 * MLP_B); memcpy(MLP_W + 2 * MLP_B, MLP_CU, 2 * MLP_B); memcpy(MLP_PV, MLP_CU, 2 * MLP_B);
+  fft(MLP_W, 2 * MLP_B);
+  memcpy(MLP_X + mlp_xi * 1024, MLP_W, 4 * MLP_B);
+  mlp_sum(MLP_Y, MLP_H);
+  mlp_xf ? (
+    mlp_sum(MLP_Y2, MLP_HO);
+    i = 0;
+    loop(MLP_B,
+      w = 0.5 - 0.5 * cos($pi * (i + 0.5) / MLP_B);
+      MLP_O[2 * i] = MLP_Y2[2 * MLP_B + 2 * i] * (1 - w) + MLP_Y[2 * MLP_B + 2 * i] * w;
+      MLP_O[2 * i + 1] = MLP_Y2[2 * MLP_B + 2 * i + 1] * (1 - w) + MLP_Y[2 * MLP_B + 2 * i + 1] * w;
+      i += 1;
+    );
+    mlp_xf = 0;
+  ) : memcpy(MLP_O, MLP_Y + 2 * MLP_B, 2 * MLP_B);
+  mlp_xi = (mlp_xi + 1) % mlp_k;
+);
+// one sample pair through (one block late plus the kernel): -> mlp_l, mlp_r
+function mlp_run(l, r) (
+  MLP_CU[2 * mlp_p] = l; MLP_CU[2 * mlp_p + 1] = r;
+  mlp_l = MLP_O[2 * mlp_p]; mlp_r = MLP_O[2 * mlp_p + 1];
+  mlp_p += 1; mlp_p >= MLP_B ? ( mlp_blk(); mlp_p = 0; );
+);
+// the LIN PHASE key's change: dip (os_gc: 5 ms), swap at silence (clear, new latency), hold until it has come
+// through (and 10 ms for the crossover to settle), back in
+function mlp_gate() (
+  mlp_t != mlp_on ? (
+    mlp_gg = max(mlp_gg - os_gc, 0);
+    mlp_gg == 0 ? (
+      mlp_on = mlp_t; mlp_clr(); mlp_on && mlp_dirty ? ( mlp_build(); mlp_xf = 0; );
+      os_base = mlp_on ? mlp_lat : 0; pdc_delay = os_base + os_lat(os_f);
+      mlp_hold = os_base + os_lat(os_f) + floor(0.01 * srate);
+    );
+  ) : mlp_hold > 0 ? mlp_hold -= 1 : mlp_gg < 1 ? mlp_gg = min(mlp_gg + os_gc, 1);
+);
+
 // ---------- one band: transient detector (linked), gain, saturation, width ----------
 // per band constants: kAf / kAs = the attack detector's fast / slow attack, kAr its release; kSr / kSf = the sustain
 // detector's long / short release (fast attack); kg = the gain's smoothing
@@ -126,8 +234,10 @@ function bd_set(at, su, dr, mx, wd, bi) instance(tA, tS, tD, tM, tW, bias, heat)
   tA = at; tS = su; tD = 1.0 * 10 ^ ((dr + 1.5 * heat * mt_dm) / 20); tM = mx; tW = wd;
   bias = bi + 0.10 * heat * mt_dm;
 );
-function bd_run(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, eS1, eS2, g, tA, tS, tD, tM, tW,
-                               bdD, bdM, bdW, bias, rest, heat, oL, oR, gmon) local(a, eps, gt, u, sl, sr, mid, sid, wn) (
+// the band's transient shaper (and the glides): l, r -> pL, pR
+function bd_pre(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, eS1, eS2, g, tA, tS, tD, tM, tW,
+                               bdD, bdM, bdW, heat, gmon, pL, pR,
+                               fA1, fA2, fS1, fS2, gf, hA1, hA2, hS1, hS2, gh) local(a, eps, gt, u, b) (
   // linked detector
   a = max(abs(l), abs(r));
   eA1 += (a > eA1 ? kAf : kAr) * (a - eA1);                            // fast attack
@@ -138,12 +248,35 @@ function bd_run(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, 
   gt = (tA != 0 ? tA * min(max((eA1 - eA2) / (eA1 + eps), 0) * 3, 1) : 0)
      + (tS != 0 ? tS * min(max((eS1 - eS2) / (eS1 + eps), 0) * 1.6, 1) : 0);
   g += (gt - g) * kg; gmon = g;
+  lk_u > 0 ? (
+    // dual mono: each side its own detectors and gain (the same law), crossfaded from the linked gain
+    b = abs(l);
+    fA1 += (b > fA1 ? kAf : kAr) * (b - fA1); fA2 += (fA1 > fA2 ? kAs : kAr) * (fA1 - fA2);
+    fS1 += (b > fS1 ? kAf : kSl) * (b - fS1); fS2 += (b > fS2 ? kAf : kSf) * (b - fS2);
+    gt = (tA != 0 ? tA * min(max((fA1 - fA2) / (fA1 + eps), 0) * 3, 1) : 0)
+       + (tS != 0 ? tS * min(max((fS1 - fS2) / (fS1 + eps), 0) * 1.6, 1) : 0);
+    gf += (gt - gf) * kg;
+    b = abs(r);
+    hA1 += (b > hA1 ? kAf : kAr) * (b - hA1); hA2 += (hA1 > hA2 ? kAs : kAr) * (hA1 - hA2);
+    hS1 += (b > hS1 ? kAf : kSl) * (b - hS1); hS2 += (b > hS2 ? kAf : kSf) * (b - hS2);
+    gt = (tA != 0 ? tA * min(max((hA1 - hA2) / (hA1 + eps), 0) * 3, 1) : 0)
+       + (tS != 0 ? tS * min(max((hS1 - hS2) / (hS1 + eps), 0) * 1.6, 1) : 0);
+    gh += (gt - gh) * kg;
+    l *= exp(0.115129255 * (g + (gf - g) * lk_u)); r *= exp(0.115129255 * (g + (gh - g) * lk_u));
+    gmon = abs(gf) > abs(gh) ? gf : gh;
+  ) : (
+    fA1 = hA1 = eA1; fA2 = hA2 = eA2; fS1 = hS1 = eS1; fS2 = hS2 = eS2; gf = gh = g;
   u = abs(g) > 0.0005 ? exp(0.115129255 * g) : 1;
   l *= u; r *= u;
+  );
   // heat: a slow thermal follower of what the band is fed
   heat += (a > heat ? kH1 : kH2) * (min(a * 2, 1) - heat);
   // glides (the drive, mix and width ride smoothly)
   bdD += (tD - bdD) * mt_gs; bdM += (tM - bdM) * mt_gs; bdW += (tW - bdW) * mt_gs;
+  pL = l; pR = r;
+);
+// the band's saturation and width (at the base rate, or once per phase at 2x / 4x): l, r -> oL, oR
+function bd_sat(l, r) instance(bdD, bdM, bdW, bias, rest, oL, oR) local(sl, sr, mid, sid, wn) (
   // saturation (level-compensated), in parallel with the clean band
   bdM > 0.0005 ? (
     sl = (mt_sc(l * bdD + bias) - rest) / bdD; sr = (mt_sc(r * bdD + bias) - rest) / bdD;
@@ -156,9 +289,12 @@ function bd_run(l, r) instance(kAf, kAs, kAr, kSl, kSf, kg, kH1, kH2, eA1, eA2, 
   );
   oL = l; oR = r;
 );
+function bd_run(l, r) ( this.bd_pre(l, r); this.bd_sat(this.pL, this.pR); );
 function bd_rest() instance(bias, rest) ( rest = mt_sc(bias); );
-function bd_tidy() instance(eA1, eA2, eS1, eS2, g, heat) (
+function bd_tidy() instance(eA1, eA2, eS1, eS2, g, heat, fA1, fA2, fS1, fS2, gf, hA1, hA2, hS1, hS2, gh) (
   eA1 = mt_tn(eA1); eA2 = mt_tn(eA2); eS1 = mt_tn(eS1); eS2 = mt_tn(eS2); g = mt_tn(g); heat = mt_tn(heat);
+  fA1 = mt_tn(fA1); fA2 = mt_tn(fA2); fS1 = mt_tn(fS1); fS2 = mt_tn(fS2); gf = mt_tn(gf);
+  hA1 = mt_tn(hA1); hA2 = mt_tn(hA2); hS1 = mt_tn(hS1); hS2 = mt_tn(hS2); gh = mt_tn(gh);
 );
 
 // ---------- presets ----------
@@ -178,7 +314,7 @@ function load_preset(p) local(i) (
   p == 10 ? ( mt_x(180, 4500); mt_b(4, 4, -2, 9, 70, 100); mt_b(9, 3, -1, 8, 60, 105); mt_b(14, 3, 0, 7, 50, 115); ) :   // Snappy Mix Bus
   p == 11 ? ( mt_x(250, 4000); mt_b(4, 0, 2, 18, 100, 100); mt_b(9, 0, 2, 16, 100, 100); mt_b(14, 0, 0, 12, 80, 100); ) :   // Thick and Hot
   p == 12 ? ( mt_x(250, 4000); mt_b(4, 0, 0, 0, 0, 80); mt_b(9, 0, 0, 0, 0, 120); mt_b(14, 0, 0, 0, 0, 150); ) :   // Clean Width
-  p == 13 ? ( slider1 = 0; slider19 = 0; slider20 = 0; slider21 = 50; slider22 = slider23 = slider24 = slider25 = slider26 = slider27 = 0; );                                  // Reset all to defaults
+  p == 13 ? ( slider1 = 0; slider19 = 0; slider20 = 0; slider21 = 50; slider22 = slider23 = slider24 = slider25 = slider26 = slider27 = 0; slider28 = 1; ui_auto(28); );                                  // Reset all to defaults
   i = 1; loop(27, ui_auto(i); i += 1; );
   pr_cur = p == 13 ? 1 : p;
 );
@@ -193,13 +329,17 @@ function mt_srinit() (
   mt_ks = 1 - exp(-1 / (0.004 * srate));              // SOLO / MUTE
   mt_xs = 1 - exp(-1 / (0.03 * srate));               // the crossover corners glide (30 ms)
   mt_mfall = exp(-1 / (0.35 * srate));
+  mt_lkc = 1 - exp(-1 / (0.01 * srate));              // LINK crossfade
   ost_init(0);
 );
 mt_srinit();
+mlp_setup(); mlp_on = mlp_t = slider30 >= 0.5; mlp_gg = 1; mlp_hold = 0; mlp_clr(); mlp_dirty = 1;
+os_design(); os_base = mlp_on ? mlp_lat : 0; os_f = os_tf = os_f2n(slider29); os_gsetup();
 in_init();
 dL.drift_init(0.8 + rand(0.4)); dM.drift_init(0.8 + rand(0.4)); dH.drift_init(0.8 + rand(0.4));
 drift_macro(50);
 mt_snap = 1;
+lk_s = slider28 >= 0.5; lk_u = 1 - lk_s;
 
 ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
 !ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
@@ -210,9 +350,12 @@ file_var(0, ui_sz);
 file_var(0, pr_cur);
 
 @block
-srate != mt_sr ? mt_srinit();
+srate != mt_sr ? ( mt_srinit(); mlp_setup(); mlp_clr(); mlp_dirty = 1; os_base = mlp_on ? mlp_lat : 0; os_gsetup(); );
+os_tf = os_f2n(slider29);
 in_setup(slider1, 0);
 ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through (a mix tool)
+pdc_delay = os_base + os_lat(os_f);                   // (ost_setup clears it; os_base = LIN PHASE's latency)
+mlp_t = slider30 >= 0.5;
 drift_macro(slider21);
 mt_dm = dm_a;
 // crossover corners: glided per block (the upper never below the lower)
@@ -223,7 +366,9 @@ mt_f2 = mt_snap ? mt_f2t : mt_f2 * (mt_f2t / mt_f2) ^ mt_k;
 abs(mt_f1 - mt_lf1) > 0.01 || abs(mt_f2 - mt_lf2) > 0.01 ? (
   xL.xo_cfg(); xR.xo_cfg();
   mt_lf1 = mt_f1; mt_lf2 = mt_f2;
+  mlp_dirty = 1;
 );
+(mlp_on || mlp_t) && mlp_dirty ? mlp_build();       // LIN PHASE follows the crossover (rebuilt while it glides)
 // DRIFT: each band's bias wanders on its own path
 mt_n = samplesblock / srate;
 mt_vL = dL.drift_tick(0.05 * dm_s * mt_n); mt_vM = dM.drift_tick(0.06 * dm_s * mt_n); mt_vH = dH.drift_tick(0.07 * dm_s * mt_n);
@@ -240,8 +385,8 @@ mt_snap ? (
 xL.xo_tidy(); xR.xo_tidy(); bL.bd_tidy(); bM.bd_tidy(); bH.bd_tidy();
 // the panel's mailboxes
 mta_pi = max(mta_pi, mt_pi); mt_pi = 0; mta_po = max(mta_po, mt_po); mt_po = 0;
-mta_l0 = max(mta_l0, mt_l0); mta_l1 = max(mta_l1, mt_l1); mta_m0 = max(mta_m0, mt_m0); mta_m1 = max(mta_m1, mt_m1);
-mta_h0 = max(mta_h0, mt_h0); mta_h1 = max(mta_h1, mt_h1); mt_l0 = mt_l1 = mt_m0 = mt_m1 = mt_h0 = mt_h1 = 0;
+mta_l0_d = max(mta_l0_d, mt_l0); mta_l1_d = max(mta_l1_d, mt_l1); mta_m0_d = max(mta_m0_d, mt_m0); mta_m1_d = max(mta_m1_d, mt_m1);
+mta_h0_d = max(mta_h0_d, mt_h0); mta_h1_d = max(mta_h1_d, mt_h1); mt_l0 = mt_l1 = mt_m0 = mt_m1 = mt_h0 = mt_h1 = 0;
 // SOLO / MUTE: with any band soloed only the soloed bands play; MUTE takes a band out
 mt_so = slider22 >= 0.5 || slider24 >= 0.5 || slider26 >= 0.5;
 mt_tL = mt_so ? slider22 >= 0.5 : slider23 < 0.5; mt_tM = mt_so ? slider24 >= 0.5 : slider25 < 0.5; mt_tH = mt_so ? slider26 >= 0.5 : slider27 < 0.5;
@@ -251,24 +396,48 @@ mta_hL = bL.heat; mta_hM = bM.heat; mta_hH = bH.heat;
 
 @sample
 spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+os_gate(); mlp_gate();
+os_chg ? ( bL.osl.os_clr(); bL.osr.os_clr(); bM.osl.os_clr(); bM.osr.os_clr(); bH.osl.os_clr(); bH.osr.os_clr();
+           mt_dnl.os_clr(); mt_dnr.os_clr(); );                     // the OS swap (at silence)
 in_process(spl0, spl1);
 mt_xl = in_l; mt_xr = in_r;
+lk_s += ((slider28 >= 0.5) - lk_s) * mt_lkc; lk_s > 0.9999 && slider28 >= 0.5 ? lk_s = 1; lk_s < 0.0001 && slider28 < 0.5 ? lk_s = 0;
+lk_u = 1 - lk_s;                                      // the dual-mono share (0 = linked, as v2.0)
 mt_pi = max(mt_pi, max(abs(mt_xl), abs(mt_xr)));
+mlp_on ? ( mlp_run(mt_xl, mt_xr); mt_xl = mlp_l; mt_xr = mlp_r; );   // LIN PHASE: the mirror-image phase turn first
 // split
 xL.xo_run(mt_xl); xR.xo_run(mt_xr);
 // the three bands
-bL.bd_run(xL.lo, xR.lo); bM.bd_run(xL.mi, xR.mi); bH.bd_run(xL.hi, xR.hi);
 mt_sL += (mt_tL - mt_sL) * mt_ks; mt_sM += (mt_tM - mt_sM) * mt_ks; mt_sH += (mt_tH - mt_sH) * mt_ks;   // SOLO / MUTE: 10 ms fades
-mt_yl = bL.oL * mt_sL + bM.oL * mt_sM + bH.oL * mt_sH; mt_yr = bL.oR * mt_sL + bM.oR * mt_sM + bH.oR * mt_sH;
-mt_l0 = max(mt_l0, abs(bL.oL)); mt_l1 = max(mt_l1, abs(bL.oR)); mt_m0 = max(mt_m0, abs(bM.oL)); mt_m1 = max(mt_m1, abs(bM.oR));
-mt_h0 = max(mt_h0, abs(bH.oL)); mt_h1 = max(mt_h1, abs(bH.oR));
+os_f == 1 ? (
+  bL.bd_run(xL.lo, xR.lo); bM.bd_run(xL.mi, xR.mi); bH.bd_run(xL.hi, xR.hi);
+  mt_yl = bL.oL * mt_sL + bM.oL * mt_sM + bH.oL * mt_sH; mt_yr = bL.oR * mt_sL + bM.oR * mt_sM + bH.oR * mt_sH;
+  mt_l0 = max(mt_l0, abs(bL.oL)); mt_l1 = max(mt_l1, abs(bL.oR)); mt_m0 = max(mt_m0, abs(bM.oL)); mt_m1 = max(mt_m1, abs(bM.oR));
+  mt_h0 = max(mt_h0, abs(bH.oL)); mt_h1 = max(mt_h1, abs(bH.oR));
+) : (
+  // 2x / 4x: each band up after its shaper; saturation, mix, width and the sum at the high rate; one way down per side
+  bL.bd_pre(xL.lo, xR.lo); bM.bd_pre(xL.mi, xR.mi); bH.bd_pre(xL.hi, xR.hi);
+  bL.osl.os_up(bL.pL); bL.osr.os_up(bL.pR); bM.osl.os_up(bM.pL); bM.osr.os_up(bM.pR); bH.osl.os_up(bH.pL); bH.osr.os_up(bH.pR);
+  mt_i = 0;
+  loop(os_f,
+    bL.bd_sat(bL.osl.os_s(mt_i), bL.osr.os_s(mt_i)); bM.bd_sat(bM.osl.os_s(mt_i), bM.osr.os_s(mt_i));
+    bH.bd_sat(bH.osl.os_s(mt_i), bH.osr.os_s(mt_i));
+    mt_ol = bL.oL * mt_sL + bM.oL * mt_sM + bH.oL * mt_sH; mt_or = bL.oR * mt_sL + bM.oR * mt_sM + bH.oR * mt_sH;
+    mt_i == 0 ? ( mt_p0 = mt_ol; mt_q0 = mt_or; ) : mt_i == 1 ? ( mt_p1 = mt_ol; mt_q1 = mt_or; ) :
+    mt_i == 2 ? ( mt_p2 = mt_ol; mt_q2 = mt_or; ) : ( mt_p3 = mt_ol; mt_q3 = mt_or; );
+    mt_l0 = max(mt_l0, abs(bL.oL)); mt_l1 = max(mt_l1, abs(bL.oR)); mt_m0 = max(mt_m0, abs(bM.oL)); mt_m1 = max(mt_m1, abs(bM.oR));
+    mt_h0 = max(mt_h0, abs(bH.oL)); mt_h1 = max(mt_h1, abs(bH.oR));
+    mt_i += 1;
+  );
+  mt_yl = mt_dnl.os_dn(mt_p0, mt_p1, mt_p2, mt_p3); mt_yr = mt_dnr.os_dn(mt_q0, mt_q1, mt_q2, mt_q3);
+);
 // OUTPUT
 mt_outs += (mt_outt - mt_outs) * mt_gs;
 mt_yl *= mt_outs; mt_yr *= mt_outs;
 mt_yl != mt_yl ? mt_yl = 0; mt_yr != mt_yr ? mt_yr = 0;
 ost_out(mt_yl, mt_yr);
-spl0 = max(-4, min(4, ost_l));
-spl1 = max(-4, min(4, ost_r));
+spl0 = max(-4, min(4, ost_l)) * os_g * mlp_gg;
+spl1 = max(-4, min(4, ost_r)) * os_g * mlp_gg;
 mt_po = max(mt_po, max(abs(spl0), abs(spl1)));
 
 @gfx 1080 430
@@ -487,8 +656,10 @@ gfx_setfont(11); ui_col(KRI2); kr_txt(krv_tx, 25, "3-BAND SATURATION"); kr_txt(k
 pk_pextra = "Reset all to defaults";
 k_ = pk_preset(470 * sc, 22 * sc, 300 * sc, 34 * sc, pr_cur, #mt_pm);
 k_ > 0 ? load_preset(k_);
+kr_key(398, 25, 62, 28, "LINK", slider28 >= 0.5) ? ( slider28 = slider28 >= 0.5 ? 0 : 1; ui_auto(28); );
 kr_key(796, 25, 56, 28, "VFD", krv_mx == 0) ? ( slider19 = 0; ui_auto(19); );
 kr_key(856, 25, 66, 28, "MATRIX", krv_mx == 1) ? ( slider19 = 1; ui_auto(19); );
+os_key(966, 28, 29, KRI, 7);
 ui_size_picker(1000 * sc, 30 * sc);
 
 // =====================================================================
@@ -505,9 +676,9 @@ gfx_setfont(11); ui_col(KRI); kr_txt(154, 83, "BAND LEVEL"); ui_col(KRI2); kr_tx
 ui_col(KRI); kr_txt(492, 83, "TRANSIENT");
 // the meters fall back at about 20 dB a second
 function kr_fall(v, pk) ( pk = pk > 0.0000001 ? 20 * log10(pk) : -90; pk > v ? pk : max(v - 0.6, -90); );
-krv_l0 = kr_fall(krv_l0, mta_l0); krv_l1 = kr_fall(krv_l1, mta_l1); krv_m0 = kr_fall(krv_m0, mta_m0);
-krv_m1 = kr_fall(krv_m1, mta_m1); krv_h0 = kr_fall(krv_h0, mta_h0); krv_h1 = kr_fall(krv_h1, mta_h1);
-mta_l0 = mta_l1 = mta_m0 = mta_m1 = mta_h0 = mta_h1 = 0;
+krv_l0 = kr_fall(krv_l0, mta_l0_d); krv_l1 = kr_fall(krv_l1, mta_l1_d); krv_m0 = kr_fall(krv_m0, mta_m0_d);
+krv_m1 = kr_fall(krv_m1, mta_m1_d); krv_h0 = kr_fall(krv_h0, mta_h0_d); krv_h1 = kr_fall(krv_h1, mta_h1_d);
+mta_l0_d = mta_l1_d = mta_m0_d = mta_m1_d = mta_h0_d = mta_h1_d = 0;
 function kr_tbar(x, y, g) local(n, w) (                   // a transient bar: -15 .. +15 dB about the centre
   ui_col(ui_mix(KRI, KRW, 0.8)); kr_r(x, y, 92, 14); ui_col(KRW); kr_r(x + 1, y + 1, 90, 12);
   n = min(max(g / 15, -1), 1); w = 42 * n;
@@ -535,6 +706,7 @@ ui_col(KRI2); kr_ctxt(492, 190, "-15"); kr_ctxt(538, 190, "0"); kr_ctxt(582, 190
 
 // ---------- CROSSOVER ----------
 kr_sect(618, 72, 200, 134, "CROSSOVER");
+kr_key(722, 77, 88, 24, "LIN PHASE", slider30 >= 0.5) ? ( slider30 = slider30 >= 0.5 ? 0 : 1; ui_auto(30); );   // LIN PHASE
 krv_lg = 1; kr_small(674, 140, 17, 2, 50, 1000, 250, "LOW / MID", kr_hz(slider2));
 kr_small(762, 140, 17, 3, 1000, 12000, 4000, "MID / HIGH", kr_hz(slider3)); krv_lg = 0;
 gfx_setfont(13); ui_col(KRI2); kr_ctxt(674, 192, kr_hz(slider2)); kr_ctxt(762, 192, kr_hz(max(slider3, slider2 * 1.5)));

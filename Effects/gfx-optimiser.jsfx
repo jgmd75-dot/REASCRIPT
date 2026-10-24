@@ -2,7 +2,12 @@ desc:GFX Optimiser [loudness processor]
 //tags: broadcast processor multiband limiter agc clipper loudness
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-drift, gfx-input, gfx-output and gfx-ui (.jsfx-inc) in the same folder.
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate,
+// gfx-instrument and gfx-os (.jsfx-inc) in the same folder.
+//
+// OVERSAMPLING (v2.1): optional oversampling round the CLIP stage - the OS key in the header cycles
+// 1x / 2x / 4x (1x = the v2.0 unit). MIX's dry path is delayed to match. Latency: the limiter's 3 ms lookahead,
+// plus 31 (2x) / 37 (4x) samples; changing OS dips the output for 5 ms and comes back once the new latency is through.
 //
 // Broadcast-style loudness chain in the spirit of the classic broadcast processors:
 //   1. AGC      - slow wideband gain riding towards a steady level (+/-12 dB). GATE freezes it
@@ -11,7 +16,7 @@ desc:GFX Optimiser [loudness processor]
 //                 stereo-linked compressor per band. DRIVE pushes all bands harder;
 //                 BASS / MID / PRESENCE / AIR set each band's output level (the "sound").
 //                 SLOW / MED / FAST set how quickly the bands recover (density).
-//   3. CLIP     - soft clipper ahead of the final limiter: adds loudness and bite.
+//   3. CLIP     - soft clipper ahead of the final limiter: adds loudness and bite (oversampled: OS 1x / 2x / 4x).
 //   4. LIMITER  - the final brickwall limiter (3 ms lookahead, -0.3 dBFS): pull THRESH (in MASTER) down to push
 //      the chain into it: louder, peaks held. The Ceiling parameter sets how far THRESH drives it.
 //   + PHASE ROTATOR (before the bands): four all-passes at 200 Hz turn lopsided speech peaks into a
@@ -25,6 +30,10 @@ desc:GFX Optimiser [loudness processor]
 // MIX blends with the unprocessed signal (phase-matched through the same crossover).
 // Drift: drive and band timing breathe slightly, like an unsteady power supply. The DRIFT dial scales the
 // drift amount (50% = the Drift amount setting, 100% = twice, 0 = none) and speeds the wander up with it.
+// LINK (in the header): lit (the default) - the AGC, the four band compressors, HF LIMIT and the final limiter each
+// hear both sides and move them together, so the image stays put. Dark: dual mono - each side its own detector and
+// gain in all of them (COUPLING then works within each side), so a loud hit on one side leaves the other alone.
+// A change crossfades over 10 ms.
 // IN / OUT: TRIM (with the GUARD key) and SAT sit on the panel.
 
 import gfx-drift.jsfx-inc
@@ -35,6 +44,7 @@ import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
 import gfx-faceplate.jsfx-inc
 import gfx-instrument.jsfx-inc
+import gfx-os.jsfx-inc
 
 slider1:1<0,2,1{Slow,Medium,Fast}>-Release
 slider2:0<0,1,1{Off,On}>-AGC
@@ -64,6 +74,8 @@ slider25:1<0,1,1{Off,On}>-Phase rotator
 slider26:40<0,100,1>-HF limit (%)
 slider27:50<0,100,1>-Band coupling (%)
 slider28:0<0,1,1{Off,On}>-Fizz
+slider29:0<0,2,1{1x,2x,4x}>-Oversampling
+slider30:1<0,1,1{Off,On}>-Link
 
 in_pin:left input
 in_pin:right input
@@ -84,6 +96,7 @@ function op_init(mem) (
   op_rel = 1 - exp(-1 / (0.08 * srate));
   op_c = 10 ^ (-0.3 / 20);
   op_lg = 1; op_lgs = 1; op_lgc = 1 - exp(-1 / (0.03 * srate));
+  op_gA = op_gB = 1; op_hgA = op_hgB = 1; op_hcA = op_hcB = 0;
 );
 // stereo-linked; results in op_l, op_r
 function op_lim(l, r) local(pk, gt, rp, dl, dr) (
@@ -99,6 +112,28 @@ function op_lim(l, r) local(pk, gt, rp, dl, dr) (
   op_gr = min(op_gr, op_g);
   op_l = min(max(dl * op_g, -op_c), op_c);
   op_r = min(max(dr * op_g, -op_c), op_c);
+);
+// LINK off: the same limiter, each side holding its own gain (the linked one carries on, for the crossfade)
+function op_lim2(l, r) local(pk, gt, rp, dl, dr, ga, gb) (
+  op_lgs += (op_lg - op_lgs) * op_lgc; l *= op_lgs; r *= op_lgs;
+  op_buf[op_wp] = l; op_buf[op_bsz + op_wp] = r;
+  rp = (op_wp - op_N + op_bsz) & op_bmask;
+  dl = op_buf[rp]; dr = op_buf[op_bsz + rp];
+  op_wp = (op_wp + 1) & op_bmask;
+  pk = max(abs(l), abs(r));
+  gt = pk > op_c ? op_c / pk : 1;
+  gt < op_hg ? ( op_hg = gt; op_hc = op_N; ) : ( op_hc > 0 ? op_hc -= 1 : op_hg = gt; );
+  op_g += (op_hg - op_g) * (op_hg < op_g ? op_att : op_rel);
+  pk = abs(l); gt = pk > op_c ? op_c / pk : 1;
+  gt < op_hgA ? ( op_hgA = gt; op_hcA = op_N; ) : ( op_hcA > 0 ? op_hcA -= 1 : op_hgA = gt; );
+  op_gA += (op_hgA - op_gA) * (op_hgA < op_gA ? op_att : op_rel);
+  pk = abs(r); gt = pk > op_c ? op_c / pk : 1;
+  gt < op_hgB ? ( op_hgB = gt; op_hcB = op_N; ) : ( op_hcB > 0 ? op_hcB -= 1 : op_hgB = gt; );
+  op_gB += (op_hgB - op_gB) * (op_hgB < op_gB ? op_att : op_rel);
+  ga = op_g + (op_gA - op_g) * lk_u; gb = op_g + (op_gB - op_g) * lk_u;
+  op_gr = min(op_gr, min(ga, gb));
+  op_l = min(max(dl * ga, -op_c), op_c);
+  op_r = min(max(dr * gb, -op_c), op_c);
 );
 
 // ---------- biquads (crossover) ----------
@@ -136,6 +171,27 @@ function band_gr(pw, att, rel) instance(e, gr) local(ldb, ov, tg) (
 );
 
 // soft clipper: clean below 70% of the threshold, rounds smoothly up to it
+// LINK off: one side's AGC and HF LIMIT, the same laws as the linked ones
+function agc_side(p) instance(ms, db) local(l, t) (
+  ms += (p - ms) * agc_c;
+  agc_on ? (
+    l = 10 * log10(max(ms, 0.000000000001));
+    !(gate_on && l < -50) ? (
+      t = min(max(-18 - l, -12), 12);
+      db += max(min(t - db, agc_up), -agc_dn);
+    );
+  ) : (
+    db += max(min(-db, agc_up * 4), -agc_dn * 4);
+  );
+);
+function hf_side(e_) instance(e, g) local(t) (
+  e += (e_ - e) * (e_ > e ? hfA : hfR);
+  t = e > hft ? hft / e : 1;
+  g += (t - g) * (t < g ? hfA : hfR);
+);
+// band coupling within one side
+function cpl_lim(g) ( gav + min(max(g - gav, -glim), glim); );
+
 function opt_clip(x, t) local(a, k) (
   a = abs(x); k = 0.7 * t;
   a < k ? x : sign(x) * (k + (t - k) * ost_tanh((a - k) / (t - k)));
@@ -154,11 +210,13 @@ function update() (
   ddr = slider10 / 100 * dm_a; tdr = ddr; dspd = slider12 * dm_s;
   mix_t = slider13 / 100;
   rot_on = slider25 > 0.5; hf_amt = slider26 / 100; cpl = slider27 / 100; fz_on = slider28 > 0.5;
+  lk_t = slider30 >= 0.5;
   out_t = 10 ^ (slider14 / 20);
   in_setup(slider21, slider22);
   ost_setup(slider15 / 100, slider16 / 100, slider17, slider18, slider23, 0);   // output stage: straight through
   op_lg = 10 ^ ((slider23 - slider19) / 20);   // THRESH drives the limiter into its -0.3 dBFS ceiling
-  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = op_N;    // the limiter's lookahead
+  os_tf = os_f2n(slider29);                          // OS: the factor asked for (os_gate swaps it in)
+  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = op_N + os_lat(os_f);    // the limiter's lookahead + the oversampling
 );
 
 // band timing (with timing drift), called per block
@@ -192,7 +250,7 @@ function load_preset(p) (
     slider10 = 5; slider11 = 10; slider12 = 0.25; slider14 = 0;
     slider15 = 0; slider16 = 30; slider17 = 120; slider18 = 6000; slider19 = 0; slider20 = 2;
     slider21 = 0; slider22 = 0; slider23 = -0.3; slider24 = 50;
-    slider25 = 1; slider26 = 40; slider27 = 50; slider28 = 0;
+    slider25 = 1; slider26 = 40; slider27 = 50; slider28 = 0; slider30 = 1; slider_automate(2 ^ 29);
     slider_automate(268435455);                    // sliders 1-28
   );
 );
@@ -206,27 +264,30 @@ kpr.bq_ap(200);                                    // phase rotator
 kfz1.bq_hp(3000); kfz2.bq_hp(5000); kfz3.bq_pk(8000, 6, 0.9);
 hfA = 1 - exp(-1 / (0.0003 * srate)); hfR = 1 - exp(-1 / (0.05 * srate)); hfE = 0; hfG = 1;
 fzA = 1 - exp(-1 / (0.001 * srate)); fzR = 1 - exp(-1 / (0.04 * srate)); fzW = 1 - exp(-1 / (0.03 * srate)); fzH = 0; fzE = 0; fzP = 0;
-d_hf = 0;
+d_hf_d = 0;
 b_thr = -12; b_sl = 0.8; b_kn = 8;      // band threshold (dBFS after drive), slope (5:1), knee
 cdet = 1 - exp(-1 / (0.005 * srate));
 agc_c  = 1 - exp(-1 / (0.4 * srate));    // AGC level detector
 agc_up = 2 / srate; agc_dn = 6 / srate;  // AGC slew (dB per sample): 2 dB/s up, 6 dB/s down
 sm  = 1 - exp(-1 / (0.03 * srate));
+lk_c = 1 - exp(-1 / (0.01 * srate));   // LINK crossfade
 vuc = 1 - exp(-1 / (0.01 * srate));
 vu_sine = 10 * log10(2);   // +3.01 dB: RMS -> sine peak, so a sine peaking at the ref level reads 0 VU
 drD.drift_init(0.8 + rand(0.5));
 drT.drift_init(0.8 + rand(0.5));
 ost_init(0); ostL.ost_ch_init(); ostR.ost_ch_init();
 op_init(20000);
+os_design(); os_base = op_N; os_f = os_tf = os_f2n(slider29); os_gsetup();
+OSD = 30000; memset(OSD, 0, 128); osd_w = 0;    // MIX's dry path: delayed by the oversampling's latency
 in_init();
 agc_ms = 0.0159; agc_db = 0;
-pkL = 0; pkR = 0; vu_ms = 0;
-d_agc = 0; d_g1 = 0; d_g2 = 0; d_g3 = 0; d_g4 = 0; d_clp = 0;
+pkL_d = 0; pkR_d = 0; vu_ms = 0;
+d_agc = 0; d_g1_d = 0; d_g2_d = 0; d_g3_d = 0; d_g4_d = 0; d_clp_d = 0;
 !ui_dflt ? ( ui_thm = 6; ui_hw = 0; ui_sz = 2; );   // defaults for new instances (saved projects keep their own)
 
 update();
 timing(1);
-mix_s = mix_t; out_s = out_t; drv_e = drv;
+mix_s = mix_t; out_s = out_t; drv_e = drv; lk_s = lk_t; lk_u = 1 - lk_s;
 drv_s = drv_e; clp_s = clp_g; bg1s = bg1; bg2s = bg2; bg3s = bg3; bg4s = bg4;
 ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
 
@@ -270,8 +331,17 @@ agc_on ? (
 ) : (
   agc_db += max(min(-agc_db, agc_up * 4), -agc_dn * 4);
 );
+lk_s += (lk_t - lk_s) * lk_c; lk_s > 0.9999 && lk_t ? lk_s = 1; lk_s < 0.0001 && !lk_t ? lk_s = 0;
+lk_u = 1 - lk_s;                                   // the dual-mono share (0 = linked, as v2.0)
+lk_u > 0 ? (
+  agA.agc_side(inL * inL); agB.agc_side(inR * inR);
+  xL = inL * 10 ^ ((agc_db + (agA.db - agc_db) * lk_u) / 20);
+  xR = inR * 10 ^ ((agc_db + (agB.db - agc_db) * lk_u) / 20);
+) : (
+  agA.ms = agB.ms = agc_ms; agA.db = agB.db = agc_db;
 ag = 10 ^ (agc_db / 20);
 xL = inL * ag; xR = inR * ag;
+);
 
 // 1b. phase rotator: four all-passes at 200 Hz even out lopsided (speech) peaks
 rot_on ? (
@@ -314,6 +384,29 @@ k1 = bg1s * 10 ^ ((drv_s - g1) / 20);
 k2 = bg2s * 10 ^ ((drv_s - g2) / 20);
 k3 = bg3s * 10 ^ ((drv_s - g3) / 20);
 k4 = bg4s * 10 ^ ((drv_s - g4) / 20);
+lk_u > 0 ? (
+  // dual mono: each side's own band compressors (and their coupling), crossfaded from the linked gains
+  gL1 = cA1.band_gr(bL1 * bL1, at1, rl1); gL2 = cA2.band_gr(bL2 * bL2, at2, rl2);
+  gL3 = cA3.band_gr(bL3 * bL3, at3, rl3); gL4 = cA4.band_gr(bL4 * bL4, at4, rl4);
+  gR1 = cB1.band_gr(bR1 * bR1, at1, rl1); gR2 = cB2.band_gr(bR2 * bR2, at2, rl2);
+  gR3 = cB3.band_gr(bR3 * bR3, at3, rl3); gR4 = cB4.band_gr(bR4 * bR4, at4, rl4);
+  cpl > 0 ? (
+    gav = (gL1 + gL2 + gL3 + gL4) * 0.25; glim = 12 * (1 - cpl);
+    gL1 = cpl_lim(gL1); gL2 = cpl_lim(gL2); gL3 = cpl_lim(gL3); gL4 = cpl_lim(gL4);
+    gav = (gR1 + gR2 + gR3 + gR4) * 0.25;
+    gR1 = cpl_lim(gR1); gR2 = cpl_lim(gR2); gR3 = cpl_lim(gR3); gR4 = cpl_lim(gR4);
+  );
+  gL1 = g1 + (gL1 - g1) * lk_u; gL2 = g2 + (gL2 - g2) * lk_u; gL3 = g3 + (gL3 - g3) * lk_u; gL4 = g4 + (gL4 - g4) * lk_u;
+  gR1 = g1 + (gR1 - g1) * lk_u; gR2 = g2 + (gR2 - g2) * lk_u; gR3 = g3 + (gR3 - g3) * lk_u; gR4 = g4 + (gR4 - g4) * lk_u;
+  kL1 = bg1s * 10 ^ ((drv_s - gL1) / 20); kL2 = bg2s * 10 ^ ((drv_s - gL2) / 20);
+  kL3 = bg3s * 10 ^ ((drv_s - gL3) / 20); kL4 = bg4s * 10 ^ ((drv_s - gL4) / 20);
+  kR1 = bg1s * 10 ^ ((drv_s - gR1) / 20); kR2 = bg2s * 10 ^ ((drv_s - gR2) / 20);
+  kR3 = bg3s * 10 ^ ((drv_s - gR3) / 20); kR4 = bg4s * 10 ^ ((drv_s - gR4) / 20);
+  g1 = max(gL1, gR1); g2 = max(gL2, gR2); g3 = max(gL3, gR3); g4 = max(gL4, gR4);   // (for the meters)
+) : (
+  cA1.e = cB1.e = c1.e; cA1.gr = cB1.gr = c1.gr; cA2.e = cB2.e = c2.e; cA2.gr = cB2.gr = c2.gr;
+  cA3.e = cB3.e = c3.e; cA3.gr = cB3.gr = c3.gr; cA4.e = cB4.e = c4.e; cA4.gr = cB4.gr = c4.gr;
+);
 // 3. clipper threshold: just under the limiter's threshold, so the clipper and the limiter start at the same point
 cth = 10 ^ (slider19 / 20) * 0.98;
 // HF LIMIT: a fast limiter on the top band, holding the treble at a steady level under the clip point
@@ -323,11 +416,21 @@ hf_amt > 0.005 ? (
   hft = cth * 10 ^ (-(3 + 15 * hf_amt) / 20);
   hfg_t = hfE > hft ? hft / hfE : 1;
   hfG += (hfg_t - hfG) * (hfg_t < hfG ? hfA : hfR);
+  lk_u > 0 ? (
+    hfL.hf_side(abs(bL4) * kL4); hfR_.hf_side(abs(bR4) * kR4);
+    kL4 *= hfG + (hfL.g - hfG) * lk_u; kR4 *= hfG + (hfR_.g - hfG) * lk_u;
+    d_hf_d = max(d_hf_d, -20 * log10(max(min(hfL.g, hfR_.g), 0.0001)));
+  ) : ( hfL.e = hfR_.e = hfE; hfL.g = hfR_.g = hfG; );
   k4 *= hfG;
-  d_hf = max(d_hf, -20 * log10(max(hfG, 0.0001)));
-) : hfG = 1;
+  d_hf_d = max(d_hf_d, -20 * log10(max(hfG, 0.0001)));
+) : ( hfG = 1; hfL.g = hfR_.g = 1; );
+lk_u > 0 ? (
+  wL = bL1 * kL1 + bL2 * kL2 + bL3 * kL3 + bL4 * kL4;
+  wR = bR1 * kR1 + bR2 * kR2 + bR3 * kR3 + bR4 * kR4;
+) : (
 wL = bL1 * k1 + bL2 * k2 + bL3 * k3 + bL4 * k4;
 wR = bR1 * k1 + bR2 * k2 + bR3 * k3 + bR4 * k4;
+);
 // FIZZ: harmonics only (the clean top is subtracted), shaped round 8 kHz, pinned ~26 dB under the programme
 fz_on ? (
   fh0 = Lfz1.bq(wL, kfz1.b0, kfz1.b1, kfz1.b2, kfz1.a1, kfz1.a2); fh1 = Rfz1.bq(wR, kfz1.b0, kfz1.b1, kfz1.b2, kfz1.a1, kfz1.a2);
@@ -341,25 +444,44 @@ fz_on ? (
   fg_ = max(0.25, min(2, 0.05 * fzP / (fzE + 0.000001)));
   wL += fg_ * fe0; wR += fg_ * fe1;
 );
-cL = opt_clip(wL * clp_s, cth); cR = opt_clip(wR * clp_s, cth);
+// the clipper, oversampled (OS); a factor change swaps in at the silent point (os_gate)
+os_gate();
+os_chg ? ( ouL.os_clr(); ouR.os_clr(); odL.os_clr(); odR.os_clr(); memset(OSD, 0, 128); );
+ouL.os_up(wL * clp_s); ouR.os_up(wR * clp_s);
+ouL.s0 = opt_clip(ouL.s0, cth); ouR.s0 = opt_clip(ouR.s0, cth);
+os_f > 1 ? (
+  ouL.s1 = opt_clip(ouL.s1, cth); ouR.s1 = opt_clip(ouR.s1, cth);
+  os_f > 2 ? (
+    ouL.s2 = opt_clip(ouL.s2, cth); ouR.s2 = opt_clip(ouR.s2, cth);
+    ouL.s3 = opt_clip(ouL.s3, cth); ouR.s3 = opt_clip(ouR.s3, cth);
+  );
+  OSD[osd_w] = dryL; OSD[64 + osd_w] = dryR;
+  osd_r = (osd_w - os_lat(os_f)) & 63; dryL = OSD[osd_r]; dryR = OSD[64 + osd_r];
+  osd_w = (osd_w + 1) & 63;
+);
+cL = odL.os_dn(ouL.s0, ouL.s1, ouL.s2, ouL.s3); cR = odR.os_dn(ouR.s0, ouR.s1, ouR.s2, ouR.s3);
 cpk = max(abs(wL), abs(wR)) * clp_s;
-cpk > cth ? d_clp = max(d_clp, 20 * log10(cpk / max(max(abs(cL), abs(cR)), 0.000001)));
+cpk > cth ? d_clp_d = max(d_clp_d, 20 * log10(cpk / max(opt_clip(cpk, cth), 0.000001)));
 
 oL = dryL * (1 - mix_s) + cL * mix_s;
 oR = dryR * (1 - mix_s) + cR * mix_s;
+os_g < 1 ? ( oL *= os_g; oR *= os_g; );
 
 // 4. output stage
 oL = ostL.ost_band(oL) * out_s;
 oR = ostR.ost_band(oR) * out_s;
 ost_out(oL, oR);
-op_lim(ost_l, ost_r);
+lk_u > 0 ? op_lim2(ost_l, ost_r) : (
+  op_lim(ost_l, ost_r);
+  op_gA = op_gB = op_g; op_hgA = op_hgB = op_hg; op_hcA = op_hcB = op_hc;
+);
 spl0 = op_l;
 spl1 = op_r;
-pkL = max(pkL, abs(spl0)); pkR = max(pkR, abs(spl1));
+pkL_d = max(pkL_d, abs(spl0)); pkR_d = max(pkR_d, abs(spl1));
 
 d_agc = agc_db;
 mIn = max(mIn * 0.9998, max(abs(inL), abs(inR)));
-d_g1 = max(d_g1, g1); d_g2 = max(d_g2, g2); d_g3 = max(d_g3, g3); d_g4 = max(d_g4, g4);
+d_g1_d = max(d_g1_d, g1); d_g2_d = max(d_g2_d, g2); d_g3_d = max(d_g3_d, g3); d_g4_d = max(d_g4_d, g4);
 
 @gfx 640 496
 ui_thm = 6; ui_hw = 1;   // one look: older projects reload their saved theme / HW flag (kept in @serialize, no longer drawn)
@@ -488,6 +610,9 @@ gfx_setfont(13); ui_col(0x160E10); op2_tc(32, 22, "GFX");
 gfx_setfont(14); ui_col(OP2_INK); op2_tl(58, 11, "OPTIMISER");
 gfx_setfont(12); ui_col(OP2_DIM); op2_tl(58, 37, "BROADCAST PROCESSOR");
 // S / M / L panel size, and ? (the pop-up: design credit, website, manual)
+// OS: a square lamp key, each click cycles 1x (grey) -> 2x (amber) -> 4x (red); "OS" printed beside it
+os_key(530, 18, 29, OP2_DIM, 7);
+op2_lamp(410, 18, 64, 22, slider30 >= 0.5, LK_BLU, "LINK", 12) ? ( slider30 = slider30 >= 0.5 ? 0 : 1; ui_auto(30); );
 op2_lamp(560, 18, 18, 22, ui_sz == 1, 0x9A8C90, "S", 11) ? ui_sz = 1;
 op2_lamp(579, 18, 18, 22, ui_sz == 0, 0x9A8C90, "M", 11) ? ui_sz = 0;
 op2_lamp(598, 18, 18, 22, ui_sz == 2, 0x9A8C90, "L", 11) ? ui_sz = 2;
@@ -518,10 +643,10 @@ gfx_setfont(10); ui_col(OP2_DIM);
 op2_tl(22, 110, "0"); op2_tl(22, 145, "10"); op2_tl(22, 180, "20");
 
 // falling display values (fast up, slow fall)
-v_g1 = max(d_g1, v_g1 * 0.9); v_g2 = max(d_g2, v_g2 * 0.9); v_g3 = max(d_g3, v_g3 * 0.9); v_g4 = max(d_g4, v_g4 * 0.9);
-v_clp = max(d_clp, v_clp * 0.85); v_hf = max(d_hf, v_hf * 0.88);
+v_g1 = max(d_g1_d, v_g1 * 0.9); v_g2 = max(d_g2_d, v_g2 * 0.9); v_g3 = max(d_g3_d, v_g3 * 0.9); v_g4 = max(d_g4_d, v_g4 * 0.9);
+v_clp = max(d_clp_d, v_clp * 0.85); v_hf = max(d_hf_d, v_hf * 0.88);
 v_lim = max(-20 * log10(max(op_gr, 0.0001)), v_lim * 0.85); op_gr = 1;
-d_g1 = 0; d_g2 = 0; d_g3 = 0; d_g4 = 0; d_clp = 0; d_hf = 0;
+d_g1_d = 0; d_g2_d = 0; d_g3_d = 0; d_g4_d = 0; d_clp_d = 0; d_hf_d = 0;
 
 gfx_setfont(11);
 op2_i = 0;
@@ -591,9 +716,9 @@ loop(12,
   op2_r(566, 421 + op2_i * 5, 12, 4);
   op2_i += 1;
 );
-mL.ui_ledm(582 * sc, 421 * sc, 12 * sc, 59 * sc, pkL);
-mR.ui_ledm(598 * sc, 421 * sc, 12 * sc, 59 * sc, pkR);
-pkL *= 0.85; pkR *= 0.85;
+mL.ui_ledm(582 * sc, 421 * sc, 12 * sc, 59 * sc, pkL_d);
+mR.ui_ledm(598 * sc, 421 * sc, 12 * sc, 59 * sc, pkR_d);
+pkL_d *= 0.85; pkR_d *= 0.85;
 
 ost_clipped = 0;
 

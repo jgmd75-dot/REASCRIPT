@@ -2,8 +2,8 @@ desc:GFX Quad11 [multiband comp]
 //tags: multiband compressor bus eq saturation dynamics
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel and gfx-instrument (.jsfx-inc) in the same folder
-// (gfx-instrument is used only for the shared OUTPUT tray and button).
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-os
+// (.jsfx-inc) in the same folder (gfx-instrument is used only for the shared OUTPUT tray and button).
 //
 // Four-band bus compressor with an EQ and a saturator in every band.
 //   SPLIT     - three Linkwitz-Riley 24 dB/oct crossovers (drag the lines in the display). The bands sum back
@@ -15,15 +15,22 @@ desc:GFX Quad11 [multiband comp]
 //               The level is made up automatically: three quarters of the average gain change, followed slowly
 //               (about 1.5 s), so the band keeps its loudness while the peaks are still held down (or lifted).
 //   SAT       - TAPE (asymmetric tanh, even + odd harmonics), TUBE (one side saturates earlier: warmer, mostly
-//               even) or CLIP (hard knee, odd harmonics). DRIVE is level-matched, 2x oversampled while any
-//               band is driven (with no drive anywhere the plugin is fully transparent).
+//               even) or CLIP (hard knee, odd harmonics). DRIVE is level-matched and oversampled as the OS key says.
 //               PRE: SAT > EQ > COMP (the compressor tames what the saturation adds)
 //               POST: EQ > COMP > SAT (the compressor steadies the level going into the saturation)
 //   SOLO / BYP - listen to a band on its own / let it through unprocessed.
 //   MASTER EQ - HPF, low shelf, high shelf, LPF on the whole bus, ahead of the split.
 //   PRESETS   - starting points for common bus jobs (they set the split, the bands, the master EQ and MIX).
 //   MIX       - parallel compression: blends the processed bus with the dry one.
-// MASTER holds SAT; INPUT has TRIM and GUARD.
+// LINK (MASTER): lit (the default) - each band's compressor hears both sides and moves them together, so the image
+//               stays put. Dark: dual mono - each side its own detector, gain and makeup in every band, so a loud
+//               hit on one side leaves the other alone. A change crossfades over 10 ms.
+// MASTER holds SAT and LINK; INPUT has TRIM and GUARD.
+// OS (header, left of PRESETS): the SAT stages' oversampling - 1x (none, no latency), 2x (the default: SAT was
+//               always 2x oversampled), 4x; each click steps on. Linear-phase (the house gfx-os filters): each band
+//               goes up and down round its SAT, a bypassed band and the dry for MIX through the same filters, so all
+//               stay in time. A change dips the output for 5 ms, swaps, comes back. Latency 0 / 31 / 37 samples
+//               (reported).
 
 import gfx-drift.jsfx-inc
 import gfx-input.jsfx-inc
@@ -31,6 +38,7 @@ import gfx-output.jsfx-inc
 import gfx-ui.jsfx-inc
 import gfx-panel.jsfx-inc
 import gfx-instrument.jsfx-inc
+import gfx-os.jsfx-inc
 
 slider1:0<-24,12,0.1>-Input trim (dB)
 slider2:0<0,1,1{Off,On}>-Input guard
@@ -41,7 +49,7 @@ slider6:30<0,100,1>-Bias (%)
 slider7:120<40,400,1>-Sat low band (Hz)
 slider8:6000<2000,16000,10>-Sat high band (Hz)
 slider9:-0.3<-24,0,0.1>-(unused, was output ceiling)
-slider10:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider10:1<0,2,1{1x,2x,4x}>-Oversampling
 slider11:120<30,16000,1>-Crossover 1 (Hz)
 slider12:1000<30,16000,1>-Crossover 2 (Hz)
 slider13:5000<30,16000,1>-Crossover 3 (Hz)
@@ -100,6 +108,7 @@ slider65:0<0,2,1{Tape,Tube,Clip}>-High: sat type
 slider66:0<0,100,1>-High: drive (%)
 slider67:1<0,1,1{Pre,Post}>-High: sat position
 slider68:0<0,2,1{Active,Bypass,Solo}>-High: state
+slider69:lk_on=1<0,1,1{Off,On}>-Link
 
 in_pin:left input
 in_pin:right input
@@ -196,42 +205,40 @@ function sat_curve(u, t) local(a) (
   t == 1 ? ( u >= 0 ? sat_th(u) : sat_th(1.6 * u) / 1.6 ) :   // tube: the negative side gives way first
   ( a = abs(u); a < 0.8 ? u : sign(u) * (0.8 + 0.2 * sat_th((a - 0.8) / 0.2)) );   // clip: hard knee
 );
-// 4th-order Butterworth anti-alias filters either side of the curve, at twice the rate
-function sat_init() instance(u1, u2, d1, d2, dcx, dcy) local(fc, fs2) (
-  fs2 = 2 * srate; fc = 0.46 * srate;
-  u1.bq_set(0, fc, 0.5411961, 0, fs2); u2.bq_set(0, fc, 1.3065630, 0, fs2);
-  d1.bq_set(0, fc, 0.5411961, 0, fs2); d2.bq_set(0, fc, 1.3065630, 0, fs2);
-  dcx = 0; dcy = 0;
-);
-// g = drive into the curve, c = level match; with off set the curve is skipped (same filters, same timing).
-// While no band is driven the oversampler does not run at all (os_run = 0) and the plugin is transparent. When a band
-// is driven the filters first run unheard for 64 samples (primed), then the oversampled path fades in over 10 ms (os_w);
-// back to no drive it fades out, then stops. A band's curve (and its DC blocker) fades in / out over 10 ms too (cw)
-// when its DRIVE leaves or returns to 0 while the oversampler runs; the DC blocker starts from rest each time.
+// the SAT stage, at the OS key's rate: up, the curve per phase, down (gfx-os; at 1x the curve on its own).
+// While a stage has no curve to run (DRIVE 0, a bypassed band, the dry) it takes the filters' latency as a plain delay
+// (CPU saved); when its curve comes in, the filters are first primed from the last 40 inputs, as if they had run all along.
+function sat_init(mem) instance(dcx, dcy, rb, w, run) ( dcx = 0; dcy = 0; rb = mem; memset(rb, 0, 64); w = 0; run = 0; );
+// g = drive into the curve, c = level match; with off set the curve is skipped (the same filters, the same timing).
+// A band's curve (and its DC blocker) fades in / out over 10 ms (cw) when its DRIVE leaves or returns to 0; the DC
+// blocker starts from rest each time.
 function sat_mix(z, g, c, t, cw) ( cw <= 0 ? z : cw >= 1 ? sat_curve(g * z, t) * c : z + (sat_curve(g * z, t) * c - z) * cw; );
-function sat_run(x, g, c, t, off) instance(u1, u2, d1, d2, dcx, dcy, cw) local(z, y) (
-  !os_run ? ( dcx = dcy = 0; cw = !off; x; ) :
-  os_w >= 1 && cw == !off ? (                       // steady: the plain oversampled path
-    z = u2.bq_run(u1.bq_run(x * 2));
-    d2.bq_run(d1.bq_run(off ? z : sat_curve(g * z, t) * c));
-    z = u2.bq_run(u1.bq_run(0));
-    y = d2.bq_run(d1.bq_run(off ? z : sat_curve(g * z, t) * c));
-    off ? y : ( dcy = y - dcx + 0.9995 * dcy; dcx = y; dcy; );    // the asymmetric curves add DC
-  ) : (                                             // a fade: the oversampler (os_w) or this band's curve (cw)
-    cw <= 0 ? ( dcx = dcy = 0; );
-    cw = off ? max(cw - os_ws, 0) : min(cw + os_ws, 1);
-    z = u2.bq_run(u1.bq_run(x * 2));
-    d2.bq_run(d1.bq_run(sat_mix(z, g, c, t, cw)));
-    z = u2.bq_run(u1.bq_run(0));
-    y = d2.bq_run(d1.bq_run(sat_mix(z, g, c, t, cw)));
-    y = cw <= 0 ? y : ( dcy = y - dcx + 0.9995 * dcy; dcx = y; cw >= 1 ? dcy : y + (dcy - y) * cw; );
-    os_w >= 1 ? y : x + (y - x) * os_w;
+function sat_run(x, g, c, t, off) instance(dcx, dcy, cw, rb, w, run) local(i, z, p0, p1, p2, p3, y) (
+  cw = off ? max(cw - sat_ws, 0) : min(cw + sat_ws, 1);
+  os_f == 1 ? y = sat_mix(x, g, c, t, cw) : (
+    w = (w + 1) & 63; rb[w] = x;
+    off && cw <= 0 ? ( run = 0; y = rb[(w - os_lat(os_f)) & 63]; ) : (
+      !run ? (
+        run = 1; i = 40;
+        loop(40, this.up.os_up(rb[(w - i) & 63]); this.dn.os_dn(this.up.s0, this.up.s1, this.up.s2, this.up.s3); i -= 1; );
+      );
+      this.up.os_up(x);
+      i = 0;
+      loop(os_f,
+        z = sat_mix(this.up.os_s(i), g, c, t, cw);
+        i == 0 ? p0 = z : i == 1 ? p1 = z : i == 2 ? p2 = z : p3 = z;
+        i += 1;
+      );
+      y = this.dn.os_dn(p0, p1, p2, p3);
+    );
   );
+  cw <= 0 ? ( dcx = dcy = 0; y; ) : ( dcy = y - dcx + sat_dcr * dcy; dcx = y; cw >= 1 ? dcy : y + (dcy - y) * cw; );   // the asymmetric curves add DC
 );
+function sat_clr() instance(run) ( this.up.os_clr(); this.dn.os_clr(); run = 0; );
 function sat_snap(snon) instance(cw) ( cw = snon; );
 
 // ---------- one band (stereo) ----------
-function band_init() instance(sL, sR, env, grm, amk) ( sL.sat_init(); sR.sat_init(); env = 0; grm = 0; amk = 0; );
+function band_init(mem) instance(sL, sR, env, grm, amk) ( sL.sat_init(mem); sR.sat_init(mem + 64); env = 0; grm = 0; amk = 0; );
 function band_set(base) instance(eqL, eqR, thr, rat, atc, rlc, mkg, st, sg, smk, soff, pre, state) local(d) (
   eqL.bq_set(2, slider(base), slider(base + 1), slider(base + 2), srate);
   eqR.bq_set(2, slider(base), slider(base + 1), slider(base + 2), srate);
@@ -250,7 +257,7 @@ function band_set(base) instance(eqL, eqR, thr, rat, atc, rlc, mkg, st, sg, smk,
   state = slider(base + 11);
 );
 function band_run(l, r) instance(eqL, eqR, sL, sR, thr, rat, atc, rlc, mkg, st, sg, smk, soff, pre, state,
-                                env, grm, amk, ol, orr) local(lv, over, gr, g) (
+                                env, grm, amk, ol, orr, enva, envb, amka, amkb) local(lv, over, gr, g, ga, gb) (
   // bypassed: through the oversampling filters only, so it stays in time with the other bands
   state == 1 ? ( ol = sL.sat_run(l, 1, 1, 0, 1); orr = sR.sat_run(r, 1, 1, 0, 1); env = 0; ) : (
   pre ? ( l = sL.sat_run(l, sg, smk, st, soff); r = sR.sat_run(r, sg, smk, st, soff); );
@@ -264,8 +271,25 @@ function band_run(l, r) instance(eqL, eqR, sL, sR, thr, rat, atc, rlc, mkg, st, 
   env += (gr - env) * (abs(gr) > abs(env) ? atc : rlc);
   abs(env) > abs(grm) ? grm = env;
   amk += (env - amk) * amc;                        // auto makeup follows the average gain change
+  lk_u > 0 ? (
+    // dual mono: each side its own level, gain and makeup, the same law (crossfaded from the linked gain)
+    lv = 20 * log10(max(abs(l), 0.000001)); over = lv - (thr < 0 ? thr : -thr);
+    gr = over < -3 ? 0 : over > 3 ? (1 - 1 / rat) * over : (1 - 1 / rat) * (over + 3) * (over + 3) / 12;
+    gr = thr < 0 ? -gr : thr > 0 ? min(gr, 6) : 0;
+    enva += (gr - enva) * (abs(gr) > abs(enva) ? atc : rlc); amka += (enva - amka) * amc;
+    lv = 20 * log10(max(abs(r), 0.000001)); over = lv - (thr < 0 ? thr : -thr);
+    gr = over < -3 ? 0 : over > 3 ? (1 - 1 / rat) * over : (1 - 1 / rat) * (over + 3) * (over + 3) / 12;
+    gr = thr < 0 ? -gr : thr > 0 ? min(gr, 6) : 0;
+    envb += (gr - envb) * (abs(gr) > abs(envb) ? atc : rlc); amkb += (envb - amkb) * amc;
+    abs(enva) > abs(grm) ? grm = enva; abs(envb) > abs(grm) ? grm = envb;
+    g = env - 0.75 * amk;
+    ga = g + (enva - 0.75 * amka - g) * lk_u; gb = g + (envb - 0.75 * amkb - g) * lk_u;
+    l *= 10 ^ (ga / 20); r *= 10 ^ (gb / 20);
+  ) : (
+    enva = envb = env; amka = amkb = amk;
   g = 10 ^ ((env - 0.75 * amk) / 20);
   l *= g; r *= g;
+  );
   !pre ? ( l = sL.sat_run(l, sg, smk, st, soff); r = sR.sat_run(r, sg, smk, st, soff); );
   ol = l * mkg; orr = r * mkg;
   );
@@ -337,7 +361,7 @@ function load_preset(p) local(i) (
     pb(0, 60, 0.8, 0, 0, 2, 1, 0, 0, 0, 1); pb(1, 400, 0.8, 0, 0, 2, 1, 0, 0, 0, 1);
     pb(2, 2500, 0.8, 0, 0, 2, 1, 0, 0, 0, 1); pb(3, 10000, 0.8, 0, 0, 2, 1, 0, 0, 0, 1);
     slider1 = 0; slider2 = 0; slider4 = 0; slider5 = 0; slider6 = 30; slider7 = 120; slider8 = 6000;
-    slider9 = -0.3; slider10 = 1;
+    slider9 = -0.3; slider10 = 1; lk_on = 1; slider_automate(lk_on);
   );
   p >= 1 && p <= 11 ? ( i = 1; loop(68, ui_auto(i); i += 1; ); );
 );
@@ -350,29 +374,35 @@ function update() (
   meq_hp = slider14 > 20.5; meq_lp = slider19 < 19990; meq_post = slider20;   // no control: new instances and the presets keep it at PRE
   meL.meq_set(); meR.meq_set();
   bnd0.band_set(21); bnd1.band_set(33); bnd2.band_set(45); bnd3.band_set(57);
-  os_on = slider30 > 0 || slider42 > 0 || slider54 > 0 || slider66 > 0;
+  os_tf = os_f2n(slider10);
   any_solo = bnd0.state == 2 || bnd1.state == 2 || bnd2.state == 2 || bnd3.state == 2;
   mix_t = any_solo ? 1 : slider3 / 100;            // a soloed band is heard on its own, without the dry signal
   out_t = 10 ^ (slider4 / 20);
+  lk_t = lk_on >= 0.5;
   in_setup(slider1, slider2);
   ins_output_straight(5);   // output stage: straight through
+  pdc_delay = os_base + os_lat(os_f);              // (the output stage clears it)
 );
 
 in_init();
 ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
-bnd0.band_init(); bnd1.band_init(); bnd2.band_init(); bnd3.band_init(); dsL.sat_init(); dsR.sat_init();
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider10); os_gsetup();
+sat_dcr = 0.9995;                                    // the SAT DC blocker (about 4 Hz at 48 kHz)
+SRB = 600000;                                        // the SAT stages' input histories (64 each)
+bnd0.band_init(SRB); bnd1.band_init(SRB + 128); bnd2.band_init(SRB + 256); bnd3.band_init(SRB + 384);
+dsL.sat_init(SRB + 512); dsR.sat_init(SRB + 576);
 sm = 1 - exp(-1 / (0.03 * srate));
 amc = 1 - exp(-1 / (1.5 * srate));
-pkI = 0; pkO = 0;
+lk_c = 1 - exp(-1 / (0.01 * srate));                 // LINK crossfade
+pkIL_d = 0; pkIR_d = 0; pkOL_d = 0; pkOR_d = 0;
 !ui_dflt ? ui_thm = 5; !ui_dflt ? ui_hw = 1;   // fixed charcoal faceplate
 !ui_dflt ? ui_kstyle = 0;
 PNL = 0x2A2B2F; INKL = 0xE8E6E0; ACC = 0xD9A441; REDL = 0xFF3A2A; AMBL = 0xFFB030;
 SH1 = 0x232428; SH2 = 0x202125; SH3 = 0x1C1D21;
 BC0 = 0xE0604A; BC1 = 0xE8B23A; BC2 = 0x5FBF7A; BC3 = 0x4A9AD8;   // band colours
 update();
-mix_s = mix_t; out_s = out_t;
-os_ws = 1 / (0.01 * srate);                          // the oversampler's fade (10 ms); a driven start begins fully on
-os_run = os_on; os_w = os_on; os_pc = os_on ? 64 : 0;
+mix_s = mix_t; out_s = out_t; lk_s = lk_t; lk_u = 1 - lk_s;
+sat_ws = 1 / (0.01 * srate);                         // a band's curve fades in / out over 10 ms
 bnd0.band_snap(); bnd1.band_snap(); bnd2.band_snap(); bnd3.band_snap();
 
 grd = 1000; memset(grd, 0, 4);                    // displayed gain reduction per band
@@ -491,17 +521,20 @@ file_var(0, ui_sz);
 file_avail(0) != 0 ? file_var(0, pr_cur);    // the preset in use (older projects end before it)
 
 @sample
-// the oversampler: primed (64 samples, unheard), faded in / out (10 ms), stopped while no band is driven
-os_on ? (
-  os_run = 1; os_pc < 64 ? os_pc += 1 : os_w < 1 ? os_w = min(os_w + os_ws, 1);
-) : os_run ? (
-  os_w > 0 ? os_w = max(os_w - os_ws, 0) : ( os_run = 0; os_pc = 0; );
+// OS: a change of factor dips the output and swaps at the silent point (all the SAT filters cleared there)
+os_gate();
+os_chg ? (
+  bnd0.sL.sat_clr(); bnd0.sR.sat_clr(); bnd1.sL.sat_clr(); bnd1.sR.sat_clr(); bnd2.sL.sat_clr(); bnd2.sR.sat_clr();
+  bnd3.sL.sat_clr(); bnd3.sR.sat_clr(); dsL.sat_clr(); dsR.sat_clr();
+  sat_dcr = 1 - 0.0005 / os_f;                       // the DC blocker keeps its corner at every rate
 );
 in_process(spl0, spl1);
-pkI = max(pkI, max(abs(in_l), abs(in_r)));
+pkIL_d = max(pkIL_d, abs(in_l)); pkIR_d = max(pkIR_d, abs(in_r));
 l = in_l; r = in_r;
 !meq_post ? ( l = meL.meq_run(l); r = meR.meq_run(r); );
 xL.xo_run(l, in_l); xR.xo_run(r, in_r);
+lk_s += (lk_t - lk_s) * lk_c; lk_s > 0.9999 && lk_t ? lk_s = 1; lk_s < 0.0001 && !lk_t ? lk_s = 0;
+lk_u = 1 - lk_s;                                   // the dual-mono share (0 = linked, as v2.0)
 
 bnd0.band_run(xL.o1, xR.o1); bnd1.band_run(xL.o2, xR.o2);
 bnd2.band_run(xL.o3, xR.o3); bnd3.band_run(xL.o4, xR.o4);
@@ -523,9 +556,9 @@ oL = (dl + (wl - dl) * mix_s) * out_s;
 oR = (dr + (wr - dr) * mix_s) * out_s;
 oL = ostL.ost_band(oL); oR = ostR.ost_band(oR);
 ost_out(oL, oR);
-spl0 = ost_l;
-spl1 = ost_r;
-pkO = max(pkO, max(abs(spl0), abs(spl1)));
+spl0 = ost_l * os_g;
+spl1 = ost_r * os_g;
+pkOL_d = max(pkOL_d, abs(spl0)); pkOR_d = max(pkOR_d, abs(spl1));
 
 @gfx 1100 624
 ui_begin(1100, 624);
@@ -544,6 +577,7 @@ gfx_setfont(4); ui_cola(INKL, 0.6); gfx_x = 172 * sc; gfx_y = 34 * sc; gfx_draws
 pk_pextra = "Reset all to defaults";   // the house preset display: PRESETS, prev / next, LCD (click it for the list)
 k_ = pk_preset(560 * sc, 18 * sc, 300 * sc, 36 * sc, pr_cur, "Gentle Glue|Mix Bus Punch|Drum Bus Smash (parallel)|Transient Lift (expand)|Vocal Control|Bass Tighten|De-Mud & Air|Tape Warmth|Master Gentle|Parallel Crush");
 k_ > 0 ? ( load_preset(k_); pr_cur = k_ > 10 ? 0 : k_; );
+os_key(526, 25, 10, INKL, 12);
 ui_size_picker(880 * sc, 31 * sc);
 
 ui_col(ACC); gfx_rect(14 * sc, 66 * sc, 1072 * sc, 3 * sc);
@@ -663,17 +697,23 @@ knob_push = 2;                                     // the GUARD LED button toggl
 ui_knob(930 * sc, 286 * sc, 1, -24, 12, 0, 0, "TRIM", "%.1f dB");
 ui_guardclick(1, 2, 930, 286, 24);   // click TRIM for GUARD
 knob_push = 0;
-mI.ui_ledm(1040 * sc, 254 * sc, 12 * sc, 64 * sc, pkI);
-gfx_setfont(4); ui_col(INKL); ui_text(1046 * sc, 322 * sc, "IN");
+mIL.ui_ledm(1032 * sc, 252 * sc, 10 * sc, 46 * sc, pkIL_d);   // L / R ladders, 1.2 s floating peak hold, click clears
+mIR.ui_ledm(1048 * sc, 252 * sc, 10 * sc, 46 * sc, pkIR_d);
+gfx_setfont(4); ui_col(INKL); ui_text(1037 * sc, 302 * sc, "L"); ui_text(1053 * sc, 302 * sc, "R");
+ui_text(1045 * sc, 314 * sc, "IN");
 qgroup(888, 344, 188, 258, "MASTER", ACC, SH2);
 ui_section(2); C_INK = INKL;
 ui_knob(940 * sc, 396 * sc, 3, 0, 100, 100, 0, "MIX", "%.0f%%");
 ui_knob(940 * sc, 474 * sc, 4, -24, 12, 0, 0, "OUTPUT", "%+.1f dB");
 ins_io(898, 534, 5, INKL);                         // SAT
-mO.ui_ledm(1040 * sc, 362 * sc, 12 * sc, 206 * sc, pkO);
-gfx_setfont(4); ui_col(INKL); ui_text(1046 * sc, 574 * sc, "OUT");
+pk_ledbtn(978 * sc, 528 * sc, 40 * sc, 26 * sc, lk_on >= 0.5, AMBL) ? ( lk_on = lk_on >= 0.5 ? 0 : 1; slider_automate(lk_on); );
+gfx_setfont(4); ui_col(INKL); ui_text(998 * sc, 556 * sc, "LINK");
+mOL.ui_ledm(1032 * sc, 362 * sc, 10 * sc, 196 * sc, pkOL_d);
+mOR.ui_ledm(1048 * sc, 362 * sc, 10 * sc, 196 * sc, pkOR_d);
+gfx_setfont(4); ui_col(INKL); ui_text(1037 * sc, 566 * sc, "L"); ui_text(1053 * sc, 566 * sc, "R");
+ui_text(1045 * sc, 579 * sc, "OUT");
 any_solo ? ( ui_col(AMBL); ui_text(940 * sc, 586 * sc, "SOLO ON"); );
-pkI *= 0.85; pkO *= 0.85;
+pkIL_d *= 0.85; pkIR_d *= 0.85; pkOL_d *= 0.85; pkOR_d *= 0.85;
 
 
 pk_end();

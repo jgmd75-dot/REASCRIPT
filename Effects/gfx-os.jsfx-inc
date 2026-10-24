@@ -1,0 +1,191 @@
+desc:GFX OS - optional oversampling (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// gfx-os - the house oversampler, so a unit can run its non-linear stages at 1x, 2x or 4x (the OS key).
+// Linear-phase half-band FIRs (Kaiser windowed), polyphase:
+//   stage 1 (1x <-> 2x): 63 taps, beta 8 - the filter Drive81 always used: flat to 0.33 dB at 0.45 x the rate,
+//                         -98 dB from 0.55 x. Latency 31 samples (up + down, at the base rate).
+//   stage 2 (2x <-> 4x): 23 taps, beta 9.5 - only has to clear the images of audio that stage 1 has already
+//                         band-limited: flat to 0.0003 dB, -93 dB where anything could fold back into the audio.
+//                         Latency 5.5 base samples, made 6 with one extra 2x sample, so 4x = 37 samples in all.
+// The kernels are symmetric, so each pair of taps shares one multiply; the delay lines are shift registers in
+// instance variables and the taps sit in globals, written out in full (no memory reads in the loop).
+//
+// API
+//   os_design()                 once in @init: the kernels
+//   os_f2n(v) / os_lat(f)       the OS slider (0 1x, 1 2x, 2 4x) -> the factor 1 / 2 / 4; a factor's latency
+//   u.os_up(x)                  one base-rate sample in -> u.s0 .. u.s(os_f - 1) at the running factor (os_f)
+//   u.os_s(i)                   u's phase i sample (u.s0 .. u.s3)
+//   d.os_dn(a, b, c, e)         os_f samples in (b, c, e unused below 4x / 2x) -> one base-rate sample out
+//   u.os_clr() / d.os_clr()     clear the state (after a factor change)
+//   os_gate()                   per sample: changing the factor (os_tf -> os_f) dips the output (os_g, 5 ms
+//                               down), swaps at the silent point (sets os_chg = 1 for one sample: the unit
+//                               re-works its rate-dependent coefficients and clears its filters there), holds
+//                               silence while the new latency comes through, then comes back (5 ms). The new
+//                               latency (os_base + os_lat(os_f)) goes to pdc_delay at the swap.
+//   os_key(x, y, idx, ink, fnt) (panel) the OS key: a 22 x 22 square lamp key (1x grey, 2x amber, 4x red), "OS"
+//                               printed on the panel to its left; each click cycles 1x -> 2x -> 4x (os_cycle)
+// Set os_base (the unit's other latency), os_f = os_tf = os_f2n(slider) and os_gsetup() in @init.
+
+@init
+function os_bi0(x) local(s, t, k) ( s = 1; t = 1; k = 1; loop(30, t *= sqr(x / (2 * k)); s += t; k += 1; ); s; );
+function os_hb(h, n, beta) local(c, t, k, w, x, se, i0) (
+  c = (n - 1) / 2; i0 = os_bi0(beta); t = 0;
+  loop(n,
+    k = t - c; x = 2 * t / (n - 1) - 1;
+    w = os_bi0(beta * sqrt(max(0, 1 - x * x))) / i0;
+    h[t] = k == 0 ? 0.5 : sin($pi * k / 2) / ($pi * k) * w;
+    t += 1;
+  );
+  se = 0; t = 0; loop((n + 1) / 2, se += h[2 * t]; t += 1; );
+  t = 0; loop((n + 1) / 2, h[2 * t] *= 0.5 / se; t += 1; );      // each polyphase branch: unity at DC
+);
+
+// ---------- stage 1: 63 taps (16 tap pairs) ----------
+// up 2x: one sample in -> o0, o1 (the odd branch of a half-band is a pure delay)
+function os_up1(x) instance(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+                            a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31,
+                            o0, o1) (
+  a31 = a30; a30 = a29; a29 = a28; a28 = a27; a27 = a26; a26 = a25; a25 = a24; a24 = a23; a23 = a22; a22 = a21;
+  a21 = a20; a20 = a19; a19 = a18; a18 = a17; a17 = a16; a16 = a15; a15 = a14; a14 = a13; a13 = a12; a12 = a11;
+  a11 = a10; a10 = a9; a9 = a8; a8 = a7; a7 = a6; a6 = a5; a5 = a4; a4 = a3; a3 = a2; a2 = a1;
+  a1 = a0; a0 = x;
+  o0 = os_u0 * (a0 + a31) + os_u1 * (a1 + a30) + os_u2 * (a2 + a29) + os_u3 * (a3 + a28)
+    + os_u4 * (a4 + a27) + os_u5 * (a5 + a26) + os_u6 * (a6 + a25) + os_u7 * (a7 + a24)
+    + os_u8 * (a8 + a23) + os_u9 * (a9 + a22) + os_u10 * (a10 + a21) + os_u11 * (a11 + a20)
+    + os_u12 * (a12 + a19) + os_u13 * (a13 + a18) + os_u14 * (a14 + a17) + os_u15 * (a15 + a16);
+  o1 = a15;
+);
+// down 2x: two samples in -> one out (on the even phase); b0..b31 the last 32 even samples, c1..c16 the odd ones
+function os_dn1(x0, x1) instance(b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
+                                 b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31,
+                                 c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16) local(y) (
+  b31 = b30; b30 = b29; b29 = b28; b28 = b27; b27 = b26; b26 = b25; b25 = b24; b24 = b23; b23 = b22; b22 = b21;
+  b21 = b20; b20 = b19; b19 = b18; b18 = b17; b17 = b16; b16 = b15; b15 = b14; b14 = b13; b13 = b12; b12 = b11;
+  b11 = b10; b10 = b9; b9 = b8; b8 = b7; b7 = b6; b6 = b5; b5 = b4; b4 = b3; b3 = b2; b2 = b1;
+  b1 = b0; b0 = x0;
+  y = os_d0 * (b0 + b31) + os_d1 * (b1 + b30) + os_d2 * (b2 + b29) + os_d3 * (b3 + b28)
+    + os_d4 * (b4 + b27) + os_d5 * (b5 + b26) + os_d6 * (b6 + b25) + os_d7 * (b7 + b24)
+    + os_d8 * (b8 + b23) + os_d9 * (b9 + b22) + os_d10 * (b10 + b21) + os_d11 * (b11 + b20)
+    + os_d12 * (b12 + b19) + os_d13 * (b13 + b18) + os_d14 * (b14 + b17) + os_d15 * (b15 + b16)
+    + 0.5 * c16;
+  c16 = c15; c15 = c14; c14 = c13; c13 = c12; c12 = c11; c11 = c10; c10 = c9; c9 = c8; c8 = c7; c7 = c6;
+  c6 = c5; c5 = c4; c4 = c3; c3 = c2; c2 = c1; c1 = x1;
+  y;
+);
+
+// ---------- stage 2: 23 taps (6 tap pairs) ----------
+function os_up2(x) instance(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, o0, o1) (
+  a11 = a10; a10 = a9; a9 = a8; a8 = a7; a7 = a6; a6 = a5; a5 = a4; a4 = a3; a3 = a2; a2 = a1; a1 = a0; a0 = x;
+  o0 = os_v0 * (a0 + a11) + os_v1 * (a1 + a10) + os_v2 * (a2 + a9) + os_v3 * (a3 + a8)
+    + os_v4 * (a4 + a7) + os_v5 * (a5 + a6);
+  o1 = a5;
+);
+function os_dn2(x0, x1) instance(b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, c1, c2, c3, c4, c5, c6) local(y) (
+  b11 = b10; b10 = b9; b9 = b8; b8 = b7; b7 = b6; b6 = b5; b5 = b4; b4 = b3; b3 = b2; b2 = b1; b1 = b0; b0 = x0;
+  y = os_e0 * (b0 + b11) + os_e1 * (b1 + b10) + os_e2 * (b2 + b9) + os_e3 * (b3 + b8)
+    + os_e4 * (b4 + b7) + os_e5 * (b5 + b6) + 0.5 * c6;
+  c6 = c5; c5 = c4; c4 = c3; c3 = c2; c2 = c1; c1 = x1;
+  y;
+);
+
+function os_design() local(h) (
+  h = os_mem = 8388000;                                 // scratch for the kernels (top of the default 8M memory)
+  os_hb(h, 63, 8);
+  os_u0 = 2 * h[0]; os_u1 = 2 * h[2]; os_u2 = 2 * h[4]; os_u3 = 2 * h[6]; os_u4 = 2 * h[8]; os_u5 = 2 * h[10];
+  os_u6 = 2 * h[12]; os_u7 = 2 * h[14]; os_u8 = 2 * h[16]; os_u9 = 2 * h[18]; os_u10 = 2 * h[20];
+  os_u11 = 2 * h[22]; os_u12 = 2 * h[24]; os_u13 = 2 * h[26]; os_u14 = 2 * h[28]; os_u15 = 2 * h[30];
+  os_d0 = h[0]; os_d1 = h[2]; os_d2 = h[4]; os_d3 = h[6]; os_d4 = h[8]; os_d5 = h[10]; os_d6 = h[12];
+  os_d7 = h[14]; os_d8 = h[16]; os_d9 = h[18]; os_d10 = h[20]; os_d11 = h[22]; os_d12 = h[24];
+  os_d13 = h[26]; os_d14 = h[28]; os_d15 = h[30];
+  os_hb(h, 23, 9.5);
+  os_v0 = 2 * h[0]; os_v1 = 2 * h[2]; os_v2 = 2 * h[4]; os_v3 = 2 * h[6]; os_v4 = 2 * h[8]; os_v5 = 2 * h[10];
+  os_e0 = h[0]; os_e1 = h[2]; os_e2 = h[4]; os_e3 = h[6]; os_e4 = h[8]; os_e5 = h[10];
+  memset(h, 0, 64);
+);
+
+function os_f2n(v) ( v >= 1.5 ? 4 : v >= 0.5 ? 2 : 1; );
+function os_lat(f) ( f == 4 ? 37 : f == 2 ? 31 : 0; );
+
+// one base-rate sample up to the running factor: s0 (1x), s0 s1 (2x), s0 .. s3 (4x)
+function os_up(x) instance(s0, s1, s2, s3, z) (
+  os_f == 1 ? s0 = x : (
+    this.st1.os_up1(x);
+    os_f == 2 ? ( s0 = this.st1.o0; s1 = this.st1.o1; ) : (
+      this.st2.os_up2(this.st1.o0); s0 = this.st2.o0; s1 = this.st2.o1;
+      this.st2.os_up2(this.st1.o1); s2 = this.st2.o0; s3 = this.st2.o1;
+    );
+  );
+);
+// phase i's sample (0 .. os_f - 1)
+function os_s(i) instance(s0, s1, s2, s3) ( i == 0 ? s0 : i == 1 ? s1 : i == 2 ? s2 : s3; );
+// the running factor's samples down to one base-rate sample (4x: one extra 2x sample of delay, z, so the total
+// latency is a whole number of base samples)
+function os_dn(a, b, c, e) instance(z) local(p, q, y) (
+  os_f == 1 ? a : os_f == 2 ? this.st1.os_dn1(a, b) : (
+    p = this.st2.os_dn2(a, b); q = this.st2.os_dn2(c, e);
+    y = this.st1.os_dn1(z, p); z = q;
+    y;
+  );
+);
+function os_clr() instance(s0, s1, s2, s3, z) (
+  s0 = s1 = s2 = s3 = z = 0;
+  loop(34, this.st1.os_up1(0); this.st1.os_dn1(0, 0); this.st2.os_up2(0); this.st2.os_dn2(0, 0); );
+);
+
+// ---------- switching the factor without a click ----------
+function os_gsetup() (
+  os_gc = 1 / (0.005 * srate); os_g = 1; os_hold = 0; os_chg = 0;
+  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = os_base + os_lat(os_f);
+);
+function os_gate() (
+  os_chg = 0;
+  os_tf != os_f ? (
+    os_g = max(os_g - os_gc, 0);
+    os_g == 0 ? (
+      os_f = os_tf; os_chg = 1; pdc_delay = os_base + os_lat(os_f);
+      os_hold = os_base + os_lat(os_f) + 8;
+    );
+  ) : os_hold > 0 ? os_hold -= 1 : os_g < 1 ? os_g = min(os_g + os_gc, 1);
+);
+
+// ---------- panel ----------
+// (idx 1 - 63: automated by mask)
+function os_cycle(idx) ( slider(idx) = slider(idx) >= 1.5 ? 0 : slider(idx) >= 0.5 ? 2 : 1; slider_automate(2 ^ (idx - 1)); );
+function os_lbl(v) ( v >= 1.5 ? "4x" : v >= 0.5 ? "2x" : "1x"; );
+// The OS key: a small square lamp key (22 x 22 design px, the size of the Grey rack's THICK key) showing 1x / 2x / 4x,
+// dark grey at 1x, lit amber at 2x, lit red at 4x; "OS" is printed on the panel to its left in the ink colour.
+// (x, y) = the key's top left in design px, sc = the panel scale, fnt = a free font slot. Each click cycles the
+// slider idx 1x -> 2x -> 4x. Returns 1 when clicked.
+function os_rect(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function os_key(x, y, idx, ink, fnt) local(v, s, hov, hit, c, tw, th, j) (
+  v = slider(idx); s = 22;
+  hov = mouse_x >= x * sc && mouse_x < (x + s) * sc && mouse_y >= y * sc && mouse_y < (y + s) * sc;
+  hit = hov && (mouse_cap & 1) && !os_mdn; os_mdn = mouse_cap & 1;
+  c = v >= 1.5 ? 0xFF3A2A : v >= 0.5 ? 0xFFB030 : 0;
+  // "OS", printed on the panel
+  gfx_setfont(fnt, "Trebuchet MS", 14 * sc, 'b');
+  gfx_r = (ink >> 16 & 255) / 255; gfx_g = (ink >> 8 & 255) / 255; gfx_b = (ink & 255) / 255; gfx_a = 1;
+  gfx_measurestr("OS", tw, th); gfx_x = (x - 7) * sc - tw; gfx_y = (y + s * 0.5) * sc - th * 0.5; gfx_drawstr("OS");
+  // soft drop shadow (light from the top left), the well, the lens
+  j = 0; loop(4, gfx_set(0, 0, 0, 0.13); os_rect(x + 2 + j * 1.3, y + 3 + j * 1.6, s + j * 0.5, s + j * 0.5); j += 1; );
+  c ? ( gfx_set((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255, 0.22); os_rect(x - 3, y - 3, s + 6, s + 6); );
+  gfx_set(0.02, 0.02, 0.02, 1); os_rect(x, y, s, s);
+  c ? (
+    gfx_set((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255, 1); os_rect(x + 2, y + 2, s - 4, s - 4);
+    gfx_set(1, 0.97, 0.88, 0.35); os_rect(x + 6, y + 6, s - 12, s - 12);                           // paler centre
+    gfx_set(1, 1, 1, 0.3); os_rect(x + 2, y + 2, s - 4, 1);
+  ) : (
+    gfx_set(0.33, 0.34, 0.35, 1); os_rect(x + 2, y + 2, s - 4, s - 4);                               // dark grey glass
+    gfx_set(0, 0, 0, 0.16); os_rect(x + 2, y + s - 5, s - 4, 3); os_rect(x + s - 5, y + 2, 3, s - 4);   // vignette
+    gfx_set(1, 1, 1, 0.12); os_rect(x + 2, y + 2, s - 4, 1);
+  );
+  hov ? ( gfx_set(1, 1, 1, 0.08); os_rect(x + 2, y + 2, s - 4, s - 4); );
+  // the legend: dark on a lit lens, light on the dark one
+  gfx_setfont(fnt, "Trebuchet MS", 12 * sc, 'b');
+  c ? gfx_set(0.13, 0.11, 0.09, 1) : gfx_set(0.78, 0.79, 0.8, 1);
+  gfx_measurestr(os_lbl(v), tw, th); gfx_x = (x + s * 0.5) * sc - tw * 0.5; gfx_y = (y + s * 0.5) * sc - th * 0.5 + 0.5 * sc;
+  gfx_drawstr(os_lbl(v));
+  hit ? os_cycle(idx);
+  hit;
+);
