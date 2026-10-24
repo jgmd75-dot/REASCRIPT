@@ -1,0 +1,1016 @@
+desc: GFX Kombi [mastering strip]
+//author: JGWizrad / Garden FX (GFX)
+//
+// Kombi — a Swedish broadcast mastering strip in five eras. Reference (comments
+// only, never on the panel): Sveriges Radio / SATT custom discrete circuitry and
+// Lundahl-wound transformers; the eras and their moods borrow from five Volvo
+// generations. The panel shows only the era numbers.
+//
+// SIGNAL FLOW (stereo; LINK lit = linked, dark = dual mono): input transformer -> PASSIVE EQ (+ LIFT / DIP) -> MONO / WIDTH -> COMPRESSOR ->
+// discrete amp stage (DRIVE) -> output transformer -> era clip -> true-peak
+// lookahead LIMITER -> CEILING.
+// SHARE THE LOAD: one LOAD control (dB) instead of a limiter input gain. Like an old
+// broadcast chain, the work is spread down the line: the first dB go into the
+// compressor, the next into the amp and iron (saturation holds peaks back), the next
+// into the era clipper, and only what's left reaches the brickwall. Each era sets the
+// shares: 240 leans on grit and clip, 360 on clean compression, 480 on sheen and soft
+// clip, 940 on glue and iron, 960 keeps it clean and gives most to the limiter. Masters
+// get louder by getting denser, not flatter. The LOAD display shows where the work is.
+// MODE (slider 7) changes every stage and the whole panel. Three eras:
+//   240  brutal: FET-style peak compressor (fast, hard knee), the hottest asymmetric amp with
+//        a little grit, a knee clipper ahead of a fast limiter; the broadest, hardest EQ
+//   480  sporty: punchy peak compressor (slow attack, sidechain high-pass), even-harmonic
+//        sheen and a transient lift, a soft clipper; the tightest low end (28 Hz high-pass)
+//   960  the apex: tube-style variable-ratio compressor, silky odd-harmonic iron, a barely-there
+//        soft clipper and the most transparent limiter; the smoothest EQ (HIGH FREQ to 20 kHz)
+// The display (every era, same order): COMP / LOAD - IN / OUT - CLIP / LIMIT.
+// EQ: passive program-EQ style (separate boost and attenuation networks; see eq_set).
+// Saturation: a smooth curve (x / sqrt(1 + x^2)), so distortion falls with the square of the
+// level: at DRIVE 3 and -12 dBFS, about 0.35% THD in 240, 0.27% in 480, 0.05% in 960.
+// The eras are voiced to sit within ~0.5 dB of each other at the same settings (etr trims the rest).
+// Compressor: feed-forward, gain computed in dB with a soft knee; automatic make-up (the gain
+// a -12 dBFS signal would lose); MIX blends in parallel. SIDECHAIN: SC HPF (20 = off - 500 Hz)
+// and SC LPF (1 - 20 kHz = off), 12 dB/oct, on the detector only.
+// LINK (lit = linked, the old sound): dark = dual mono - each side its own compressor, transient
+// lift and limiter detector (the limiter is still lookahead and true-peak). Switching glides 10 ms.
+// MID LIFT / DIP: 3 dB in 240, 2 dB in 480, 1 dB in 960.
+// OS (header key, 1x / 2x / 4x, default 1x = the old sound): the amp stage, output iron and era
+// clipper run oversampled (one section, linear-phase half-bands from gfx-os). The dry path
+// for IN is delayed to match. Switching dips 5 ms.
+// DRIVE is level-matched at -12 dBFS: it changes the character, not the loudness.
+// Limiter: 1.5 ms lookahead, true-peak detection (4x windowed-sinc interpolation plus a
+// parabolic crest estimate; within 0.1 dB up to 19 kHz, like 4x meters blinder above 20 kHz),
+// sliding-minimum gain with a box-smoothed attack, so the output never passes the
+// CEILING (a final sample clamp is a seatbelt only). Release and voicing per era.
+// Every curve is anti-aliased (first-order ADAA). Era switches dip ~5 ms (no click).
+// Latency: 1.5 ms + 8 samples, plus 31 (2x) or 37 (4x) samples with OS (reported to REAPER).
+//
+// STATUS: Stable (graduated from the Lab on 24 Oct 2026 as Lab v0.3: SC filters, LINK, OS, three era panels).
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-clip.jsfx-inc
+import gfx-os.jsfx-inc
+
+slider1:drive=3<0,10,0.1>-Drive
+slider2:eq_lb=0<0,10,0.1>-Low Boost
+slider3:eq_la=0<0,10,0.1>-Low Atten
+slider4:eq_lf=2<0,3,1{20,30,60,100}>-Low Freq (Hz)
+slider5:eq_hb=0<0,10,0.1>-High Boost
+slider6:c_thr=-12<-36,0,0.1>-Comp Threshold (dB)
+slider7:mode=2<0,2,1{240,480,960}>-Mode
+slider8:k_on=1<0,1,1{Off,On}>-In
+slider9:c_rat=2<1,20,0.01>-Comp Ratio
+slider10:c_atk=10<0.1,100,0.01>-Comp Attack (ms)
+slider11:c_rel=150<20,1500,1>-Comp Release (ms)
+slider12:c_mix=100<0,100,0.1>-Comp Mix (%)
+slider13:l_push=3<0,18,0.1>-Load (dB)
+slider14:l_ceil=-1<-6,0,0.1>-Ceiling (dBTP)
+slider15:eq_hf=4<0,6,1{3k,4k,5k,8k,10k,12k,16k}>-High Freq (kHz; 240 / 960 shift the steps)
+slider16:eq_bw=5<0,10,0.1>-Bandwidth (sharp - broad)
+slider17:eq_af=1<0,2,1{5k,10k,20k}>-Atten Freq
+slider18:eq_ha=0<0,10,0.1>-High Atten
+slider19:md_mode=0<0,2,1{Off,Lift,Dip}>-Mid Lift / Dip
+slider20:md_freq=0<0,1,1{750 Hz,2 kHz}>-Mid Freq
+slider21:st_mono=0<0,330,1>-Mono Below (Hz, 0 = off)
+slider22:st_width=0<0,10,0.1>-Width Above 5 kHz
+slider23:0<0,2,1{1x,2x,4x}>-Oversampling
+slider24:lk_on=1<0,1,1{Off,On}>-Link
+slider25:sc_hp=20<20,500,1>-SC HPF (Hz, 20 = off)
+slider26:sc_lp=20000<1000,20000,1>-SC LPF (Hz, 20000 = off)
+
+@init
+ext_noinit = 1;
+fsr = srate;
+os_design();
+gfx_ext_retina = 1;
+pr_cur = 1;
+first_run = 1;
+clp_aa = 1;
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function tg(f) ( tan($pi * min(f, fsr * 0.45) / fsr); );   // fsr: the rate the filter runs at (srate, or srate x OS)
+
+// smooth saturator x / sqrt(1 + x^2) with first-order ADAA (half-sample lag made up). Smooth at zero, so quiet
+// material stays clean (distortion falls with the square of the level); only the peaks are coloured.
+function sat_f(x) ( x / sqrt(1 + x * x); );
+function sat_ad(x) ( sqrt(1 + x * x) - 1; );
+function adaa(x) instance(xp, Fp, yp) local(F, yc, d, y) (
+  F = sat_ad(x);  yc = sat_f(x);  d = x - xp;
+  abs(d) < 0.00001 ? ( y = sat_f(0.5 * (x + xp)); ) : ( y = (F - Fp) / d; );
+  y += 0.5 * (yc - yp);
+  xp = x;  Fp = F;  yp = yc;  y;
+);
+// driven, biased amp stage: unity at DRIVE 0, level-matched at -12 dBFS once driven
+function stage(x, g, b) instance(a) (
+  (a.adaa(x * g + b) - sat_f(b)) * ((1 - stg_t) * (1 + b * b) ^ 1.5 / g + stg_t * 0.5 / (sat_f(g * 0.25 + b) - sat_f(-g * 0.25 + b)));   // both halves (asymmetric stages)
+);
+// one-pole low-pass (TPT)
+function op_set(fc) instance(G) local(w) ( w = tg(fc);  G = w / (1 + w); );
+function op_lp(x) instance(G, s) local(v, y) ( v = (x - s) * G;  y = v + s;  s = y + v;  y; );
+// transformer: the lows split off and pushed through the iron curve (unity for small signals)
+function iron(x, ik, ib) instance(lp, a) local(lf) (
+  lf = lp.op_lp(x);
+  (x - lf) + (a.adaa(lf * ik + ib) - sat_f(ib)) * (1 + ib * ib) ^ 1.5 / ik;
+);
+// RBJ biquad (per instance): 1 HP, 2 peak, 3 high shelf, 4 low shelf, 5 LP
+function kq_set(type, f, q, gdb) instance(b0, b1, b2, a1, a2) local(w0, cw, sw, al, amp, sa, n) (
+  w0 = 2 * $pi * min(f, fsr * 0.45) / fsr;  cw = cos(w0);  sw = sin(w0);  al = sw / (2 * q);  amp = 10 ^ (gdb / 40);
+  type == 5 ? ( n = 1 + al;  b0 = (1 - cw) * 0.5 / n;  b1 = (1 - cw) / n;  b2 = b0;  a1 = -2 * cw / n;  a2 = (1 - al) / n; ) :
+  type == 1 ? ( n = 1 + al;  b0 = (1 + cw) * 0.5 / n;  b1 = -(1 + cw) / n;  b2 = b0;  a1 = -2 * cw / n;  a2 = (1 - al) / n; ) :
+  type == 2 ? ( n = 1 + al / amp;  b0 = (1 + al * amp) / n;  b1 = -2 * cw / n;  b2 = (1 - al * amp) / n;  a1 = b1;  a2 = (1 - al / amp) / n; ) :
+  type == 3 ? ( sa = 2 * sqrt(amp) * al;  n = (amp + 1) - (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) + (amp - 1) * cw + sa) / n;  b1 = -2 * amp * ((amp - 1) + (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) + (amp - 1) * cw - sa) / n;  a1 = 2 * ((amp - 1) - (amp + 1) * cw) / n;  a2 = ((amp + 1) - (amp - 1) * cw - sa) / n; ) :
+  ( sa = 2 * sqrt(amp) * al;  n = (amp + 1) + (amp - 1) * cw + sa;                  // 4: low shelf
+    b0 = amp * ((amp + 1) - (amp - 1) * cw + sa) / n;  b1 = 2 * amp * ((amp - 1) - (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) - (amp - 1) * cw - sa) / n;  a1 = -2 * ((amp - 1) + (amp + 1) * cw) / n;  a2 = ((amp + 1) + (amp - 1) * cw - sa) / n; );
+);
+function kq_clr() instance(x1, x2, y1, y2) ( x1 = x2 = y1 = y2 = 0; );
+function kq_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;  x2 = x1;  x1 = x;  y2 = y1;  y1 = y;  y;
+);
+// SVF low-pass (the 940 band split)
+function sv_set(fc, q) instance(g, k, a1, a2, a3) ( g = tg(fc);  k = 1 / q;  a1 = 1 / (1 + g * (g + k));  a2 = g * a1;  a3 = g * a2; );
+function sv_clr() instance(ic1, ic2) ( ic1 = ic2 = 0; );
+function sv_lp(x) instance(g, k, a1, a2, a3, ic1, ic2) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;  v2;
+);
+
+// ---------- the OS section's filters: the output iron's corners and the clip residual's low-pass, at srate x OS ----------
+function os_rates() (
+  fsr = srate * os_f;
+  chL.olp.lp.op_set(xof);  chR.olp.lp.op_set(xof);  chL.o2lp.lp.op_set(xof * 1.6);  chR.o2lp.lp.op_set(xof * 1.6);   // (iron's own low-pass: name.lp)
+  lfL.kq_set(5, min(20000, srate * 0.42), 0.7071, 0);  lfR.kq_set(5, min(20000, srate * 0.42), 0.7071, 0);
+  fsr = srate;
+);
+// ---------- the compressor's sidechain filters (SC HPF / SC LPF, 12 dB/oct; at the ends of their travel: off) ----------
+function sc_set() (
+  sh_on = sc_hs > 20.5;  sl_on = sc_ls < 19999;
+  sh_on ? ( sfhL.kq_set(1, sc_hs, 0.7071, 0);  sfhR.kq_set(1, sc_hs, 0.7071, 0); );
+  sl_on ? ( sflL.kq_set(5, sc_ls, 0.7071, 0);  sflR.kq_set(5, sc_ls, 0.7071, 0); );
+  sc_dirty = 0;
+);
+
+// ---------- the eras ----------
+// drive / iron:  mkc make-up per DRIVE; hr amp headroom; dmax DRIVE range (dB); ab amp bias (even harmonics); grit 240's knee;
+//                xi* / xo* input / output iron corner, depth, bias; trn 480 transient lift
+// compressor:    cpk peak (1) or RMS (0) detector; ckn knee (dB); cam / crm attack / release multipliers; chp sidechain HPF (Hz, 0 off);
+//                cpd program-dependent release; cvm variable ratio
+// limiter:       lrl release (ms); lcl pre-clip knee (1 hardest .. 3 softest); lpd program-dependent release; etr era trim (dB, loudness match)
+// share the load: ldc / ldi / ldk how many dB of LOAD the compressor / iron + amp / clipper take before passing the rest on
+function set_era(m) (
+  m == 0 ? ( mkc = 0.17; hr = 0.45; dmax = 6;   ab = 0.07;  grit = 0.06;  xif = 110;  xik = 0.9;  xib = 0.03;  xof = 85;  xok = 0.7;  xob = 0.02;  trn = 0;
+             cpk = 1;  ckn = 4;   cam = 0.7;  crm = 0.85; chp = 0;    cpd = 0;    cvm = 0;   lrl = 60;   lcl = 1;  lpd = 0;    etr = 0.5;
+             ldc = 3;  ldi = 1.5;  ldk = 2; ) :
+  m == 2 ? ( mkc = 0.5;  hr = 0.4;  dmax = 8;   ab = 0.04;  grit = 0;     xif = 80;   xik = 0.55; xib = 0.03;  xof = 70;  xok = 0.5;  xob = 0.025; trn = 0.15;
+             cpk = 1;  ckn = 4;   cam = 1.3;  crm = 0.9;  chp = 120;  cpd = 0;    cvm = 0;   lrl = 70;   lcl = 2;  lpd = 0;    etr = 0;
+             ldc = 3;  ldi = 1.2;  ldk = 2; ) :
+           ( mkc = 0.04; hr = 0.15; dmax = 14;  ab = 0;     grit = 0;     xif = 50;   xik = 0.5;  xib = 0;     xof = 45;  xok = 0.45; xob = 0;     trn = 0;
+             cpk = 0;  ckn = 8;   cam = 1.5;  crm = 1;    chp = 60;   cpd = 0.6;  cvm = 1;   lrl = 70;   lcl = 3;  lpd = 0;    etr = 0;
+             ldc = 3;  ldi = 1;  ldk = 2; );
+  era = m;
+  et_g = db2g(etr);                                                       // era trim (set at the silent point): the eras meet at the same loudness
+  chL.ilp.lp.op_set(xif);  chR.ilp.lp.op_set(xif);
+  os_rates();                                                              // the output iron runs in the OS section
+  scL.op_set(max(chp, 10));  scR.op_set(max(chp, 10));
+  sc_dirty = 1;
+  eq_dirty = 1;  lim_dirty = 1;  cmp_dirty = 1;
+);
+
+// ---------- the passive EQ (both channels) ----------
+// Reference (comments only): the classic passive program equalisers (Pultec EQP-1A style low and high-boost
+// networks, HLF-style high attenuation). Boost and attenuation are separate networks: LOW BOOST is a broad shelf at
+// LOW FREQ, LOW ATTEN a gentler shelf turning over higher up, so using both gives the bump-and-dip low end. HIGH
+// BOOST is a bell at HIGH FREQ with BANDWIDTH (sharp .. broad), HIGH ATTEN a shelf at ATTEN FREQ. Knobs read 0 - 10.
+// Per era (the network values): eb boost shelf Q; ec atten corner (x LOW FREQ); ea atten Q; eqs / eqb bell Q sharp /
+// broad; ehs high-boost scale; ehq atten shelf Q. 240 broad and hard, 480 a tight low end (and its 28 Hz high-pass),
+// 960 the smoothest, with HIGH FREQ steps reaching 20 kHz (240's start lower).
+function hf_tab(i) ( era == 0 ? ( i == 0 ? 2000 : i == 1 ? 3000 : i == 2 ? 4000 : i == 3 ? 5000 : i == 4 ? 8000 : i == 5 ? 10000 : 12000; ) :
+                     era == 4 ? ( i == 0 ? 4000 : i == 1 ? 5000 : i == 2 ? 8000 : i == 3 ? 10000 : i == 4 ? 12000 : i == 5 ? 16000 : 20000; ) :
+                                ( i == 0 ? 3000 : i == 1 ? 4000 : i == 2 ? 5000 : i == 3 ? 8000 : i == 4 ? 10000 : i == 5 ? 12000 : 16000; ); );
+function eq_set() local(lf, hf, af, q, eb, ec, ea, eqs, eqb, ehs, ehq) (
+  era == 0 ? ( eb = 0.5;  ec = 5.0;  ea = 0.7;    eqs = 2.0;  eqb = 0.35;  ehs = 1.0;  ehq = 0.7; ) :
+  era == 2 ? ( eb = 0.7;  ec = 5.5;  ea = 0.9;   eqs = 2.8;  eqb = 0.5;   ehs = 1.1;  ehq = 0.6; ) :
+             ( eb = 0.55; ec = 6.0;  ea = 0.7;   eqs = 2.0;  eqb = 0.35;  ehs = 1.0;  ehq = 0.45; );
+  lf = eq_lf < 0.5 ? 20 : eq_lf < 1.5 ? 30 : eq_lf < 2.5 ? 60 : 100;
+  hf = hf_tab(floor(eq_hf + 0.5));
+  af = eq_af < 0.5 ? 5000 : eq_af < 1.5 ? 10000 : 20000;
+  q = eqs * exp(eq_bw / 10 * log(eqb / eqs));
+  chL.e1.kq_set(4, lf, eb, eq_lb * 1.4);             chR.e1.kq_set(4, lf, eb, eq_lb * 1.4);
+  chL.e2.kq_set(4, lf * ec, ea, -eq_la * (era == 0 ? 0.7 : 0.6));   chR.e2.kq_set(4, lf * ec, ea, -eq_la * (era == 0 ? 0.7 : 0.6));
+  chL.e3.kq_set(2, hf, q, eq_hb * 1.6 * ehs);        chR.e3.kq_set(2, hf, q, eq_hb * 1.6 * ehs);
+  chL.e4.kq_set(3, af, ehq, -eq_ha * 1.6);           chR.e4.kq_set(3, af, ehq, -eq_ha * 1.6);
+  chL.hp.kq_set(1, 28, 0.7071, 0);                   chR.hp.kq_set(1, 28, 0.7071, 0);
+  // LIFT / DIP: a broad passive-style bell at 750 Hz or 2 kHz, +-3 dB in 240, +-2 in 480, +-1 in 960
+  md_db = era == 0 ? 3 : era == 2 ? 2 : 1;
+  chL.e5.kq_set(2, md_freq < 0.5 ? 750 : 2000, 0.8, md_mode < 0.5 ? 0 : md_mode < 1.5 ? md_db : -md_db);
+  chR.e5.kq_set(2, md_freq < 0.5 ? 750 : 2000, 0.8, md_mode < 0.5 ? 0 : md_mode < 1.5 ? md_db : -md_db);
+  ms_w.kq_set(3, 5000, 0.6, st_width * 0.6);                               // WIDTH: the side lifted above 5 kHz (a shelf, up to +6 dB)
+  eq_dirty = 0;
+);
+
+// one channel: input iron and EQ
+function ch_eq(x) instance(ilp, e1, e2, e3, e4, e5, hp) local(y) (
+  y = ilp.iron(x, xik * (1 + 0.5 * dn), xib);                               // input transformer
+  era == 2 ? y = hp.kq_run(y);                                               // 480: the tight 28 Hz high-pass
+  e5.kq_run(e4.kq_run(e3.kq_run(e2.kq_run(e1.kq_run(y)))));
+);
+// one channel: the amp stage and output iron
+function ch_drv(y, tg_) instance(ga, gk, olp, o2lp) (
+  y = ga.stage(y, dg, ab * (0.25 + 0.75 * dn));                              // discrete amp stage (the bias grows with DRIVE)
+  grit > 0 ? ( y += (gk.clp_run(y) - y) * grit * dn; );                      // 240: hard knee at -9 dBFS
+  trn > 0 ? ( y *= tg_; );                                                   // 480: transient lift (this side's gain; LINK: shared)
+  y = olp.iron(y, xok * (1 + 0.3 * dn), xob);                                // output transformer
+  era == 3 ? ( y = o2lp.iron(y, xok * 0.7, 0.02); );                         // 940: the second stage
+  y;
+);
+// at the silent point of an era switch: every filter memory cleared, so the new era starts clean
+function ch_clear() instance(e1, e2, e3, e4, e5, hp) (
+  e1.kq_clr();  e2.kq_clr();  e3.kq_clr();  e4.kq_clr();  e5.kq_clr();  hp.kq_clr();
+);
+// the oversampled section's memories (amp stage, output iron, the clippers), cleared when the OS factor changes
+function ch_osclr() instance(ga, gk, olp, o2lp) (
+  ga.a.xp = ga.a.Fp = ga.a.yp = 0;  olp.a.xp = olp.a.Fp = olp.a.yp = 0;  o2lp.a.xp = o2lp.a.Fp = o2lp.a.yp = 0;
+  olp.lp.s = 0;  o2lp.lp.s = 0;  gk.clp_reset();
+);
+
+// ---------- compressor gain computer (dB in, gain change in dB out, <= 0) ----------
+function cgc(l, t, r, w) local(o) (
+  o = l - t;
+  2 * o < -w ? 0 : 2 * abs(o) <= w ? (1 / r - 1) * sqr(o + w * 0.5) / (2 * max(w, 0.001)) : (1 / r - 1) * o;
+);
+function cmp_set() (
+  c_a = 1 - exp(-1 / (max(0.05, c_atk * cam) * 0.001 * srate));
+  c_r = c_rel * crm;
+  c_mk = db2g(min(12, -cgc(-12, c_thr, c_rat, ckn)));                        // auto make-up: what -12 dBFS would lose
+  c_mx = c_mix / 100;
+  cmp_dirty = 0;
+);
+
+// ---------- limiter ----------
+// memory: true-peak history, sliding-min deque, box ring, audio / dry delay lines
+RN = 1024;  TPH = 10240;  DQV = 11264;  DQI = 12288;  BOX = 13312;  DLL = 14336;  DLR = 15360;  DRL = 16384;  DRR = 17408;
+DQV2 = 18432;  DQI2 = 19456;  BOX2 = 20480;                                  // the right side's deque and box (LINK dark: each side its own gain)   // RN apart: no block overlaps the next
+// 4x interpolation: phases 1/4, 2/4, 3/4 between x[n-8] and x[n-7], 16 taps (Hann-windowed sinc)
+function tp_init() local(ph, k, t, w) (
+  ph = 1;
+  loop(3, k = 0;
+    loop(16, t = ph / 4 - (k - 7);  w = 0.5 + 0.5 * cos($pi * t / 8.5);
+      TPC[(ph - 1) * 16 + k] = (abs(t) < 0.000001 ? 1 : sin($pi * t) / ($pi * t)) * w;  k += 1; );
+    ph += 1; );
+);
+TPC = 9000;  TPV = 9100;
+tp_init();
+function lim_set() (
+  la_n = max(8, min(RN - 16, floor(0.0015 * srate + 0.5)));                 // lookahead (samples)
+  l_rc = 1 - exp(-1 / (lrl * 0.001 * srate));
+  l_cg = db2g(l_ceil) * 0.9995;
+  lcl == 1 ? ( lkL.clp_set(2, l_cg * 1.12, l_cg * 1.12, 0);  lkL.clp_knee(l_cg * 0.3);  lkR.clp_set(2, l_cg * 1.12, l_cg * 1.12, 0);  lkR.clp_knee(l_cg * 0.3); );
+  lcl == 2 ? ( lkL.clp_set(2, l_cg * 1.15, l_cg * 1.15, 0);  lkL.clp_knee(l_cg * 0.4);  lkR.clp_set(2, l_cg * 1.15, l_cg * 1.15, 0);  lkR.clp_knee(l_cg * 0.4); );   // 480: a soft knee, clean below it
+  lcl == 3 ? ( lkL.clp_set(2, l_cg * 1.2, l_cg * 1.2, 0);  lkL.clp_knee(l_cg * 0.35);  lkR.clp_set(2, l_cg * 1.2, l_cg * 1.2, 0);  lkR.clp_knee(l_cg * 0.35); );   // 960: barely there, clean below the ceiling
+  os_base = la_n + 8;  pdc_delay = os_base + os_lat(os_f);  pdc_bot_ch = 0;  pdc_top_ch = 2;
+  lim_dirty = 0;
+);
+function lim_reset() (
+  memset(TPH, 0, 64);  memset(BOX, 1, RN);  memset(BOX2, 1, RN);  dq_h2 = dq_t2 = 0;  box_s2 = la_n;  l_env2 = 1;  memset(DLL, 0, RN);  memset(DLR, 0, RN);  memset(DRL, 0, RN);  memset(DRR, 0, RN);
+  dq_h = dq_t = 0;  box_s = la_n;  l_env = 1;  l_n = 0;
+);
+
+// the drive stage's gains from DRIVE and the era (per block, and at the silent point of an era switch)
+function drv_upd() (
+  dn = drive_s / 10;
+  dg = db2g(drive_s * dmax / 10) * hr;
+  stg_t = min(1, drive_s / 4);
+  mk_g = db2g(-mkc * dn);                                        // per-era make-up: loudness stays put as DRIVE turns
+);
+function update_targets() (
+  mode_t = floor(mode + 0.5) * 2;                   // eras kept: 240 (0), 480 (2), 960 (4)
+  on_t = k_on >= 0.5;
+  os_tf = os_f2n(slider23);
+  lk_t = lk_on >= 0.5;
+  eq_dirty = 1;  cmp_dirty = 1;  lim_dirty = 1;
+);
+
+sm = 1 - exp(-1 / (0.02 * srate));
+fstep = 1 / (0.0025 * srate);
+t_fa = 1 - exp(-1 / (0.0005 * srate));  t_fr = 1 - exp(-1 / (0.03 * srate));
+t_sa = 1 - exp(-1 / (0.015 * srate));
+lk_a = 1 - exp(-1 / (0.01 * srate));                                         // LINK glides over 10 ms
+c_rms = 1 - exp(-1 / (0.005 * srate));                                      // RMS detector window
+c_slw = 1 - exp(-1 / (0.8 * srate));
+w_rl = exp(-1 / (0.08 * srate));                                             // work meters: peak hold release                                         // program memory (program-dependent releases)
+chL.gk.clp_set(2, 0.35, 0.35, 0);  chL.gk.clp_knee(0.05);  chR.gk.clp_set(2, 0.35, 0.35, 0);  chR.gk.clp_knee(0.05);
+
+@slider
+update_targets();
+first_run ? (
+  os_f = os_tf;  os_gsetup();  lk_s = lk_t;  sc_hs = sc_hp;  sc_ls = sc_lp;
+  set_era(mode_t);  on_s = on_t;  fade = 1;  drive_s = drive;  cgr = 0;  gc_s = gi_s = gk_s = gl_s = 1;
+  lim_set();  lim_reset();
+  first_run = 0;
+);
+
+@block
+prm_dirty ? ( prm_dirty = 0;  update_targets(); );
+drive_s += (drive - drive_s) * (1 - exp(-samplesblock / (0.03 * srate)));
+drv_upd();                                        // per-era make-up: loudness stays put as DRIVE turns
+// SHARE THE LOAD: LOAD (dB) is handed down the chain in order; each stage takes up to its era's share, the limiter the rest
+ld_c = min(l_push, ldc);  ld_i = min(max(l_push - ldc, 0), ldi);  ld_k = min(max(l_push - ldc - ldi, 0), ldk);  ld_l = max(l_push - ldc - ldi - ldk, 0);
+gc_t = db2g(ld_c);  gi_t = db2g(ld_i);  gk_t = db2g(ld_k);  gl_t = db2g(ld_l);
+ldc_d = ld_c;  ldi_d = ld_i;  ldk_d = ld_k;  ldl_d = ld_l;
+eq_dirty ? eq_set();
+cmp_dirty ? cmp_set();
+// SC HPF / LPF: the corners glide (per block), so a sweep doesn't step
+sc_hs != sc_hp || sc_ls != sc_lp ? ( sc_hs += (sc_hp - sc_hs) * min(1, samplesblock / (0.03 * srate));  sc_ls += (sc_lp - sc_ls) * min(1, samplesblock / (0.03 * srate));
+  abs(sc_hs - sc_hp) < 0.5 ? sc_hs = sc_hp;  abs(sc_ls - sc_lp) < 5 ? sc_ls = sc_lp;  sc_dirty = 1; );
+sc_dirty ? sc_set();
+// MONO / WIDTH (mid-side, after the EQ): the mono corner glides so a sweep doesn't zip
+mo_s += (st_mono - mo_s) * (1 - exp(-samplesblock / (0.05 * srate)));
+mo_on = mo_s >= 20;
+mo_on && abs(mo_s - mo_set) > 0.5 ? ( mo_set = mo_s;  ms_h1.kq_set(1, mo_s, 0.7071, 0);  ms_h2.kq_set(1, mo_s, 0.7071, 0); );
+!mo_on ? mo_set = 0;
+lim_dirty ? ( la_old = la_n;  lim_set();  la_n != la_old ? lim_reset(); );
+// meters
+inpk_d = max(inpk_d, inpk);  inpk = 0;  outpk_d = max(outpk_d, outpk);  outpk = 0;
+opL_d = max(opL_d, opL);  opL = 0;  opR_d = max(opR_d, opR);  opR = 0;
+cgr_d = min(cgr_d, cgr_m);  cgr_m = 0;  lgr_d = min(lgr_d, lgr_m);  lgr_m = 0;
+iw_d = max(iw_d, iw_m);  iw_m = 0;  kw_d = max(kw_d, kw_m);  kw_m = 0;
+
+@sample
+os_gate();
+os_chg ? ( os_rates();  chL.ch_osclr();  chR.ch_osclr();  lkL.clp_reset();  lkR.clp_reset();  lfL.kq_clr();  lfR.kq_clr();  k_pL = k_pR = 0;
+           upL.os_clr();  upR.os_clr();  dnL.os_clr();  dnR.os_clr(); );
+gc_s += (gc_t - gc_s) * sm;  gi_s += (gi_t - gi_s) * sm;  gk_s += (gk_t - gk_s) * sm;  gl_s += (gl_t - gl_s) * sm;
+lk_s += (lk_t - lk_s) * lk_a;  lk_u = 1 - lk_s;                             // LINK: 1 = linked, 0 = dual mono (the dual-mono share lk_u)
+on_s != on_t ? ( on_s = on_t > on_s ? min(1, on_s + fstep * 0.25) : max(0, on_s - fstep * 0.25); );
+// era switch: dip, switch at the silent point, return
+mode_t != era ? ( fade = max(0, fade - fstep);  fade == 0 ? ( set_era(mode_t);  drv_upd();  eq_set();  cmp_set();  lim_set();  chL.ch_clear();  chR.ch_clear(); ); ) : fade < 1 ? ( fade = min(1, fade + fstep); );
+xL = spl0;  xR = spl1;
+inpk = max(inpk, max(abs(xL), abs(xR)));
+
+// 480's transient lift detector (LINK: both sides hear the louder; dark: each its own)
+trn > 0 ? (
+  dv = max(abs(xL), abs(xR));
+  dvL = dv * lk_s + abs(xL) * lk_u;  dvR = dv * lk_s + abs(xR) * lk_u;
+  tfL += (dvL - tfL) * (dvL > tfL ? t_fa : t_fr);  tsL += (dvL - tsL) * (dvL > tsL ? t_sa : t_fr);
+  tfR += (dvR - tfR) * (dvR > tfR ? t_fa : t_fr);  tsR += (dvR - tsR) * (dvR > tsR ? t_sa : t_fr);
+  trgL = 1 + trn * dn * max(0, min(1, (tfL - tsL) / max(tsL, 0.0001)));
+  trgR = 1 + trn * dn * max(0, min(1, (tfR - tsR) / max(tsR, 0.0001)));
+);
+
+// 1. iron + EQ
+yL = chL.ch_eq(xL);
+yR = chR.ch_eq(xR);
+
+// 1b. MONO below the corner (the side high-passed, 4th order) and WIDTH above 5 kHz (the side lifted up to +6 dB)
+mo_on || st_width > 0 ? (
+  ms_m = (yL + yR) * 0.5;  ms_d = (yL - yR) * 0.5;
+  mo_on ? ms_d = ms_h2.kq_run(ms_h1.kq_run(ms_d));
+  st_width > 0 ? ms_d = ms_w.kq_run(ms_d);
+  yL = ms_m + ms_d;  yR = ms_m - ms_d;
+);
+
+// 2. compressor (LINK lit: one detector for both sides; dark: each side its own)
+yL *= gc_s;  yR *= gc_s;                                                      // LOAD share 1: into the compressor
+dL = yL;  dR = yR;
+chp > 0 ? ( dL = yL - scL.op_lp(yL);  dR = yR - scR.op_lp(yR); );            // the era's own sidechain high-pass
+sh_on ? ( dL = sfhL.kq_run(dL);  dR = sfhR.kq_run(dR); );                      // SC HPF
+sl_on ? ( dL = sflL.kq_run(dL);  dR = sflR.kq_run(dR); );                      // SC LPF
+cpk ? (
+  c_lv = max(abs(dL), abs(dR));
+  c_lL = c_lv * lk_s + abs(dL) * lk_u;  c_lR = c_lv * lk_s + abs(dR) * lk_u;
+) : (
+  c_sq = (dL * dL + dR * dR) * 0.5;
+  c_msL += (c_sq * lk_s + dL * dL * lk_u - c_msL) * c_rms;  c_msR += (c_sq * lk_s + dR * dR * lk_u - c_msR) * c_rms;
+  c_lL = sqrt(max(c_msL, 0)) * 1.4142136;  c_lR = sqrt(max(c_msR, 0)) * 1.4142136;
+);
+c_dbL = 8.685889638065035 * log(max(c_lL, 0.00001));  c_dbR = 8.685889638065035 * log(max(c_lR, 0.00001));
+c_vrL = cvm ? 1 + (c_rat - 1) * (0.7 + 0.3 * min(1, -cgrL / 8)) : c_rat;    // 960: the ratio rises a little as it works
+c_vrR = cvm ? 1 + (c_rat - 1) * (0.7 + 0.3 * min(1, -cgrR / 8)) : c_rat;
+c_tgL = cgc(c_dbL, c_thr, c_vrL, ckn);  c_tgR = cgc(c_dbR, c_thr, c_vrR, ckn);
+c_pmL += (-cgrL - c_pmL) * c_slw;  c_pmR += (-cgrR - c_pmR) * c_slw;        // how long it's been working
+c_rrL = 1 - exp(-1 / (c_r * (1 + cpd * 2 * min(1, c_pmL / 6)) * 0.001 * srate));
+c_rrR = cpd > 0 ? 1 - exp(-1 / (c_r * (1 + cpd * 2 * min(1, c_pmR / 6)) * 0.001 * srate)) : c_rrL;
+cgrL += (c_tgL - cgrL) * (c_tgL < cgrL ? c_a : c_rrL);
+cgrR += (c_tgR - cgrR) * (c_tgR < cgrR ? c_a : c_rrR);
+cgr = min(cgrL, cgrR);
+yL *= 1 + (db2g(cgrL) * c_mk - 1) * c_mx;  yR *= 1 + (db2g(cgrR) * c_mk - 1) * c_mx;
+cgr_m = min(cgr_m, cgr);
+
+// 3 + 4a. THE OVERSAMPLED SECTION (OS 1x / 2x / 4x): amp stage, output iron, the era clipper
+yL *= gi_s;  yR *= gi_s;                                                      // LOAD share 2: into the amp and iron
+w_a = max(abs(yL), abs(yR));
+upL.os_up(yL);  upR.os_up(yR);
+oi = 0;
+loop(os_f,
+  uL = chL.ch_drv(upL.os_s(oi), trn > 0 ? trgL : 1);
+  uR = chR.ch_drv(upR.os_s(oi), trn > 0 ? trgR : 1);
+  w_b = max(w_b, max(abs(uL), abs(uR)));
+  uL *= mk_g;  uR *= mk_g;
+  lcl ? (                                                                     // LOAD share 3: into the era clipper
+    uL *= gk_s;  uR *= gk_s;
+    k_wa = max(k_wa, max(abs(uL), abs(uR)));
+    // the clipper works on what it removes: its residual (the clipped output minus what ADAA makes of a straight line,
+    // the mean of this and the last sample) is filtered above 20 kHz and added back, so below the knee the music passes
+    // untouched, full bandwidth and no delay
+    k_rL = lkL.clp_run(uL) - 0.5 * (uL + k_pL);  k_pL = uL;
+    k_rR = lkR.clp_run(uR) - 0.5 * (uR + k_pR);  k_pR = uR;
+    uL += lfL.kq_run(k_rL);  uR += lfR.kq_run(k_rR);
+    k_wb = max(k_wb, max(abs(uL), abs(uR)));
+  );
+  oi == 0 ? ( o0L = uL;  o0R = uR; ) : oi == 1 ? ( o1L = uL;  o1R = uR; ) : oi == 2 ? ( o2L = uL;  o2R = uR; ) : ( o3L = uL;  o3R = uR; );
+  oi += 1;
+);
+yL = dnL.os_dn(o0L, o1L, o2L, o3L);  yR = dnR.os_dn(o0R, o1R, o2R, o3R);
+iw_a = max(w_a, iw_a * w_rl);  iw_b = max(w_b, iw_b * w_rl);  w_b = 0;   // how much the iron is holding back (peak in vs out)
+iw_m = max(iw_m, 8.685889638065035 * log(max(iw_a, 0.00001) / max(iw_b, 0.00001)));
+lcl ? (
+  kw_a = max(k_wa, kw_a * w_rl);  kw_b = max(k_wb, kw_b * w_rl);  k_wa = k_wb = 0;
+  kw_m = max(kw_m, 8.685889638065035 * log(max(kw_a, 0.00001) / max(kw_b, 0.00001)));
+);
+
+// 4b. limiter: true-peak lookahead (LINK lit: one gain for both sides; dark: each side its own)
+yL *= gl_s * fade * et_g;  yR *= gl_s * fade * et_g;                          // LOAD share 4: the rest, into the limiter (and the era dip, ahead of the lookahead)
+l_n += 1;
+// true-peak history (16 per channel)
+memcpy(TPH, TPH + 1, 15);  TPH[15] = yL;  memcpy(TPH + 16, TPH + 17, 15);  TPH[31] = yR;
+// five points across the interval (x[n-8], three interpolated, x[n-7]) per channel, then a parabola through the
+// largest and its neighbours finds the crest between the 4x points (a plain 4x reading can miss ~0.3 dB at 15 kHz)
+TPV[0] = abs(TPH[7]);  TPV[4] = abs(TPH[8]);  TPV[5] = abs(TPH[23]);  TPV[9] = abs(TPH[24]);
+tk = 0;
+loop(3,
+  tvL = 0;  tvR = 0;  tj = 0;
+  loop(16, tvL += TPH[tj] * TPC[tk * 16 + tj];  tvR += TPH[16 + tj] * TPC[tk * 16 + tj];  tj += 1; );
+  TPV[1 + tk] = abs(tvL) * 1.012;  TPV[6 + tk] = abs(tvR) * 1.012;  tk += 1;   // 0.1 dB margin: a short interpolator reads HF crests low
+);
+tc = 0;
+loop(2,
+  tk = 0;  tm = 0;  loop(5, TPV[tc + tk] > TPV[tc + tm] ? tm = tk;  tk += 1; );
+  pq_a = TPV[tc + max(tm - 1, 0)];  pq_b = TPV[tc + tm];  pq_c = TPV[tc + min(tm + 1, 4)];  pq_d = pq_a - 2 * pq_b + pq_c;
+  pq_v = tm > 0 && tm < 4 && pq_d < 0 ? pq_b - sqr(pq_a - pq_c) / (8 * pq_d) : pq_b;
+  tc == 0 ? l_pkL = pq_v : l_pkR = pq_v;
+  tc += 5;
+);
+l_pk = max(l_pkL, l_pkR);
+l_pkL = l_pk * lk_s + l_pkL * lk_u;  l_pkR = l_pk * lk_s + l_pkR * lk_u;
+// left (and linked): sliding minimum over la_n + 1 samples (monotonic deque)
+l_req = l_pkL > l_cg ? l_cg / l_pkL : 1;
+while ( dq_t > dq_h && DQV[(dq_t - 1) % RN] >= l_req ) ( dq_t -= 1; );
+DQV[dq_t % RN] = l_req;  DQI[dq_t % RN] = l_n;  dq_t += 1;
+while ( DQI[dq_h % RN] <= l_n - la_n - 1 ) ( dq_h += 1; );
+l_min = DQV[dq_h % RN];
+// release (instant down, era release up; 940 / 960 slow down further on long passages)
+l_pm += ((1 - min(l_env, l_env2)) - l_pm) * c_slw;
+l_env = l_min < l_env ? l_min : l_env + (l_min - l_env) * l_rc / (1 + lpd * 4 * min(1, l_pm * 8));
+// box smoothing over la_n: the attack ramps in across the lookahead
+bi = l_n % la_n;  box_s += l_env - BOX[bi];  BOX[bi] = l_env;
+l_g = min(1, box_s / la_n);
+// right: the same, its own deque and box (with LINK lit it hears the same peaks, so it moves exactly as the left)
+l_req = l_pkR > l_cg ? l_cg / l_pkR : 1;
+while ( dq_t2 > dq_h2 && DQV2[(dq_t2 - 1) % RN] >= l_req ) ( dq_t2 -= 1; );
+DQV2[dq_t2 % RN] = l_req;  DQI2[dq_t2 % RN] = l_n;  dq_t2 += 1;
+while ( DQI2[dq_h2 % RN] <= l_n - la_n - 1 ) ( dq_h2 += 1; );
+l_min = DQV2[dq_h2 % RN];
+l_env2 = l_min < l_env2 ? l_min : l_env2 + (l_min - l_env2) * l_rc / (1 + lpd * 4 * min(1, l_pm * 8));
+box_s2 += l_env2 - BOX2[bi];  BOX2[bi] = l_env2;
+l_g2 = min(1, box_s2 / la_n);
+lgr_m = min(lgr_m, 8.685889638065035 * log(max(min(l_g, l_g2), 0.00001)));
+// delay lines (audio: 8 + la_n, the true-peak centre; dry: the same plus the OS latency, for a latency-matched bypass)
+wi = l_n % RN;  ri = (l_n - la_n - 8 + RN * 4) % RN;  rd = (l_n - la_n - 8 - os_lat(os_f) + RN * 4) % RN;
+DLL[wi] = yL;  DLR[wi] = yR;  DRL[wi] = xL;  DRR[wi] = xR;
+yL = DLL[ri] * l_g;  yR = DLR[ri] * l_g2;
+yL = max(-l_cg, min(l_cg, yL));  yR = max(-l_cg, min(l_cg, yR));             // seatbelt
+zL = DRL[rd];  zR = DRR[rd];
+yL = (zL + (yL - zL) * on_s) * os_g;  yR = (zR + (yR - zR) * on_s) * os_g;   // (os_g: the OS change dip)
+opL = max(opL, abs(yL));  opR = max(opR, abs(yR));
+outpk = max(outpk, max(opL, opR));
+spl0 = yL;  spl1 = yR;
+
+@serialize
+file_var(0, pr_cur);
+
+@gfx 1000 640
+// =====================================================================
+// GUI — one layout, three skins (the era repaints everything):
+//   240 matte charcoal, desk knobs (charcoal caps), machined-ring DRIVE / LOAD / CEILING (LOAD's ring orange),
+//       band-colour EQ knobs, heavy sans,
+//       one safety-orange accent line and indicator dot; OUT = L and R bars
+//   480 pitch black cockpit, wedge sliders instead of knobs, monospaced digits,
+//       illuminated digital green with amber pop-ups; OUT = L (outer) and R (inner) LED arcs
+//   960 luxury: dark brown ground, light warm-grey plates (one per row), ivory bakelite
+//       (compressor), modern hi-fi (DRIVE / LOAD), flat knobs (CEILING, MONO, WIDTH), band-colour
+//       EQ knobs, a dark brown display with cream arcs; OUT = L (outer) and R (inner) arcs
+// Every model: filter knobs for the SC filters, a floating peak hold per side on OUT (held 1.2 s,
+// then falls; the held peaks as figures; click the OUT meter to clear). Pointers, arcs and wedges
+// are supersampled (even at every angle).
+// Values show on hover (house rule), except 480's digital readouts, which are the look.
+// =====================================================================
+function col(h, a) ( gfx_r = floor(h / 65536) / 255;  gfx_g = (floor(h / 256) % 256) / 255;  gfx_b = (h % 256) / 255;  gfx_a = a; );
+function shade(h, f) local(r, g, b) (
+  r = min(255, floor(floor(h / 65536) * f));  g = min(255, floor((floor(h / 256) % 256) * f));  b = min(255, floor((h % 256) * f));  r * 65536 + g * 256 + b;
+);
+function px(v) ( ox + v * sc; );
+function py(v) ( oy + v * sc; );
+function ps(v) ( v * sc; );
+function text_c(x, y, str) local(w, h) ( gfx_measurestr(str, w, h);  gfx_x = x - w * 0.5;  gfx_y = y - h * 0.5;  gfx_drawstr(str); );
+function rr(x, y, w, h, r) local(i, d, ins) (
+  x = floor(px(x) + 0.5);  y = floor(py(y) + 0.5);  w = floor(ps(w) + 0.5);  h = floor(ps(h) + 0.5);
+  r = min(floor(ps(r) + 0.5), floor(min(w, h) * 0.5));  i = 0;
+  loop(r, d = r - i - 0.5;  ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);  gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);  i += 1; );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+function gdb(x) ( 8.685889638065035 * log(max(x, 0.000000001)); );
+function param_touched(idx) ( slider_automate(2 ^ (idx - 1));  gui_dirty = 1; );
+function pointer(x, y, sa, ca, r0, r1, hw) local(ax, ay, bx, by, dx, dy) (
+  ax = x + sa * r0;  ay = y - ca * r0;  bx = x + sa * r1;  by = y - ca * r1;  dx = ca * hw;  dy = sa * hw;
+  gfx_triangle(ax + dx, ay + dy, bx + dx, by + dy, bx - dx, by - dy, ax - dx, ay - dy);
+);
+// HIGH FREQ steps per era (the GUI's own copy of hf_tab)
+function u_hft(i) ( era_h == 0 ? ( i == 0 ? 2000 : i == 1 ? 3000 : i == 2 ? 4000 : i == 3 ? 5000 : i == 4 ? 8000 : i == 5 ? 10000 : 12000; ) :
+                    era_h == 4 ? ( i == 0 ? 4000 : i == 1 ? 5000 : i == 2 ? 8000 : i == 3 ? 10000 : i == 4 ? 12000 : i == 5 ? 16000 : 20000; ) :
+                                 ( i == 0 ? 3000 : i == 1 ? 4000 : i == 2 ? 5000 : i == 3 ? 8000 : i == 4 ? 10000 : i == 5 ? 12000 : 16000; ); );
+function vstr(v, fmt) (
+  fmt == 0 ? sprintf(#kv, "%+.1f dB", v) : fmt == 1 ? sprintf(#kv, "%.1f", v) :
+  fmt == 2 ? ( v < 1000 ? sprintf(#kv, "%d Hz", v) : sprintf(#kv, "%.2f kHz", v / 1000); ) :
+  fmt == 3 ? sprintf(#kv, "%.1f:1", v) : fmt == 4 ? ( v < 10 ? sprintf(#kv, "%.1f ms", v) : sprintf(#kv, "%d ms", v); ) :
+  fmt == 5 ? sprintf(#kv, "%d%%", v) : fmt == 6 ? sprintf(#kv, "%.1f dB", v) : fmt == 7 ? sprintf(#kv, "%.1f dBTP", v) :
+  fmt == 8 ? sprintf(#kv, "%d Hz", v < 0.5 ? 20 : v < 1.5 ? 30 : v < 2.5 ? 60 : 100) :
+  fmt == 9 ? sprintf(#kv, "%d kHz", u_hft(floor(v + 0.5)) / 1000) : fmt == 10 ? sprintf(#kv, "%d kHz", v < 0.5 ? 5 : v < 1.5 ? 10 : 20) :
+  fmt == 11 ? ( v < 20 ? strcpy(#kv, "OFF") : sprintf(#kv, "%d Hz", v); ) :
+  fmt == 13 ? ( v <= 20.5 ? strcpy(#kv, "OFF") : sprintf(#kv, "%d Hz", v); ) :
+  fmt == 14 ? ( v >= 19999 ? strcpy(#kv, "OFF") : sprintf(#kv, "%.1f kHz", v / 1000); ) : sprintf(#kv, "%.1f", v);
+  #kv;
+);
+
+// ---------- one control, three looks. Interaction is shared: drag up / down (480: also sideways),
+// Ctrl-click or double-click = default. lg = log taper. Returns nothing. ----------
+function ctl(cx, cy, r, idx, vmin, vmax, def, lbl, fmt, lg, dis)
+  local(x, y, RR, v, t, hov, hv, now, a0, a1, tv, j, b, w, h, ty, ww, hh, x0, y0, xs, qq)
+(
+  x = px(cx);  y = py(cy);  RR = ps(r);
+  sk == 2 ? ( ww = r * 2.6;  hh = 26;  hov = mouse_x >= px(cx - ww * 0.5) && mouse_x <= px(cx + ww * 0.5) && mouse_y >= py(cy - 22) && mouse_y <= py(cy + 22); )
+             : ( hov = sqr(mouse_x - x) + sqr(mouse_y - y) <= sqr(RR * 1.2); );
+  v = slider(idx);  t = lg == 1 ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  click && hov && !dis ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? ( slider(idx) = def;  param_touched(idx);  drag_idx = 0; )
+      : ( drag_idx = idx;  drag_y = mouse_y;  drag_x = mouse_x;  drag_t = t; );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  drag_idx == idx ? (
+    t = max(0, min(1, drag_t + (drag_y - mouse_y + (sk == 2 ? mouse_x - drag_x : 0)) / ps(220)));
+    v = lg == 1 ? vmin * exp(t * log(vmax / vmin)) : vmin + t * (vmax - vmin);
+    lg == 1 ? ( qq = 10 ^ (floor(log10(v)) - 2);  v = floor(v / qq + 0.5) * qq; ) : lg == 2 ? ( v = floor(v + 0.5); ) : ( v = floor(v * 10 + 0.5) / 10; );
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = slider(idx);  t = lg == 1 ? log(v / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;  tv = a0 + t * (a1 - a0);  hv = hov || drag_idx == idx;
+  sk == 2 ? (                                       // 480: a wedge slider with a digital readout (supersampled edges)
+    x0 = cx - ww * 0.5;  y0 = cy + 4;  xs = x0 + ww * t;
+    col(0x0A2A16, 1);  ui_sstri(px(x0), py(y0 + hh * 0.5), px(x0 + ww), py(y0 - hh * 0.5), px(x0 + ww), py(y0 + hh * 0.5));
+    t > 0.002 ? ( col(u_cap ? u_cap4 : 0x00FF66, 0.85);  ui_sstri(px(x0), py(y0 + hh * 0.5), px(xs), py(y0 + hh * 0.5 - hh * t), px(xs), py(y0 + hh * 0.5)); );
+    col(0x00FF66, 1);  ui_ssline(px(x0), py(y0 + hh * 0.5), px(x0 + ww), py(y0 - hh * 0.5), ps(1.2), 1);
+    gfx_rect(px(x0), py(y0 + hh * 0.5) - ps(0.6), ps(ww), ps(1.2), 1);  gfx_rect(px(x0 + ww) - ps(0.6), py(y0 - hh * 0.5), ps(1.2), ps(hh), 1);
+    col(0xFFB020, 1);  gfx_rect(px(xs - 1), py(y0 - hh * 0.5 - 4), ps(2), ps(hh + 8), 1);
+    gfx_setfont(3);  col(0x00FF66, 0.75);  text_c(x, py(cy + 34), lbl);
+    gfx_setfont(8);  col(dis ? 0x1E5A34 : 0x00FF66, 1);  text_c(x, py(cy - 26), dis ? "FIXED" : vstr(v, fmt));
+  ) : (
+    // 240: desk knobs (charcoal caps, LOAD orange) and band-colour EQ knobs; 960: ivory bakelite (compressor),
+    // modern hi-fi (DRIVE / LOAD), flat knobs (CEILING, MONO, WIDTH), band-colour EQ knobs. Filter knobs for the
+    // sidechain filters on both. Every pointer is supersampled (even at any angle).
+    kt == 4 || kt == 5 ? ui_knob_filter(x, y, RR, tv, hv, kt - 3) :
+    kt == 1 ? dy_ccap(x, y, RR, t, u_cap) :
+    sk == 0 && (kt == 2 || kt == 3) ? (       // 240 DRIVE / LOAD / CEILING: machined-ring knobs (LOAD's ring orange)
+      ui_knonum = 1;  ui_knob_main(x, y, RR, tv, t, hv, 0, idx == 13 ? 0xFF6A13 : 0xE6E6DE, 0xEDEDE6);  ui_knonum = 0; ) :
+    sk == 0 ? ui_knob_desk(x, y, RR, tv, hv, 0x3A3C3F, 0) :
+    kt == 3 ? dy_flcap(x, y, RR, t) : (
+      pk_kstyle = kt == 2 ? 5 : 4;  j = 0;
+      col(u_ink, 0.55);  loop(11, b = a0 + j / 10 * (a1 - a0);  gfx_circle(x + sin(b) * (RR + ps(6)), y - cos(b) * (RR + ps(6)), ps(1.2), 1, 1);  j += 1; );
+      kt == 2 ? ( col(0xD08A2A, 1);  t > 0.004 ? ui_ssarc(x, y, RR + ps(6), a0, tv, ps(1.6)); );
+      pk_bkcap(x, y, RR, tv);
+    );
+    gfx_setfont(3);  col(u_ink, 1);  text_c(x, y + RR + ps(22), lbl);
+  );
+  dis && sk != 2 ? ( gfx_setfont(5);  col(0xFF6A13, 0.9);  text_c(x, y, "FIXED"); );
+  sk != 2 && (hov || drag_idx == idx) ? (
+    gfx_setfont(4);  gfx_measurestr(vstr(v, fmt), w, h);  ty = y - RR - ps(16) - h;
+    col(0x0C0C0C, 0.92);  gfx_rect(x - w * 0.5 - ps(6), ty - ps(3), w + ps(12), h + ps(6), 1);
+    col(0xF0F0EA, 1);  text_c(x, ty + h * 0.5, #kv);
+  );
+);
+
+// a key in the era's style (mode selector, IN)
+function ekey(x, y, w, h, on, str) local(hov, j) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  sk == 0 ? (
+    col(0x000000, 0.5);  rr(x + 2, y + 3, w, h, 2);  col(on ? 0x3C3C3C : 0x262626, 1);  rr(x, y, w, h, 2);
+    on ? ( col(0xFF6A13, 1);  gfx_rect(px(x + 6), py(y + h - 5), ps(w - 12), ps(2), 1); );
+    gfx_setfont(2);  col(on ? 0xF2F2EC : 0x8A8A84, 1);
+  ) : sk == 2 ? (
+    col(on ? 0x00FF66 : 0x0E3A20, 1);  gfx_rect(px(x), py(y), ps(w), ps(h), 0);  on ? ( col(0x00FF66, 0.15);  gfx_rect(px(x), py(y), ps(w), ps(h), 1); );
+    gfx_setfont(8);  col(on ? 0x00FF66 : 0x1E6A3A, 1);
+  ) : (
+    col(0x000000, 0.13);  j = 0;  loop(4, rr(x + 2 + j * 1.3, y + 3 + j * 1.6, w + j * 0.5, h + j * 0.5, 4);  j += 1; );
+    col(0x8E8678, 1);  rr(x, y, w, h, 4);  col(on ? 0xE2DCD0 : 0xC4BDB0, 1);  rr(x + 1, y + 1, w - 2, h - 2, 3);
+    col(0xFFFFFF, 0.35);  gfx_rect(px(x + 4), py(y + 1), ps(w - 8), ps(1), 1);
+    on ? ( col(0xFFB040, 0.25);  gfx_circle(px(x + 12), py(y + h * 0.5), ps(6), 1, 1); );
+    col(0x2A1E16, 1);  gfx_circle(px(x + 12), py(y + h * 0.5), ps(4.5), 1, 1);
+    col(on ? 0xFFB040 : 0x5A4630, 1);  gfx_circle(px(x + 12), py(y + h * 0.5), ps(3.3), 1, 1);
+    gfx_setfont(2);  col(on ? 0x2A1E16 : 0x6A5E50, 1);
+  );
+  sk == 3 ? text_c(px(x + w * 0.5 + 6), py(y + h * 0.5), str) : text_c(px(x + w * 0.5), py(y + h * 0.5), str);
+  click && hov;
+);
+
+function u_pkstr(h, dst) ( h <= -59.9 ? strcpy(dst, " --") : sprintf(dst, "%+5.1f", h);  dst; );
+// ---------- the instrument cluster kit (one per era, after the era's own dashboard) ----------
+// angles clockwise from 12 o'clock, in radians
+function u_band(cx, cy, r0, r1, a0, a1, c, al) (
+  col(c, al);  a1 > a0 + 0.0005 ? ui_ssarc(px(cx), py(cy), ps((r0 + r1) * 0.5), a0, a1, ps(r1 - r0));
+);
+// 240: a blocky bar of chunky segments with a yellow digit window. v in units of vmax (dB); shr marks a share
+function u_blk(x, y, w, h, n, v, vmin, vmax, lbl, shr, on, dig) local(k, sw, f, c, lit) (
+  sw = w / n;  f = (v - vmin) / (vmax - vmin);  k = 0;
+  gfx_setfont(2);  col(0xF2C230, on ? 1 : 0.35);  gfx_x = px(x);  gfx_y = py(y - 17);  gfx_drawstr(lbl);
+  col(0x000000, 1);  gfx_rect(px(x - 3), py(y - 3), ps(w + 6), ps(h + 6), 1);
+  loop(n,
+    c = vmin < 0 && k >= n - 2 ? 0xFF3A20 : vmin < 0 && k >= n - 5 ? 0xFF6A13 : 0xF2C230;
+    lit = on && (k + 0.5) / n <= f;
+    col(c, lit ? 1 : 0.1);  gfx_rect(px(x + k * sw + 1), py(y), ps(sw - 2), ps(h), 1);
+    k += 1;
+  );
+  shr > 0 ? ( col(0xFF6A13, 0.9);  gfx_rect(px(x), py(y + h + 3), ps(w * min(1, (shr - vmin) / (vmax - vmin))), ps(2), 1); );
+  col(0x000000, 1);  gfx_rect(px(x + w + 10), py(y - 3), ps(62), ps(h + 6), 1);
+  gfx_setfont(11);  col(0xF2C230, on ? 1 : 0.3);  text_c(px(x + w + 41), py(y + h * 0.5), on ? dig : "--");
+);
+// 960: a thin, precise arc with a crisp readout (no needle)
+function u_ring(cx, cy, r, v, vmin, vmax, lbl, dig) local(f, a0, a1, av, k, a) (
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;  f = max(0, min(1, (v - vmin) / (vmax - vmin)));  av = a0 + f * (a1 - a0);
+  u_band(cx, cy, r * 0.9, r, a0, a1, 0x4A3A2E, 1);
+  f > 0.001 ? u_band(cx, cy, r * 0.9, r, a0, min(av, a0 + 0.86 * (a1 - a0)), 0xF1E4CA, 1);
+  av > a0 + 0.86 * (a1 - a0) ? u_band(cx, cy, r * 0.9, r, a0 + 0.86 * (a1 - a0), av, 0xFFB040, 1);
+  k = 0;  loop(7, a = a0 + k / 6 * (a1 - a0);  col(0xF1E4CA, 0.5);
+    gfx_circle(px(cx) + sin(a) * ps(r * 0.8), py(cy) - cos(a) * ps(r * 0.8), ps(1.3), 1, 1);  k += 1; );
+  gfx_setfont(13);  col(0xF1E4CA, 1);  text_c(px(cx), py(cy - 4), dig);
+  gfx_setfont(2);   col(0xBFA98C, 1);  text_c(px(cx), py(cy + r * 0.42), lbl);
+);
+// 960 OUT: L on the outer arc, R on the inner one, each with a floating peak tick; the held peaks as figures
+function u_ring2(cx, cy, r, vl, vr, hl, hr, vmin, vmax) local(a0, a1, f, av, ah, k, rr, v, h) (
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;  k = 0;
+  loop(2, rr = k == 0 ? r : r * 0.86;  v = k == 0 ? vl : vr;  h = k == 0 ? hl : hr;
+    f = max(0, min(1, (v - vmin) / (vmax - vmin)));  av = a0 + f * (a1 - a0);
+    u_band(cx, cy, rr - r * 0.1, rr, a0, a1, 0x4A3A2E, 1);
+    f > 0.001 ? u_band(cx, cy, rr - r * 0.1, rr, a0, min(av, a0 + 0.86 * (a1 - a0)), 0xF1E4CA, 1);
+    av > a0 + 0.86 * (a1 - a0) ? u_band(cx, cy, rr - r * 0.1, rr, a0 + 0.86 * (a1 - a0), av, 0xFFB040, 1);
+    f = (h - vmin) / (vmax - vmin);
+    f > 0.005 ? ( ah = a0 + min(f, 1) * (a1 - a0);  u_band(cx, cy, rr - r * 0.1, rr, ah - 0.02, ah + 0.02, h > -0.5 ? 0xFF5030 : 0xFFD080, 1); );
+    k += 1; );
+  k = 0;  loop(7, a0 = -0.75 * $pi + k / 6 * 1.5 * $pi;  col(0xF1E4CA, 0.5);
+    gfx_circle(px(cx) + sin(a0) * ps(r * 0.66), py(cy) - cos(a0) * ps(r * 0.66), ps(1.3), 1, 1);  k += 1; );
+  gfx_setfont(12);  col(0xBFA98C, 1);  text_c(px(cx - 30), py(cy - 14), "L");  text_c(px(cx - 30), py(cy + 10), "R");
+  col(0xF1E4CA, 1);  text_c(px(cx + 6), py(cy - 14), u_pkstr(hl, #pkl));  text_c(px(cx + 6), py(cy + 10), u_pkstr(hr, #pkr));
+  gfx_setfont(2);   col(0xBFA98C, 1);  text_c(px(cx), py(cy + r * 0.5), "OUT  PEAK");
+);
+// 960: a thin bar with label, readout and an amber share tick
+function u_thin(x, y, w, v, vmax, lbl, shr, on) local(f) (
+  f = max(0, min(1, v / vmax));
+  gfx_setfont(2);  col(0xBFA98C, on ? 1 : 0.4);  gfx_x = px(x);  gfx_y = py(y - 19);  gfx_drawstr(lbl);
+  col(0x4A3A2E, 1);  gfx_rect(px(x), py(y), ps(w), ps(4), 1);
+  col(0xF1E4CA, on ? 0.95 : 0.2);  gfx_rect(px(x), py(y), ps(w * f), ps(4), 1);
+  shr > 0 ? ( col(0xFFB040, 1);  gfx_rect(px(x + w * min(1, shr / vmax)) - 1, py(y - 4), ps(2), ps(12), 1); );
+  gfx_setfont(12);  col(0xF1E4CA, on ? 1 : 0.3);  gfx_x = px(x + w + 12);  gfx_y = py(y - 9);  gfx_drawstr(on ? sprintf(#th9, "%4.1f", v) : " --");
+);
+// 480: a digital arc of LED segments with an amber readout. Drawn at 2x and filtered down (smooth segment
+// edges); two = 1: OUT, the outer arc L and the inner one R, a floating peak segment on each, the held peaks as figures.
+function u_seg(c, lit) ( col(lit ? c : ui_mix(0x0A0202, c, 0.12), 1); );
+function u_dgauge(cx, cy, r, v, vmin, vmax, lbl, dig, two, vr, hl, hr) local(x, y, RG, n, k, a, w, f, fr, c, sa, ca, sb, cb, r0, r1, r2, r3, kh, kr) (
+  x = px(cx);  y = py(cy);  RG = ps(r);  n = 36;  w = 1.5 * $pi / n;
+  two ? ( r0 = RG * 0.88;  r1 = RG;  r2 = RG * 0.74;  r3 = RG * 0.85; ) : ( r0 = RG * 0.80;  r1 = RG; );
+  f = max(0, min(1, (v - vmin) / (vmax - vmin)));  fr = max(0, min(1, (vr - vmin) / (vmax - vmin)));
+  kh = floor((hl - vmin) / (vmax - vmin) * n);  kr = floor((hr - vmin) / (vmax - vmin) * n);
+  ui_ss_begin(x - RG - 2, y - RG - 2, x + RG + 2, y + RG * 0.75 + 2);
+  x = ui_ssx(x);  y = ui_ssy(y);  r0 *= 2;  r1 *= 2;  r2 *= 2;  r3 *= 2;  k = 0;
+  loop(n,
+    a = -0.75 * $pi + k * w;  c = k >= n - 3 ? 0xFF3020 : k >= n - 8 ? 0xFFB020 : 0x00FF66;
+    sa = sin(a + w * 0.12);  ca = cos(a + w * 0.12);  sb = sin(a + w * 0.88);  cb = cos(a + w * 0.88);
+    u_seg(c, (k + 0.5) / n <= f || (two && k == kh && hl > vmin + 0.5));
+    gfx_triangle(x + sa * r0, y - ca * r0, x + sa * r1, y - ca * r1, x + sb * r1, y - cb * r1, x + sb * r0, y - cb * r0);
+    two ? (
+      u_seg(c, (k + 0.5) / n <= fr || (k == kr && hr > vmin + 0.5));
+      gfx_triangle(x + sa * r2, y - ca * r2, x + sa * r3, y - ca * r3, x + sb * r3, y - cb * r3, x + sb * r2, y - cb * r2);
+    );
+    k += 1;
+  );
+  ui_ss_end();
+  x = px(cx);  y = py(cy);
+  col(0x00FF66, 0.25);  k = 0;  loop(7, a = -0.75 * $pi + k / 6 * 1.5 * $pi;
+    ui_ssline(x + sin(a) * RG * (two ? 0.64 : 0.72), y - cos(a) * RG * (two ? 0.64 : 0.72), x + sin(a) * RG * (two ? 0.69 : 0.77), y - cos(a) * RG * (two ? 0.69 : 0.77), ps(1), 0);  k += 1; );
+  two ? (
+    col(0x1A0A00, 1);  gfx_rect(x - ps(42), y - ps(26), ps(84), ps(46), 1);
+    gfx_setfont(10);  col(0x00FF66, 0.8);  text_c(x - ps(28), y - ps(13), "L");  text_c(x - ps(28), y + ps(8), "R");
+    col(0xFFB020, 1);  text_c(x + ps(8), y - ps(13), u_pkstr(hl, #pkl));  text_c(x + ps(8), y + ps(8), u_pkstr(hr, #pkr));
+  ) : (
+    col(0x1A0A00, 1);  gfx_rect(x - ps(40), y - ps(16), ps(80), ps(30), 1);
+    gfx_setfont(10);  col(0xFFB020, 1);  text_c(x, y - ps(1), dig);
+  );
+  gfx_setfont(6);  col(0x00FF66, 0.8);  text_c(x, y + RG * (two ? 0.66 : 0.48), lbl);
+);
+// 480: a red LED bar with its digits (stage work)
+function u_dbar(x, y, lbl, v, shr, on, dps) local(k, n, c) (
+  n = 16;  k = 0;
+  gfx_setfont(2);  col(0xFF6040, on ? 0.9 : 0.3);  gfx_x = px(x);  gfx_y = py(y - 17);  gfx_drawstr(lbl);
+  loop(n, c = (k + 1) * dps <= shr ? 0xFFB020 : 0xFF3020;
+    col(c, on && (k + 0.5) * dps <= v ? 1 : 0.1);  gfx_rect(px(x + k * 9), py(y), ps(7), ps(10), 1);  k += 1; );
+  gfx_setfont(10);  col(0xFF3020, on ? 1 : 0.3);  gfx_x = px(x + 150);  gfx_y = py(y - 6);  gfx_drawstr(on ? sprintf(#db8, "%4.1f", v) : " --");
+);
+// 240 OUT: an L bar over an R bar, a floating peak segment on each, the held peaks in the digit windows
+function u_blk2(x, y, w, n, vl, vr, hl, hr, vmin, vmax, lbl) local(k, sw, j, v, h, yy, c, kh) (
+  sw = w / n;
+  gfx_setfont(2);  col(0xF2C230, 1);  gfx_x = px(x);  gfx_y = py(y - 17);  gfx_drawstr(lbl);
+  j = 0;
+  loop(2, yy = y + j * 22;  v = j == 0 ? vl : vr;  h = j == 0 ? hl : hr;
+    kh = h > vmin + 0.5 ? min(n - 1, floor((h - vmin) / (vmax - vmin) * n)) : -1;
+    col(0x000000, 1);  gfx_rect(px(x - 3), py(yy - 3), ps(w + 6), ps(18), 1);
+    k = 0;
+    loop(n, c = k >= n - 2 ? 0xFF3A20 : k >= n - 5 ? 0xFF6A13 : 0xF2C230;
+      col(c, (k + 0.5) / n <= (v - vmin) / (vmax - vmin) || k == kh ? 1 : 0.1);  gfx_rect(px(x + k * sw + 1), py(yy), ps(sw - 2), ps(12), 1);  k += 1; );
+    col(0x000000, 1);  gfx_rect(px(x + w + 10), py(yy - 3), ps(62), ps(18), 1);
+    gfx_setfont(11);  col(0xF2C230, 1);  text_c(px(x + w + 41), py(yy + 6), u_pkstr(h, j == 0 ? #pkl : #pkr));
+    gfx_setfont(6);  col(0xF2C230, 0.7);  text_c(px(x - 12), py(yy + 6), j == 0 ? "L" : "R");
+    j += 1; );
+);
+// a square warning lamp (240) / a round status light (940)
+function u_lamp(x, y, w, h, on, c, lbl) (
+  col(0x000000, 0.5);  gfx_rect(px(x), py(y), ps(w), ps(h), 1);
+  col(on ? c : shade(c, 0.22), 1);  gfx_rect(px(x + 2), py(y + 2), ps(w - 4), ps(h - 4), 1);
+  gfx_setfont(6);  col(on ? 0x101010 : shade(c, 0.6), 1);  text_c(px(x + w * 0.5), py(y + h * 0.5), lbl);
+);
+
+// the step values printed round a stepped dial (240 and 960; the 480 shows its value as digits). n steps, the
+// figure for step i from the GUI's own tables
+function u_steps(cx, cy, r, n, kind) local(i, a, x, y) (
+  sk != 2 ? (
+    gfx_setfont(6);  col(sk == 0 ? 0xC8C8C0 : 0x4A3A2E, 1);  i = 0;
+    loop(n, a = -0.75 * $pi + i / (n - 1) * 1.5 * $pi;
+      kind == 0 ? sprintf(#stp, "%d", i == 0 ? 20 : i == 1 ? 30 : i == 2 ? 60 : 100) :
+      kind == 1 ? sprintf(#stp, "%d", u_hft(i) / 1000) : sprintf(#stp, "%d", i == 0 ? 5 : i == 1 ? 10 : 20);
+      x = px(cx) + sin(a) * ps(r + 16);  y = py(cy) - cos(a) * ps(r + 16);
+      text_c(x, y, #stp);  i += 1; );
+  );
+);
+
+// ---------- presets (OUTPUT evens the loudness; GUI thread only) ----------
+function pb_item(menu, i, dst) local(k, k0, m, c, len) (
+  strcpy(dst, "");  len = strlen(menu);  k = 0;  k0 = 0;  m = 1;
+  loop(len + 1,
+    c = k < len ? str_getchar(menu, k) : 124;
+    c == 124 ? ( m == i ? strcpy_substr(dst, menu, k0, k - k0);  m += 1;  k0 = k + 1; );
+    k += 1;
+  );
+  dst;
+);
+function load_preset(p) (
+  p == 1 ? ( slider(1) = 3;  slider(2) = 0;  slider(3) = 0;  slider(4) = 2;  slider(5) = 0;  slider(6) = -12;  slider(7) = 2;  slider(9) = 2;  slider(10) = 10;  slider(11) = 150;  slider(12) = 100;  slider(13) = 3;  slider(14) = -1;  slider(15) = 4;  slider(16) = 5;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Init
+  p == 2 ? ( slider(1) = 2;  slider(2) = 0;  slider(3) = 0;  slider(4) = 2;  slider(5) = 1.5;  slider(6) = -14;  slider(7) = 2;  slider(9) = 1.5;  slider(10) = 30;  slider(11) = 300;  slider(12) = 100;  slider(13) = 8;  slider(14) = -1;  slider(15) = 5;  slider(16) = 7;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Clean Master
+  p == 3 ? ( slider(1) = 3;  slider(2) = 2;  slider(3) = 0;  slider(4) = 1;  slider(5) = 3;  slider(6) = -16;  slider(7) = 2;  slider(9) = 2;  slider(10) = 20;  slider(11) = 200;  slider(12) = 100;  slider(13) = 9.5;  slider(14) = -1;  slider(15) = 6;  slider(16) = 8;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Apex Air
+  p == 4 ? ( slider(1) = 6;  slider(2) = 3;  slider(3) = 2;  slider(4) = 2;  slider(5) = 0;  slider(6) = -12;  slider(7) = 2;  slider(9) = 1.5;  slider(10) = 50;  slider(11) = 500;  slider(12) = 60;  slider(13) = 7.5;  slider(14) = -1;  slider(15) = 4;  slider(16) = 5;  slider(17) = 1;  slider(18) = 2;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Tape Finish
+  p == 5 ? ( slider(1) = 4;  slider(2) = 2;  slider(3) = 2;  slider(4) = 1;  slider(5) = 0;  slider(6) = -18;  slider(7) = 2;  slider(9) = 2;  slider(10) = 10;  slider(11) = 100;  slider(12) = 80;  slider(13) = 9;  slider(14) = -1;  slider(15) = 4;  slider(16) = 5;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Bus Glue Master
+  p == 6 ? ( slider(1) = 5;  slider(2) = 3;  slider(3) = 1;  slider(4) = 2;  slider(5) = 2.5;  slider(6) = -20;  slider(7) = 1;  slider(9) = 3;  slider(10) = 5;  slider(11) = 80;  slider(12) = 100;  slider(13) = 10;  slider(14) = -1;  slider(15) = 4;  slider(16) = 6;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Dense Pop
+  p == 7 ? ( slider(1) = 2;  slider(2) = 0;  slider(3) = 2;  slider(4) = 3;  slider(5) = 2;  slider(6) = -16;  slider(7) = 1;  slider(9) = 2.5;  slider(10) = 5;  slider(11) = 120;  slider(12) = 100;  slider(13) = 9;  slider(14) = -1;  slider(15) = 2;  slider(16) = 4;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Broadcast Clean
+  p == 8 ? ( slider(1) = 2;  slider(2) = 0;  slider(3) = 4;  slider(4) = 3;  slider(5) = 3;  slider(6) = -22;  slider(7) = 0;  slider(9) = 4;  slider(10) = 3;  slider(11) = 80;  slider(12) = 100;  slider(13) = 10.5;  slider(14) = -1;  slider(15) = 1;  slider(16) = 5;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Spoken Word
+  p == 9 ? ( slider(1) = 5;  slider(2) = 4;  slider(3) = 3;  slider(4) = 2;  slider(5) = 2.5;  slider(6) = -16;  slider(7) = 1;  slider(9) = 3;  slider(10) = 30;  slider(11) = 80;  slider(12) = 100;  slider(13) = 8;  slider(14) = -1;  slider(15) = 2;  slider(16) = 3;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Sport Punch
+  p == 10 ? ( slider(1) = 6;  slider(2) = 5;  slider(3) = 4;  slider(4) = 1;  slider(5) = 1.5;  slider(6) = -18;  slider(7) = 1;  slider(9) = 4;  slider(10) = 25;  slider(11) = 60;  slider(12) = 100;  slider(13) = 8.5;  slider(14) = -1;  slider(15) = 5;  slider(16) = 7;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Club Tight
+  p == 11 ? ( slider(1) = 6;  slider(2) = 3;  slider(3) = 0;  slider(4) = 3;  slider(5) = 3;  slider(6) = -14;  slider(7) = 0;  slider(9) = 4;  slider(10) = 1;  slider(11) = 60;  slider(12) = 100;  slider(13) = 10.5;  slider(14) = -1;  slider(15) = 2;  slider(16) = 5;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Nuts and Bolts
+  p == 12 ? ( slider(1) = 8;  slider(2) = 0;  slider(3) = 0;  slider(4) = 2;  slider(5) = 0;  slider(6) = -20;  slider(7) = 0;  slider(9) = 6;  slider(10) = 0.5;  slider(11) = 50;  slider(12) = 100;  slider(13) = 11.5;  slider(14) = -1;  slider(15) = 4;  slider(16) = 5;  slider(17) = 1;  slider(18) = 2;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0; ) :   // Brick Loud
+  p == 13 ? ( slider(1) = 3;  slider(2) = 0;  slider(3) = 0;  slider(4) = 2;  slider(5) = 0;  slider(6) = -12;  slider(7) = 2;  slider(8) = 1;  slider(9) = 2;  slider(10) = 10;  slider(11) = 150;  slider(12) = 100;  slider(13) = 3;  slider(14) = -1;  slider(15) = 4;  slider(16) = 5;  slider(17) = 1;  slider(18) = 0;  slider(19) = 0;  slider(20) = 0;  slider(21) = 0;  slider(22) = 0;  slider(23) = 0;  slider(24) = 1;  slider(25) = 20;  slider(26) = 20000; ) : 0;   // Reset all to defaults
+  slider_automate(p == PB_N + 1 ? 67108863 : 4194175);   // (Reset also switches the strip back IN, 1x, linked, SC filters off)
+  gui_dirty = 1;
+);
+PRESET_MENU = "Init|Clean Master|Apex Air|Tape Finish|Bus Glue Master|Dense Pop|Broadcast Clean|Spoken Word|Sport Punch|Club Tight|Nuts and Bolts|Brick Loud";
+PB_N = 12;
+
+// ---------- frame setup ----------
+sc = min(gfx_w / 1000, gfx_h / 640);
+ox = (gfx_w - 1000 * sc) * 0.5;
+oy = (gfx_h - 640 * sc) * 0.5;
+lmb = mouse_cap & 1;
+click = lmb && !last_lmb;
+era_h = floor(mode + 0.5) * 2;                     // the era (0 / 2 / 4); the panel follows the slider, the audio after its dip
+sk = era_h == 4 ? 3 : era_h;                       // the skin: 240, 480, and 960 in the executive black panel
+
+// fonts per era: 240 heavy sans, 480 monospaced, 960 Helvetica-style
+sk == 0 ? ( strcpy(#fa, "Arial Black");  strcpy(#fb, "Arial");     fl_a = 0;   fl_b = 'b'; ) :
+sk == 2 ? ( strcpy(#fa, "Consolas");     strcpy(#fb, "Consolas");  fl_a = 'b'; fl_b = 0; ) :
+          ( strcpy(#fa, "Helvetica");    strcpy(#fb, "Arial");     fl_a = 'b'; fl_b = 0; );
+gfx_setfont(1, #fa, ps(32), fl_a);
+gfx_setfont(2, #fb, ps(12), 'b');
+gfx_setfont(3, #fb, ps(12), fl_b);
+gfx_setfont(4, "Verdana", ps(12), 'b');
+gfx_setfont(5, #fb, ps(11), 'b');
+gfx_setfont(6, #fb, ps(10), 'b');
+gfx_setfont(8, sk == 2 ? "Consolas" : "Courier New", ps(sk == 2 ? 13 : 16), 'b');
+gfx_setfont(10, "Consolas", ps(17), 'b');                                      // 480 digits
+gfx_setfont(11, "Arial Black", ps(15));                                        // 240 digits
+gfx_setfont(12, "Helvetica", ps(sk == 3 ? 15 : 14), 'b');                      // 960 readouts
+gfx_setfont(13, "Helvetica", ps(24), 'b');
+
+// meter hand-offs, eased
+u_in  = max(gdb(inpk_d),  u_in - 1.2);   inpk_d = 0;
+u_out = max(gdb(outpk_d), u_out - 1.2);  outpk_d = 0;
+u_oL = max(gdb(opL_d), u_oL - 1.2);  u_oR = max(gdb(opR_d), u_oR - 1.2);
+// floating peak hold per side: held 1.2 s, then falls 0.6 dB a frame; a click on the OUT meter clears it
+now_t = time_precise();
+gdb(opL_d) >= h_oL ? ( h_oL = gdb(opL_d);  t_oL = now_t; ) : now_t - t_oL > 1.2 ? h_oL = max(-60, h_oL - 0.6);
+gdb(opR_d) >= h_oR ? ( h_oR = gdb(opR_d);  t_oR = now_t; ) : now_t - t_oR > 1.2 ? h_oR = max(-60, h_oR - 0.6);
+opL_d = opR_d = 0;
+w_cmp = max(-cgr_d, w_cmp * 0.88);  cgr_d = 0;
+w_irn = max(iw_d,   w_irn * 0.88);  iw_d = 0;
+w_clp = max(kw_d,   w_clp * 0.88);  kw_d = 0;
+w_lim = max(-lgr_d, w_lim * 0.88);  lgr_d = 0;
+n_in  += (u_in - n_in) * 0.4;   n_out += (u_out - n_out) * 0.4;  n_oL += (u_oL - n_oL) * 0.4;  n_oR += (u_oR - n_oR) * 0.4;
+n_cmp += (w_cmp - n_cmp) * 0.4;  n_irn += (w_irn - n_irn) * 0.4;  n_clp += (w_clp - n_clp) * 0.4;  n_lim += (w_lim - n_lim) * 0.4;
+n_lod = n_cmp + n_irn + n_clp + n_lim;                                        // LOAD: everything the chain is holding back
+d_in  = sprintf(#d_in,  "%+5.1f", max(-60, u_in));
+d_out = sprintf(#d_out, "%+5.1f", max(-60, u_out));
+
+click && (sk == 0 ? mouse_x >= px(330) && mouse_x < px(670) && mouse_y >= py(170) && mouse_y < py(240) :
+          sqr(mouse_x - px(sk == 2 ? 600 : 602)) + sqr(mouse_y - py(184)) < sqr(ps(90))) ? ( h_oL = h_oR = -60; );
+
+// ---------- ground and control strips (row A: passive EQ; row B: compressor, drive / load) ----------
+sk == 0 ? (
+  col(0x1A1A1A, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+  col(0x232323, 1);  gfx_rect(px(20), py(304), ps(960), ps(240), 1);
+  col(0x1A1A1A, 1);  gfx_rect(px(20), py(422), ps(960), ps(4), 1);
+                     gfx_rect(px(330), py(304), ps(4), ps(118), 1);  gfx_rect(px(680), py(304), ps(4), ps(118), 1);  gfx_rect(px(604), py(426), ps(4), ps(118), 1);
+  col(0xFF6A13, 1);  gfx_rect(px(40), py(64), ps(150), ps(3), 1);                  // the one safety-orange line
+) : sk == 2 ? (
+  col(0x000000, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+  col(0x00FF66, 0.3);  gfx_line(px(20), py(300), px(980), py(300), 1);  gfx_line(px(20), py(548), px(980), py(548), 1);
+  col(0x00FF66, 0.15); gfx_line(px(20), py(424), px(980), py(424), 1);
+                       gfx_line(px(332), py(308), px(332), py(418), 1);  gfx_line(px(682), py(308), px(682), py(418), 1);  gfx_line(px(604), py(430), px(604), py(542), 1);
+) : (
+  col(0x2B2019, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+  col(0x1E1611, 1);  gfx_rect(px(0), py(636), ps(1000), ps(4), 1);  gfx_rect(px(996), py(0), ps(4), ps(636), 1);
+  gi = 0;  loop(2, yy = gi == 0 ? 304 : 428;
+    col(0x000000, 0.13);  gj = 0;  loop(4, rr(20 + 2 + gj * 1.3, yy + 3 + gj * 1.6, 960 + gj * 0.5, 116 + gj * 0.5, 5);  gj += 1; );
+    col(0xCFC8BC, 1);  rr(20, yy, 960, 116, 5);
+    col(0xFFFFFF, 0.35);  gfx_rect(px(26), py(yy), ps(948), ps(1), 1);  gfx_rect(px(20), py(yy + 5), ps(1), ps(106), 1);
+    col(0x6E6050, 0.45);  gfx_rect(px(26), py(yy + 115), ps(948), ps(1), 1);  gfx_rect(px(979), py(yy + 5), ps(1), ps(106), 1);
+    col(0x8A7A66, 0.5);  gi == 0 ? ( gfx_rect(px(330), py(yy + 12), ps(1), ps(92), 1);  gfx_rect(px(680), py(yy + 12), ps(1), ps(92), 1); )
+                                : ( gfx_rect(px(604), py(yy + 12), ps(1), ps(92), 1); );
+    gi += 1; );
+  gi = 0;  loop(4, col(0x1A120C, 1);  gfx_circle(px(gi % 2 ? 988 : 12), py(gi > 1 ? 628 : 12), ps(4), 1, 1);
+    col(0x8A7866, 1);  gfx_circle(px(gi % 2 ? 988 : 12) - ps(0.6), py(gi > 1 ? 628 : 12) - ps(0.6), ps(3), 1, 1);  gi += 1; );
+);
+
+// ---------- the display: COMP / LOAD - IN / OUT - CLIP / LIMIT (every era, same order) ----------
+sk == 0 ? (                                          // 240: black binnacle, blocky bars, yellow digits, warning lamps
+  col(0x000000, 0.5);  rr(24, 76, 956, 222, 10);
+  col(0x0C0C0C, 1);    rr(20, 72, 956, 222, 10);
+  col(0x262626, 1);    rr(20, 72, 956, 3, 2);
+  col(0x2A2A2A, 1);    gfx_rect(px(318), py(90), ps(2), ps(186), 1);  gfx_rect(px(676), py(90), ps(2), ps(186), 1);
+  u_blk(44, 118, 176, 18, 12, n_cmp, 0, 12, "COMP  dB", ldc_d, 1, sprintf(#b1, "%4.1f", n_cmp));
+  u_blk(44, 206, 176, 18, 12, n_lod, 0, 24, "LOAD  dB", l_push, 1, sprintf(#b2, "%4.1f", n_lod));
+  u_blk(342, 112, 232, 26, 18, n_in,  -36, 0, "IN  dBFS",  0, 1, d_in);
+  u_blk2(356, 188, 218, 18, n_oL, n_oR, h_oL, h_oR, -36, 0, "OUT  L / R  dBFS  (PEAK)");
+  u_blk(700, 118, 176, 18, 12, n_clp, 0, 12, "CLIP  dB", ldk_d, 1, sprintf(#b3, "%4.1f", n_clp));
+  u_blk(700, 206, 176, 18, 12, n_lim, 0, 12, "LIMIT  dB", 0, 1, sprintf(#b4, "%4.1f", n_lim));
+  u_lamp(372, 254, 48, 22, w_cmp > 0.5, 0xFFA020, "COMP");
+  u_lamp(424, 254, 48, 22, n_lod > 3,   0xFFA020, "LOAD");
+  u_lamp(476, 254, 48, 22, w_clp > 0.5, 0xFF3020, "CLIP");
+  u_lamp(528, 254, 48, 22, w_lim > 1,   0xFF3020, "LIMIT");
+  u_lamp(580, 254, 48, 22, k_on,        0x40D040, "IN");
+) : sk == 2 ? (                                      // 480: the digital cockpit
+  col(0x0A0202, 1);    rr(20, 70, 956, 224, 10);
+  col(0x3A0A08, 1);    rr(20, 70, 956, 2, 1);  rr(20, 292, 956, 2, 1);
+  u_dgauge(400, 182, 92, n_in,  -36, 0, "IN  dBFS",  d_in, 0, 0, 0, 0);
+  u_dgauge(600, 182, 92, n_oL, -36, 0, "OUT  L / R", 0, 1, n_oR, h_oL, h_oR);
+  u_dbar(50, 128, "COMP",  n_cmp, ldc_d, 1, 0.75);
+  u_dbar(50, 216, "LOAD",  n_lod, l_push, 1, 1.5);
+  u_dbar(752, 128, "CLIP",  n_clp, ldk_d, 1, 0.75);
+  u_dbar(752, 216, "LIMIT", n_lim, 12, 1, 0.75);
+) : (                                                // 960: executive black, thin precise arcs, amber status lights
+  col(0x000000, 0.13);  gj = 0;  loop(4, rr(22 + gj * 1.3, 73 + gj * 1.6, 956 + gj * 0.5, 226 + gj * 0.5, 8);  gj += 1; );
+  col(0xBDB5A8, 1);    rr(20, 70, 956, 226, 8);
+  col(0xFFFFFF, 0.3);  gfx_rect(px(28), py(70), ps(940), ps(1), 1);
+  col(0x1E1510, 1);    rr(28, 78, 940, 210, 6);
+  col(0x3A2C22, 1);    gfx_rect(px(300), py(92), ps(1), ps(182), 1);  gfx_rect(px(700), py(92), ps(1), ps(182), 1);
+  u_thin(52, 136, 170, n_cmp, 12, "COMP  dB", ldc_d, 1);
+  u_thin(52, 224, 170, n_lod, 24, "LOAD  dB", l_push, 1);
+  u_ring(398, 184, 84, n_in,  -36, 0, "IN  dBFS",  d_in);
+  u_ring2(602, 184, 84, n_oL, n_oR, h_oL, h_oR, -36, 0);
+  u_thin(724, 136, 170, n_clp, 12, "CLIP  dB", ldk_d, 1);
+  u_thin(724, 224, 170, n_lim, 12, "LIMIT  dB", 0, 1);
+  col(w_cmp > 0.5 ? 0xFFB040 : 0x3A2A10, 1);  gfx_circle(px(52), py(266), ps(4), 1, 1);
+  col(n_lod > 3   ? 0xFFB040 : 0x3A2A10, 1);  gfx_circle(px(68), py(266), ps(4), 1, 1);
+  col(w_clp > 0.5 ? 0xFFB040 : 0x3A2A10, 1);  gfx_circle(px(724), py(266), ps(4), 1, 1);
+  col(w_lim > 1   ? 0xFFB040 : 0x3A2A10, 1);  gfx_circle(px(740), py(266), ps(4), 1, 1);
+  col(k_on        ? 0xFFB040 : 0x3A2A10, 1);  gfx_circle(px(500), py(276), ps(4), 1, 1);
+);
+
+// title and era line
+txt_a = sk == 0 ? 0xF2F2EC : sk == 2 ? 0x00FF66 : 0xEFE6D6;
+txt_b = sk == 0 ? 0x9A9A94 : sk == 2 ? 0xFFB020 : 0xBFA98C;
+sec_c = sk == 0 ? 0xFF6A13 : sk == 2 ? 0xFFB020 : 0x8A4A1A;   // section names (960: on the light plates)
+// knob kit colours: desk-knob scale dots, band-colour track, flat knobs (960)
+C_INK = sk == 0 ? 0xC8C8C0 : 0x4A3A2E;  dy_bg = sk == 0 ? 0x232323 : 0xCFC8BC;
+C_ACC = 0xD08A2A;  C_DIM = 0x8A7A66;  C_KEDGE = 0x140E0A;  C_KNOB = 0x3A2C22;  C_PTR = 0xF1E4CA;
+u_ink = sk == 0 ? 0xD8D8D0 : 0x3A2A1E;                        // knob labels (960: brown ink on the plates)
+gfx_setfont(1);  col(txt_a, 1);  gfx_x = px(40);  gfx_y = py(16);  gfx_drawstr("KOMBI");
+sk == 0 ? ( col(0xFF6A13, 1);  gfx_circle(px(28), py(33), ps(4), 1, 1); );                 // 240's indicator dot
+sk == 3 ? ( col(0xB08A4A, 1);  gfx_rect(px(40), py(62), ps(150), ps(1), 1); );              // 960's fine gold rule
+gfx_setfont(6);  col(sec_c, 1);
+gfx_x = px(36);  gfx_y = py(310);  gfx_drawstr("PASSIVE EQ  -  LOW");
+gfx_x = px(350); gfx_y = py(310);  gfx_drawstr("HIGH BOOST");
+gfx_x = px(700); gfx_y = py(310);  gfx_drawstr("HIGH ATTEN");
+gfx_x = px(36);  gfx_y = py(434);  gfx_drawstr("COMPRESSOR");
+gfx_x = px(624); gfx_y = py(434);  gfx_drawstr("DRIVE  /  LOAD");
+gfx_x = px(436); gfx_y = py(434);  gfx_drawstr("SIDECHAIN");
+
+// ---------- row A: the passive EQ (LF blue, high boost red, high atten green) ----------
+kt = 1;  u_cap = 0x2F5FA8;  u_cap4 = 0x40A0FF;                                // LF blue
+ctl(75,  362, 20, 4, 0, 3, 2, "LOW FREQ", 8, 2, 0);  u_steps(75, 362, 20, 4, 0);
+ctl(165, 362, 24, 2, 0, 10, 0, "BOOST", 1, 0, 0);
+ctl(255, 362, 24, 3, 0, 10, 0, "ATTEN", 1, 0, 0);
+u_cap = 0xB02A22;  u_cap4 = 0xFF4030;                                // high boost red
+ctl(420, 362, 20, 15, 0, 6, 4, "HIGH FREQ", 9, 2, 0);  u_steps(420, 362, 20, 7, 1);
+ctl(510, 362, 22, 16, 0, 10, 5, "BANDWIDTH", 1, 0, 0);
+ctl(600, 362, 24, 5, 0, 10, 0, "BOOST", 1, 0, 0);
+u_cap = 0x2E8B4A;  u_cap4 = 0x9CFF60;                                // high atten green
+ctl(770, 362, 20, 17, 0, 2, 1, "ATTEN FREQ", 10, 2, 0);  u_steps(770, 362, 20, 3, 2);
+ctl(870, 362, 24, 18, 0, 10, 0, "ATTEN", 1, 0, 0);
+u_cap = 0;
+// ---------- row B: compressor, sidechain filters, then drive / load ----------
+kt = 0;
+ctl(64,  486, 22, 6, -36, 0, -12, "THRESH", 0, 0, 0);
+ctl(142, 486, 22, 9, 1, 20, 2, "RATIO", 3, 1, 0);
+ctl(220, 486, 22, 10, 0.1, 100, 10, "ATTACK", 4, 1, 0);
+ctl(298, 486, 22, 11, 20, 1500, 150, "RELEASE", 4, 1, 0);
+ctl(376, 486, 22, 12, 0, 100, 100, "MIX", 5, 0, 0);
+kt = 4;  ctl(466, 486, 17, 25, 20, 500, 20, "SC HPF", 13, 1, 0);
+kt = 5;  ctl(544, 486, 17, 26, 1000, 20000, 20000, "SC LPF", 14, 1, 0);
+kt = 2;
+ctl(680, 484, 28, 1, 0, 10, 3, "DRIVE", 1, 0, 0);
+ctl(800, 484, 28, 13, 0, 18, 3, "LOAD", 6, 0, 0);
+kt = 3;
+ctl(910, 486, 22, 14, -6, 0, -1, "CEILING", 7, 0, 0);
+
+// ---------- bottom bar: era selector, IN, mid LIFT / DIP, MONO, WIDTH ----------
+gfx_setfont(5);  col(txt_b, 1);  gfx_x = px(40);  gfx_y = py(586);  gfx_drawstr("ERA");
+gi = 0;
+loop(3,
+  ekey(80 + gi * 104, 574, 96, 34, floor(mode + 0.5) == gi, gi == 0 ? "240" : gi == 1 ? "480" : "960") ? ( slider(7) = gi;  param_touched(7); );
+  gi += 1;
+);
+ekey(404, 574, 68, 34, lk_on >= 0.5, "LINK") ? ( slider(24) = lk_on >= 0.5 ? 0 : 1;  param_touched(24); );
+ekey(484, 574, 96, 34, md_mode >= 0.5, md_mode < 0.5 ? "LIFT/DIP" : md_mode < 1.5 ? "LIFT" : "DIP") ? ( slider(19) = md_mode < 0.5 ? 1 : md_mode < 1.5 ? 2 : 0;  param_touched(19); );
+ekey(592, 574, 60, 34, md_mode >= 0.5, md_freq < 0.5 ? "750" : "2k") ? ( slider(20) = md_freq < 0.5 ? 1 : 0;  param_touched(20); );
+u_ink = txt_a;                                                 // MONO / WIDTH sit on the ground
+kt = sk == 0 ? 0 : 3;                                          // (240: desk knobs; 960: flat)
+ctl(735, 588, 17, 21, 0, 330, 0, "MONO", 11, 0, 0);
+ctl(825, 588, 17, 22, 0, 10, 0, "WIDTH", 12, 0, 0);
+gfx_setfont(5);  col(txt_b, 0.8);  gfx_x = px(930);  gfx_y = py(604);  gfx_drawstr("GFX");
+
+// ---------- IN (header): the whole strip in / out ----------
+ekey(470, 22, 60, 34, k_on, "IN") ? ( slider(8) = k_on ? 0 : 1;  param_touched(8); );
+
+// ---------- OS key (header, left of the preset box): cycles 1x / 2x / 4x ----------
+os_key(ox / sc + 566, oy / sc + 28, 23, txt_b, 14) ? gui_dirty = 1;
+
+// ---------- preset box (top right) ----------
+pb_bg = sk == 0 ? 0x101010 : sk == 2 ? 0x000000 : 0x1E1510;
+col(0x000000, 0.35);  rr(602, 24, 360, 34, 4);
+col(sk == 2 ? 0x00FF66 : sk == 3 ? 0xBDB5A8 : 0x2E2E2E, sk == 2 ? 0.5 : 1);  rr(600, 22, 360, 34, 4);
+col(pb_bg, 1);  rr(601, 23, 358, 32, 3);
+col(0x000000, 1);  rr(694, 27, 260, 24, 2);
+cur_ok = pr_cur >= 1 && pr_cur <= PB_N;
+cur_ok ? pb_item(PRESET_MENU, pr_cur, #pb_nm) : strcpy(#pb_nm, "--");
+gfx_setfont(8);  col(sk == 0 ? 0xFF6A13 : txt_a, 1);  gfx_x = px(702);  gfx_y = py(30);  gfx_drawstr(#pb_nm);
+gfx_setfont(5);  col(txt_b, 1);  text_c(px(626), py(39), "PRESET");
+col(sk == 2 ? 0x0E3A20 : sk == 3 ? 0x5A4636 : 0x4A4A4A, 1);  rr(654, 28, 16, 22, 2);  rr(672, 28, 16, 22, 2);
+col(txt_a, 1);  gfx_triangle(px(658), py(39), px(666), py(33), px(666), py(45));  gfx_triangle(px(684), py(39), px(676), py(33), px(676), py(45));
+pb_sel = 0;
+click && mouse_y >= py(26) && mouse_y < py(52) ? (
+  mouse_x >= px(654) && mouse_x < px(670) ? pb_sel = pr_cur <= 1 || pr_cur > PB_N ? PB_N : pr_cur - 1 :
+  mouse_x >= px(672) && mouse_x < px(688) ? pb_sel = pr_cur >= PB_N || pr_cur < 1 ? 1 : pr_cur + 1 :
+  (mouse_x >= px(602) && mouse_x < px(652)) || (mouse_x >= px(694) && mouse_x < px(954)) ? (
+    strcpy(#pb_m, "");  gi = 1;
+    loop(PB_N, gi == pr_cur ? strcat(#pb_m, "!");  strcat(#pb_m, pb_item(PRESET_MENU, gi, #pb_t));  strcat(#pb_m, "|");  gi += 1; );
+    strcat(#pb_m, "Reset all to defaults");
+    gfx_x = px(694);  gfx_y = py(54);  gi = gfx_showmenu(#pb_m);  gi > 0 ? pb_sel = gi;
+  );
+);
+pb_sel > 0 ? ( load_preset(pb_sel);  pr_cur = pb_sel > PB_N ? 1 : pb_sel; );
+
+// ---------- end of frame ----------
+!lmb ? drag_idx = 0;
+last_lmb = lmb;
+gui_dirty ? ( prm_dirty = 1;  gui_dirty = 0; );   // rebuilt in @block, never on the GUI thread
