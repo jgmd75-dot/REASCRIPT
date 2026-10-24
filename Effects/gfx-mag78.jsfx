@@ -10,12 +10,13 @@ desc:GFX MAG78 [tape saturation]
 //
 // SIGNAL FLOW
 //   INPUT > 2x oversampled: [SATURATION <ORDER> TAPE COLOUR] > pre-emphasis > TAPE CORE > de-emphasis >
-//   speed / model EQ (head bump, dip, gap loss, low cut) > DC blocker > LOWS / HIGHS > WOW & FLUTTER >
-//   MIX with the dry signal > OUTPUT > house output stage (CLIP at -0.3 dBFS, zero latency)
+//   MIX with the clean signal > speed / model EQ (head bump, dip, gap loss, low cut) > DC blocker > LOWS / HIGHS >
+//   WOW & FLUTTER > OUTPUT > house output stage (CLIP at -0.3 dBFS, zero latency)
+//   (MIX sits before the machine's EQ and the wow so both halves of the blend share them: no comb filtering.)
 //   (THICK and BAND BALANCE sit after the DC blocker, before LOWS / HIGHS.)
 // SATURATION (0 - 100 %, Tube / Tape / Both): ahead of the tape, anti-aliased. TUBE leans (2nd harmonic first),
 //   TAPE is symmetric (3rd first), BOTH is the tube into the tape. Level-matched at -18 dBFS; it fades in over the
-//   first 20 % and drives from -6 dB (0 %) to +24 dB (100 %). Modes crossfade (15 ms).
+//   first 44 % and drives from -6 dB (0 %) to +7.5 dB (100 %). Modes crossfade (15 ms).
 // TAPE COLOUR (Natural / Vintage / Modern): what goes into the tape - Vintage adds low-mid weight and rolls the top,
 //   Modern tightens the lows and lifts presence and air. ORDER puts the colour after (dark) or before (lit) the saturation
 //   (the change dips the sound for 5 ms, swaps, comes back).
@@ -70,7 +71,7 @@ import gfx-thick.jsfx-inc
 slider1:in_db=0<-24,24,0.1>-Input gain (dB)
 slider2:model=0<0,9,1{MAGN,J80,J90,M12,U102,U60,S80,S827,S820,F24}>-Tape model
 slider3:speed=1<0,3,1{Low,15 ips,30 ips,HD}>-Reel speed
-slider4:sat_amt=30<0,100,1>-Saturation (%)
+slider4:sat_amt=67<0,100,1>-Saturation (%)
 slider5:sat_mode=1<0,2,1{Tube,Tape,Both}>-Saturation mode
 slider6:colour=0<0,2,1{Natural,Vintage,Modern}>-Tape colour
 slider7:lo_mode=0<0,2,1{Thump,Weight,Bloom}>-Lows mode
@@ -300,8 +301,8 @@ function eq_targets() local(a, b) (
 NGV = 31;                                   // glided values: 0-13 tape, 14-16 colour, 17-28 lows / highs, 29 saturation, 30 trim
 
 function sat_coefs() local(a, g) (
-  a = GV[29];
-  g = 10 ^ ((-6 + 30 * a) / 20);            // 0 %: -6 dB into the curve ... 100 %: +24 dB
+  a = 0.45 * GV[29];                        // the knob's full travel = the first 45 % of the old range (JG, 24 Oct 2026)
+  g = 10 ^ ((-6 + 30 * a) / 20);            // 0 %: -6 dB into the curve ... 100 %: +7.5 dB
   mt_sg = g;
   mt_sw = min(1, a * 5);                    // fades in over the first 20 %
   mt_c0 = 1 / (g * st_cal(0, g));  mt_c1 = 1 / (g * st_cal(1, g));  mt_c2 = 1 / (g * st_cal(2, g));
@@ -479,6 +480,7 @@ ipk_l_d = max(ipk_l_d, abs(xl));  ipk_r_d = max(ipk_r_d, abs(xr));
 // dry, delayed to match the latency
 DRY[dpos * 2] = xl;  DRY[dpos * 2 + 1] = xr;
 rp = (dpos + DRYN - LAT) % DRYN;  dl = DRY[rp * 2];  dr = DRY[rp * 2 + 1];
+rp = (dpos + DRYN - 31) % DRYN;  ml = DRY[rp * 2];  mr = DRY[rp * 2 + 1];    // the MIX's dry: in time with the 2x section
 dpos = (dpos + 1) % DRYN;
 
 // 2x
@@ -488,6 +490,9 @@ ua = cL.ch2x(ua);  ub = cL.ch2x(ub);
 va = cR.ch2x(va);  vb = cR.ch2x(vb);
 wl = DNL.dn2(ua, ub, DOL, DEL) * mg_comp / g_in;
 wr = DNR.dn2(va, vb, DOR, DER) * mg_comp / g_in;
+// MIX: the saturated tape with the clean signal, before the machine's EQ - everything after runs on both, so the
+// blend has no phase difference to comb with (the 2x section's filters are linear phase, the emphasis cancels)
+wl = ml + (wl - ml) * g_mix;  wr = mr + (wr - mr) * g_mix;
 // speed / model EQ at 1x
 wl = LCL.mg_run(HSL.mg_run(GLL.mg_run(MCL.mg_run(DPL.mg_run(BPL.mg_run(wl))))));
 wr = LCR.mg_run(HSR.mg_run(GLR.mg_run(MCR.mg_run(DPR.mg_run(BPR.mg_run(wr))))));
@@ -523,9 +528,8 @@ wd = D0 + max(-D0 + 2, min(D0 - 2, wdel));
 WWL[wpos] = wl;  WWR[wpos] = wr;
 wl = hm(WWL, WWN, wpos, wd);  wr = hm(WWR, WWN, wpos, wd);
 wpos = (wpos + 1) % WWN;
-// mix, output, IN
-ol = (dl + (wl - dl) * g_mix) * g_out;
-orr = (dr + (wr - dr) * g_mix) * g_out;
+// output, IN
+ol = wl * g_out;  orr = wr * g_out;
 ol = dl + (ol - dl) * g_on;  orr = dr + (orr - dr) * g_on;
 ost_out(ol, orr);
 spl0 = ost_l;  spl1 = ost_r;
@@ -805,23 +809,23 @@ function sl_list() local(i) ( i = 1;  loop(23, i != 20 ? param_touched(i);  i +=
 // ---------- presets ----------
 // (each level-matched: pink noise at -18 dBFS RMS comes out at -18 dBFS RMS)
 function p_init() (
-  pv(1, 0); pv(2, 0); pv(3, 1); pv(4, 30); pv(5, 1); pv(6, 0); pv(7, 0); pv(8, 0); pv(9, 0); pv(10, 0); pv(11, 0);
+  pv(1, 0); pv(2, 0); pv(3, 1); pv(4, 67); pv(5, 1); pv(6, 0); pv(7, 0); pv(8, 0); pv(9, 0); pv(10, 0); pv(11, 0);
   pv(12, 1); pv(13, 1); pv(14, 5); pv(15, 10); pv(16, 0); pv(17, 100); pv(18, 0); pv(19, 50); pv(21, 0); pv(22, 0);
 );
 PRESET_MENU = "Default|Master Bus Glue|Hot 2-Inch Punch|Cassette Lo-Fi|Vocal Warmth|Drum Bus Crunch|High-Speed Mastering Sheen|Bass Fatness|Subtle Tape Sheen|Saturated Parallel|Vintage Slap|Lo-Fi Warmth";
 function load_preset(p) (
   p_init();
-  p == 2 ? ( pv(2, 7);  pv(3, 2);  pv(4, 20);  pv(8, 1);  pv(9, 2);  pv(10, 1);  pv(14, 0);  pv(15, 3);  pv(18, 0.9);  pv(22, -25); );   // Master Bus Glue
-  p == 3 ? ( pv(1, 6);  pv(2, 1);  pv(4, 55);  pv(5, 2);  pv(6, 1);  pv(8, 2);  pv(10, 1);  pv(14, 3);  pv(15, 8);  pv(18, 4.1);  pv(21, 1);  pv(22, -30); );   // Hot 2-Inch Punch
-  p == 4 ? ( pv(1, 4);  pv(3, 0);  pv(4, 45);  pv(6, 1);  pv(7, 1);  pv(8, 2);  pv(9, 1);  pv(10, -3);  pv(14, 35);  pv(15, 40);  pv(18, 0.7);  pv(19, 80); );   // Cassette Lo-Fi
-  p == 5 ? ( pv(2, 5);  pv(4, 35);  pv(5, 0);  pv(7, 1);  pv(8, 1.5);  pv(9, 1);  pv(10, 1.5);  pv(14, 0);  pv(15, 5);  pv(18, 0.3);  pv(22, -20); );   // Vocal Warmth
-  p == 6 ? ( pv(1, 8);  pv(2, 9);  pv(4, 65);  pv(5, 2);  pv(6, 2);  pv(8, 2.5);  pv(10, 2);  pv(18, 2.8);  pv(21, 1);  pv(22, 30); );   // Drum Bus Crunch
-  p == 7 ? ( pv(2, 4);  pv(3, 2);  pv(4, 15);  pv(6, 2);  pv(7, 2);  pv(8, 1);  pv(9, 2);  pv(10, 1.5);  pv(14, 0);  pv(15, 2);  pv(18, 0.3);  pv(22, -15); );   // High-Speed Mastering Sheen
-  p == 8 ? ( pv(1, 3);  pv(2, 3);  pv(4, 45);  pv(5, 0);  pv(6, 1);  pv(7, 2);  pv(8, 3);  pv(18, 0.6);  pv(21, 1); );   // Bass Fatness
-  p == 9 ? ( pv(2, 8);  pv(3, 2);  pv(4, 12);  pv(9, 2);  pv(10, 1);  pv(14, 0);  pv(15, 3);  pv(18, -0.3); );   // Subtle Tape Sheen
-  p == 10 ? ( pv(1, 10);  pv(2, 2);  pv(4, 80);  pv(5, 2);  pv(6, 1);  pv(8, 1.5);  pv(17, 45);  pv(18, 3.7);  pv(21, 1); );   // Saturated Parallel
-  p == 11 ? ( pv(1, 4);  pv(2, 6);  pv(4, 50);  pv(5, 0);  pv(6, 1);  pv(7, 1);  pv(8, 1);  pv(9, 1);  pv(10, 2);  pv(14, 12);  pv(15, 15);  pv(16, 1);  pv(18, 0.7); );   // Vintage Slap
-  p == 12 ? ( pv(1, 2);  pv(3, 0);  pv(4, 40);  pv(5, 0);  pv(6, 1);  pv(7, 1);  pv(8, 3);  pv(10, -4);  pv(14, 20);  pv(15, 25);  pv(18, -0.6);  pv(21, 1); );   // Lo-Fi Warmth
+  p == 2 ? ( pv(2, 7);  pv(3, 2);  pv(4, 44);  pv(8, 1);  pv(9, 2);  pv(10, 1);  pv(14, 0);  pv(15, 3);  pv(18, 0.9);  pv(22, -25); );   // Master Bus Glue
+  p == 3 ? ( pv(1, 6);  pv(2, 1);  pv(4, 100);  pv(5, 2);  pv(6, 1);  pv(8, 2);  pv(10, 1);  pv(14, 3);  pv(15, 8);  pv(18, 3.7);  pv(21, 1);  pv(22, -30); );   // Hot 2-Inch Punch
+  p == 4 ? ( pv(1, 4);  pv(3, 0);  pv(4, 100);  pv(6, 1);  pv(7, 1);  pv(8, 2);  pv(9, 1);  pv(10, -3);  pv(14, 35);  pv(15, 40);  pv(18, 0.7);  pv(19, 80); );   // Cassette Lo-Fi
+  p == 5 ? ( pv(2, 5);  pv(4, 78);  pv(5, 0);  pv(7, 1);  pv(8, 1.5);  pv(9, 1);  pv(10, 1.5);  pv(14, 0);  pv(15, 5);  pv(18, 0.3);  pv(22, -20); );   // Vocal Warmth
+  p == 6 ? ( pv(1, 8);  pv(2, 9);  pv(4, 100);  pv(5, 2);  pv(6, 2);  pv(8, 2.5);  pv(10, 2);  pv(18, 1.9);  pv(21, 1);  pv(22, 30); );   // Drum Bus Crunch
+  p == 7 ? ( pv(2, 4);  pv(3, 2);  pv(4, 33);  pv(6, 2);  pv(7, 2);  pv(8, 1);  pv(9, 2);  pv(10, 1.5);  pv(14, 0);  pv(15, 2);  pv(18, 0.3);  pv(22, -15); );   // High-Speed Mastering Sheen
+  p == 8 ? ( pv(1, 3);  pv(2, 3);  pv(4, 100);  pv(5, 0);  pv(6, 1);  pv(7, 2);  pv(8, 3);  pv(18, 0.6);  pv(21, 1); );   // Bass Fatness
+  p == 9 ? ( pv(2, 8);  pv(3, 2);  pv(4, 27);  pv(9, 2);  pv(10, 1);  pv(14, 0);  pv(15, 3);  pv(18, -0.3); );   // Subtle Tape Sheen
+  p == 10 ? ( pv(1, 10);  pv(2, 2);  pv(4, 100);  pv(5, 2);  pv(6, 1);  pv(8, 1.5);  pv(17, 45);  pv(18, 1.9);  pv(21, 1); );   // Saturated Parallel
+  p == 11 ? ( pv(1, 4);  pv(2, 6);  pv(4, 100);  pv(5, 0);  pv(6, 1);  pv(7, 1);  pv(8, 1);  pv(9, 1);  pv(10, 2);  pv(14, 12);  pv(15, 15);  pv(16, 1);  pv(18, 0.6); );   // Vintage Slap
+  p == 12 ? ( pv(1, 2);  pv(3, 0);  pv(4, 89);  pv(5, 0);  pv(6, 1);  pv(7, 1);  pv(8, 3);  pv(10, -4);  pv(14, 20);  pv(15, 25);  pv(18, -0.6);  pv(21, 1); );   // Lo-Fi Warmth
   sl_list();
 );
 MODEL_NAMES = "MAGN|J80|J90|M12|U102|U60|S80|S827|S820|F24";
@@ -904,7 +908,7 @@ loop(16, g_v = (g_j + 1) / 16;
 
 // ---------- SATURATION ----------
 section(408, 76, 228, 388, C_SEC3, "SATURATION");
-kcap = 0x7A2A22;  kn(522, 168, 30, 4, 0, 100, 30, "AMOUNT", 1);
+kcap = 0x7A2A22;  kn(522, 168, 30, 4, 0, 100, 67, "AMOUNT", 1);
 gfx_setfont(5);  col(C_INK2, 1);  g_mx = swap >= 0.5 ? 540 : 424;  g_cx = swap >= 0.5 ? 424 : 516;   // ORDER lit (colour first): TAPE COLOUR moves left of MODE
 text_c(px(g_mx + 40), py(254), "MODE");  text_c(px(g_cx + 52), py(254), "TAPE COLOUR");
 g_j = 0;
@@ -923,15 +927,15 @@ tlamp(668, 236, "LOWS", lo_in >= 0.5, 12);
 g_m = floor(lo_mode + 0.5);
 dbox(668, 258, 104, 30, g_m == 0 ? "THUMP" : g_m == 1 ? "WEIGHT" : "BLOOM") ? (
   gfx_x = px(668);  gfx_y = py(288);
-  g_i = gfx_showmenu(sprintf(#lm, "%sThump|%sWeight|%sBloom", g_m == 0 ? "!" : "", g_m == 1 ? "!" : "", g_m == 2 ? "!" : ""));
-  g_i > 0 ? ( slider(7) = g_i - 1;  param_touched(7); ); );
+  g_i = gfx_showmenu(sprintf(#lm, "%sBloom|%sWeight|%sThump", g_m == 2 ? "!" : "", g_m == 1 ? "!" : "", g_m == 0 ? "!" : ""));   // listed bottom-up: THUMP last
+  g_i > 0 ? ( slider(7) = 3 - g_i;  param_touched(7); ); );
 kzero = 1;  kcap = 0x6B4226;  kn(828, 268, 22, 8, -10, 10, 0, "AMOUNT", 4);
 tlamp(668, 130, "HIGHS", hi_in >= 0.5, 13);
 g_m = floor(hi_mode + 0.5);
 dbox(668, 152, 104, 30, g_m == 0 ? "EDGE" : g_m == 1 ? "PRESENCE" : "SHEEN") ? (
   gfx_x = px(668);  gfx_y = py(182);
-  g_i = gfx_showmenu(sprintf(#hm, "%sEdge|%sPresence|%sSheen", g_m == 0 ? "!" : "", g_m == 1 ? "!" : "", g_m == 2 ? "!" : ""));
-  g_i > 0 ? ( slider(9) = g_i - 1;  param_touched(9); ); );
+  g_i = gfx_showmenu(sprintf(#hm, "%sSheen|%sPresence|%sEdge", g_m == 2 ? "!" : "", g_m == 1 ? "!" : "", g_m == 0 ? "!" : ""));   // SHEEN first
+  g_i > 0 ? ( slider(9) = 3 - g_i;  param_touched(9); ); );
 kzero = 1;  kcap = 0x9A2A24;  kn(828, 162, 22, 10, -10, 10, 0, "AMOUNT", 4);
 // LINK: the two amounts move together
 link >= 0.5 && kn_moved == 8 ? ( slider(10) = lo_amt;  param_touched(10); );
