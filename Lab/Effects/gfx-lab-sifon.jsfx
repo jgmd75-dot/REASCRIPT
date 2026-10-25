@@ -26,10 +26,13 @@ desc:GFX Lab Sifon [bus compressor]
 // IRON (always on): the output transformer. The lows below ~150 Hz saturate first (mostly 3rd harmonic, a touch of
 //   2nd): weight and glue that grow with level. Only the harmonics the saturation makes are added (the lows keep
 //   their level), so quiet signal passes untouched.
-// COLOUR LOW / HIGH (either, both or neither): a second saturation on each band, added the same way. HIGH: the band above ~3 kHz (widening down to ~1 kHz as TEXTURE rises), mostly 2nd harmonic (sheen,
-//   air, upper-mid edge). LOW: the band below ~300 Hz, more asymmetric (2nd harmonic: warmth, thickness).
-//   Each band also lifts with TEXTURE (HIGH: a first-order shelf from 4.7 kHz, up to +3.1 dB; LOW: up to +2.5 dB below
-//   300 Hz), and only harmonics are added, so a
+// COLOUR LOW / HIGH (either, both or neither): a parallel HEAD saturation (the tape curve of HeadSmoother) on each
+//   band, driven harder as TEXTURE rises (0 - +18 dB), only its harmonics added. HIGH: the band above ~3 kHz (widening
+//   down to ~1 kHz as TEXTURE rises), mostly 2nd harmonic (sheen, air, upper-mid edge). LOW: the band below ~300 Hz.
+//   Each band also shapes the tone: HIGH a first-order shelf from 4.7 kHz (up to +3.1 dB); above 50 % TEXTURE a broad
+//   dip at 3 kHz (to -2 dB) and a shelf above 15 kHz (to +3 dB). LOW a lift below 300 Hz (up to +1.25 dB at 50 %); above
+//   50 % a shelf below 120 Hz (to +4 dB), a narrow dip at 220 Hz deepening with it (to -3 dB) and a 30 Hz subsonic
+//   filter fading in. Only harmonics are added by the saturation, so a
 //   band never loses level. Switching crossfades (30 ms). TEXTURE (0 - 100 %) drives IRON and COLOUR together.
 //   LOW WIDTH / HIGH WIDTH (0 - 200 %, 100 = as made): where each band's added harmonics sit - 0 = centre only,
 //   200 = sides only (only the added harmonics move, so no phase issues).
@@ -179,6 +182,19 @@ function tp_peak(ch, x) local(h, b, p, m, y, a, c, e, d, q, pv) (
 
 // TPT one-pole: low-pass output (G = g / (1 + g) for the running rate)
 function op_lp(x, gg) instance(s) local(v, y) ( v = (x - s) * gg; y = v + s; s = y + v; y; );
+// RBJ biquads at 1x (the COLOUR tone): 0 high-pass, 1 peak, 2 low shelf, 3 high shelf
+function bq_set(t, f, q, gdb) instance(b0, b1, b2, a1, a2) local(w, cw, al, a, sa, n) (
+  w = 2 * $pi * min(f, 0.45 * srate) / srate; cw = cos(w); al = sin(w) / (2 * q); a = 10 ^ (gdb / 40);
+  t == 0 ? ( n = 1 + al; b0 = (1 + cw) / 2 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n; ) :
+  t == 1 ? ( n = 1 + al / a; b0 = (1 + al * a) / n; b1 = -2 * cw / n; b2 = (1 - al * a) / n; a1 = b1; a2 = (1 - al / a) / n; ) :
+  t == 2 ? ( sa = 2 * sqrt(a) * al; n = (a + 1) + (a - 1) * cw + sa;
+    b0 = a * ((a + 1) - (a - 1) * cw + sa) / n; b1 = 2 * a * ((a - 1) - (a + 1) * cw) / n; b2 = a * ((a + 1) - (a - 1) * cw - sa) / n;
+    a1 = -2 * ((a - 1) + (a + 1) * cw) / n; a2 = ((a + 1) + (a - 1) * cw - sa) / n; ) :
+  ( sa = 2 * sqrt(a) * al; n = (a + 1) - (a - 1) * cw + sa;
+    b0 = a * ((a + 1) + (a - 1) * cw + sa) / n; b1 = -2 * a * ((a - 1) + (a + 1) * cw) / n; b2 = a * ((a + 1) + (a - 1) * cw - sa) / n;
+    a1 = 2 * ((a - 1) - (a + 1) * cw) / n; a2 = ((a + 1) - (a - 1) * cw - sa) / n; );
+);
+function bq_run(x) instance(b0, b1, b2, a1, a2, z1, z2) local(y) ( y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; y; );
 // smooth saturator: x (27 + x^2) / (27 + 9 x^2), flat from |x| = 3 (slope 1 at 0, 0 at the knee)
 function sat3(x) ( x = max(-3, min(3, x)); x * (27 + x * x) / (27 + 9 * x * x); );
 // what saturating a band adds: (sat(k x + b) - sat(b)) / (k sat'(b)) - x   (b = bias for the 2nd harmonic; dividing
@@ -191,19 +207,38 @@ function hfund(h, x) instance(cxy, cxx) (
   cxy += (h * x - cxy) * cg_cr; cxx += (x * x - cxx) * cg_cr;
   h - x * (cxx > 0.000000000001 ? cxy / cxx : 1);
 );
+// the parallel saturation (the HEAD curve of HeadSmoother): tanh with a small bias, its gain set so a band peaking at
+// -12 dBFS comes out at the same level whatever the drive
+function th(v) local(e) ( e = exp(2 * max(min(v, 20), -20)); (e - 1) / (e + 1); );
+function hsat(x, g, b, tb, c) ( (th(g * x + b) - tb) * c; );
+function hs_coefs() local(g) (
+  g_hs = db2g(18 * tex_s);                                 // TEXTURE drives it from 0 to +18 dB
+  tb_hi = th(0.3); c_hi = 0.25 / (th(g_hs * 0.125 + 0.3) - th(0.3 - g_hs * 0.125));
+  tb_lo = th(0.4); c_lo = 0.25 / (th(g_hs * 0.125 + 0.4) - th(0.4 - g_hs * 0.125));
+  // the tone moves above 50 % TEXTURE: HIGH a broad dip at 3 kHz and a shelf above 15 kHz; LOW a shelf below 120 Hz
+  // with a narrow dip at 220 Hz that deepens with it (the subsonic filter at 30 Hz fades in with t2)
+  t2 = max(0, 2 * tex_s - 1); tex_q = tex_s;
+  eqL.h1.bq_set(1, 3000, 0.6, -2 * t2); eqL.h2.bq_set(3, 15000, 0.707, 3 * t2);
+  eqL.l1.bq_set(2, 120, 0.707, 4 * t2); eqL.l2.bq_set(1, 220, 2.5, -3 * t2);
+  eqR.h1.bq_set(1, 3000, 0.6, -2 * t2); eqR.h2.bq_set(3, 15000, 0.707, 3 * t2);
+  eqR.l1.bq_set(2, 120, 0.707, 4 * t2); eqR.l2.bq_set(1, 220, 2.5, -3 * t2);
+);
+function hs_tone(x) instance(h1, h2, l1, l2, l3) local(y) (
+  y = x + w_red * (this.h2.bq_run(this.h1.bq_run(x)) - x);
+  y += t2 * (this.l3.bq_run(y) - y) * w_blue;
+  y + w_blue * (this.l2.bq_run(this.l1.bq_run(y)) - y);
+);
 // IRON + COLOUR on one oversampled sample (per-channel filter states in the instance)
 function colour_run(u) instance(ip, rp, bp, ep, hc, lc, ic, sp) local(lo, hi, bl, di, dr, dd, y, band, ev, eb) (
   lo = this.ip.op_lp(u, cg_iron);                         // iron band, below ~150 Hz
   hi = u - this.rp.op_lp(u, cg_red);                       // HIGH band, above 3 kHz - 1 kHz (TEXTURE)
   bl = this.bp.op_lp(u, cg_blue);                          // LOW band, below ~300 Hz
   di = this.ic.hfund(sdiff(lo, k_iron, 0.12, sd_i) + lo, lo);   // the iron's harmonics, the lows' level kept
-  // LOW: mostly the even part too (warmth, the bass's octave), with some odd for grip; keeps the low end's level
-  eb = (sat3(k_col * bl + 0.35) + sat3(0.35 - k_col * bl) - 2 * sat3(0.35)) / (2 * k_col * sd_b);
-  dd = a_lo * (1.5 * eb + 0.4 * this.lc.hfund(sdiff(bl, k_col, 0, 1) + bl, bl));
-  // HIGH: mostly the even (2nd-harmonic) part, high-passed, so the top gains sheen instead of losing its peaks
-  ev = (sat3(k_red * hi + 0.4) + sat3(0.4 - k_red * hi) - 2 * sat3(0.4)) / (2 * k_red * sd_e);
-  ev -= this.ep.op_lp(ev, cg_red);
-  dr = a_hi * (2 * ev + 0.2 * this.hc.hfund(sdiff(hi, k_red, 0, 1) + hi, hi));
+  // LOW / HIGH: a parallel HEAD saturation driven harder with TEXTURE, only its harmonics added (the bands keep
+  // their level); HIGH's high-passed so the top gains sheen instead of losing its peaks
+  dd = a_lo * this.lc.hfund(hsat(bl, g_hs, 0.4, tb_lo, c_lo), bl);
+  ev = this.hc.hfund(hsat(hi, g_hs, 0.3, tb_hi, c_hi), hi);
+  dr = a_hi * (ev - this.ep.op_lp(ev, cg_red));
   // the LOW / HIGH harmonics are handed to cw_add() (their own widths); the dry and IRON stay here
   this.dlo = w_blue * dd; this.dhi = w_red * dr;
   // + each band's lift: HIGH a first-order shelf from 4.7 kHz (+3.1 dB at 100 %), LOW a shelf below 300 Hz
@@ -266,6 +301,8 @@ function clear_lim() (
 
 in_init();
 sd_e = sat3d(0.4); sd_i = sat3d(0.12); sd_r = sat3d(0.05); sd_b = sat3d(0.35);
+hs_ah = 1; hs_al = 1;                                    // the HIGH / LOW harmonics' amounts
+eqL.l3.bq_set(0, 30, 0.707, 0); eqR.l3.bq_set(0, 30, 0.707, 0); hs_coefs();
 os_design();
 os_f = os_tf = os_f2n(os_sl);
 colour_coefs(os_f);
@@ -384,8 +421,9 @@ tex_s += (texture * 0.01 - tex_s) * c_kn;
 // HIGH widens as it is pushed: its band starts at 3 kHz at TEXTURE 0 and comes down to 1 kHz at 100 %
 abs(tex_s - tex_r) > 0.0005 ? ( tex_r = tex_s; tx_g = tan($pi * 3000 * 2 ^ (-1.6 * tex_s) / (srate * os_f)); cg_red = tx_g / (1 + tx_g); );
 k_iron = db2g(-17 + 27 * tex_s); k_col = db2g(-4 + 10 * tex_s); k_red = db2g(10 * tex_s);   // drive into the iron and the COLOUR bands
-a_hi = a_lo = 1 + tex_s;                                     // the COLOUR harmonics grow with TEXTURE
-sh_hi = db2g(3.1 * tex_s) - 1; sh_lo = db2g(2.5 * tex_s) - 1;   // and each band lifts: HIGH up to +3.1 dB, LOW +2.5 dB   // drive into the iron and the COLOUR bands
+a_hi = hs_ah; a_lo = hs_al;                                  // the COLOUR harmonics' amounts
+sh_hi = db2g(3.1 * tex_s) - 1; sh_lo = db2g(2.5 * min(tex_s, 0.5)) - 1;   // each band lifts: HIGH up to +3.1 dB, LOW +1.25 dB
+abs(tex_s - tex_q) > 0.002 || (tex_s != tex_q && tex_s == texture * 0.01) ? hs_coefs();
 wid_s += (width_pc * 0.01 - wid_s) * c_kn; dep_s += (depth_pc * 0.01 - dep_s) * c_kn;
 shp_s += ((sidehpf > 0) - shp_s) * c_sw;
 sh_gw += (sh_tw - sh_gw) * c_kn; sh_h = 1 / (1 + sh_gw * (sh_gw + 1.4142135623730951));
@@ -473,6 +511,7 @@ os_f == 1 ? (
 // DC blocker (5 Hz): the 2nd harmonic's offset
 dcv = cl - dcx_l + dc_c * dcy_l; dcx_l = cl; dcy_l = dcv; cl = dcv;
 dcv = cr - dcx_r + dc_c * dcy_r; dcx_r = cr; dcy_r = dcv; cr = dcv;
+cl = eqL.hs_tone(cl); cr = eqR.hs_tone(cr);                // the COLOUR tone above 50 % TEXTURE
 
 // ---------- stereo field ----------
 sm = 0.5 * (cl + cr); ss = 0.5 * (cl - cr);
