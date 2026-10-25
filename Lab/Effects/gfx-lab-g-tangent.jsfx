@@ -171,7 +171,8 @@ LYR = 64;  LST = 12;  L_DR = 0;  L_LX = 1;  L_AX = 2;  L_AY = 3;  L_E = 4;  L_EI
 CHB = 700000;  CHN = 4096;               // the chorus's two lines (L, R)
 RVB = 720000;  RVN = 16384;  RVM = 16383;   // the spring tank: two lines; its dispersion stages' little buffers at SAB (32 each)
 SAB = RVB + 2 * RVN;
-memset(VOX, 0, NV * VS);  memset(LN, 0, 6 * NV * VSZ);  memset(CHB, 0, 2 * CHN);  memset(RVB, 0, 2 * RVN + 512);
+HX = 690000;                             // the loss filter's taps above 48 kHz: HX + v * 40 (string, then the 4 layers, 8 each)
+memset(VOX, 0, NV * VS);  memset(LN, 0, 6 * NV * VSZ);  memset(CHB, 0, 2 * CHN);  memset(RVB, 0, 2 * RVN + 512);  memset(HX, 0, NV * 40);
 
 // ---------- helpers ----------
 function ts(x) ( x = max(-3, min(3, x));  x * (27 + x * x) / (27 + 9 * x * x); );
@@ -218,7 +219,7 @@ function v_tune(b) local(n, f, w, sx, d) (
   f = 440 * 2 ^ ((n - 69) / 12);
   w = 2 * $pi * f / srate;
   sx = b[F_S];
-  d = srate / f - pd_fir(sx, w) - pd_ap(b[F_STF], w);
+  d = srate / f - st_r * pd_fir(sx, w * st_r) - pd_ap(b[F_STF], w);
   b[F_DR] = max(3, min(VSZ - 8, d));
   b[F_F] = f;  b[F_FD] = srate / f - d;                      // (the layers: their pitch from here, the filters' delay barely moves)
   // the pickups: where each falls along this string (fixed across the keys, so the share grows up the keyboard)
@@ -230,6 +231,9 @@ function v_tune(b) local(n, f, w, sx, d) (
 function v_stiff(n) ( vc_stiff * (n <= 51 ? 1.3 - 0.35 * max(0, n - 29) / 22 : 0.75 * 2 ^ (-(n - 52) / 22)); );
 // the loss filter's weight for the key: the short treble strings lose less per pass (they make many more passes)
 function v_s0(b) ( max(0.015, min(0.4, ST_S0 * vc_sm * 2 ^ (-(b[F_NOTE] - 60) / 20))); );
+// the loss filter was voiced at 48 kHz: above it the two taps sit st_r samples apart (2 at 96k, 4 at 192k: the 48 kHz
+// response below 24 kHz), and the weight is trimmed for what's left (44.1 / 88.2 kHz): same ring and level at every rate
+function st_sr(s) local(p) ( st_k == 1 ? s : ( p = min(0.25, s * (1 - s) * st_k);  0.5 * (1 - sqrt(1 - 4 * p)); ); );
 // the loop gain per pass for a T60 of t seconds at the voice's pitch
 function v_gain(b, t) ( 10 ^ (-3 * b[F_DR] / (srate * max(0.005, t))); );
 function v_held_t60(b) local(t) (
@@ -262,14 +266,14 @@ function l_env(b, k, t) local(x) (
 );
 // a layer's read delay for its pitch offset c (cents); the ATTACK layer's brighter loss filter has a little less delay
 function l_tune(b, lb, c) (
-  lb[L_DR] = max(3, min(VSZ - 8, (c == 0 ? srate / b[F_F] : srate / (b[F_F] * 2 ^ (c / 1200))) - b[F_FD] + b[F_S] - lb[L_S]));
+  lb[L_DR] = max(3, min(VSZ - 8, (c == 0 ? srate / b[F_F] : srate / (b[F_F] * 2 ^ (c / 1200))) - b[F_FD] + st_r * (b[F_S] - lb[L_S])));
 );
 function l_start(b) local(k, lb, vi) (
   vi = (b - VOX) / VS;  k = 0;
   loop(4, lb = b + LYR + k * LST;
     lb[L_S] = k == 0 ? b[F_S] * 0.3 : b[F_S];
     !lb[L_ON] ? (                                            // (a layer still ringing from the last strike keeps going)
-      ln_clr(LL + (k * NV + vi) * VSZ, b[F_W], ln_m);  lb[L_LX] = 0;  lb[L_AX] = 0;  lb[L_AY] = 0;  lb[L_ON] = 1;
+      ln_clr(LL + (k * NV + vi) * VSZ, b[F_W], ln_m);  lb[L_LX] = 0;  memset(HX + vi * 40 + 8 * (k + 1), 0, 8);  lb[L_AX] = 0;  lb[L_AY] = 0;  lb[L_ON] = 1;
       lb[L_E] = k == 3 ? 0 : l_env(b, k, 0);
       lb[L_GT] = k == 0 ? v_gain(b, 0.3) : k == 3 ? v_gain(b, v_held_t60(b) * LL_T) : b[F_GT];  lb[L_G] = lb[L_GT];
     );
@@ -302,7 +306,7 @@ function l_ctl(b, t, held) local(k, lb, tg, c) (
 function v_start(b, note, vel) local(k, base) (
   base = LN + ((b - VOX) / VS) * VSZ;
   ln_m = floor(1.6 * srate / (440 * 2 ^ ((note - 69) / 12))) + 16;   // (the longest the loops can grow: bend, the release drop)
-  b[F_ON] && b[F_NOTE] == note ? 0 : ( b[F_W] = 0;  ln_clr(base, 0, ln_m);  ln_clr(base + NV * VSZ, 0, ln_m);  b[F_LX] = 0;  b[F_AX] = 0;  b[F_AY] = 0;
+  b[F_ON] && b[F_NOTE] == note ? 0 : ( b[F_W] = 0;  ln_clr(base, 0, ln_m);  ln_clr(base + NV * VSZ, 0, ln_m);  b[F_LX] = 0;  memset(HX + vi * 40, 0, 40);  b[F_AX] = 0;  b[F_AY] = 0;
     b[F_LVL] = 0;  b[F_ATS] = 0;  k = 0;  loop(4, b[LYR + k * LST + L_ON] = 0;  k += 1; ); );
   b[F_RD] = 0;  b[F_RLS] = 0;  b[F_AT] = 0;
   b[F_ON] = 1;  b[F_NOTE] = note;  b[F_VEL] = vel;  b[F_GATE] = 1;  b[F_SUS] = 0;
@@ -312,7 +316,7 @@ function v_start(b, note, vel) local(k, base) (
   b[F_LSG] = hsh(note, 5) < 0.5 ? -1 : 1;                    // which way the PARALLEL copy sits (the LONG one the other way)
   b[F_T] = 0;
   b[F_STF] = v_stiff(note);
-  b[F_S] = v_s0(b) + 0.25 * mute_s;  b[F_ST] = b[F_S];
+  b[F_S] = st_sr(v_s0(b) + 0.25 * mute_s);  b[F_ST] = b[F_S];
   v_strike(b, vel);
   v_tune(b);
   b[F_GT] = v_gain(b, v_held_t60(b));  b[F_G] = b[F_GT];
@@ -364,9 +368,9 @@ function v_ctl(b) local(t) (
   b[F_RLS] ? b[F_RD] += (1 - b[F_RD]) * rd_c;                          // the release drop: about 20 ms
   b[F_STF] += (v_stiff(b[F_NOTE]) - b[F_STF]) * 0.25;
   b[F_GATE] || b[F_SUS] ? (
-    b[F_ST] = v_s0(b) + 0.25 * mute_s;  t = v_held_t60(b);
+    b[F_ST] = st_sr(v_s0(b) + 0.25 * mute_s);  t = v_held_t60(b);
   ) : (
-    b[F_ST] = 0.42;  t = damp_t * (1 + 0.6 * max(0, 52 - b[F_NOTE]) / 24);   // the yarn: the bass takes a little longer
+    b[F_ST] = st_sr(0.42);  t = damp_t * (1 + 0.6 * max(0, 52 - b[F_NOTE]) / 24);   // the yarn: the bass takes a little longer
   );
   b[F_S] += (b[F_ST] - b[F_S]) * 0.25;
   v_tune(b);
@@ -377,7 +381,7 @@ function v_ctl(b) local(t) (
   b[F_LVL] *= 0.7;
 );
 // one voice, one sample: the string loop and its two pickups
-function v_run(b) local(vi, base, hy, lbs, lb, w, p, i, f, im, i1, i2, y, z, mx, lf, ap, e, ph, pu, pl, q, dq, g, ex, rp, stf) (
+function v_run(b) local(vi, base, hy, lbs, lb, w, p, i, f, im, i1, i2, y, z, mx, lf, ap, e, ph, pu, pl, q, dq, g, ex, rp, stf, qx, x) (
   vi = (b - VOX) / VS;  base = LN + vi * VSZ;  hy = MH + vi * VSZ;  w = b[F_W];
   // read the string at its loop delay (four-point Lagrange: smooth under pitch changes)
   p = w - b[F_DR];  p < 0 ? p += VSZ;  i = floor(p);  f = p - i;
@@ -385,7 +389,12 @@ function v_run(b) local(vi, base, hy, lbs, lb, w, p, i, f, im, i1, i2, y, z, mx,
   y = -f * (f - 1) * (f - 2) / 6 * base[im] + (f + 1) * (f - 1) * (f - 2) * 0.5 * base[i] - (f + 1) * f * (f - 2) * 0.5 * base[i1] + (f + 1) * f * (f - 1) / 6 * base[i2];
   rp = base[(w - floor(b[F_DR] * (1 - b[F_RPR]))) & VMK];                  // the ripple tap (a shorter path round the loop)
   // loss (two-tap), stiffness (all-pass), loop gain (glides: no step when the damper lands)
-  lf = (1 - b[F_S]) * (y + b[F_RPA] * rp) + b[F_S] * b[F_LX];  b[F_LX] = y + b[F_RPA] * rp;
+  qx = HX + vi * 40;
+  st_r == 1 ? (
+    lf = (1 - b[F_S]) * (y + b[F_RPA] * rp) + b[F_S] * b[F_LX];  b[F_LX] = y + b[F_RPA] * rp;
+  ) : (
+    x = y + b[F_RPA] * rp;  lf = (1 - b[F_S]) * x + b[F_S] * qx[(w + 8 - st_r) & 7];  qx[w & 7] = x;
+  );
   ap = b[F_STF] * lf + b[F_AX] - b[F_STF] * b[F_AY];  b[F_AX] = lf;  b[F_AY] = ap;
   b[F_G] += (b[F_GT] - b[F_G]) * g_c;
   y = ap * b[F_G];
@@ -409,12 +418,16 @@ function v_run(b) local(vi, base, hy, lbs, lb, w, p, i, f, im, i1, i2, y, z, mx,
     lb[L_ON] ? (
       p = w - lb[L_DR];  p < 0 ? p += VSZ;  i = floor(p);  f = p - i;
       z = lbs[i] + (lbs[(i + 1) & VMK] - lbs[i]) * f;
-      lf = (1 - lb[L_S]) * z + lb[L_S] * lb[L_LX];  lb[L_LX] = z;
+      st_r == 1 ? (
+        lf = (1 - lb[L_S]) * z + lb[L_S] * lb[L_LX];  lb[L_LX] = z;
+      ) : (
+        lf = (1 - lb[L_S]) * z + lb[L_S] * qx[8 + ((w + 8 - st_r) & 7)];  qx[8 + (w & 7)] = z;
+      );
       ap = stf * lf + lb[L_AX] - stf * lb[L_AY];  lb[L_AX] = lf;  lb[L_AY] = ap;
       z = ap * lb[L_G] + ex;  lbs[w] = z;
       lb[L_E] += lb[L_EI];  mx += z * lb[L_E];
     );
-    lb += LST;  lbs += NV * VSZ;
+    lb += LST;  lbs += NV * VSZ;  qx += 8;
   );
   hy[w] = mx;  w += 1;  w >= VSZ ? w = 0;  b[F_W] = w;
   // the pickups: the string's motion at each one (now, less a pickup's distance back along the string), string and
@@ -546,6 +559,7 @@ AM_OUT = 0.393;                                                // TWEAK: the amp
 
 function update_params() local(ws) (
   drift_macro(drift);  l_dm = 0.5 + 0.5 * dm_a;
+  st_r = max(1, floor(srate / 48000 + 0.5));  st_k = (srate / (48000 * st_r)) ^ 2;   // the strings' loss filter follows the rate (st_sr)
   sm_c = 1 - exp(-1 / (0.03 * srate));  sw_c = 1 - exp(-1 / (0.015 * srate));
   cc_c = 1 - exp(-CR / (0.03 * srate));  fc_c = 1 - exp(-CR / (0.004 * srate));  md_c = 1 - exp(-CR / (0.08 * srate));
   g_c = 1 - exp(-1 / (0.002 * srate));                      // the loop gain glides over 2 ms
