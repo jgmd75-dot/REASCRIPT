@@ -24,11 +24,12 @@ desc:GFX Lab Sifon [bus compressor]
 //   M/S: the compressor works on Mid and Side; LINK on = one gain for both, off = each side (or Mid and Side) its own
 //   detector (glided 10 ms). Changing L/R <-> M/S dips the sound for 5 ms and swaps at the silent point.
 // IRON (always on): the output transformer. The lows below ~150 Hz saturate first (mostly 3rd harmonic, a touch of
-//   2nd): weight and glue that grow with level. Only the difference the saturation makes is added, so quiet signal
-//   passes untouched.
-// COLOUR LOW / HIGH (either, both or neither): a second saturation on each band, added the same way. HIGH: the band above ~3 kHz, mostly 2nd harmonic (sheen,
+//   2nd): weight and glue that grow with level. Only the harmonics the saturation makes are added (the lows keep
+//   their level), so quiet signal passes untouched.
+// COLOUR LOW / HIGH (either, both or neither): a second saturation on each band, added the same way. HIGH: the band above ~3 kHz (widening down to ~1 kHz as TEXTURE rises), mostly 2nd harmonic (sheen,
 //   air, upper-mid edge). LOW: the band below ~300 Hz, more asymmetric (2nd harmonic: warmth, thickness).
-//   Switching crossfades (30 ms). TEXTURE (0 - 100 %) drives IRON and COLOUR together.
+//   Each band also lifts with TEXTURE (a gentle shelf, up to +2.5 dB at 100 %), and only harmonics are added, so a
+//   band never loses level. Switching crossfades (30 ms). TEXTURE (0 - 100 %) drives IRON and COLOUR together.
 //   LOW WIDTH / HIGH WIDTH (0 - 200 %, 100 = as made): where each band's added harmonics sit - 0 = centre only,
 //   200 = sides only (only the added harmonics move, so no phase issues).
 //   SOLO: hear only the band being worked on (LOW's and / or HIGH's, or IRON's when COLOUR is off), crossfaded.
@@ -190,21 +191,21 @@ function hfund(h, x) instance(cxy, cxx) (
   h - x * (cxx > 0.000000000001 ? cxy / cxx : 1);
 );
 // IRON + COLOUR on one oversampled sample (per-channel filter states in the instance)
-function colour_run(u) instance(ip, rp, bp, ep, hc, lc) local(lo, hi, bl, di, dr, dd, y, band, ev, eb) (
+function colour_run(u) instance(ip, rp, bp, ep, hc, lc, ic) local(lo, hi, bl, di, dr, dd, y, band, ev, eb) (
   lo = this.ip.op_lp(u, cg_iron);                         // iron band, below ~150 Hz
-  hi = u - this.rp.op_lp(u, cg_red);                       // HIGH band, above ~3 kHz
+  hi = u - this.rp.op_lp(u, cg_red);                       // HIGH band, above 3 kHz - 1 kHz (TEXTURE)
   bl = this.bp.op_lp(u, cg_blue);                          // LOW band, below ~300 Hz
-  di = sdiff(lo, k_iron, 0.12, sd_i);
+  di = this.ic.hfund(sdiff(lo, k_iron, 0.12, sd_i) + lo, lo);   // the iron's harmonics, the lows' level kept
   // LOW: mostly the even part too (warmth, the bass's octave), with some odd for grip; keeps the low end's level
   eb = (sat3(k_col * bl + 0.35) + sat3(0.35 - k_col * bl) - 2 * sat3(0.35)) / (2 * k_col * sd_b);
-  dd = 1.5 * eb + 0.4 * this.lc.hfund(sdiff(bl, k_col, 0, 1) + bl, bl);
+  dd = a_lo * (1.5 * eb + 0.4 * this.lc.hfund(sdiff(bl, k_col, 0, 1) + bl, bl));
   // HIGH: mostly the even (2nd-harmonic) part, high-passed, so the top gains sheen instead of losing its peaks
   ev = (sat3(k_red * hi + 0.4) + sat3(0.4 - k_red * hi) - 2 * sat3(0.4)) / (2 * k_red * sd_e);
   ev -= this.ep.op_lp(ev, cg_red);
-  dr = 2 * ev + 0.2 * this.hc.hfund(sdiff(hi, k_red, 0, 1) + hi, hi);
+  dr = a_hi * (2 * ev + 0.2 * this.hc.hfund(sdiff(hi, k_red, 0, 1) + hi, hi));
   // the LOW / HIGH harmonics are handed to cw_add() (their own widths); the dry and IRON stay here
   this.dlo = w_blue * dd; this.dhi = w_red * dr;
-  y = u + di;
+  y = u + di + w_red * sh_hi * hi + w_blue * sh_lo * bl;   // + the bands' lift (a gentle shelf each)
   // SOLO: only the band being worked on (the COLOUR bands, or IRON's when COLOUR is off)
   band = max(1 - w_red - w_blue, 0) * (lo + di) + w_red * hi + w_blue * bl;
   y + so_s * (band - y);
@@ -218,7 +219,7 @@ function cw_add() local(m, d) (
 );
 function colour_coefs(f) local(g) (
   g = tan($pi * 150 / (srate * f)); cg_iron = g / (1 + g);
-  g = tan($pi * 3000 / (srate * f)); cg_red = g / (1 + g);
+  g = tan($pi * 3000 * 2 ^ (-1.6 * tex_s) / (srate * f)); cg_red = g / (1 + g); tex_r = tex_s;
   g = tan($pi * 300 / (srate * f)); cg_blue = g / (1 + g);
   cg_cr = 1 - exp(-1 / (0.03 * srate * f));
 );
@@ -340,6 +341,7 @@ rs_req ? (
   ul.os_clr(); ur.os_clr(); dl_.os_clr(); dr_.os_clr();
   chL.ip.s = chL.rp.s = chL.bp.s = chL.ep.s = chR.ip.s = chR.rp.s = chR.bp.s = chR.ep.s = 0;
   chL.hc.cxy = chL.hc.cxx = chL.lc.cxy = chL.lc.cxx = chR.hc.cxy = chR.hc.cxx = chR.lc.cxy = chR.lc.cxx = 0;
+  chL.ic.cxy = chL.ic.cxx = chR.ic.cxy = chR.ic.cxx = 0;
   memset(DLINE, 0, 2048); memset(DRY, 0, 2048);   // the limiter keeps its gain: the best guess for now
   memset(XCH, 0, 62 * 1024);
 );
@@ -376,7 +378,11 @@ lw_s += (lo_wid * 0.01 - lw_s) * c_kn; hw_s += (hi_wid * 0.01 - hw_s) * c_kn;
 lwm_g = min(1, 2 - lw_s); lws_g = min(1, lw_s); hwm_g = min(1, 2 - hw_s); hws_g = min(1, hw_s);
 w_red += ((colour & 1) - w_red) * c_kn; w_blue += (((colour & 2) > 0) - w_blue) * c_kn;
 tex_s += (texture * 0.01 - tex_s) * c_kn;
-k_iron = db2g(-17 + 27 * tex_s); k_col = db2g(-2 + 26 * tex_s); k_red = db2g(2 + 26 * tex_s);   // drive into the iron and the COLOUR bands
+// HIGH widens as it is pushed: its band starts at 3 kHz at TEXTURE 0 and comes down to 1 kHz at 100 %
+abs(tex_s - tex_r) > 0.0005 ? ( tex_r = tex_s; tx_g = tan($pi * 3000 * 2 ^ (-1.6 * tex_s) / (srate * os_f)); cg_red = tx_g / (1 + tx_g); );
+k_iron = db2g(-17 + 27 * tex_s); k_col = db2g(-4 + 10 * tex_s); k_red = db2g(10 * tex_s);   // drive into the iron and the COLOUR bands
+a_hi = a_lo = 1 + tex_s;                                     // the COLOUR harmonics grow with TEXTURE
+sh_hi = sh_lo = db2g(2.5 * tex_s) - 1;                       // and each band lifts, up to +2.5 dB   // drive into the iron and the COLOUR bands
 wid_s += (width_pc * 0.01 - wid_s) * c_kn; dep_s += (depth_pc * 0.01 - dep_s) * c_kn;
 shp_s += ((sidehpf > 0) - shp_s) * c_sw;
 sh_gw += (sh_tw - sh_gw) * c_kn; sh_h = 1 / (1 + sh_gw * (sh_gw + 1.4142135623730951));
@@ -386,6 +392,7 @@ os_chg ? (
   ul.os_clr(); ur.os_clr(); dl_.os_clr(); dr_.os_clr();
   chL.ip.s = chL.rp.s = chL.bp.s = chL.ep.s = chR.ip.s = chR.rp.s = chR.bp.s = chR.ep.s = 0;
   chL.hc.cxy = chL.hc.cxx = chL.lc.cxy = chL.lc.cxx = chR.hc.cxy = chR.hc.cxx = chR.lc.cxy = chR.lc.cxx = 0;
+  chL.ic.cxy = chL.ic.cxx = chR.ic.cxy = chR.ic.cxx = 0;
   os_hold += 2 * samplesblock;                // stay silent while REAPER takes up the new latency
 );
 
