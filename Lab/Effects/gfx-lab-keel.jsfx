@@ -1,0 +1,496 @@
+desc:GFX Lab Keel [low-end shaper]
+//tags: mastering bass low end transient compressor mono harmonics
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-lab-drift, gfx-lab-input, gfx-lab-ui, gfx-lab-panel and gfx-lab-os (.jsfx-inc) in the same folder.
+//
+// Keel. A low-end shaper for the mix bus and the master, in the spirit of the low-band modules of the modern
+// mastering suites: the bass is split off on a phase-matched crossover, shaped on its own - its attack (PUNCH), its
+// evenness (SMOOTH), its level (LOW) and its width (MONO) - and put back without touching the rest of the mix. The
+// keel is what keeps a boat steady below the waterline.
+//
+// SIGNAL FLOW
+//   input -> TRIM (+ optional GUARD) -> SUB (high-pass) -> M / S -> crossover at SPLIT -> low band: PUNCH -> SMOOTH ->
+//   LOW -> MONO -> [oversampled: HARMONICS on the middle]; high band untouched (delayed to match) -> sum -> L / R ->
+//   OUTPUT -> out.
+// SPLIT (40 - 250 Hz): the crossover, 24 dB/oct (Linkwitz-Riley). The two bands add back to a flat response, so with
+//   every control at rest Keel changes no level at any frequency (only a gentle phase turn around SPLIT, as any
+//   analogue crossover has). Glided per sample, so it can be swept.
+// SUB (yellow, 10 - 40 Hz, IN key): a 12 dB/oct high-pass that clears rumble below the music.
+// PUNCH (0 - 100 %): a transient shaper on the low band only - it lifts the start of each kick and bass note (up
+//   to +6 dB on the attack at full) and leaves the sustain alone. Level-independent.
+// SMOOTH (0 - 100 %): evens out the low band - notes that jump out are pulled back, notes that sink are brought up,
+//   towards the low band's own average over the last second or so (up to 6 dB either way, 40 ms detector). It never
+//   lifts the low band when it is near silence.
+// LOW (-6 .. +6 dB): the level of the low band. MONO (0 - 100 %): narrows the low band towards mono (100 % = mono
+//   below SPLIT); the high band keeps its width.
+// HARMONICS (0 - 100 %): adds harmonics of the bass (the 2nd to the 5th) so it carries on small speakers and
+//   reads in a busy mix without turning up the lows themselves. They are made from the middle of the low band at a
+//   steady strength whatever the level (the bass is followed and normalised, then shaped), high-passed at SPLIT so
+//   they add no weight below it, and mixed back in. TONE (0 - 100 %): the mix of harmonics - warm (mostly the 2nd
+//   and 3rd) to bright (more of the 4th and 5th).
+// OS (1x / 2x / 4x, default 1x): the rate HARMONICS runs at (gfx-lab-os). Changing it dips the sound for 5 ms and
+//   swaps at the silent point.
+// OUTPUT: -12 .. +12 dB. BYPASS (top bar): a 15 ms crossfade to the input, kept in time with the latency.
+// METERS: LOW BAND ACTION = what PUNCH and SMOOTH are doing to the low band (up = lift, down = pull back, +/-6 dB);
+//   IN and OUT = an LED row each for L and R (-42 .. +3 dBFS, 1.2 s floating peak hold) and the OUT peak figure -
+//   click a meter to clear it.
+// GUI: drag a knob (SHIFT = fine), wheel, double-click = default; values show while a knob is touched. Keys light
+//   when on. S / M / L / ? = size and help.
+// DRIFT (0 - 100 %, 50 % = standard): the upper harmonics wander (JG) - the 3rd, 4th and 5th each drift slowly and
+//   independently in level (about +/-35 % at standard, every few seconds), so the bass's colour breathes the way an
+//   analogue stage's does as it warms. The 2nd harmonic, the crossover and the dynamics stay put.
+// PRESETS: Init, Tight Kick, Smooth Bass, Mono Master, Small Speakers, Deep Weight, Punchy Drums, Even Bass Line,
+//   Warm Glow, Clean Sub, Club Master, Gentle Master, Bright Bass, Vintage Low End - level-matched on programme
+//   (TRIM, GUARD, OS and BYPASS stay as they are).
+// Latency: 0 / 31 / 37 samples at 1x / 2x / 4x (reported). Stereo pins are declared, so on a multichannel track
+//   REAPER carries channels 3 and up round the unit and keeps them in time.
+
+slider1:split=100<40,250,1>-Split (Hz)
+slider2:sub_f=20<10,40,0.1>-Sub filter (Hz)
+slider3:sub_in=0<0,1,1{Out,In}>-Sub filter
+slider4:punch=0<0,100,0.1>-Punch (%)
+slider5:smooth=0<0,100,0.1>-Smooth (%)
+slider6:low_db=0<-6,6,0.1>-Low (dB)
+slider7:mono=0<0,100,0.1>-Mono (%)
+slider8:harm=0<0,100,0.1>-Harmonics (%)
+slider9:tone=50<0,100,0.1>-Harmonics tone (%)
+slider10:drift=50<0,100,0.1>-Drift (%)
+slider11:out_db=0<-12,12,0.1>-Output (dB)
+slider12:trim_db=0<-24,12,0.1>-Trim (dB)
+slider13:guard=0<0,1,1{Off,On}>-Guard
+slider14:byp=0<0,1,1{Off,On}>-Bypass
+slider15:os_sl=0<0,2,1{1x,2x,4x}>-Oversampling
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-drift.jsfx-inc
+import gfx-lab-input.jsfx-inc
+import gfx-lab-ui.jsfx-inc
+import gfx-lab-panel.jsfx-inc
+import gfx-lab-os.jsfx-inc
+
+@init
+#ui_man = "gfx-lab-keel";
+ext_noinit = 1;
+
+DRY = 30000; DLY = 32100; RMASK = 1023; DMASK = 63;   // the dry input (L / R, 1024 each); the high band and low sides delayed (3 x 64)
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function g2db(g) ( log(max(g, 0.000000001)) * 8.685889638065035; );
+function coef(t) ( 1 - exp(-1 / (max(t, 0.00001) * srate)); );
+
+// ---------- TPT state-variable sections (one glided cutoff word each) ----------
+// sv_run leaves the low-pass in lp and the high-pass in hp; k = 1 / Q
+function sv_run(x, g, k) instance(s1, s2, lp, hp) local(h, v1, v2, bp) (
+  h = 1 / (1 + g * (g + k));
+  hp = (x - (g + k) * s1 - s2) * h;
+  v1 = g * hp; bp = v1 + s1; s1 = bp + v1;
+  v2 = g * bp; lp = s2 + v2; s2 = lp + v2;
+  lp;
+);
+function sv_clr() instance(s1, s2) ( s1 = s2 = 0; );
+
+// the crossover: Linkwitz-Riley 24 dB/oct = two Butterworth (Q 0.707) sections in a row on each side
+function xo_run(x) instance(a, b, c, d, lo, hi) (
+  a.sv_run(x, xo_g, 1.4142135623730951); lo = b.sv_run(a.lp, xo_g, 1.4142135623730951);
+  c.sv_run(x, xo_g, 1.4142135623730951); d.sv_run(c.hp, xo_g, 1.4142135623730951); hi = d.hp;
+);
+function xo_clr() instance(a, b, c, d) ( a.sv_clr(); b.sv_clr(); c.sv_clr(); d.sv_clr(); );
+
+// HARMONICS: one sample of the low band's middle (at the running OS rate) -> the harmonics to add. The bass is
+// followed (instant attack, 300 ms release) and divided by its level, so the Chebyshev shapes T2 .. T5 make each
+// harmonic at a fixed strength; the result is scaled back by the level and high-passed at SPLIT.
+function hg_run(x) instance(env) local(xn, x2, y) (
+  env = max(abs(x), env * hg_rel);
+  env > 0.00001 ? (
+    xn = max(-1, min(1, x / env)); x2 = xn * xn;
+    y = hw2 * (2 * x2 - 1) + xn * (hw3 * (4 * x2 - 3) + hw5 * (16 * x2 * x2 - 20 * x2 + 5)) + hw4 * (8 * x2 * x2 - 8 * x2 + 1);
+    hhp.sv_run(y * env, hg_g, 1.4142135623730951);
+  ) : hhp.sv_run(0, hg_g, 1.4142135623730951);
+  hhp.hp * hg_a;
+);
+function hg_clr() instance(env) ( env = 0; hhp.sv_clr(); );
+// the rate-dependent parts of HARMONICS (on load and when the OS factor changes)
+function hg_rate() (
+  hg_rel = exp(-1 / (0.3 * srate * os_f));
+  hg_g = tan($pi * min(split, 0.2 * srate) / (srate * os_f));
+);
+
+function set_rate() (
+  c_sw = coef(0.015); c_kn = coef(0.03);
+  rs_c = 1 / (0.015 * srate);
+  // PUNCH: a fast and a slow envelope with the same release; their ratio in dB is the attack
+  pf_a = coef(0.0005); ps_a = coef(0.025); p_r = coef(0.06);
+  // SMOOTH: a 40 ms RMS detector and a 1.2 s average of it (in dB), the gain glided over 20 ms
+  sm_c = coef(0.04); sm_lc = coef(1.2); sm_g = coef(0.02);
+  g_top = 0.45 * srate;
+);
+// parameters derived from the sliders: run from @slider and every @block (panel moves don't trigger @slider)
+function kl_params() (
+  in_setup(trim_db, guard);
+  os_tf = os_f2n(os_sl);
+  drift_macro(drift);
+  xo_t = tan($pi * split / srate);
+  sb_t = tan($pi * min(sub_f, g_top) / srate);
+);
+
+in_init();
+os_design();
+os_base = 0; os_f = os_tf = os_f2n(os_sl);
+os_gsetup();
+memset(DRY, 0, 2048); memset(DLY, 0, 192); dw = 0;
+d3.drift_init(0.8 + rand(1) * 0.4); d4.drift_init(0.9 + rand(1) * 0.4); d5.drift_init(1.0 + rand(1) * 0.4);
+set_rate();
+kl_params();
+xo_g = xo_t; sb_g = sb_t;
+out_s = db2g(out_db); lo_s = low_db; mo_s = mono; pu_s = punch; smo_s = smooth; by_s = byp; sbin_s = sub_in;
+sm_avg = -40; sm_rd = -40; ha_s = harm; to_s = tone; hg_rate();
+
+// presets (TRIM, GUARD and BYPASS stay as they are)
+#kl_pmn = "Init|Tight Kick|Smooth Bass|Mono Master|Small Speakers|Deep Weight|Punchy Drums|Even Bass Line|Warm Glow|Clean Sub|Club Master|Gentle Master|Bright Bass|Vintage Low End";
+function load_preset(p) local(i) (
+  split = 100; sub_f = 20; sub_in = 0; punch = 0; smooth = 0; low_db = 0; mono = 0;
+  harm = 0; tone = 50; drift = 50; out_db = 0;
+  // tight kick: more attack, the rumble cleared
+  p == 2 ? ( split = 110; sub_in = 1; sub_f = 28; punch = 55; smooth = 10; low_db = 0.5; out_db = -0.9; ) :
+  // smooth bass: the notes evened out, a little extra weight
+  p == 3 ? ( split = 140; smooth = 65; low_db = 1; out_db = -0.1; ) :
+  // mono master: the lows in the centre, rumble out
+  p == 4 ? ( split = 120; sub_in = 1; sub_f = 20; mono = 100; smooth = 15; out_db = 0.2; ) :
+  // small speakers: harmonics so the bass reads on laptops and phones
+  p == 5 ? ( split = 90; harm = 55; tone = 60; smooth = 25; mono = 50; out_db = 0.1; ) :
+  // deep weight: a fuller bottom, kept even
+  p == 6 ? ( split = 80; low_db = 2.5; smooth = 35; sub_in = 1; sub_f = 18; mono = 40; out_db = -0.5; ) :
+  // punchy drums: kick and toms jump out
+  p == 7 ? ( split = 160; punch = 75; low_db = 0.5; harm = 15; tone = 40; out_db = -2.1; ) :
+  // even bass line: strong smoothing for uneven bass playing
+  p == 8 ? ( split = 180; smooth = 90; punch = 15; mono = 30; out_db = 0; ) :
+  // warm glow: gentle low harmonics and weight
+  p == 9 ? ( split = 120; harm = 35; tone = 20; low_db = 1; smooth = 20; drift = 60; out_db = -0.3; ) :
+  // clean sub: the very bottom cleared, nothing added
+  p == 10 ? ( split = 70; sub_in = 1; sub_f = 32; mono = 100; out_db = 0.2; ) :
+  // club master: big, mono, punchy lows
+  p == 11 ? ( split = 110; sub_in = 1; sub_f = 22; punch = 40; smooth = 30; low_db = 1.5; mono = 100; harm = 20; tone = 40; out_db = -1; ) :
+  // gentle master: a light touch of everything
+  p == 12 ? ( split = 100; sub_in = 1; sub_f = 16; punch = 15; smooth = 20; mono = 60; harm = 10; out_db = -0.1; ) :
+  // bright bass: upper harmonics for definition on a dull bass
+  p == 13 ? ( split = 150; harm = 50; tone = 90; punch = 20; out_db = -0.4; ) :
+  // vintage low end: warm, a little wandering colour, softened attack
+  p == 14 ? ( split = 130; harm = 40; tone = 35; drift = 80; smooth = 40; low_db = 1; out_db = -0.2; );
+  i = 1; loop(11, ui_auto(i); i += 1; );
+  pr_cur = p;
+);
+
+ui_thm = 5; ui_hw = 1;                               // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );               // new instances open in Medium, on Init
+ui_dflt = 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@slider
+kl_params();
+
+@block
+kl_params();
+// resume after REAPER's bypass (or any gap in processing): fade in from the dry signal
+rs_now = time_precise();
+rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) ? rs_req = 1;
+rs_last = rs_now;
+pdc_bot_ch = 0; pdc_top_ch = 2;
+
+@sample
+rs_req ? (
+  rs_req = 0; rs_f = 0;
+  sbl.sv_clr(); sbr.sv_clr(); xm.xo_clr(); xs.xo_clr();
+  hg.hg_clr(); hu.os_clr(); hd.os_clr(); memset(DRY, 0, 2048); memset(DLY, 0, 192);
+  rs_x = pdc_delay > 0 ? 0 : 1; rs_wait = pdc_delay;
+);
+rw_l = spl0; rw_r = spl1;
+os_gate();
+os_chg ? ( hu.os_clr(); hd.os_clr(); hg.hg_clr(); hg_rate(); );
+
+// ---------- control rate: HARMONICS' weights, with DRIFT on the upper three ----------
+(cr_n -= 1) <= 0 ? (
+  cr_n = 32;
+  c32 = 1 - exp(-32 / (0.03 * srate));
+  ha_s += (harm - ha_s) * c32; abs(harm - ha_s) < 0.01 ? ha_s = harm;
+  to_s += (tone - to_s) * c32; abs(tone - to_s) < 0.01 ? to_s = tone;
+  hg_a = 0.7 * (ha_s * 0.01) ^ 1.5;
+  dr_i = 32 * 0.2 * dm_s / srate;
+  dr3 = 1 + 0.35 * dm_a * d3.drift_tick(dr_i); dr4 = 1 + 0.35 * dm_a * d4.drift_tick(dr_i); dr5 = 1 + 0.35 * dm_a * d5.drift_tick(dr_i);
+  tt = to_s * 0.01;
+  hw2 = 0.6 - 0.4 * tt; hw3 = 0.35 * dr3; hw4 = (0.1 + 0.25 * tt) * dr4; hw5 = (0.05 + 0.25 * tt) * dr5;
+  hg_g += (tan($pi * min(split, 0.2 * srate) / (srate * os_f)) - hg_g) * c32;
+);
+
+// ---------- per-sample glides ----------
+out_s += (db2g(out_db) - out_s) * c_kn;
+xo_g += (xo_t - xo_g) * c_kn; sb_g += (sb_t - sb_g) * c_kn;
+lo_s += (low_db - lo_s) * c_kn; mo_s += (mono - mo_s) * c_kn;
+pu_s += (punch - pu_s) * c_kn; smo_s += (smooth - smo_s) * c_kn;
+sbin_s += (sub_in - sbin_s) * c_sw;
+
+in_process(spl0, spl1);
+il_d = max(il_d, abs(in_l)); ir_d = max(ir_d, abs(in_r));
+xl = in_l; xr = in_r;
+
+// ---------- SUB ----------
+sbin_s > 0.00001 ? (
+  sbl.sv_run(xl, sb_g, 1.4142135623730951); sbr.sv_run(xr, sb_g, 1.4142135623730951);
+  xl += (sbl.hp - xl) * sbin_s; xr += (sbr.hp - xr) * sbin_s;
+);
+
+// ---------- the crossover, in M / S ----------
+xm.xo_run((xl + xr) * 0.5); xs.xo_run((xl - xr) * 0.5);
+lm = xm.lo; ls = xs.lo;
+
+// ---------- PUNCH and SMOOTH (one gain for both sides of the low band) ----------
+lv = max(abs(lm + ls), abs(lm - ls));
+pf += (lv - pf) * (lv > pf ? pf_a : p_r);
+ps += (lv - ps) * (lv > ps ? ps_a : p_r);
+gp = pu_s > 0.01 ? min(6, max(0, g2db((pf + 0.00001) / (ps + 0.00001)) * 1.2)) * pu_s * 0.01 : 0;
+sm_ms += (lv * lv - sm_ms) * sm_c;
+sm_rd = g2db(sqrt(sm_ms) + 0.000000001);
+sm_avg += (max(sm_rd, -60) - sm_avg) * sm_lc;
+sm_t = smo_s > 0.01 && sm_rd > -54 ? max(-6, min(6, (sm_avg - sm_rd) * 0.8)) * smo_s * 0.01 : 0;
+sm_rd < -54 ? sm_t = min(sm_t, 0);
+gs += (sm_t - gs) * sm_g;
+ga = gp + gs;
+ac_hi_d = max(ac_hi_d, ga); ac_lo_d = min(ac_lo_d, ga);
+lg = db2g(ga + lo_s);
+lm *= lg; ls *= lg * (1 - mo_s * 0.01);
+
+// ---------- HARMONICS (oversampled; the up / down filters always run, so the latency never changes with the dial) ----------
+hmd = xm.hi; hsd = xs.hi;
+os_f == 1 ? (
+  hg_a > 0 ? lm += hg.hg_run(lm);
+) : (
+  hu.os_up(lm);
+  hg_a > 0 ? (
+    os_f == 2 ? lm = hd.os_dn(hu.s0 + hg.hg_run(hu.s0), hu.s1 + hg.hg_run(hu.s1), 0, 0) :
+    lm = hd.os_dn(hu.s0 + hg.hg_run(hu.s0), hu.s1 + hg.hg_run(hu.s1), hu.s2 + hg.hg_run(hu.s2), hu.s3 + hg.hg_run(hu.s3));
+  ) : (
+    lm = hd.os_dn(hu.s0, hu.s1, hu.s2, hu.s3);
+  );
+  // the rest waits for the oversampled middle: the low sides and both high bands, delayed by the latency
+  dl_n = os_lat(os_f);
+  DLY[dw & DMASK] = ls; DLY[64 + (dw & DMASK)] = hmd; DLY[128 + (dw & DMASK)] = hsd;
+  ls = DLY[(dw - dl_n) & DMASK]; hmd = DLY[64 + ((dw - dl_n) & DMASK)]; hsd = DLY[128 + ((dw - dl_n) & DMASK)];
+);
+
+// ---------- the sum ----------
+om = lm + hmd; oz = ls + hsd;
+ol = (om + oz) * out_s * os_g; orr = (om - oz) * out_s * os_g;
+
+// the resume fade and BYPASS use the dry input delayed by the latency, so they stay in time
+DRY[dw & RMASK] = rw_l; DRY[1024 + (dw & RMASK)] = rw_r;
+dy_l = DRY[(dw - pdc_delay) & RMASK]; dy_r = DRY[1024 + ((dw - pdc_delay) & RMASK)];
+rs_f < 1 ? (
+  rs_wait > 0 ? rs_wait -= 1 : ( rs_f = min(rs_f + rs_c, 1); rs_x = min(rs_x + 3 * rs_c, 1); );
+  rs_s = rs_f * rs_f * (3 - 2 * rs_f); rs_xs = rs_x * rs_x * (3 - 2 * rs_x);
+  rs_dl = rw_l + (dy_l - rw_l) * rs_xs; rs_dr = rw_r + (dy_r - rw_r) * rs_xs;
+  ol = rs_dl + (ol - rs_dl) * rs_s; orr = rs_dr + (orr - rs_dr) * rs_s;
+);
+by_s += (byp - by_s) * c_sw;
+by_s > 0.0001 ? ( ol += (dy_l - ol) * by_s; orr += (dy_r - orr) * by_s; );
+dw = (dw + 1) & 65535;
+spl0 = ol; spl1 = orr;
+mo_l_d = max(mo_l_d, abs(spl0)); mo_r_d = max(mo_r_d, abs(spl1));
+
+@gfx 1080 490
+ui_begin(1080, 490);
+// =====================================================================
+// GUI (design space 1080 x 490; S / M / L = 85 / 100 / 130 %). A light blue faceplate with grey plates, a dark hull
+// header with an anchor and an antifouling-red rule under it, desk knobs (SUB yellow). Two plates: the controls
+// (SPLIT & SUB | LOW BAND | HARMONICS) and the meters (TRIM, GUARD, LOW BAND ACTION, IN, OUT, OUTPUT).
+// =====================================================================
+BG = 0xBCD2E2; HDR = 0x262B33; PL = 0xD4D8DB; PLD = 0xC6CBCF; HAIR = 0x8A9298; INK = 0x22292F; DIM = 0x5A646B;
+RED = 0xB5432E; CREAM = 0xF4EEDC; GLASS = 0x1E1B18; BRASS = 0xD8B46A;
+sc != kl_lsc ? (
+  kl_lsc = sc;
+  kl_f2 = ui_fitfont(2, 14 * sc);                    // knob labels / values: 14 px
+  gfx_setfont(10, "Trebuchet MS", 30 * sc, 'b');     // the unit's name
+  gfx_setfont(11, "Trebuchet MS", 15 * sc, 'b');     // section titles
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print
+  gfx_setfont(14, "Trebuchet MS", 14 * sc, 'b');     // key legends
+  gfx_setfont(15, "Trebuchet MS", 18 * sc, 'b');     // the OUT peak figure
+);
+gfx_setfont(2, "Trebuchet MS", kl_f2, 'b'); gfx_setfont(3, "Trebuchet MS", kl_f2, 'b');
+C_INK = INK; lk_font = 14; lk_font2 = 14; lk_well = 0x2A3036;
+
+function kl_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function kl_rr(x, y, w, h, r) ( ui_rrs(x * sc, y * sc, w * sc, h * sc, r * sc); );
+function kl_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function kl_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function kl_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function kl_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+// soft drop shadow, light from the top left: 4 layers, (+2, +3) to (+6, +8)
+function kl_shadow(x, y, w, h, r) local(j) (
+  j = 0; loop(4, ui_cola(0x000000, 0.10); kl_rr(x + 2 + j * 1.3, y + 3 + j * 1.7, w + j * 0.4, h + j * 0.4, r + j); j += 1; );
+);
+// a plate: shadow, a light top / left edge, a darker bottom / right edge
+function kl_plate(x, y, w, h) (
+  kl_shadow(x, y, w, h, 6);
+  ui_col(0x98A0A6); kl_rr(x, y, w, h, 6);
+  ui_col(0xF1F3F4); kl_rr(x, y, w - 1, h - 1, 6);
+  ui_col(PL); kl_rr(x + 1, y + 1, w - 2.5, h - 2.5, 5);
+);
+// a section header band: the title on the band's centre line, a hairline under it
+function kl_head(x, w, title) local(tw, th) (
+  ui_col(PLD); kl_r(x + 1, 81, w - 2, 32);
+  ui_cola(HAIR, 0.6); kl_r(x + 1, 113, w - 2, 1);
+  gfx_setfont(11); gfx_measurestr(title, tw, th);
+  ui_col(INK); gfx_x = (x + 16) * sc; gfx_y = 97 * sc - th * 0.5; gfx_drawstr(title);
+);
+// a divider between two sections: a dark and a light hairline
+function kl_div(x) ( ui_col(0xA6ADB3); kl_r(x, 82, 1, 268); ui_col(0xEEF1F3); kl_r(x + 1, 82, 1, 268); );
+// a desk knob (ui_knob does the mouse, the value on touch and the label)
+function kl_kn(cx, cy, r, idx, lo, hi, def, lg, cap, lbl, fmt) (
+  ui_kdesk = cap; ui_kdesk_r = r; ui_kdesk_p = 0;
+  ui_knob(cx * sc, cy * sc, idx, lo, hi, def, lg, lbl, fmt);
+  ui_kdesk = 0; ui_kdesk_r = 0;
+);
+// a small "0" printed outside a dial at the normalised position n
+function kl_zero(cx, cy, r, n) local(a) (
+  a = -0.75 * $pi + n * 1.5 * $pi; gfx_setfont(13); ui_col(DIM);
+  kl_tc(cx + sin(a) * (r + 17), cy - cos(a) * (r + 17) - 7, "0");
+);
+// a lamp key from its slider: lit = on; the click toggles
+function kl_key(x, y, w, h, idx, col, s) (
+  lk_key(x, y, w, h, slider(idx) >= 0.5, col, s) ? ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+);
+
+// ---------- the meters' hand-off (the audio thread fills, the panel takes and clears) ----------
+kl_il = il_d; kl_ir = ir_d; il_d = ir_d = 0;
+kl_ol = mo_l_d; kl_or = mo_r_d; mo_l_d = mo_r_d = 0;
+kl_ah = ac_hi_d; kl_al = ac_lo_d; ac_hi_d = ac_lo_d = 0;
+
+// ---------- faceplate and header ----------
+ui_col(BG); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(HDR); kl_r(0, 0, 1080, 64);
+ui_col(RED); kl_r(0, 63, 1080, 2); ui_col(0x101318); kl_r(0, 65, 1080, 1);
+ui_cola(0x000000, 0.18); kl_r(1077, 66, 3, 424); kl_r(0, 487, 1080, 3);       // a narrow darker right / bottom edge
+ui_screw(9 * sc, 9 * sc); ui_screw((1080 - 9) * sc, 9 * sc); ui_screw(9 * sc, (490 - 9) * sc); ui_screw((1080 - 9) * sc, (490 - 9) * sc);
+ui_col(CREAM); gfx_circle(40 * sc, 32 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(HDR); ui_keytext(40 * sc, 32 * sc, "GFX");
+gfx_setfont(10); ui_col(CREAM); kl_tl(68, 15, "KEEL"); gfx_measurestr("KEEL", kl_tw, kl_th);
+gfx_setfont(13); ui_col(0xB8C4CE); kl_tl(82 + kl_tw / sc, 20, "LOW-END"); kl_tl(82 + kl_tw / sc, 34, "SHAPER");
+kl_k = pk_preset(340 * sc, 15 * sc, 290 * sc, 34 * sc, pr_cur, #kl_pmn);
+kl_k > 0 ? load_preset(kl_k);
+kl_key(818, 20, 84, 26, 14, LK_WHT, "BYPASS");
+os_key(950, 22, 15, CREAM, 12);
+ui_size_picker(998 * sc, 23 * sc);
+
+// ---------- header art: an anchor, in the gap between the presets and BYPASS (JG, 25 Oct 2026) ----------
+// drawn once per scale at 2x into image 117 on the header's own colour (all solid), then blitted at half size
+function an_mix(c, a) (
+  gfx_r = (floor(HDR / 65536) * (1 - a) + floor(c / 65536) * a) / 255;
+  gfx_g = ((floor(HDR / 256) & 255) * (1 - a) + (floor(c / 256) & 255) * a) / 255;
+  gfx_b = ((HDR & 255) * (1 - a) + (c & 255) * a) / 255; gfx_a = 1;
+);
+// a thick line as a filled, anti-aliased quad (2x image units)
+function an_line(x1, y1, x2, y2, w) local(dx, dy, l, nx, ny) (
+  dx = x2 - x1; dy = y2 - y1; l = sqrt(dx * dx + dy * dy); nx = -dy / l * w * 0.5; ny = dx / l * w * 0.5;
+  gfx_triangle(x1 + nx, y1 + ny, x2 + nx, y2 + ny, x2 - nx, y2 - ny, x1 - nx, y1 - ny);
+);
+an_x0 = 636; an_y0 = 2; an_w = 176; an_h = 60; an_z = 0.6;
+an_sc != sc ? (
+  an_sc = sc; an_k = 2 * sc * an_z; an_iw = ceil(an_w * an_k) + 2; an_ih = ceil(an_h * an_k) + 2;
+  gfx_setimgdim(117, an_iw, an_ih); gfx_dest = 117; gfx_mode = 0;
+  ui_col(HDR); gfx_a = 1; gfx_rect(0, 0, an_iw, an_ih);
+  an_cx = 88 * an_k; an_t = 8 * an_k; an_b = 50 * an_k; an_s = 2.6 * an_k;   // centre, top of the ring, crown, shank width
+  // a faint sea line behind it
+  an_i = 0;
+  loop(30, an_t2 = abs(an_i - 14.5) / 14.5; an_mix(0x6F8796, 0.5 * (1 - an_t2 * an_t2));
+    gfx_rect(floor((8 + an_i * 5.4) * an_k), 2 * floor(41 * an_k * 0.5), ceil(5.4 * an_k), 2); an_i += 1; );
+  an_mix(BRASS, 1);
+  // the ring
+  gfx_circle(an_cx, an_t + 4.5 * an_k, 4.5 * an_k, 1, 1); ui_col(HDR); gfx_circle(an_cx, an_t + 4.5 * an_k, 2.4 * an_k, 1, 1);
+  an_mix(BRASS, 1);
+  // the shank and the stock (cross bar) with rounded ends
+  an_line(an_cx, an_t + 8.5 * an_k, an_cx, an_b, an_s);
+  an_line(an_cx - 11 * an_k, an_t + 15 * an_k, an_cx + 11 * an_k, an_t + 15 * an_k, 2.4 * an_k);
+  gfx_circle(an_cx - 11 * an_k, an_t + 15 * an_k, 1.8 * an_k, 1, 1); gfx_circle(an_cx + 11 * an_k, an_t + 15 * an_k, 1.8 * an_k, 1, 1);
+  // the arms: an arc of thick segments from the crown up to each fluke
+  an_i = 0;
+  loop(14,
+    an_a1 = $pi * (0.5 + an_i / 14 * 0.42); an_a2 = $pi * (0.5 + (an_i + 1) / 14 * 0.42);
+    an_rr = 16 * an_k; an_yc = an_b - an_rr;
+    an_line(an_cx + cos(an_a1) * an_rr, an_yc + sin(an_a1) * an_rr, an_cx + cos(an_a2) * an_rr, an_yc + sin(an_a2) * an_rr, 2.6 * an_k);
+    an_line(an_cx - cos(an_a1) * an_rr, an_yc + sin(an_a1) * an_rr, an_cx - cos(an_a2) * an_rr, an_yc + sin(an_a2) * an_rr, 2.6 * an_k);
+    an_i += 1;
+  );
+  // the flukes: arrow heads at the arm ends, pointing up and out
+  an_a1 = $pi * 0.92; an_fx = cos(an_a1) * 16 * an_k; an_fy = an_b - 16 * an_k + sin(an_a1) * 16 * an_k;
+  gfx_triangle(an_cx + an_fx - 3.2 * an_k, an_fy - 4.5 * an_k, an_cx + an_fx - 3.6 * an_k, an_fy + 3.2 * an_k, an_cx + an_fx + 3.6 * an_k, an_fy + 2.4 * an_k);
+  gfx_triangle(an_cx - an_fx + 3.2 * an_k, an_fy - 4.5 * an_k, an_cx - an_fx + 3.6 * an_k, an_fy + 3.2 * an_k, an_cx - an_fx - 3.6 * an_k, an_fy + 2.4 * an_k);
+  // the crown
+  gfx_circle(an_cx, an_b - 0.5 * an_k, 2 * an_k, 1, 1);
+  gfx_a = 1; gfx_dest = -1;
+);
+gfx_a = 1; gfx_mode = 0; gfx_blit(117, 1, 0, 0, 0, an_iw, an_ih, (an_x0 + an_w * (1 - an_z) / 2) * sc, (an_y0 + an_h * (1 - an_z) / 2) * sc, an_iw / 2, an_ih / 2);
+
+// ---------- the controls plate ----------
+kl_plate(16, 80, 1048, 272);
+kl_head(16, 216, "SPLIT & SUB"); kl_head(232, 504, "LOW BAND"); kl_head(736, 328, "HARMONICS");
+kl_div(232); kl_div(736);
+
+// SPLIT & SUB
+kl_kn(124, 186, 30, 1, 40, 250, 100, 1, 0x3E4A5C, "SPLIT", "%.0f Hz");
+kl_kn(78, 296, 18, 2, 10, 40, 20, 1, 0xE0B12A, "SUB", "%.0f Hz");
+!sub_in ? ( ui_cola(PL, 0.55); kl_r(50, 268, 60, 74); );
+lk_font = lk_font2 = 13;
+kl_key(122, 286, 82, 24, 3, LK_AMB, "SUB IN");
+lk_font = lk_font2 = 14;
+
+// LOW BAND: PUNCH, SMOOTH, LOW, MONO in one row, the action meter under them
+kl_kn(316, 186, 30, 4, 0, 100, 0, 0, 0xB5432E, "PUNCH", "%.0f %%");
+kl_kn(436, 186, 30, 5, 0, 100, 0, 0, 0x3F6E8C, "SMOOTH", "%.0f %%");
+kl_kn(556, 186, 30, 6, -6, 6, 0, 0, 0x7A4E2E, "LOW", "%+.1f dB");
+kl_zero(556, 186, 30, 0.5);
+kl_kn(668, 192, 24, 7, 0, 100, 0, 0, 0x5A5650, "MONO", "%.0f %%");
+// LOW BAND ACTION: a centre-zero bar, lift to the right, pull-back to the left (+/-6 dB), with a held peak each way
+kl_ax = 288; kl_aw = 420; kl_ay = 292;
+gfx_setfont(13); ui_col(DIM); kl_tl(kl_ax, kl_ay - 22, "LOW BAND ACTION (dB)");
+ui_col(0x0C0B0A); kl_rr(kl_ax - 1, kl_ay - 1, kl_aw + 2, 18, 3);
+ui_col(GLASS); kl_rr(kl_ax, kl_ay, kl_aw, 16, 2);
+kl_ahs = kl_ah > kl_ahs ? kl_ah : kl_ahs * 0.9; kl_als = kl_al < kl_als ? kl_al : kl_als * 0.9;
+kl_cx = kl_ax + kl_aw * 0.5;
+kl_ahs > 0.05 ? ( ui_col(0x7CC46A); kl_r(kl_cx, kl_ay + 3, min(kl_ahs, 6) / 6 * (kl_aw * 0.5 - 3), 10); );
+kl_als < -0.05 ? ( kl_wd = min(-kl_als, 6) / 6 * (kl_aw * 0.5 - 3); ui_col(0xE0A030); kl_r(kl_cx - kl_wd, kl_ay + 3, kl_wd, 10); );
+ui_col(0x8A8078); kl_r(kl_cx - 0.5, kl_ay + 1, 1, 14);
+gfx_setfont(13); ui_col(DIM);
+kl_tc(kl_ax + 3, kl_ay + 22, "-6"); kl_tc(kl_ax + kl_aw * 0.25, kl_ay + 22, "-3"); kl_tc(kl_cx, kl_ay + 22, "0");
+kl_tc(kl_ax + kl_aw * 0.75, kl_ay + 22, "+3"); kl_tc(kl_ax + kl_aw - 5, kl_ay + 22, "+6");
+
+// HARMONICS
+kl_kn(828, 186, 30, 8, 0, 100, 0, 0, 0xC8892A, "HARMONICS", "%.0f %%");
+kl_kn(966, 172, 18, 9, 0, 100, 50, 0, 0x8A6AA8, "TONE", "%.0f %%");
+kl_kn(966, 280, 15, 10, 0, 100, 50, 0, 0x5A5650, "DRIFT", "%.0f %%");
+
+// ---------- the bottom plate: TRIM, GUARD, IN / OUT meters, PEAK, OUTPUT ----------
+kl_plate(16, 368, 1048, 106);
+kl_kn(56, 413, 15, 12, -24, 12, 0, 0, 0x5A5650, "TRIM", "%+.1f dB");
+kl_key(92, 401, 64, 24, 13, LK_AMB, "GUARD");
+kl_kn(1022, 425, 18, 11, -12, 12, 0, 0, 0x5A5650, "OUTPUT", "%+.1f dB");
+kl_zero(1022, 425, 18, 0.5);
+gfx_setfont(13); ui_col(DIM); kl_tl(200, 378, "IN (dBFS)"); kl_tl(560, 378, "OUT (dBFS)");
+ui_col(INK); kl_tl(200, 403, "L"); kl_tl(200, 431, "R"); kl_tl(560, 403, "L"); kl_tl(560, 431, "R");
+mIL.ui_ledm(218 * sc, 404 * sc, 300 * sc, 14 * sc, kl_il); mIR.ui_ledm(218 * sc, 432 * sc, 300 * sc, 14 * sc, kl_ir);
+mOL.ui_ledm(578 * sc, 404 * sc, 300 * sc, 14 * sc, kl_ol); mOR.ui_ledm(578 * sc, 432 * sc, 300 * sc, 14 * sc, kl_or);
+gfx_setfont(13); ui_col(DIM);
+kl_tc(218 + 300 * 2 / 15, 452, "-36"); kl_tc(218 + 300 * 6 / 15, 452, "-24"); kl_tc(218 + 300 * 10 / 15, 452, "-12"); kl_tc(218 + 300 * 14 / 15, 452, "0");
+kl_tc(578 + 300 * 2 / 15, 452, "-36"); kl_tc(578 + 300 * 6 / 15, 452, "-24"); kl_tc(578 + 300 * 10 / 15, 452, "-12"); kl_tc(578 + 300 * 14 / 15, 452, "0");
+kl_pk = max(mOL.hold, mOR.hold);
+gfx_setfont(15); ui_col(kl_pk > -0.05 ? 0xD8332E : INK);
+kl_pk > -60 ? sprintf(#kl_s, kl_pk > 0.05 ? "+%.1f" : "%.1f", kl_pk) : strcpy(#kl_s, "--"); kl_tr(966, 408, #kl_s);
+gfx_setfont(13); ui_col(DIM); kl_tr(966, 436, "PEAK");
+
+pk_end();
+ui_end();

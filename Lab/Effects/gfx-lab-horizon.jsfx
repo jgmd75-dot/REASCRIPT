@@ -1,0 +1,691 @@
+desc:GFX Lab Horizon [mastering EQ]
+//tags: equaliser eq mastering wide bandwidth mid side analogue
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-lab-input, gfx-lab-ui, gfx-lab-panel and gfx-lab-os (.jsfx-inc) in the same folder.
+//
+// Horizon. A mastering EQ in the spirit of the early-90s wide-bandwidth console EQs: open and uncoloured even with
+// big boosts, bells that tighten as you push them, and a top end that behaves like analogue - no digital cramping
+// near 20 kHz, so a 16 kHz bell keeps its shape. Named after the line where the sea meets the sky.
+//
+// SIGNAL FLOW
+//   input -> TRIM (+ optional GUARD) -> M / S -> HPF -> LPF -> LF -> LMF -> HMF -> HF -> [BLOOM -> SILK] -> L / R
+//   -> [oversampled: SAT] -> OUTPUT -> out. Everything but SAT is linear; no drift.
+// HPF (yellow): 10 - 300 Hz, 12 or 18 dB/oct (Butterworth), glided per sample. LPF (black): 8 - 40 kHz, 12 dB/oct,
+//   analogue-shaped (the corners above 20 kHz still roll the audible top off gently, as an analogue filter would).
+// LF (brown): shelf or bell, 20 - 400 Hz. LMF (blue): bell, 100 Hz - 2 kHz. HMF (green): bell, 800 Hz - 12 kHz.
+//   HF (red): shelf or bell, 3 - 25 kHz. GAIN +/-12 dB (+/-6 with FINE lit). Q 0.4 - 4 is the width at 6 dB of
+//   boost or cut; the bells narrow as the gain rises (proportional Q: about 0.7 x Q at 2 dB, 1.4 x at 10 dB) and
+//   widen as it falls. Shelves have a gentle slope with no overshoot (Q 0.6). Each band's IN key glides it out,
+//   and SHELF / BELL glides the band to flat, swaps, and glides back - never a click.
+// ST / M / S per band: the band works on both sides (ST), only on the middle (MID: what both sides share - vocal,
+//   kick, bass) or only on the sides (SIDE: the width). Changing it glides.
+// THE ANALOGUE TOP END: each band is a second-order filter whose poles come from the analogue design and whose
+//   numerator is fitted to the analogue curve across the whole band (a least-squares match in the log domain),
+//   so its shape stays within about 0.7 dB of the analogue one right up to 20 kHz at 44.1 kHz (an ordinary
+//   digital EQ is several dB off there). The coefficients are re-worked every 32 samples while a control moves
+//   and ramp sample by sample in between.
+// BLOOM (0 - 4 dB): a broad lift of the low end - a low shelf at 90 Hz with a little resonance, so it lifts the
+//   lows (about +4.4 dB at 40 Hz at full) and dips slightly above them (about -0.4 dB near 150 Hz) to keep the low
+//   mids clear: the bottom grows without getting muddy. On both sides alike; glided.
+// SILK (0 - 4 dB) and CORNER (16 / 24 / 32 kHz): an open, very gentle lift of the very top - a high shelf with a
+//   soft slope whose corner can sit above the audible range, so it adds air without hardness (at full: +2.5 / +1.7 /
+//   +1.2 dB at 20 kHz for the three corners, rising gently from about 5 kHz). On both sides alike;
+//   the gain and the corner glide.
+// SAT (0 - 100 %, default 0 = clean): gentle console-style saturation after the EQ, mostly 3rd harmonic with a
+//   little 2nd. Unity for quiet signals; it rounds the loud peaks more as the dial goes up. Only what the curve
+//   adds is DC-blocked (5 Hz), so at 0 % the signal is untouched.
+// OS (1x / 2x / 4x, default 1x): the rate SAT runs at (gfx-lab-os); the EQ stays at 1x. Changing it dips the
+//   sound for 5 ms and swaps at the silent point.
+// OUTPUT: -12 .. +12 dB. BYPASS (top bar): a 15 ms crossfade to the input, kept in time with the latency.
+// METERS: IN and OUT = an LED row each for L and R (-42 .. +3 dBFS, 1.2 s floating peak hold) and the OUT peak
+//   figure - click a meter to clear it.
+// GUI: drag a knob (SHIFT = fine), wheel, double-click = default; values show while a knob is touched. Display
+//   boxes: click for the list. Keys light when on. S / M / L / ? = size and help.
+// DRIFT: none (JG: a clean mastering EQ).
+// PRESETS: Init, Open Master, Warm Master, Vocal Presence, Wide Air, Bass Focus, De-Mud, Tame Harsh, Bright Pop,
+//   Dark and Smooth, Vintage Glow, Acoustic Air, Dance Floor, Wide Master - level-matched on programme (TRIM, GUARD,
+//   OS and BYPASS stay as they are).
+// Latency: 0 / 31 / 37 samples at 1x / 2x / 4x (reported). Stereo pins are declared, so on a multichannel track
+//   REAPER carries channels 3 and up round the unit and keeps them in time.
+
+slider1:hp_f=20<10,300,0.1>-HPF frequency (Hz)
+slider2:hp_sl=0<0,1,1{12 dB/oct,18 dB/oct}>-HPF slope
+slider3:hp_in=0<0,1,1{Out,In}>-HPF
+slider4:lp_f=30000<8000,40000,1>-LPF frequency (Hz)
+slider5:lp_in=0<0,1,1{Out,In}>-LPF
+slider6:lf_g=0<-12,12,0.1>-LF gain (dB)
+slider7:lf_f=80<20,400,0.1>-LF frequency (Hz)
+slider8:lf_q=0.8<0.4,4,0.01>-LF Q
+slider9:lf_bell=0<0,1,1{Shelf,Bell}>-LF shape
+slider10:lf_ms=0<0,2,1{ST,Mid,Side}>-LF on
+slider11:lf_in=1<0,1,1{Out,In}>-LF
+slider12:lm_g=0<-12,12,0.1>-LMF gain (dB)
+slider13:lm_f=400<100,2000,0.1>-LMF frequency (Hz)
+slider14:lm_q=0.8<0.4,4,0.01>-LMF Q
+slider15:lm_ms=0<0,2,1{ST,Mid,Side}>-LMF on
+slider16:lm_in=1<0,1,1{Out,In}>-LMF
+slider17:hm_g=0<-12,12,0.1>-HMF gain (dB)
+slider18:hm_f=3000<800,12000,1>-HMF frequency (Hz)
+slider19:hm_q=0.8<0.4,4,0.01>-HMF Q
+slider20:hm_ms=0<0,2,1{ST,Mid,Side}>-HMF on
+slider21:hm_in=1<0,1,1{Out,In}>-HMF
+slider22:hf_g=0<-12,12,0.1>-HF gain (dB)
+slider23:hf_f=12000<3000,25000,1>-HF frequency (Hz)
+slider24:hf_q=0.8<0.4,4,0.01>-HF Q
+slider25:hf_bell=0<0,1,1{Shelf,Bell}>-HF shape
+slider26:hf_ms=0<0,2,1{ST,Mid,Side}>-HF on
+slider27:hf_in=1<0,1,1{Out,In}>-HF
+slider28:fine=0<0,1,1{12 dB,6 dB}>-Gain range
+slider29:bloom=0<0,4,0.1>-Bloom (dB)
+slider30:silk=0<0,4,0.1>-Silk (dB)
+slider31:silk_f=0<0,2,1{16 kHz,24 kHz,32 kHz}>-Silk corner
+slider32:out_db=0<-12,12,0.1>-Output (dB)
+slider33:trim_db=0<-24,12,0.1>-Input trim (dB)
+slider34:guard=0<0,1,1{Off,On}>-Guard
+slider35:byp=0<0,1,1{Off,On}>-Bypass
+slider36:sat=0<0,100,1>-Saturation (%)
+slider37:os_sl=0<0,2,1{1x,2x,4x}>-Oversampling
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-input.jsfx-inc
+import gfx-lab-ui.jsfx-inc
+import gfx-lab-panel.jsfx-inc
+import gfx-lab-os.jsfx-inc
+
+@init
+#ui_man = "gfx-lab-horizon";
+ext_noinit = 1;
+
+FP = 20000;                                   // the fitting grid: 24 points x (w, p0, p1, p2)
+DRY = 21000; RMASK = 1023;                    // the dry input delayed by the latency, L / R (1024 each)
+NPT = 24;
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function g2db(g) ( log(max(g, 0.000000001)) * 8.685889638065035; );
+function coef(t) ( 1 - exp(-1 / (max(t, 0.00001) * srate)); );
+
+// ---------- the analogue-matched second-order design ----------
+// The analogue prototype is (n2 s^2 + n1 s + n0) / (d2 s^2 + d1 s + d0), s in radians per sample. The poles are
+// the analogue poles mapped by impulse invariance (their frequency held below 0.97 x Nyquist). The numerator is
+// fitted through |B|^2 = bb0 p0 + bb1 p1 + bb2 p2 (p1 = sin^2(w/2), p0 = 1 - p1, p2 = 4 p0 p1): bb0 from the DC gain,
+// bb1 and bb2 by least squares on the relative error at the 24 grid points (10 Hz .. 0.98 x Nyquist, log spaced).
+// The result goes to d_b0, d_b1, d_b2, d_a1, d_a2.
+function fit_grid() local(k, w, wl, wh) (
+  wl = 2 * $pi * 10 / srate; wh = 0.98 * $pi; k = 0;
+  loop(NPT,
+    w = wl * (wh / wl) ^ (k / (NPT - 1));
+    FP[k * 4] = w; FP[k * 4 + 2] = sqr(sin(w * 0.5)); FP[k * 4 + 1] = 1 - FP[k * 4 + 2];
+    FP[k * 4 + 3] = 4 * FP[k * 4 + 1] * FP[k * 4 + 2];
+    k += 1;
+  );
+);
+function fit(n2, n1, n0, d2, d1, d0)
+  local(wn, z, wc, e, a1, a2, aa0, aa1, aa2, bb0, bb1, bb2, k, w, re, im, hn, hd, t, u, v, r, suu, suv, svv, sur, svr, det, ww, b0, b1, b2, dd) (
+  wn = sqrt(d0 / d2); z = d1 / (2 * sqrt(d0 * d2));
+  wc = min(wn, 0.97 * $pi); e = exp(-z * wc);
+  a1 = z < 1 ? -2 * e * cos(wc * sqrt(1 - z * z)) : -2 * e * (exp(wc * sqrt(z * z - 1)) + exp(-wc * sqrt(z * z - 1))) * 0.5;
+  a2 = e * e;
+  aa0 = sqr(1 + a1 + a2); aa1 = sqr(1 - a1 + a2); aa2 = -4 * a2;
+  bb0 = sqr(n0 / d0) * aa0;
+  suu = suv = svv = sur = svr = 0; k = 0;
+  loop(NPT,
+    w = FP[k * 4];
+    re = n0 - n2 * w * w; im = n1 * w; hn = re * re + im * im;
+    re = d0 - d2 * w * w; im = d1 * w; hd = re * re + im * im;
+    t = hn / hd * (aa0 * FP[k * 4 + 1] + aa1 * FP[k * 4 + 2] + aa2 * FP[k * 4 + 3]);
+    t = max(t, 0.000000000000000001);
+    u = FP[k * 4 + 2] / t; v = FP[k * 4 + 3] / t; r = 1 - bb0 * FP[k * 4 + 1] / t;
+    suu += u * u; suv += u * v; svv += v * v; sur += u * r; svr += v * r;
+    k += 1;
+  );
+  det = suu * svv - suv * suv;
+  bb1 = (sur * svv - svr * suv) / det; bb2 = (suu * svr - suv * sur) / det;
+  bb1 = max(bb1, 0);
+  ww = 0.5 * (sqrt(bb0) + sqrt(bb1)); b1 = 0.5 * (sqrt(bb0) - sqrt(bb1));
+  dd = ww * ww + bb2;
+  b0 = 0.5 * (ww + sqrt(max(dd, 0))); b2 = ww - b0;
+  d_b0 = b0; d_b1 = b1; d_b2 = b2; d_a1 = a1; d_a2 = a2;
+);
+// the prototypes (f in Hz, g in dB, q = Q); each calls fit()
+function des_peak(f, g, q) local(w, a) (
+  w = 2 * $pi * f / srate; a = db2g(g * 0.5);
+  fit(1, a * w / q, w * w, 1, w / (a * q), w * w);
+);
+function des_lshelf(f, g, q) local(w, a, r) (
+  w = 2 * $pi * f / srate; a = db2g(g * 0.5); r = sqrt(a);
+  fit(a, a * r * w / q, a * a * w * w, a, r * w / q, w * w);
+);
+function des_hshelf(f, g, q) local(w, a, r) (
+  w = 2 * $pi * f / srate; a = db2g(g * 0.5); r = sqrt(a);
+  fit(a * a, a * r * w / q, a * w * w, 1, r * w / q, a * w * w);
+);
+function des_lp(f) local(w) (
+  w = 2 * $pi * f / srate;
+  fit(0, 0, w * w, 1, w * 1.4142135623730951, w * w);
+);
+// SAT: x (27 + x^2) / (27 + 9 x^2), flat from |x| = 3; one oversampled sample through it. The curve is driven by
+// st_k with a small bias st_b (the 2nd harmonic) and divided by its slope at the bias, so quiet signals pass at
+// unity; only the difference it makes is DC-blocked, so the clean signal never meets the blocker.
+function sat3(x) ( x = max(-3, min(3, x)); x * (27 + x * x) / (27 + 9 * x * x); );
+function sat3d(b) ( (sat3(b + 0.0001) - sat3(b - 0.0001)) * 5000; );
+function st_run(x) instance(dx, dy) local(d, y) (
+  d = (sat3(st_k * x + st_b) - st_o) * st_n - x;
+  y = d - dx + dc_co * dy; dx = d; dy = y;
+  x + y * st_w;
+);
+// proportional Q: the Q knob is the width at 6 dB; narrower above, wider below
+function qprop(q, g) ( q * 2 ^ ((abs(g) - 6) / 9); );
+
+// ---------- a biquad whose coefficients ramp to the last design over 32 samples ----------
+function bq_set() instance(c0, c1, c2, c3, c4, i0, i1, i2, i3, i4) (
+  cr_init ? (
+    i0 = (d_b0 - c0) / 32; i1 = (d_b1 - c1) / 32; i2 = (d_b2 - c2) / 32; i3 = (d_a1 - c3) / 32; i4 = (d_a2 - c4) / 32;
+  ) : (
+    c0 = d_b0; c1 = d_b1; c2 = d_b2; c3 = d_a1; c4 = d_a2; i0 = i1 = i2 = i3 = i4 = 0;
+  );
+);
+function bq_hold() instance(i0, i1, i2, i3, i4) ( i0 = i1 = i2 = i3 = i4 = 0; );
+function bq_run(x) instance(c0, c1, c2, c3, c4, i0, i1, i2, i3, i4, s1, s2) local(y) (
+  c0 += i0; c1 += i1; c2 += i2; c3 += i3; c4 += i4;
+  y = c0 * x + s1; s1 = c1 * x - c3 * y + s2; s2 = c2 * x - c4 * y;
+  y;
+);
+function bq_clr() instance(s1, s2) ( s1 = s2 = 0; );
+
+// ---------- the HPF: TPT state-variable sections on one glided cutoff word (hp_gw) ----------
+function svf_hp(x, k) instance(s1, s2) local(hp, v1, v2, bp, h) (
+  h = 1 / (1 + hp_gw * (hp_gw + k));
+  hp = (x - (hp_gw + k) * s1 - s2) * h;
+  v1 = hp_gw * hp; bp = v1 + s1; s1 = bp + v1;
+  v2 = hp_gw * bp; s2 = s2 + 2 * v2;
+  hp;
+);
+function op_hp(x) instance(s) local(v, lp) ( v = (x - s) * hp_gw / (1 + hp_gw); lp = v + s; s = lp + v; x - lp; );
+function hp_clr() instance(s1, s2, s) ( s1 = s2 = s = 0; );
+
+function set_rate() (
+  c_sw = coef(0.015); c_kn = coef(0.03);
+  c32 = 1 - exp(-32 / (0.03 * srate));         // a 30 ms glide worked every 32 samples
+  c32f = 1 - exp(-32 / (0.008 * srate));       // the SHELF / BELL dip: 8 ms down, 8 ms back
+  rs_c = 1 / (0.015 * srate);
+  fit_grid();
+  hp_top = 0.45 * srate;
+);
+// parameters derived from the sliders: run from @slider and every @block (panel moves don't trigger @slider)
+function hz_params() (
+  in_setup(trim_db, guard);
+  os_tf = os_f2n(os_sl);
+  hp_tw = tan($pi * min(hp_f, hp_top) / srate);
+  gsc_t = fine ? 0.5 : 1;
+);
+
+// one band's control-rate work. p = the band's slider base (gain, freq, q at p, p + 1, p + 2); bell = its shape
+// (1 bell, 0 shelf; -1 = always bell); kind 0 = low shelf, 1 = high shelf. Smoothed state in the instance.
+function band_ctl(g, f, q, bell, ms, inon, kind) instance(gs, fs, qs, sh, shm, ins, ms_m, ms_s, ldm, lds, lf, lq, gm, gsd, first)
+  local(gt, mt, st, chg, ge) (
+  // the SHELF / BELL swap: dip to flat, swap at flat, come back
+  bell >= 0 && bell != sh ? (
+    shm = max(shm - c32f * 2, 0);
+    shm == 0 ? sh = bell;
+  ) : shm = min(shm + c32f * 2, 1);
+  bell < 0 ? sh = 1;
+  ins += (inon - ins) * c32; abs(inon - ins) < 0.0005 ? ins = inon;
+  gs += (g * gsc_s - gs) * c32; abs(g * gsc_s - gs) < 0.001 ? gs = g * gsc_s;
+  fs += (log(f) - fs) * c32; abs(log(f) - fs) < 0.0001 ? fs = log(f);
+  qs += (q - qs) * c32; abs(q - qs) < 0.0005 ? qs = q;
+  mt = ms == 2 ? 0 : 1; st = ms == 1 ? 0 : 1;
+  ms_m += (mt - ms_m) * c32; abs(mt - ms_m) < 0.0005 ? ms_m = mt;
+  ms_s += (st - ms_s) * c32; abs(st - ms_s) < 0.0005 ? ms_s = st;
+  ge = gs * ins * shm;
+  gm = ge * ms_m; gsd = ge * ms_s;
+  chg = first == 0 || gm != ldm || gsd != lds || fs != lf || qs != lq;
+  first = 1;
+  ldm = gm; lds = gsd; lf = fs; lq = qs;
+  chg;
+);
+// work a design for one side of a band into the current d_* (for band b's smoothed state)
+function band_des(g, kind, bell, f, q) (
+  bell ? des_peak(f, g, qprop(q, g)) : kind == 0 ? des_lshelf(f, g, 0.6) : des_hshelf(f, g, 0.6);
+);
+
+in_init();
+os_design();
+os_base = 0; os_f = os_tf = os_f2n(os_sl);
+os_gsetup();
+sat_s = sat; dw = 0; memset(DRY, 0, 2048);
+set_rate();
+hz_params();
+gsc_s = gsc_t; out_s = db2g(out_db); by_s = byp; hpin_s = hp_in; hps_s = hp_sl; lpin_s = lp_in;
+hp_gw = hp_tw;
+lf.sh = lf_bell; lf.shm = 1; hf.sh = hf_bell; hf.shm = 1; lm.shm = 1; hm.shm = 1;
+lps = log(lp_f);
+bl_s = bloom; sk_s = silk; skf_s = log(silk_f == 0 ? 16000 : silk_f == 1 ? 24000 : 32000);
+// presets (TRIM, GUARD and BYPASS stay as they are)
+#hz_pmn = "Init|Open Master|Warm Master|Vocal Presence|Wide Air|Bass Focus|De-Mud|Tame Harsh|Bright Pop|Dark and Smooth|Vintage Glow|Acoustic Air|Dance Floor|Wide Master";
+function load_preset(p) local(i) (
+  hp_f = 20; hp_sl = 0; hp_in = 0; lp_f = 30000; lp_in = 0;
+  lf_g = 0; lf_f = 80; lf_q = 0.8; lf_bell = 0; lf_ms = 0; lf_in = 1;
+  lm_g = 0; lm_f = 400; lm_q = 0.8; lm_ms = 0; lm_in = 1;
+  hm_g = 0; hm_f = 3000; hm_q = 0.8; hm_ms = 0; hm_in = 1;
+  hf_g = 0; hf_f = 12000; hf_q = 0.8; hf_bell = 0; hf_ms = 0; hf_in = 1;
+  fine = 0; out_db = 0; sat = 0; bloom = 0; silk = 0; silk_f = 0;
+  // open: a clean lift of the top, a touch of low end, the sub cleaned
+  p == 2 ? ( hp_in = 1; hp_f = 18; lf_g = 1; lf_f = 60; hf_g = 2; hf_f = 14000; lm_g = -0.8; lm_f = 300; lm_q = 0.7; silk = 1.5; silk_f = 1; out_db = 0; ) :
+  // warm: low-mid weight, a softer top
+  p == 3 ? ( lf_g = 1.5; lf_f = 120; lm_g = 1; lm_f = 250; lm_q = 0.6; hm_g = -1; hm_f = 3500; hm_q = 0.9; hf_g = -0.8; hf_f = 16000; bloom = 1.5; out_db = -0.8; ) :
+  // vocal presence in the middle only
+  p == 4 ? ( lm_g = -1.5; lm_f = 350; lm_q = 1.2; lm_ms = 1; hm_g = 2; hm_f = 3200; hm_q = 0.8; hm_ms = 1; hf_g = 1; hf_f = 12000; out_db = -0.4; ) :
+  // air on the sides, the low end tidied in mono
+  p == 5 ? ( hp_in = 1; hp_f = 25; lf_g = -2; lf_f = 120; lf_ms = 2; hf_g = 2.5; hf_f = 10000; hf_ms = 2; hm_g = 1; hm_f = 5000; hm_ms = 2; silk = 2; silk_f = 2; out_db = 0; ) :
+  // bass focus: lows in the middle, rumble out of the sides, a tighter kick
+  p == 6 ? ( hp_in = 1; hp_f = 22; hp_sl = 1; lf_g = -4; lf_f = 150; lf_ms = 2; lm_g = 1.2; lm_f = 110; lm_q = 1; lm_ms = 1; hm_g = -0.8; hm_f = 900; hm_q = 0.8; out_db = 0.1; ) :
+  // de-mud: the boxy low mids out, a little presence back
+  p == 7 ? ( lm_g = -2.5; lm_f = 280; lm_q = 1.1; hm_g = 0.8; hm_f = 4500; hm_q = 0.6; lf_g = 0.8; lf_f = 70; out_db = 0.1; ) :
+  // tame harsh: a broad dip at the harsh upper mids, the air kept
+  p == 8 ? ( hm_g = -2; hm_f = 3200; hm_q = 1.4; hf_g = -1; hf_f = 7500; hf_bell = 1; hf_q = 1.5; silk = 1.5; silk_f = 1; out_db = 0.5; ) :
+  // bright pop: a forward top, a clear low end
+  p == 9 ? ( hp_in = 1; hp_f = 20; lf_g = 1; lf_f = 55; lm_g = -1; lm_f = 400; lm_q = 0.8; hm_g = 1.2; hm_f = 2500; hm_q = 0.6; hf_g = 2.5; hf_f = 9000; silk = 2; silk_f = 0; out_db = -0.7; ) :
+  // dark and smooth: the top eased, the body kept
+  p == 10 ? ( hm_g = -1.2; hm_f = 4000; hm_q = 0.6; hf_g = -2; hf_f = 9000; lm_g = 0.6; lm_f = 200; lm_q = 0.6; lp_in = 1; lp_f = 20000; bloom = 1; out_db = 0.2; ) :
+  // vintage glow: bloom and silk with a little console saturation
+  p == 11 ? ( bloom = 2; silk = 2.5; silk_f = 1; lm_g = 0.6; lm_f = 180; lm_q = 0.6; hm_g = -0.6; hm_f = 3000; sat = 35; out_db = -0.5; ) :
+  // acoustic air: a light, open top and a cleaner bottom for acoustic music
+  p == 12 ? ( hp_in = 1; hp_f = 35; lm_g = -1; lm_f = 220; lm_q = 0.9; hm_g = 0.6; hm_f = 6000; hm_q = 0.5; silk = 3; silk_f = 1; out_db = 0.1; ) :
+  // dance floor: a big low end in mono, a sub filter, crisp top
+  p == 13 ? ( hp_in = 1; hp_f = 20; hp_sl = 1; lf_g = 2; lf_f = 60; lf_ms = 1; bloom = 1.5; lm_g = -1.5; lm_f = 300; lm_q = 0.9; hf_g = 2; hf_f = 11000; sat = 20; out_db = -0.3; ) :
+  // wide master: the sides opened gently above the low mids
+  p == 14 ? ( lf_g = -1.5; lf_f = 200; lf_ms = 2; hm_g = 1.5; hm_f = 3000; hm_q = 0.5; hm_ms = 2; hf_g = 1.5; hf_f = 12000; hf_ms = 2; out_db = -0.1; );
+  i = 1; loop(32, ui_auto(i); i += 1; ); ui_auto(36);
+  pr_cur = p;
+);
+
+ui_thm = 5; ui_hw = 1;                               // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );               // new instances open in Medium, on Init
+ui_dflt = 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@slider
+hz_params();
+
+@block
+hz_params();
+// resume after REAPER's bypass (or any gap in processing): fade in from the dry signal
+rs_now = time_precise();
+rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) ? rs_req = 1;
+rs_last = rs_now;
+// stereo pins are declared: REAPER carries any other channels round the unit
+pdc_bot_ch = 0; pdc_top_ch = 2;
+
+@sample
+rs_req ? (
+  rs_req = 0; rs_f = 0;
+  hpm1.hp_clr(); hpm2.hp_clr(); hps1.hp_clr(); hps2.hp_clr(); hpm3.hp_clr(); hps3.hp_clr();
+  lpm.bq_clr(); lps_.bq_clr(); lfm.bq_clr(); lfs.bq_clr(); lmm.bq_clr(); lms.bq_clr();
+  hmm.bq_clr(); hms.bq_clr(); hfm.bq_clr(); hfs.bq_clr();
+  blm.bq_clr(); bls.bq_clr(); skm.bq_clr(); sks.bq_clr();
+  ul.os_clr(); ur.os_clr(); dl_.os_clr(); dr_.os_clr(); memset(DRY, 0, 2048);
+  rs_x = pdc_delay > 0 ? 0 : 1; rs_wait = pdc_delay;
+);
+rw_l = spl0; rw_r = spl1;
+os_gate();
+os_chg ? ( ul.os_clr(); ur.os_clr(); dl_.os_clr(); dr_.os_clr(); );
+
+// ---------- control rate: glide, and re-work the designs that moved ----------
+(cr_n -= 1) <= 0 ? (
+  cr_n = 32;
+  gsc_s += (gsc_t - gsc_s) * c32; abs(gsc_t - gsc_s) < 0.0005 ? gsc_s = gsc_t;
+  // SAT: drive 0.05 .. 2 (square law on the dial), bias up to 0.12, faded in over the first few per cent
+  sat_s += (sat - sat_s) * c32; abs(sat - sat_s) < 0.01 ? sat_s = sat;
+  st_a = sat_s * 0.01; st_k = 0.05 + 1.95 * st_a * st_a; st_b = 0.12 * st_a;
+  st_o = sat3(st_b); st_n = 1 / (st_k * sat3d(st_b)); st_w = min(1, st_a * 20);
+  dc_co = 1 - 2 * $pi * 5 / (srate * os_f);
+  // the bands (LF and HF: shelf or bell; LMF and HMF: bells)
+  lf.band_ctl(lf_g, lf_f, lf_q, lf_bell, lf_ms, lf_in, 0) ? (
+    band_des(lf.gm, 0, lf.sh, exp(lf.fs), lf.qs); lfm.bq_set();
+    lf.gsd == lf.gm ? lfs.bq_set() : ( band_des(lf.gsd, 0, lf.sh, exp(lf.fs), lf.qs); lfs.bq_set(); );
+  ) : ( lfm.bq_hold(); lfs.bq_hold(); );
+  lm.band_ctl(lm_g, lm_f, lm_q, -1, lm_ms, lm_in, 0) ? (
+    band_des(lm.gm, 0, 1, exp(lm.fs), lm.qs); lmm.bq_set();
+    lm.gsd == lm.gm ? lms.bq_set() : ( band_des(lm.gsd, 0, 1, exp(lm.fs), lm.qs); lms.bq_set(); );
+  ) : ( lmm.bq_hold(); lms.bq_hold(); );
+  hm.band_ctl(hm_g, hm_f, hm_q, -1, hm_ms, hm_in, 1) ? (
+    band_des(hm.gm, 1, 1, exp(hm.fs), hm.qs); hmm.bq_set();
+    hm.gsd == hm.gm ? hms.bq_set() : ( band_des(hm.gsd, 1, 1, exp(hm.fs), hm.qs); hms.bq_set(); );
+  ) : ( hmm.bq_hold(); hms.bq_hold(); );
+  hf.band_ctl(hf_g, hf_f, hf_q, hf_bell, hf_ms, hf_in, 1) ? (
+    band_des(hf.gm, 1, hf.sh, exp(hf.fs), hf.qs); hfm.bq_set();
+    hf.gsd == hf.gm ? hfs.bq_set() : ( band_des(hf.gsd, 1, hf.sh, exp(hf.fs), hf.qs); hfs.bq_set(); );
+  ) : ( hfm.bq_hold(); hfs.bq_hold(); );
+  // the LPF (one design for both sides)
+  lp_t = log(lp_f);
+  lp_t != lps || lp_first == 0 ? (
+    lps += (lp_t - lps) * c32; abs(lp_t - lps) < 0.0001 ? lps = lp_t;
+    des_lp(exp(lps)); lpm.bq_set(); lps_.bq_set();
+    lp_first = 1;
+  ) : ( lpm.bq_hold(); lps_.bq_hold(); );
+  // BLOOM: a low shelf at 90 Hz with a little resonance (Q 1.1), so it lifts the lows and dips slightly above
+  // them, keeping the low mids clear. SILK: a very gentle high shelf (Q 0.5) with its corner at 16 / 24 / 32 kHz.
+  bl_s += (bloom - bl_s) * c32; abs(bloom - bl_s) < 0.001 ? bl_s = bloom;
+  sk_s += (silk - sk_s) * c32; abs(silk - sk_s) < 0.001 ? sk_s = silk;
+  sk_t = log(silk_f == 0 ? 16000 : silk_f == 1 ? 24000 : 32000);
+  skf_s += (sk_t - skf_s) * c32; abs(sk_t - skf_s) < 0.0001 ? skf_s = sk_t;
+  bl_s != bl_l || bl_first == 0 ? (
+    des_lshelf(90, bl_s, 1.1); blm.bq_set(); bls.bq_set(); bl_l = bl_s; bl_first = 1;
+  ) : ( blm.bq_hold(); bls.bq_hold(); );
+  sk_s != sk_l || skf_s != skf_l || sk_first == 0 ? (
+    des_hshelf(exp(skf_s), sk_s, 0.5); skm.bq_set(); sks.bq_set(); sk_l = sk_s; skf_l = skf_s; sk_first = 1;
+  ) : ( skm.bq_hold(); sks.bq_hold(); );
+  cr_init = 1;
+);
+
+// ---------- per-sample glides ----------
+out_s += (db2g(out_db) - out_s) * c_kn;
+hp_gw += (hp_tw - hp_gw) * c_kn;
+hpin_s += (hp_in - hpin_s) * c_sw; hps_s += (hp_sl - hps_s) * c_sw; lpin_s += (lp_in - lpin_s) * c_sw;
+
+in_process(spl0, spl1);
+il_d = max(il_d, abs(in_l)); ir_d = max(ir_d, abs(in_r));
+sm_m = (in_l + in_r) * 0.5; sm_s = (in_l - in_r) * 0.5;
+
+// ---------- HPF: 12 dB (Q 0.707) and 18 dB (Q 1 + first order) side by side, crossfaded by SLOPE ----------
+hpin_s > 0.00001 ? (
+  h12 = hpm1.svf_hp(sm_m, 1.4142135623730951); h18 = hpm3.op_hp(hpm2.svf_hp(sm_m, 1));
+  sm_m += (h12 + (h18 - h12) * hps_s - sm_m) * hpin_s;
+  h12 = hps1.svf_hp(sm_s, 1.4142135623730951); h18 = hps3.op_hp(hps2.svf_hp(sm_s, 1));
+  sm_s += (h12 + (h18 - h12) * hps_s - sm_s) * hpin_s;
+);
+// ---------- LPF ----------
+lp_m = lpm.bq_run(sm_m); lp_s = lps_.bq_run(sm_s);
+sm_m += (lp_m - sm_m) * lpin_s; sm_s += (lp_s - sm_s) * lpin_s;
+// ---------- the four bands ----------
+sm_m = hfm.bq_run(hmm.bq_run(lmm.bq_run(lfm.bq_run(sm_m))));
+sm_s = hfs.bq_run(hms.bq_run(lms.bq_run(lfs.bq_run(sm_s))));
+// ---------- BLOOM and SILK (both sides alike) ----------
+bl_s > 0 || bl_l > 0 ? ( sm_m = blm.bq_run(sm_m); sm_s = bls.bq_run(sm_s); ) : ( blm.bq_clr(); bls.bq_clr(); );
+sk_s > 0 || sk_l > 0 ? ( sm_m = skm.bq_run(sm_m); sm_s = sks.bq_run(sm_s); ) : ( skm.bq_clr(); sks.bq_clr(); );
+
+ol = sm_m + sm_s; orr = sm_m - sm_s;
+
+// ---------- SAT (oversampled; the up / down filters always run, so the latency never changes with the dial) ----------
+os_f == 1 ? (
+  st_w > 0 ? ( ol = sl.st_run(ol); orr = sr.st_run(orr); );
+) : (
+  ul.os_up(ol); ur.os_up(orr);
+  st_w > 0 ? (
+    os_f == 2 ? (
+      ol = dl_.os_dn(sl.st_run(ul.s0), sl.st_run(ul.s1), 0, 0); orr = dr_.os_dn(sr.st_run(ur.s0), sr.st_run(ur.s1), 0, 0);
+    ) : (
+      ol = dl_.os_dn(sl.st_run(ul.s0), sl.st_run(ul.s1), sl.st_run(ul.s2), sl.st_run(ul.s3));
+      orr = dr_.os_dn(sr.st_run(ur.s0), sr.st_run(ur.s1), sr.st_run(ur.s2), sr.st_run(ur.s3));
+    );
+  ) : (
+    os_f == 2 ? ( ol = dl_.os_dn(ul.s0, ul.s1, 0, 0); orr = dr_.os_dn(ur.s0, ur.s1, 0, 0); ) :
+    ( ol = dl_.os_dn(ul.s0, ul.s1, ul.s2, ul.s3); orr = dr_.os_dn(ur.s0, ur.s1, ur.s2, ur.s3); );
+  );
+);
+ol *= out_s * os_g; orr *= out_s * os_g;
+
+// the resume fade and BYPASS use the dry input delayed by the latency, so they stay in time
+DRY[dw] = rw_l; DRY[1024 + dw] = rw_r;
+rs_f < 1 ? (
+  rs_wait > 0 ? rs_wait -= 1 : ( rs_f = min(rs_f + rs_c, 1); rs_x = min(rs_x + 3 * rs_c, 1); );
+  rs_s = rs_f * rs_f * (3 - 2 * rs_f); rs_xs = rs_x * rs_x * (3 - 2 * rs_x);
+  rs_dl = rw_l + (DRY[(dw - pdc_delay) & RMASK] - rw_l) * rs_xs;
+  rs_dr = rw_r + (DRY[1024 + ((dw - pdc_delay) & RMASK)] - rw_r) * rs_xs;
+  ol = rs_dl + (ol - rs_dl) * rs_s; orr = rs_dr + (orr - rs_dr) * rs_s;
+);
+by_s += (byp - by_s) * c_sw;
+by_s > 0.0001 ? (
+  ol += (DRY[(dw - pdc_delay) & RMASK] - ol) * by_s; orr += (DRY[1024 + ((dw - pdc_delay) & RMASK)] - orr) * by_s;
+);
+dw = (dw + 1) & RMASK;
+spl0 = ol; spl1 = orr;
+mo_l_d = max(mo_l_d, abs(spl0)); mo_r_d = max(mo_r_d, abs(spl1));
+
+@gfx 1080 490
+ui_begin(1080, 490);
+// =====================================================================
+// GUI (design space 1080 x 490; S / M / L = 85 / 100 / 130 %). Soft cool white faceplate (#E3EBEE), a dusk-navy header
+// with a setting sun over the sea, dark print, desk knobs in the house band colours (HPF yellow, LPF black, LF
+// brown, LMF blue, HMF green, HF red). Two plates: the controls (FILTERS | LF | LMF | HMF | HF | BLOOM & SILK)
+// and the meters (TRIM, GUARD, FINE, SAT, IN, OUT, OUTPUT).
+// =====================================================================
+BG = 0xE3EBEE; HDR = 0x22334A; PL = 0xDAE4E8; PLD = 0xCEDAE0; HAIR = 0x8FA6B2; INK = 0x22303A; DIM = 0x5E717C;
+SUN = 0xF08A3A; CREAM = 0xF4EEDC; GLASS = 0x1C242A;
+sc != hz_lsc ? (
+  hz_lsc = sc;
+  hz_f2 = ui_fitfont(2, 14 * sc);                    // knob labels / values: 14 px
+  gfx_setfont(10, "Trebuchet MS", 30 * sc, 'b');     // the unit's name
+  gfx_setfont(11, "Trebuchet MS", 15 * sc, 'b');     // section titles
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print
+  gfx_setfont(14, "Trebuchet MS", 14 * sc, 'b');     // key legends, display boxes
+  gfx_setfont(15, "Trebuchet MS", 18 * sc, 'b');     // the OUT peak figure
+);
+gfx_setfont(2, "Trebuchet MS", hz_f2, 'b'); gfx_setfont(3, "Trebuchet MS", hz_f2, 'b');
+C_INK = INK; lk_font = 14; lk_font2 = 14; lk_well = 0x2A343A;
+
+function hz_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function hz_rr(x, y, w, h, r) ( ui_rrs(x * sc, y * sc, w * sc, h * sc, r * sc); );
+function hz_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function hz_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function hz_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function hz_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+// soft drop shadow, light from the top left: 4 layers, (+2, +3) to (+6, +8)
+function hz_shadow(x, y, w, h, r) local(j) (
+  j = 0; loop(4, ui_cola(0x000000, 0.10); hz_rr(x + 2 + j * 1.3, y + 3 + j * 1.7, w + j * 0.4, h + j * 0.4, r + j); j += 1; );
+);
+// a plate: shadow, a light top / left edge, a darker bottom / right edge
+function hz_plate(x, y, w, h) (
+  hz_shadow(x, y, w, h, 6);
+  ui_col(0xA9BBC4); hz_rr(x, y, w, h, 6);
+  ui_col(0xF2F7F9); hz_rr(x, y, w - 1, h - 1, 6);
+  ui_col(PL); hz_rr(x + 1, y + 1, w - 2.5, h - 2.5, 5);
+);
+// a section header band: the title on the band's centre line, a hairline under it
+function hz_head(x, w, title) local(tw, th) (
+  ui_col(PLD); hz_r(x + 1, 81, w - 2, 32);
+  ui_cola(HAIR, 0.6); hz_r(x + 1, 113, w - 2, 1);
+  gfx_setfont(11); gfx_measurestr(title, tw, th);
+  ui_col(INK); gfx_x = (x + 16) * sc; gfx_y = 97 * sc - th * 0.5; gfx_drawstr(title);
+);
+// a divider between two sections: a dark and a light hairline
+function hz_div(x) ( ui_col(0xADBDC6); hz_r(x, 82, 1, 268); ui_col(0xEEF4F6); hz_r(x + 1, 82, 1, 268); );
+// a dark recessed display box: the current item and a down-pointing triangle; a click opens the list. Its name (if
+// any) sits above it. Returns the chosen index or -1.
+function hz_box(x, y, w, h, name, menu, v) local(hov, sel, n, i, tw, th) (
+  hov = hz_in(x, y, w, h);
+  strlen(name) > 0 ? ( gfx_setfont(13); ui_col(DIM); hz_tc(x + w * 0.5, y - 17, name); );
+  ui_col(0x0C1114); hz_rr(x - 1, y - 1, w + 2, h + 2, 4);
+  ui_col(GLASS); hz_rr(x, y, w, h, 3);
+  ui_cola(0x000000, 0.5); hz_r(x + 1, y + 1, w - 2, 2);
+  hov ? ( ui_cola(0xFFFFFF, 0.07); hz_rr(x, y, w, h, 3); );
+  pk_pitem(menu, v + 1, #hz_di);
+  gfx_setfont(14); ui_col(0xE6EEF2); gfx_measurestr(#hz_di, tw, th);
+  gfx_x = (x + (w - 14) * 0.5) * sc - tw * 0.5; gfx_y = (y + h * 0.5) * sc - th * 0.5; gfx_drawstr(#hz_di);
+  ui_col(0x9FB2BC); ui_sstri((x + w - 17) * sc, (y + h * 0.5 - 3) * sc, (x + w - 7) * sc, (y + h * 0.5 - 3) * sc, (x + w - 12) * sc, (y + h * 0.5 + 3) * sc);
+  sel = -1;
+  pressed && hov && drag_id == 0 ? (
+    drag_id = -1;
+    strcpy(#hz_dm, ""); n = pk_pcount(menu); i = 1;
+    loop(n, i == v + 1 ? strcat(#hz_dm, "!"); strcat(#hz_dm, pk_pitem(menu, i, #hz_dt)); i < n ? strcat(#hz_dm, "|"); i += 1; );
+    gfx_x = x * sc; gfx_y = (y + h) * sc; i = gfx_showmenu(#hz_dm); i > 0 ? sel = i - 1;
+  );
+  sel;
+);
+// a desk knob (ui_knob does the mouse, the value on touch and the label)
+function hz_kn(cx, cy, r, idx, lo, hi, def, lg, cap, lbl, fmt) (
+  ui_kdesk = cap; ui_kdesk_r = r; ui_kdesk_p = 0;
+  ui_knob(cx * sc, cy * sc, idx, lo, hi, def, lg, lbl, fmt);
+  ui_kdesk = 0; ui_kdesk_r = 0;
+);
+// a small "0" printed outside a dial at the normalised position n
+function hz_zero(cx, cy, r, n) local(a) (
+  a = -0.75 * $pi + n * 1.5 * $pi; gfx_setfont(13); ui_col(DIM);
+  hz_tc(cx + sin(a) * (r + 17), cy - cos(a) * (r + 17) - 7, "0");
+);
+// a lamp key from its slider: lit = on; the click toggles
+function hz_key(x, y, w, h, idx, col, s) (
+  lk_key(x, y, w, h, slider(idx) >= 0.5, col, s) ? ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+);
+// one band section at x (168 wide): GAIN on top, FREQ and Q under it, the ST / M / S box (and SHELF / BELL for
+// LF and HF) at the bottom. b = the slider of its GAIN; shape = the SHELF / BELL slider (0 = none).
+function hz_band(x, b, cap, flo, fhi, fdef, fmt_f, shape) local(cx, bell) (
+  cx = x + 84;
+  ui_kvs = gsc_d;
+  hz_kn(cx, 178, 26, b, -12, 12, 0, 0, cap, "GAIN", "%+.1f dB");
+  hz_zero(cx, 178, 26, 0.5);
+  hz_kn(cx - 40, 270, 17, b + 1, flo, fhi, fdef, 1, cap, "FREQ", fmt_f);
+  bell = shape == 0 || slider(shape) >= 0.5;
+  hz_kn(cx + 40, 270, 17, b + 2, 0.4, 4, 0.8, 1, cap, "Q", "%.2f");
+  !bell ? ( ui_cola(PL, 0.55); hz_r(cx + 18, 248, 46, 64); );
+  shape > 0 ? (
+    hz_v = hz_box(x + 14, 318, 70, 26, "", "ST|MID|SIDE", slider(b + 4)); hz_v >= 0 ? ( slider(b + 4) = hz_v; ui_auto(b + 4); );
+    hz_key(x + 92, 318, 62, 26, shape, LK_BLU_LT, "BELL");
+  ) : (
+    hz_v = hz_box(x + 49, 318, 70, 26, "", "ST|MID|SIDE", slider(b + 3)); hz_v >= 0 ? ( slider(b + 3) = hz_v; ui_auto(b + 3); );
+  );
+);
+
+// ---------- the meters' hand-off (the audio thread fills, the panel takes and clears) ----------
+hz_il = il_d; hz_ir = ir_d; il_d = ir_d = 0;
+hz_ol = mo_l_d; hz_or = mo_r_d; mo_l_d = mo_r_d = 0;
+gsc_d = fine ? 0.5 : 1;
+
+// ---------- faceplate and header ----------
+ui_col(BG); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(HDR); hz_r(0, 0, 1080, 64);
+ui_col(SUN); hz_r(0, 63, 1080, 2); ui_col(0x0E1620); hz_r(0, 65, 1080, 1);
+ui_cola(0x000000, 0.18); hz_r(1077, 66, 3, 424); hz_r(0, 487, 1080, 3);       // a narrow darker right / bottom edge
+ui_screw(9 * sc, 9 * sc); ui_screw((1080 - 9) * sc, 9 * sc); ui_screw(9 * sc, (490 - 9) * sc); ui_screw((1080 - 9) * sc, (490 - 9) * sc);
+ui_col(CREAM); gfx_circle(40 * sc, 32 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(HDR); ui_keytext(40 * sc, 32 * sc, "GFX");
+gfx_setfont(10); ui_col(CREAM); hz_tl(68, 15, "HORIZON"); gfx_measurestr("HORIZON", hz_tw, hz_th);
+gfx_setfont(13); ui_col(0xB8C8D4); hz_tl(82 + hz_tw / sc, 20, "MASTERING"); hz_tl(82 + hz_tw / sc, 34, "EQ");
+hz_k = pk_preset(340 * sc, 15 * sc, 290 * sc, 34 * sc, pr_cur, #hz_pmn);
+hz_k > 0 ? load_preset(hz_k);
+hz_key(818, 20, 84, 26, 35, LK_WHT, "BYPASS");
+os_key(950, 22, 37, CREAM, 12);
+ui_size_picker(998 * sc, 23 * sc);
+
+// ---------- header art: a sun setting over the sea, in the gap before BYPASS (JG, 25 Oct 2026) ----------
+// drawn once per scale at 2x into image 117 (anti-aliased circles and bars), then blitted back at half size; 65 %
+// colours are mixed with the header's own and drawn solid
+function sa_mix(c, a) (
+  gfx_r = (floor(HDR / 65536) * (1 - a) + floor(c / 65536) * a) / 255;
+  gfx_g = ((floor(HDR / 256) & 255) * (1 - a) + (floor(c / 256) & 255) * a) / 255;
+  gfx_b = ((HDR & 255) * (1 - a) + (c & 255) * a) / 255; gfx_a = 1;
+);
+sa_x0 = 596; sa_y0 = 2; sa_w = 230; sa_h = 60; sa_z = 0.65;
+sa_sc != sc ? (
+  sa_sc = sc; sa_k = 2 * sc * sa_z; sa_iw = ceil(sa_w * sa_k) + 2; sa_ih = ceil(sa_h * sa_k) + 2;
+  gfx_setimgdim(117, sa_iw, sa_ih); gfx_dest = 117; gfx_mode = 0;
+  ui_col(HDR); gfx_a = 1; gfx_rect(0, 0, sa_iw, sa_ih);       // drawn on the header's own colour: all solid
+  sa_hy = 38; sa_r = 24; sa_cx = 115;                  // the horizon, the sun's radius and centre
+  // a soft glow behind the sun: solid rings from the header's colour inwards, then cleared below the horizon
+  sa_i = 0; loop(12, sa_mix(0xE0703A, 0.3 * sqr(sa_i / 11)); gfx_circle(sa_cx * sa_k, sa_hy * sa_k, (sa_r + 16 - sa_i * 1.4) * sa_k, 1, 1); sa_i += 1; );
+  ui_col(HDR); gfx_rect(0, floor(sa_hy * sa_k), sa_iw, sa_ih);
+  // the sun above the horizon, in slats (the gaps widen towards the sea), yellow at the top to deep orange
+  sa_y = floor((sa_hy - sa_r) * sa_k);
+  while (sa_y < floor(sa_hy * sa_k)) (
+    sa_d = sa_hy - sa_y / sa_k;                        // height above the horizon, design units
+    sa_t = 1 - sa_d / sa_r;                            // 0 at the top, 1 at the horizon
+    sa_p = sa_y / sa_k - (sa_hy - sa_r); sa_p -= floor(sa_p / 6) * 6;   // the slat pattern: 6 units, the gap growing to 3
+    sa_p < 6 - 3.2 * sa_t * sa_t || sa_t < 0.35 ? (
+      sa_hw = sqrt(max(0, sa_r * sa_r - sa_d * sa_d));
+      gfx_r = (0xFF - 0x10 * sa_t) / 255; gfx_g = (0xD2 - 0x88 * sa_t) / 255; gfx_b = (0x5C - 0x34 * sa_t) / 255; gfx_a = 1;
+      gfx_rect(floor((sa_cx - sa_hw) * sa_k), sa_y, ceil(2 * sa_hw * sa_k), 1);
+    );
+    sa_y += 1;
+  );
+  // the horizon: a thin line that fades out towards both ends
+  sa_i = 0;
+  loop(40,
+    sa_t = abs(sa_i - 19.5) / 19.5; sa_mix(0xF2A24A, 0.9 * (1 - sa_t * sa_t));
+    gfx_rect(floor((10 + sa_i * 5.25) * sa_k), 2 * floor(sa_hy * sa_k * 0.5), ceil(5.25 * sa_k), 2);
+    sa_i += 1;
+  );
+  // the sun's broken reflection on the water: dashes narrowing and fading towards the viewer
+  sa_i = 0;
+  loop(6,
+    sa_yy = sa_hy + 3.5 + sa_i * 3; sa_hw = sa_r * (0.8 - sa_i * 0.11);
+    sa_mix(0xF7A040, 0.85 - sa_i * 0.12);
+    sa_o = (sa_i & 1) ? 2.5 : -2.5;                     // each ripple a little off centre, alternately
+    gfx_rect(floor((sa_cx - sa_hw + sa_o) * sa_k), 2 * floor(sa_yy * sa_k * 0.5), ceil(2 * sa_hw * sa_k), 2);
+    sa_i += 1;
+  );
+  gfx_a = 1; gfx_dest = -1;
+);
+gfx_a = 1; gfx_mode = 0; gfx_blit(117, 1, 0, 0, 0, sa_iw, sa_ih, (sa_x0 + sa_w * (1 - sa_z) / 2) * sc, (sa_y0 + sa_h * (1 - sa_z) / 2) * sc, sa_iw / 2, sa_ih / 2);
+
+// ---------- the controls plate ----------
+hz_plate(16, 80, 1048, 272);
+hz_head(16, 176, "FILTERS"); hz_head(192, 168, "LF"); hz_head(360, 168, "LMF"); hz_head(528, 168, "HMF"); hz_head(696, 168, "HF");
+hz_head(864, 200, "BLOOM & SILK");
+hz_div(192); hz_div(360); hz_div(528); hz_div(696); hz_div(864);
+
+// FILTERS
+hz_kn(62, 182, 22, 1, 10, 300, 20, 1, 0xE0B12A, "HPF", "%.0f Hz");
+hz_v = hz_box(106, 200, 74, 26, "SLOPE", "12 dB|18 dB", hp_sl); hz_v >= 0 ? ( hp_sl = hz_v; ui_auto(2); );
+hz_kn(62, 290, 22, 4, 8000, 40000, 30000, 1, 0x2A2A2A, "LPF", "%.0f Hz");
+
+// the four bands
+hz_band(192, 6, 0x7A4E2E, 20, 400, 80, "%.0f Hz", 9);
+hz_band(360, 12, 0x2F5FA0, 100, 2000, 400, "%.0f Hz", 0);
+hz_band(528, 17, 0x2F7A4A, 800, 12000, 3000, "%.0f Hz", 0);
+hz_band(696, 22, 0xB03A2E, 3000, 25000, 12000, "%.0f Hz", 25);
+
+// BLOOM & SILK
+hz_kn(918, 182, 24, 29, 0, 4, 0, 0, 0xC8892A, "BLOOM", "+%.1f dB");
+hz_kn(1010, 182, 24, 30, 0, 4, 0, 0, 0x8A6AA8, "SILK", "+%.1f dB");
+hz_v = hz_box(966, 270, 84, 26, "CORNER", "16 kHz|24 kHz|32 kHz", silk_f); hz_v >= 0 ? ( silk_f = hz_v; ui_auto(31); );
+
+// switched-off sections (greyed, IN keys on top)
+!hp_in ? ( ui_cola(PL, 0.55); hz_r(17, 114, 175, 120); );
+!lp_in ? ( ui_cola(PL, 0.55); hz_r(17, 236, 175, 114); );
+!lf_in ? ( ui_cola(PL, 0.55); hz_r(193, 114, 166, 236); );
+!lm_in ? ( ui_cola(PL, 0.55); hz_r(361, 114, 166, 236); );
+!hm_in ? ( ui_cola(PL, 0.55); hz_r(529, 114, 166, 236); );
+!hf_in ? ( ui_cola(PL, 0.55); hz_r(697, 114, 166, 236); );
+lk_font = lk_font2 = 13;
+hz_key(106, 154, 74, 24, 3, LK_AMB, "HPF IN");
+hz_key(106, 278, 74, 24, 5, LK_AMB, "LPF IN");
+hz_key(300, 86, 52, 22, 11, LK_AMB, "IN");
+hz_key(468, 86, 52, 22, 16, LK_AMB, "IN");
+hz_key(636, 86, 52, 22, 21, LK_AMB, "IN");
+hz_key(804, 86, 52, 22, 27, LK_AMB, "IN");
+lk_font = lk_font2 = 14;
+
+// ---------- the meters plate ----------
+hz_plate(16, 368, 1048, 106);
+ui_kdesk = 0x5A6670; ui_kdesk_r = 16; ui_knob(52 * sc, 400 * sc, 33, -24, 12, 0, 0, "TRIM", "%+.1f dB"); ui_kdesk = 0; ui_kdesk_r = 0;
+lk_font = lk_font2 = 13;
+hz_key(92, 384, 64, 24, 34, LK_AMB, "GUARD");
+hz_key(92, 422, 64, 24, 28, LK_BLU_LT, "FINE");
+lk_font = lk_font2 = 14;
+gfx_setfont(13); ui_col(DIM); hz_tl(162, 428, "GAIN +/-6");
+hz_kn(268, 404, 18, 36, 0, 100, 0, 0, 0xC0602E, "SAT", "%.0f %%");
+hz_kn(1022, 404, 18, 32, -12, 12, 0, 0, 0x5A6670, "OUTPUT", "%+.1f dB");
+hz_zero(1022, 404, 18, 0.5);
+// IN and OUT: L and R rows each
+gfx_setfont(13); ui_col(DIM); hz_tl(320, 378, "IN (dBFS)"); hz_tl(604, 378, "OUT (dBFS)");
+ui_col(INK); hz_tl(320, 403, "L"); hz_tl(320, 431, "R"); hz_tl(604, 403, "L"); hz_tl(604, 431, "R");
+mIL.ui_ledm(338 * sc, 404 * sc, 244 * sc, 14 * sc, hz_il); mIR.ui_ledm(338 * sc, 432 * sc, 244 * sc, 14 * sc, hz_ir);
+mOL.ui_ledm(622 * sc, 404 * sc, 260 * sc, 14 * sc, hz_ol); mOR.ui_ledm(622 * sc, 432 * sc, 260 * sc, 14 * sc, hz_or);
+gfx_setfont(13); ui_col(DIM);
+hz_tc(338 + 244 * 2 / 15, 452, "-36"); hz_tc(338 + 244 * 6 / 15, 452, "-24"); hz_tc(338 + 244 * 10 / 15, 452, "-12"); hz_tc(338 + 244 * 14 / 15, 452, "0");
+hz_tc(622 + 260 * 2 / 15, 452, "-36"); hz_tc(622 + 260 * 6 / 15, 452, "-24"); hz_tc(622 + 260 * 10 / 15, 452, "-12"); hz_tc(622 + 260 * 14 / 15, 452, "0");
+hz_pk = max(mOL.hold, mOR.hold);
+gfx_setfont(15); ui_col(hz_pk > -0.05 ? 0xD8332E : INK);
+hz_pk > -60 ? sprintf(#hz_s, hz_pk > 0.05 ? "+%.1f" : "%.1f", hz_pk) : strcpy(#hz_s, "--"); hz_tr(966, 408, #hz_s);
+gfx_setfont(13); ui_col(DIM); hz_tr(966, 436, "PEAK");
+
+pk_end();
+ui_end();
