@@ -50,7 +50,8 @@ desc:GFX Lab Sifon [bus compressor]
 //   SC HPF and SIDE HPF: click the box for the list. Keys light when on. S / M / L / ? = size and help.
 // PRESETS: Init, Mix Bus Glue, Gentle Master, Drum Bus Smash, M/S Tighten, Warm Low Master, High Sheen Mix,
 //   Wide and Open, Vocal Bus Smooth, Loud and Safe, Parallel Crush (they leave TRIM, GUARD and OS as they are).
-// Latency: 0 / 31 / 37 samples at 1x / 2x / 4x; BRICKWALL adds 1.5 ms + 7 samples (79 at 48 kHz); reported. Changing the limiter type
+// Latency: 0 / 31 / 37 samples at 1x / 2x / 4x; BRICKWALL adds 1.5 ms + 7 samples (79 at 48 kHz); reported. On a
+//   multichannel track the channels above 1 / 2 are delayed by the same amount (they are not processed). Changing the limiter type
 //   dips the sound for 5 ms, swaps at the silent point and comes back once the new latency has come through.
 
 slider1:thr_db=-18<-40,0,0.1>-Threshold (dB)
@@ -99,6 +100,7 @@ TPK = 105120;                                 // true-peak interpolator taps: 7 
 TPH = 105300;                                 // true-peak histories, L / R (32 each)
 RMASK = 1023;
 DRY = 106000;                                 // dry input delayed by the latency, L / R (1024 each): the resume fade
+XCH = 110000;                                 // channels 3 - 64 (1024 each): delayed by the latency too
 
 function db2g(d) ( exp(d * 0.11512925464970228); );
 function g2db(g) ( log(max(g, 0.000000001)) * 8.685889638065035; );
@@ -176,19 +178,25 @@ function sat3(x) ( x = max(-3, min(3, x)); x * (27 + x * x) / (27 + 9 * x * x); 
 // by the slope at b keeps quiet signal exactly as it was)
 function sat3d(b) ( (sat3(b + 0.0001) - sat3(b - 0.0001)) * 5000; );
 function sdiff(x, k, b, d) ( (sat3(k * x + b) - sat3(b)) / (k * d) - x; );
+// harmonics only: takes out of a saturated band (h) the part that still follows the band itself (x), measured over
+// 30 ms, so COLOUR adds harmonics without turning the band down
+function hfund(h, x) instance(cxy, cxx) (
+  cxy += (h * x - cxy) * cg_cr; cxx += (x * x - cxx) * cg_cr;
+  h - x * (cxx > 0.000000000001 ? cxy / cxx : 1);
+);
 // IRON + COLOUR on one oversampled sample (per-channel filter states in the instance)
-function colour_run(u) instance(ip, rp, bp, ep) local(lo, hi, bl, di, dr, dd, y, band, ev, eb) (
+function colour_run(u) instance(ip, rp, bp, ep, hc, lc) local(lo, hi, bl, di, dr, dd, y, band, ev, eb) (
   lo = this.ip.op_lp(u, cg_iron);                         // iron band, below ~150 Hz
   hi = u - this.rp.op_lp(u, cg_red);                       // HIGH band, above ~3 kHz
   bl = this.bp.op_lp(u, cg_blue);                          // LOW band, below ~300 Hz
   di = sdiff(lo, k_iron, 0.12, sd_i);
   // LOW: mostly the even part too (warmth, the bass's octave), with some odd for grip; keeps the low end's level
   eb = (sat3(k_col * bl + 0.35) + sat3(0.35 - k_col * bl) - 2 * sat3(0.35)) / (2 * k_col * sd_b);
-  dd = 1.5 * eb + 0.4 * sdiff(bl, k_col, 0, 1);
+  dd = 1.5 * eb + 0.4 * this.lc.hfund(sdiff(bl, k_col, 0, 1) + bl, bl);
   // HIGH: mostly the even (2nd-harmonic) part, high-passed, so the top gains sheen instead of losing its peaks
   ev = (sat3(k_red * hi + 0.4) + sat3(0.4 - k_red * hi) - 2 * sat3(0.4)) / (2 * k_red * sd_e);
   ev -= this.ep.op_lp(ev, cg_red);
-  dr = 2 * ev + 0.2 * sdiff(hi, k_red, 0, 1);
+  dr = 2 * ev + 0.2 * this.hc.hfund(sdiff(hi, k_red, 0, 1) + hi, hi);
   // the LOW / HIGH harmonics are handed to cw_add() (their own widths); the dry and IRON stay here
   this.dlo = w_blue * dd; this.dhi = w_red * dr;
   y = u + di;
@@ -207,6 +215,7 @@ function colour_coefs(f) local(g) (
   g = tan($pi * 150 / (srate * f)); cg_iron = g / (1 + g);
   g = tan($pi * 3000 / (srate * f)); cg_red = g / (1 + g);
   g = tan($pi * 300 / (srate * f)); cg_blue = g / (1 + g);
+  cg_cr = 1 - exp(-1 / (0.03 * srate * f));
 );
 
 function set_rate() local(g) (
@@ -314,6 +323,10 @@ bx_params();
 rs_now = time_precise();
 rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) ? rs_req = 1;
 rs_last = rs_now;
+// the track's other channels (3 and up, e.g. stems on a multichannel bus) pass through untouched but delayed by
+// the same latency, so everything on the track stays in time
+xn = min(num_ch, 64) - 2;
+pdc_bot_ch = 0; pdc_top_ch = 2 + max(xn, 0);
 c_lra = coef(lr_s);
 
 @sample
@@ -321,7 +334,9 @@ rs_req ? (
   rs_req = 0; rs_f = 0; rs_x = pdc_delay > 0 ? 0 : 1; rs_wait = pdc_delay;
   ul.os_clr(); ur.os_clr(); dl_.os_clr(); dr_.os_clr();
   chL.ip.s = chL.rp.s = chL.bp.s = chL.ep.s = chR.ip.s = chR.rp.s = chR.bp.s = chR.ep.s = 0;
+  chL.hc.cxy = chL.hc.cxx = chL.lc.cxy = chL.lc.cxx = chR.hc.cxy = chR.hc.cxx = chR.lc.cxy = chR.lc.cxx = 0;
   memset(DLINE, 0, 2048); memset(DRY, 0, 2048);   // the limiter keeps its gain: the best guess for now
+  memset(XCH, 0, 62 * 1024);
 );
 rw_l = spl0; rw_r = spl1;
 // ---------- swaps that need silence: L/R <-> M/S, limiter type ----------
@@ -365,6 +380,7 @@ os_chg ? (
   colour_coefs(os_f);
   ul.os_clr(); ur.os_clr(); dl_.os_clr(); dr_.os_clr();
   chL.ip.s = chL.rp.s = chL.bp.s = chL.ep.s = chR.ip.s = chR.rp.s = chR.bp.s = chR.ep.s = 0;
+  chL.hc.cxy = chL.hc.cxx = chL.lc.cxy = chL.lc.cxx = chR.hc.cxy = chR.hc.cxx = chR.lc.cxy = chR.lc.cxx = 0;
   os_hold += 2 * samplesblock;                // stay silent while REAPER takes up the new latency
 );
 
@@ -501,6 +517,14 @@ by_s += (byp - by_s) * c_sw;
 by_s > 0.0001 ? (
   rs_dl = DRY[(dw - pdc_delay) & RMASK]; rs_dr = DRY[1024 + ((dw - pdc_delay) & RMASK)];
   spl0 += (rs_dl - spl0) * by_s; spl1 += (rs_dr - spl1) * by_s;
+);
+xn > 0 ? (
+  xs = rs_f < 1 ? rs_xs : 1; k = 0;
+  loop(xn,
+    XCH[k * 1024 + dw] = spl(k + 2);
+    spl(k + 2) = (spl(k + 2) + (XCH[k * 1024 + ((dw - pdc_delay) & RMASK)] - spl(k + 2)) * xs) * dip_s;
+    k += 1;
+  );
 );
 dw = (dw + 1) & RMASK;
 mo_l_d = max(mo_l_d, abs(spl0)); mo_r_d = max(mo_r_d, abs(spl1));
