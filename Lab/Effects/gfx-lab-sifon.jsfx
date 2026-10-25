@@ -17,6 +17,9 @@ desc:GFX Lab Sifon [bus compressor]
 //   DETECTOR: FEED-FORWARD listens to the input (tight, precise, 6 dB knee); FEEDBACK listens to its own output (the
 //   knee widens to 10 dB and the ratio eases off under fast attacks: softer, more programme-dependent). Both run
 //   all the time and the switch crossfades them (15 ms).
+//   RMS (key under SC HPF): the detector reads the average level (a 15 ms RMS window, scaled so a steady sine
+//   compresses at the same THRESHOLD as in PEAK) instead of every peak: it rides the body of the mix and lets short
+//   transients through - smoother, more "loudness" than "peak" control. Works with both detectors; glided 15 ms.
 //   SC HPF (off / 60 / 100 / 150 / 250 Hz, 12 dB/oct, glided) keeps the kick from pumping the mix.
 //   M/S: the compressor works on Mid and Side; LINK on = one gain for both, off = each side (or Mid and Side) its own
 //   detector (glided 10 ms). Changing L/R <-> M/S dips the sound for 5 ms and swaps at the silent point.
@@ -78,6 +81,7 @@ slider25:csolo=0<0,1,1{Off,On}>-Colour solo
 slider26:lo_wid=100<0,200,1>-Low colour width (%)
 slider27:hi_wid=100<0,200,1>-High colour width (%)
 slider28:byp=0<0,1,1{Off,On}>-Bypass
+slider29:rmsdet=0<0,1,1{Peak,RMS}>-Detector level
 
 import gfx-lab-input.jsfx-inc
 import gfx-lab-ui.jsfx-inc
@@ -209,7 +213,7 @@ function set_rate() local(g) (
   la_n = ceil(0.0015 * srate);                // look-ahead length (moving average)
   la_w = la_n + 1;                            // sliding-minimum window
   la_d = la_n + 7;                            // audio delay (the true-peak detector looks 7 samples back)
-  c_sw = coef(0.015); c_kn = coef(0.03); c_lk = coef(0.01);
+  c_sw = coef(0.015); c_rms = coef(0.015); c_kn = coef(0.03); c_lk = coef(0.01);
   dip_c = 1 / (0.005 * srate);
   c_vu = coef(0.3);
   sc_tw = tan($pi * 10 / srate);
@@ -259,6 +263,7 @@ os_gsetup();
 env_fa = env_fb = env_sa = env_sb = 0;
 fb_ga = fb_gb = 0; fbs_a = fbs_b = 0;
 env_ffa = env_ffb = 0;
+rq_a = rq_b = rq_fa = rq_fb = 0; rms_s = rmsdet;
 yfa = yfb = 0;
 thr_s = thr_db; rat_s = 2; mk_s = db2g(mkup_db); bl_s = blend_pc / 100;
 top_s = topo; lk_s = lnk; cin_s = comp_in; lin_s = lim_in; ceil_s = db2g(lim_ceil);
@@ -272,7 +277,7 @@ sh_gw = sh_tw = tan($pi * 80 / srate); sh_h = 1 / (1 + sh_gw * (sh_gw + 1.414213
 // ---------- presets (TRIM, GUARD and OS stay as they are) ----------
 #bx_pmn = "Init|Mix Bus Glue|Gentle Master|Drum Bus Smash|M/S Tighten|Warm Low Master|High Sheen Mix|Wide and Open|Vocal Bus Smooth|Loud and Safe|Parallel Crush";
 function load_preset(p) local(i) (
-  thr_db = -18; ratio_i = 1; att_ms = 10; rel_ms = 300; rel_auto = 0; mkup_db = 0; blend_pc = 100; topo = 0;
+  thr_db = -18; ratio_i = 1; att_ms = 10; rel_ms = 300; rel_auto = 0; mkup_db = 0; blend_pc = 100; topo = 0; rmsdet = 0;
   schpf = 0; msmode = 0; lnk = 1; comp_in = 1; lim_ceil = -1; lim_rel = 0; brick = 0; lim_in = 0;
   colour = 0; texture = 30; lo_wid = 100; hi_wid = 100; width_pc = 100; depth_pc = 0; sidehpf = 0;
   p == 2 ? ( thr_db = -24; ratio_i = 0; att_ms = 30; rel_auto = 1; mkup_db = 2; topo = 1; schpf = 2; ) :
@@ -287,6 +292,7 @@ function load_preset(p) local(i) (
               colour = 2; texture = 40; schpf = 2; ) :
   p == 11 ? ( thr_db = -40; ratio_i = 5; att_ms = 1; rel_ms = 80; mkup_db = 12; blend_pc = 35; );
   i = 1; loop(27, i != 17 && i != 18 && i != 21 && i != 25 ? ui_auto(i); i += 1; );
+  ui_auto(29);
   pr_cur = p;
 );
 
@@ -337,6 +343,7 @@ rat_s += (rat_t - rat_s) * c_kn;
 mk_s += (db2g(mkup_db) - mk_s) * c_kn;
 bl_s += (blend_pc * 0.01 - bl_s) * c_kn;
 top_s += (topo - top_s) * c_sw;
+rms_s += (rmsdet - rms_s) * c_sw; rmsdet < 0.5 && rms_s < 0.000001 ? rms_s = 0;
 lk_s += (lnk - lk_s) * c_lk;
 cin_s += (comp_in - cin_s) * c_sw;
 lin_s += (lim_in - lin_s) * c_sw;
@@ -371,11 +378,15 @@ ms_on ? ( xa = 0.5 * (xl + xr); xb = 0.5 * (xl - xr); ) : ( xa = xl; xb = xr; );
 
 sl_ff = 1 - 1 / rat_s; sl_fb = rat_s - 1;
 // feed-forward detector: the input
-da = abs(hpa.svf_hp(xa)); db = abs(hpb.svf_hp(xb));
+ha = hpa.svf_hp(xa); hb = hpb.svf_hp(xb); da = abs(ha); db = abs(hb);
+rq_a += (ha * ha - rq_a) * c_rms; rq_b += (hb * hb - rq_b) * c_rms;      // RMS: always running, so the key never jumps
+rms_s > 0 ? ( da += (sqrt(2 * rq_a) - da) * rms_s; db += (sqrt(2 * rq_b) - db) * rms_s; );
 dm = max(da, db); da += (dm - da) * lk_s; db += (dm - db) * lk_s;
 tga = gcurve(g2db(da) - thr_s, sl_ff, 6); tgb = gcurve(g2db(db) - thr_s, sl_ff, 6);
 // feedback detector: its own output (last sample)
-fa = abs(fha.svf_hp(yfa)); fb = abs(fhb.svf_hp(yfb));
+hfa = fha.svf_hp(yfa); hfb = fhb.svf_hp(yfb); fa = abs(hfa); fb = abs(hfb);
+rq_fa += (hfa * hfa - rq_fa) * c_rms; rq_fb += (hfb * hfb - rq_fb) * c_rms;
+rms_s > 0 ? ( fa += (sqrt(2 * rq_fa) - fa) * rms_s; fb += (sqrt(2 * rq_fb) - fb) * rms_s; );
 fm = max(fa, fb); fa += (fm - fa) * lk_s; fb += (fm - fb) * lk_s;
 tfa = gcurve(g2db(fa) - thr_s, sl_fb, 10); tfb = gcurve(g2db(fb) - thr_s, sl_fb, 10);
 
@@ -644,6 +655,7 @@ bx_key(272, 262, 96, 32, 8, LK_BLU_LT, "FEEDBACK");
 bx_key(384, 262, 84, 32, 5, LK_BLU_LT, "AUTO");
 bx_key(272, 308, 96, 32, 11, LK_BLU_LT, "LINK");
 bx_key(384, 308, 84, 32, 10, LK_BLU_LT, "M/S");
+bx_key(148, 308, 96, 32, 29, LK_BLU_LT, "RMS");
 
 // COLOUR (IRON is always on)
 lk_key(584, 130, 66, 34, colour & 1, LK_RED, "HIGH") ? ( colour = colour ~ 1; ui_auto(19); );
