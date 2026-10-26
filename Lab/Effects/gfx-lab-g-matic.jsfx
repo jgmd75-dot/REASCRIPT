@@ -2,7 +2,7 @@ desc:GFX Lab G-Matic [lo-fi tape]
 //tags: lo-fi tape varispeed saturation bitcrusher
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-lab-drift, gfx-lab-output, gfx-lab-input, gfx-lab-clip, gfx-lab-os (.jsfx-inc) in the same folder.
+// Requires gfx-lab-drift, gfx-lab-output, gfx-lab-input, gfx-lab-clip, gfx-lab-os, gfx-lab-power (.jsfx-inc) in the same folder.
 //
 // G-Matic: a worn broadcast video deck's audio track, in the spirit of the cream 3/4-inch editing decks of the
 // 70s and 80s, pushed into lo-fi: a record amp that crunches, hiss, a transport that can be run slow or fast, a cheap
@@ -25,6 +25,10 @@ desc:GFX Lab G-Matic [lo-fi tape]
 //   (a whole slice of it after silence), so a project saved with STUTTER lit starts looping once the audio arrives.
 //   GLITCH (0 - 100 %): the deck does it by itself - at each slice's end there is that chance (squared: gentle low
 //   down) of a stutter of 2 - 5 repeats of a full or half slice. The loop's seam is crossfaded (4 ms); in and out fade over 5 ms.
+// MAINS / EQUATOR PROXIMITY (in the ? pop-up, gfx-lab-power): OFF / UK / US mains hum (very faint), supply sag and
+//   ripple into the record amp; and the warm-up: a cold deck's capstan runs a touch slow (about 3 cents flat,
+//   wandering), the record amp a little duller and lower; it settles as it warms (by 5 min at FAR).
+//   Default OFF + NEAR = as before.
 // GUI: a cream broadcast video deck (1080 x 560). Top: the INPUT / OUTPUT VU pair (0 VU = -18 dBFS) and the smoked
 //   tape window - two reels that turn at the tape's speed and a red tape counter (h:mm:ss:ff, 25 frames) that runs
 //   with REAPER's transport at the VARISPEED rate and holds while the deck stutters; STUTTER and DROPOUT lamps.
@@ -46,6 +50,7 @@ import gfx-lab-output.jsfx-inc
 import gfx-lab-input.jsfx-inc
 import gfx-lab-clip.jsfx-inc
 import gfx-lab-os.jsfx-inc
+import gfx-lab-power.jsfx-inc
 
 slider1:trim_db=0<-24,12,0.1>-Trim (dB)
 slider2:drive_db=6<0,24,0.1>-Drive (dB)
@@ -76,6 +81,8 @@ ext_noinit = 1;
 
 in_init();
 ost_init(0); ostL.ost_ch_init(); ostR.ost_ch_init();
+pwr_init();  pwr_wu_loss = 1;  pwr_wu_drv = 2;  pwr_wu_lp = 7000;  pwr_bloom = 0.2;
+wu_sp = 1;
 clL.clp_reset(); clR.clp_reset();
 clL.clp_pf_cfg(0.45 * srate, 9000, -1.5, 250); clR.clp_pf_cfg(0.45 * srate, 9000, -1.5, 250);
 clL.clp_pf_reset(); clR.clp_pf_reset();
@@ -217,6 +224,9 @@ spd_inc = 0.08 * dm_s / srate; wrp_inc = 0.4 * dm_s / srate;
 st_n = slice_ms * 0.001 * srate;
 gl_p = sqr(glitch_pc / 100) * 0.6;                    // chance at each slice's end
 dr_rate = 3 * sqr(drop_pc / 100) / srate;              // dropouts per sample
+// MAINS: sag, ripple, hum; warm-up: the cold capstan runs slow (about 3 cents) and wanders
+pwr_block(1);
+wu_sp = 1 - (1 - pwr_gm) * (0.0018 + 0.0006 * pwr_w1);
 // the track's other channels (3 and up, e.g. stems on a multichannel bus) pass through untouched but delayed by
 // the latency, so everything on the track stays in time
 xch_n = min(num_ch, 64) - 2;
@@ -225,6 +235,7 @@ pdc_bot_ch = 0; pdc_top_ch = 2 + max(xch_n, 0);
 
 @serialize
 file_var(0, ui_sz); file_var(0, pr_cur);
+pwr_ser();
 
 @sample
 // ---------- control rate ----------
@@ -259,6 +270,7 @@ m_radio += (radio_on - m_radio) * k15;
 
 // ---------- input ----------
 in_process(spl0, spl1); l = in_l; r = in_r;
+pwr_in(l, r); l = pwr_l; r = pwr_r;
 vin_s_d += 0.5 * (l * l + r * r); vin_n_d += 1;
 // STUTTER waits for audio: how long the input has carried sound (above -80 dBFS; a slice of silence starts it again)
 abs(l) + abs(r) > 0.0001 ? st_q = 0 : st_q += 1;
@@ -295,7 +307,7 @@ m_hiss > 0.0001 ? (
 // ---------- TAPE: varispeed, wow, flutter, warp ----------
 TP_L[tp_w] = l; TP_R[tp_w] = r; tp_w += 1; tp_w >= TP_N ? tp_w = 0;
 s_dm += (dm_a - s_dm) * k30;
-ratio = s_spd * (1 + s_dm * 0.0015 * dSpd.drift_tick(spd_inc));
+ratio = s_spd * wu_sp * (1 + s_dm * 0.0015 * dSpd.drift_tick(spd_inc));
 // near 1x a weak spring pulls the head home (21 s; under a cent), so the resting latency stays put
 sp = max(0, 1 - abs(s_spd - 1) / 0.02);
 ratio += sp * min(max(0.000001 * (tp_d - tp_home), -0.0002), 0.0002) * (tp_x > 0 ? 0 : 1);
@@ -389,6 +401,7 @@ m_radio > 0.0001 ? (
 );
 
 // ---------- output ----------
+pwr_out(l, r); l = pwr_l; r = pwr_r;
 l *= s_out * os_g; r *= s_out * os_g;
 l = ostL.ost_band(l); r = ostR.ost_band(r);
 ost_out(l, r);
@@ -707,6 +720,9 @@ g_want = ui_sz == 1 ? 0.85 : ui_sz == 2 ? 1.3 : 1;
 sc = g_ret * max(min(g_want, min(gfx_w / (1080 * g_ret), gfx_h / (560 * g_ret))), 0.5);
 ox = (gfx_w - 1080 * sc) * 0.5;  oy = (gfx_h - 560 * sc) * 0.5;
 lmb = mouse_cap & 1;  click = lmb && !last_lmb;  kcap = 0;
+// while the ? pop-up is open, it takes the clicks and the wheel (the panel under it doesn't)
+h_click = sz_help ? click : 0;  h_wheel = sz_help ? mouse_wheel : 0;
+sz_help ? ( click = 0;  mouse_wheel = 0; );
 gfx_setfont(1, "Trebuchet MS", ps(32), 'b');
 gfx_setfont(2, "Trebuchet MS", ps(14), 'b');
 gfx_setfont(3, "Trebuchet MS", ps(14), 'b');
@@ -879,20 +895,24 @@ loop(4,
   );
   g_j += 1;
 );
-sz_help && click && !sz_new ? sz_help = 0;
+// the card: credits, website, manual, then MAINS / EQUATOR PROXIMITY; a click outside it closes it
+strcpy(#hl3, "Manual - https://www.gardenfx.uk/manual/");  strcat(#hl3, #ui_man);  strcat(#hl3, ".pdf");
+gfx_setfont(5);  gfx_measurestr(#hl3, g_tw, g_th);
+g_cw = max(g_tw + ps(40), ps(440));  g_ch = ps(320);  g_cx = (gfx_w - g_cw) * 0.5;  g_cy = (gfx_h - g_ch) * 0.5;
+sz_help && h_click && !sz_new && (mouse_x < g_cx || mouse_x >= g_cx + g_cw || mouse_y < g_cy || mouse_y >= g_cy + g_ch) ? ( sz_help = 0;  h_click = 0; );
+sz_new ? h_click = 0;
 sz_new = 0;
 sz_help ? (
   col(0x000000, 0.62);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
-  strcpy(#hl3, "Manual - https://www.gardenfx.uk/manual/");  strcat(#hl3, #ui_man);  strcat(#hl3, ".pdf");
-  gfx_setfont(5);  gfx_measurestr(#hl3, g_tw, g_th);
-  g_cw = max(g_tw + ps(40), ps(380));  g_ch = ps(130);  g_cx = (gfx_w - g_cw) * 0.5;  g_cy = (gfx_h - g_ch) * 0.5;
   col(0x000000, 0.5);  ui_rrs(g_cx + ps(3), g_cy + ps(5), g_cw, g_ch, ps(8));
   col(0x1C1D20, 1);    ui_rrs(g_cx, g_cy, g_cw, g_ch, ps(8));
-  col(0xE0603A, 1);    gfx_rect(g_cx + ps(20), g_cy + ps(36), g_cw - ps(40), max(1, ps(1)), 1);
+  col(0xE0603A, 1);      gfx_rect(g_cx + ps(20), g_cy + ps(36), g_cw - ps(40), max(1, ps(1)), 1);
   gfx_setfont(6);  col(0xF2F2EE, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(14);  gfx_drawstr("Design by JGWizrad.  © John Garden 2026");
   gfx_setfont(5);  col(0xE8B23A, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(50);  gfx_drawstr("https://www.gardenfx.uk/");
   col(0xD8D6D0, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(72);  gfx_drawstr(#hl3);
-  col(0x85837E, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(102);  gfx_drawstr("Click anywhere to close.");
+  col(0x3A3C42, 1);    gfx_rect(g_cx + ps(20), g_cy + ps(100), g_cw - ps(40), max(1, ps(1)), 1);
+  pwr_panel(g_cx + ps(30), g_cy + ps(118), sc, 14, h_click, h_wheel);
+  gfx_setfont(5);  col(0x85837E, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(292);  gfx_drawstr("Click outside to close.");
 );
 !lmb ? ( drag_idx = 0;  drag_sh = 0; );
 mouse_wheel = 0;

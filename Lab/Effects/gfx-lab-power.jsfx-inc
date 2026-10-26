@@ -1,0 +1,357 @@
+desc:GFX Mains power and warm-up (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// Lab-only system file (JG, 26 Oct 2026): the unit is plugged into the mains and has valves that warm up.
+// The controls live in the unit's ? pop-up. Defaults (MAINS OFF, EQUATOR PROXIMITY NEAR) null bit for bit with the
+// unit's own sound and cost nothing: pwr_in / pwr_out pass the signal untouched while nothing is active.
+//
+// MAINS: OFF / UK / US
+//   HUM     the mains frequency (UK 50 Hz, US 60 Hz) and its harmonics, added before the unit's distorting stage
+//           (so a driven unit makes real hum sidebands). A designed fingerprint per unit: the transformer's stray
+//           field (1f, 3f, 5f, 7f) blended with the rectifier's buzz (2f .. 12f, about 1/n) by pwr_buzz.
+//           UK runs a 60 Hz-designed power transformer harder, so its odd harmonics are stronger: grittier, colder.
+//           Every instance locks to one mains clock (the project's time while playing) with its own small fixed phase
+//           offset (+/- 10 deg, saved with the project), and each instance's hum wanders slowly in phase (up to
+//           +/- 160 deg) with its own slightly different harmonic mix, so many instances beat gently and the sum
+//           grows as random sources do (20 instances about +13 dB, not +26) instead of piling up on one line.
+//   SAG     the supply droops as the unit works harder (an envelope on its output = the current it draws): the
+//           signal into the distorting stage gets hotter (less headroom) and the output comes down. UK is tight
+//           (50 ms recovery), US looser and saggier (150 ms, 1.4x deeper) - JG: "looser and flabbier in the US,
+//           tighter and colder in the UK".
+//   RIPPLE  the rectifier's 100 / 120 Hz ripple on the rail, deeper as the load rises: faint sidebands that follow
+//           the playing. (The honest version of "the grid gets into the sound".)
+//   Switching mode fades the mains out (20 ms), swaps, fades back in.
+// EQUATOR PROXIMITY: FAR .. NEAR = how warm the room is.
+//   A cold unit is lower (pwr_wu_loss dB), duller (a low-pass from pwr_wu_lp Hz opening to 20 kHz), saturates
+//   earlier (pwr_wu_drv dB more into its curve) and unsteady (+/- pwr_wu_wob dB of slow wander); it blooms
+//   (pwr_bloom: a slight lift on the way up) and settles. Warm-up: heater then cathode, settled by 5 min at FAR (JG);
+//   the room's temperature is a floor the unit never drops below (NEAR = always fully warm, no warm-up at all).
+//   Cooling while the heater is off (the unit's own BYPASS, REAPER's bypass, or between sessions): FAR loses it
+//   all in about 60 s, warmer rooms cool slower and keep a higher floor. Switching back on heats again at once.
+//   Warm-up counts played audio (renders don't depend on the computer's speed); gaps in processing (REAPER's
+//   bypass, a stopped and sleeping track) are timed with the wall clock and cool the unit for their length.
+//   The heat is saved with the project, with the time; on reopening it cools by the real time that has passed.
+//
+// Usage (needs no other include; it never calls rand(), so a unit's own random sequences - DRIFT, noise - are
+// exactly as they were):
+//   @init    pwr_init();  then the unit's design (optional): pwr_hum_db, pwr_buzz, pwr_sag, pwr_rip,
+//            pwr_wu_loss, pwr_wu_drv, pwr_wu_lp, pwr_wu_wob, pwr_bloom
+//   @block   pwr_block(heat)                      heat = 1 unless the unit's own BYPASS is on
+//   @sample  pwr_in(l, r);   l = pwr_l;  r = pwr_r;  before the first distorting stage
+//            ... the unit ...
+//            pwr_out(l, r);  l = pwr_l;  r = pwr_r;  after its last distorting stage (before the output clipper)
+//   Hooks    pwr_gm (0 cold .. 1 warm, per block) for a unit's own warm-up design (tuning, bias ...);
+//            pwr_rail (1 = full supply, per sample) for a unit's own sag.
+//   @serialize  pwr_ser();  (after the unit's own fields; every field behind file_avail)
+//   @gfx     pwr_panel(x, y, s, fnt, clk, wheel) - draws the MAINS / EQUATOR PROXIMITY block (pixels; s = scale;
+//            fnt, fnt + 1 = two font slots the panel doesn't use; clk = mouse click edge, wheel = mouse_wheel);
+//            about 380 x 150 design px. Writes pwr_mode_d / pwr_prox_d only (hand-offs to the audio thread).
+// CPU: OFF + NEAR = one test per sample. Mains on: a rotation, 12 harmonics, one envelope, a one-pole.
+
+@init
+
+function pwr_db(d) ( exp(d * 0.11512925464970228); );
+function pwr_floor(p) ( p * sqrt(p); );                     // the room's temperature as a floor: FAR 0, NEAR 1
+
+// this instance's own random numbers: seeded from the clock, so instances differ even in hosts whose rand() repeats
+// the same sequence in every instance (the hum's wander and fingerprint must never line up between instances)
+function pwr_rnd() ( pwr_sd0 = (pwr_sd0 * 16807) % 2147483647;  pwr_sd0 / 2147483647; );
+// slow random wander, -1..1: cosine-interpolated random points (as drift_tick), on pwr_rnd; one instance per use.
+// pwr_hw = the hum's phase, pwr_gw = the warm-up's level; pwr_w1 / pwr_w2 (per block) for a unit's own hooks (tuning)
+function pwr_wnd(inc) instance(a, b, p, r) (
+  !r ? ( a = pwr_rnd() * 2 - 1;  b = pwr_rnd() * 2 - 1;  p = pwr_rnd();  r = 0.7 + pwr_rnd() * 0.6; );
+  p += inc * r;
+  p >= 1 ? ( p -= floor(p);  a = b;  b = pwr_rnd() * 2 - 1; );
+  a + (b - a) * (0.5 - 0.5 * cos($pi * p));
+);
+
+function pwr_init() (
+  pwr_sd0 = 1 + floor(time_precise() * 1000003) % 2147483645;
+  loop(3, pwr_rnd(); );
+  !pwr_did ? (                                               // first instance only (survives a sample-rate change)
+    pwr_mode_d = 0;  pwr_prox_d = 1;  pwr_h = -1;  pwr_c_th = -1;
+    pwr_phi = (pwr_rnd() * 2 - 1) * 0.1745;                    // this instance's phase offset, +/- 10 deg
+    pwr_did = 1;
+  );
+  pwr_v1 = 0.75 + pwr_rnd() * 0.5;  pwr_v2 = 0.75 + pwr_rnd() * 0.5;  pwr_v3 = 0.7 + pwr_rnd() * 0.6;   // this instance's
+  pwr_v4 = 0.7 + pwr_rnd() * 0.6;  pwr_v5 = 0.6 + pwr_rnd() * 0.8;  pwr_v6 = 0.6 + pwr_rnd() * 0.8;     // fingerprint
+  pwr_cd = 1;  pwr_sd = 0;  pwr_c = 1;  pwr_s = 0;
+  pwr_gi = pwr_gi_t = pwr_go = pwr_go_t = 1;  pwr_rin = 1;  pwr_rail = 1;
+  pwr_k20 = 1 - exp(-1 / (0.02 * srate));
+  // the unit's design (defaults: a valve box)
+  // hum: very faint (JG, 26 Oct 2026: -76 too loud, -90 inaudible even to him - split the difference)
+  pwr_hum_db = -83;  pwr_buzz = 0.6;  pwr_sag = 0.25;  pwr_rip = 0.004;
+  pwr_wu_loss = 1.5;  pwr_wu_drv = 3;  pwr_wu_lp = 5000;  pwr_wu_wob = 0.5;  pwr_bloom = 0.3;
+);
+
+// the hum's harmonics for a mode (1 UK, 2 US): stray field (odd) + rectifier buzz (even), normalised to 1 RMS
+function pwr_table(m) local(o, b, n) (
+  o = m == 1 ? 1.6 : 1;  b = pwr_buzz;
+  pwr_a1 = 1 - b;  pwr_a3 = (1 - b) * 0.35 * o;  pwr_a5 = (1 - b) * 0.15 * o;  pwr_a7 = (1 - b) * 0.06 * o;
+  pwr_a2 = b;  pwr_a4 = b * 0.5;  pwr_a6 = b * 0.33;  pwr_a8 = b * 0.25;  pwr_a10 = b * 0.2;  pwr_a12 = b * 0.16;
+  pwr_a1 *= pwr_v1;  pwr_a2 *= pwr_v2;  pwr_a3 *= pwr_v3;  pwr_a4 *= pwr_v4;  pwr_a5 *= pwr_v5;  pwr_a6 *= pwr_v6;
+  pwr_a7 *= pwr_v6;  pwr_a8 *= pwr_v5;  pwr_a10 *= pwr_v4;  pwr_a12 *= pwr_v3;
+  pwr_a9 = pwr_a11 = 0;
+  n = sqrt(0.5 * (sqr(pwr_a1) + sqr(pwr_a2) + sqr(pwr_a3) + sqr(pwr_a4) + sqr(pwr_a5) + sqr(pwr_a6) + sqr(pwr_a7)
+                + sqr(pwr_a8) + sqr(pwr_a10) + sqr(pwr_a12)));
+  pwr_hg = pwr_db(pwr_hum_db) / max(n, 0.0001);
+  pwr_fq = m == 2 ? 60 : 50;
+  pwr_erel = 1 - exp(-1 / ((m == 2 ? 0.15 : 0.05) * srate));
+  pwr_sagm = m == 2 ? 1.4 : 1;
+);
+
+// heater off for g seconds: heater and cathode fall towards the room (FAR: about 60 s to cold)
+function pwr_cool(g) local(tc, f) (
+  f = pwr_floor(pwr_prox);  tc = 10 + 40 * pwr_prox * pwr_prox;
+  pwr_h = f + (pwr_h - f) * exp(-g / tc);
+  pwr_c_th = f + (pwr_c_th - f) * exp(-g / (1.3 * tc));
+);
+// heater on for g seconds: heater, then cathode (an S-curve: 95 % in about 3 min at FAR; fully settled by 5 - JG)
+function pwr_heat(g) local(k) (
+  k = 1 - exp(-g * 7.5 / (60 + 240 * (1 - pwr_prox)));
+  pwr_h += (1 - pwr_h) * k;  pwr_c_th += (pwr_h - pwr_c_th) * k;
+);
+
+function pwr_block(heat) local(dt, now, gap, d, w, th, er, fc, el) (
+  dt = samplesblock / srate;
+  pwr_prox = min(max(pwr_prox_d, 0), 1);
+  pwr_mode_t = min(max(floor(pwr_mode_d + 0.5), 0), 2);
+  pwr_ld_dirty ? (                                          // a project / preset loaded its saved heat
+    pwr_ld_dirty = 0;
+    pwr_h = min(max(pwr_ldh_d, 0), 1);  pwr_c_th = min(max(pwr_ldc_d, 0), 1);  pwr_phi = pwr_ldphi_d;
+    pwr_f = pwr_floor(pwr_prox);
+    el = time() - pwr_ldt_d;
+    pwr_ldt_d > 0 && el > 0 ? pwr_cool(min(el, 1000000));
+  );
+  pwr_h < 0 ? ( pwr_f = pwr_floor(pwr_prox);  pwr_h = pwr_c_th = pwr_f; );   // a new instance starts at the room's warmth
+  // gaps in processing (REAPER's bypass, a sleeping track): the heater was off that long
+  now = time_precise();
+  gap = pwr_tl > 0 ? now - pwr_tl - dt : 0;
+  pwr_tl = now;
+  gap > max(0.5, 8 * dt) ? pwr_cool(gap);
+  pwr_f += (pwr_floor(pwr_prox) - pwr_f) * (1 - exp(-dt / 2));            // turning the room up or down glides (2 s)
+  heat ? pwr_heat(dt) : pwr_cool(dt);
+  pwr_h = max(pwr_h, pwr_f);  pwr_c_th = max(pwr_c_th, pwr_f);
+  pwr_h_d = pwr_h;  pwr_c_d = pwr_c_th;  pwr_gm = pwr_c_th;                  // hand-offs: the lamp, the save
+  d = 1 - pwr_c_th;  d < 0.000001 ? d = 0;
+
+  // the mains: fade out, swap the mode at silence, fade in
+  pwr_mode_a != pwr_mode_t && pwr_on < 0.0001 ? ( pwr_mode_a = pwr_mode_t;  pwr_mode_a ? pwr_table(pwr_mode_a); );
+  pwr_on_t = pwr_mode_a == pwr_mode_t && pwr_mode_a > 0;
+  // the mains clock: locked to the project's time while playing (a 50 ms pull, so a jump glides), free otherwise
+  w = 2 * $pi * (pwr_fq ? pwr_fq : 50) / srate;
+  // the hum's phase wanders (up to +/- 160 deg over tens of seconds), so many instances beat gently against each
+  // other instead of piling up on one line (JG): 20 instances sum about 13 dB up, not 26
+  pwr_wv0 = pwr_wv;  pwr_wv = pwr_hw.pwr_wnd(dt * 0.05) * 2.8;
+  w += (pwr_wv - pwr_wv0) / samplesblock;
+  pwr_lk = (play_state & 1) && play_position != pwr_pp;  pwr_pp = play_position;   // (only while the timeline moves)
+  pwr_lk && pwr_mode_a ? (
+    th = 2 * $pi * (pwr_fq * play_position - floor(pwr_fq * play_position)) + pwr_phi + pwr_wv;
+    er = th - atan2(pwr_s, pwr_c);
+    er -= 2 * $pi * floor((er + $pi) / (2 * $pi));
+    w += er / (0.05 * srate);
+  );
+  pwr_cd = cos(w);  pwr_sd = sin(w);
+  th = 1 / sqrt(max(sqr(pwr_c) + sqr(pwr_s), 0.000001));  pwr_c *= th;  pwr_s *= th;
+
+  // the warm-up: lower, duller, hotter into the curve, unsteady; a bloom on the way up
+  w = pwr_gw.pwr_wnd(dt * 0.3);
+  pwr_w1 = pwr_t1w.pwr_wnd(dt * 0.2);  pwr_w2 = pwr_t2w.pwr_wnd(dt * 0.2);
+  pwr_gi_t = pwr_db(pwr_wu_drv * d);
+  pwr_go_t = pwr_db(-pwr_wu_loss * d + pwr_bloom * 6.75 * sqr(pwr_c_th) * d + pwr_wu_wob * d * w - pwr_wu_drv * d);
+  fc = min(pwr_wu_lp * (20000 / pwr_wu_lp) ^ pwr_c_th, 0.45 * srate);
+  pwr_lpk = 1 - exp(-2 * $pi * fc / srate);
+  pwr_tm = min(1, d * 20);
+
+  pwr_act = pwr_mode_t > 0 || pwr_on > 0.00001 || d > 0 || abs(pwr_gi - 1) > 0.000001 || abs(pwr_go - 1) > 0.000001
+           || abs(pwr_rail - 1) > 0.000001;
+  !pwr_act ? ( pwr_on = 0;  pwr_gi = pwr_go = 1;  pwr_env = 0;  pwr_rail = 1;  pwr_rin = 1;  pwr_lpl = pwr_lpr = 0; );
+);
+
+function pwr_in(l, r) local(h, cp, cn, t) (
+  pwr_act ? (
+    pwr_on += (pwr_on_t - pwr_on) * pwr_k20;
+    pwr_gi += (pwr_gi_t - pwr_gi) * pwr_k20;
+    t = pwr_c * pwr_cd - pwr_s * pwr_sd;  pwr_s = pwr_s * pwr_cd + pwr_c * pwr_sd;  pwr_c = t;
+    h = 0;  pwr_t2 = 2 * pwr_c * pwr_c - 1;
+    pwr_on > 0.00001 ? (                                     // cos(n theta) by Chebyshev: one cosine, 12 harmonics
+      cp = pwr_c;  cn = pwr_t2;  h = pwr_a1 * cp + pwr_a2 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a3 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a4 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a5 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a6 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a7 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a8 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a10 * cn;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;
+      t = 2 * pwr_c * cn - cp;  cp = cn;  cn = t;  h += pwr_a12 * cn;
+      h *= pwr_on * pwr_hg;
+    );
+    pwr_l = (l + h) * pwr_gi * pwr_rin;  pwr_r = (r + h * 0.94) * pwr_gi * pwr_rin;
+  ) : ( pwr_l = l;  pwr_r = r; );
+);
+
+function pwr_out(l, r) local(a, ld, g) (
+  pwr_act ? (
+    pwr_go += (pwr_go_t - pwr_go) * pwr_k20;
+    a = max(abs(l), abs(r));
+    pwr_env += (a - pwr_env) * (a > pwr_env ? 0.007 : pwr_erel);
+    ld = min(pwr_env * 2, 2) * pwr_on;                        // the load: -6 dBFS = 1
+    pwr_rail = 1 / (1 + pwr_sag * pwr_sagm * ld);
+    pwr_rin = sqrt(1 + pwr_sag * pwr_sagm * ld);               // less headroom: hotter into the curve
+    g = pwr_go * pwr_rail * (1 + pwr_rip * ld * pwr_t2);
+    l *= g;  r *= g;
+    pwr_tm > 0 ? (
+      pwr_lpl += (l - pwr_lpl) * pwr_lpk;  pwr_lpr += (r - pwr_lpr) * pwr_lpk;
+      l += (pwr_lpl - l) * pwr_tm;  r += (pwr_lpr - r) * pwr_tm;
+    ) : ( pwr_lpl = l;  pwr_lpr = r; );
+    pwr_l = l;  pwr_r = r;
+  ) : ( pwr_l = l;  pwr_r = r; );
+);
+
+// @serialize: mode, room, heat, the time, the phase offset (each behind file_avail, so old projects load)
+function pwr_ser() (
+  pwr_svm_d = pwr_mode_d;  pwr_svp_d = pwr_prox_d;  pwr_ldh_d = pwr_h_d;  pwr_ldc_d = pwr_c_d;  pwr_ldt_d = time();
+  pwr_ldphi_d = pwr_phi;
+  file_avail(0) != 0 ? ( file_var(0, pwr_svm_d);  file_avail(0) >= 0 ? pwr_mode_d = pwr_svm_d; );
+  file_avail(0) != 0 ? ( file_var(0, pwr_svp_d);  file_avail(0) >= 0 ? pwr_prox_d = pwr_svp_d; );
+  file_avail(0) != 0 ? ( file_var(0, pwr_ldh_d);  file_var(0, pwr_ldc_d);  file_var(0, pwr_ldt_d);  file_var(0, pwr_ldphi_d);
+                         file_avail(0) >= 0 ? pwr_ld_dirty = 1; );
+);
+
+// ---------- the pop-up block (GUI thread only) ----------
+function pwr_rgb(h, a) ( gfx_r = floor(h / 65536) / 255;  gfx_g = (floor(h / 256) % 256) / 255;  gfx_b = (h % 256) / 255;  gfx_a = a; );
+function pwr_mixc(c1, c2, t) (
+  floor(floor(c1 / 65536) * (1 - t) + floor(c2 / 65536) * t) * 65536 +
+  floor((floor(c1 / 256) % 256) * (1 - t) + (floor(c2 / 256) % 256) * t) * 256 + floor((c1 % 256) * (1 - t) + (c2 % 256) * t);
+);
+// Trebuchet MS bold, sized by width as ui_fitfont does ("THRESHOLD" = 5.28 x size wide on every system)
+function pwr_fonts(fnt, s) local(w, h) (
+  gfx_setfont(fnt, "Trebuchet MS", 100, 'b');  gfx_measurestr("THRESHOLD", w, h);
+  pwr_fk = w > 0 ? 528 / w : 1;
+  gfx_setfont(fnt, "Trebuchet MS", 16 * s * pwr_fk, 'b');       // titles, key legends, knob label
+  gfx_setfont(fnt + 1, "Trebuchet MS", 13 * s * pwr_fk, 'b');   // scale ends, the hover tag
+);
+function pwr_txt(x, y, str, al) local(w, h) (
+  gfx_measurestr(str, w, h);
+  gfx_x = al < 0 ? x : al > 0 ? x - w : x - w * 0.5;  gfx_y = y - h * 0.5;  gfx_drawstr(str);
+);
+// a cream selector key with its amber LED: the house ck_key (gfx-lab-ui), drawn here in pixels - square corners,
+// every pixel shaded once (no rounded overlaps, no doubled corners). Selected = raised cream, lit LED top left;
+// not selected = greyed and slightly depressed, LED dark.
+function pwr_key(x, y, w, h, s, on, lbl, fnt) local(k, b, dn, tw, th) (
+  k = min(h / 21, w / 40);  b = 1.1 * k;  dn = on ? 0 : 1.1 * k;
+  on ? ( pwr_rgb(0x000000, 0.4);  gfx_rect(x + 0.75 * k, y + 1.5 * k, w, h, 1); );
+  pwr_rgb(0x16140F, 1);  gfx_rect(x, y, w, h, 1);
+  pwr_rgb(on ? 0xEDE5CF : 0xBDB6A6, 1);  gfx_rect(x + b, y + b + dn, w - 2 * b, h - 2 * b - dn, 1);
+  on ? (
+    pwr_rgb(0xFFFFFF, 0.55);  gfx_rect(x + b, y + b, w - 2 * b, max(1, 0.75 * k), 1);
+    pwr_rgb(0x000000, 0.18);  gfx_rect(x + b, y + h - b - 1.5 * k, w - 2 * b, 1.5 * k, 1);
+  ) : (
+    pwr_rgb(0x000000, 0.3);  gfx_rect(x + b, y + b + dn, w - 2 * b, max(1, 1.1 * k), 1);
+  );
+  on ? (
+    pwr_rgb(0xFFB030, 0.35);  gfx_circle(x + 5.25 * k, y + 4.5 * k, 3.75 * k, 1, 1);
+    pwr_rgb(0xFFB030, 1);     gfx_circle(x + 5.25 * k, y + 4.5 * k, 1.95 * k, 1, 1);
+    pwr_rgb(0xFFFFFF, 0.6);   gfx_circle(x + 4.7 * k, y + 4 * k, 0.7 * k, 1, 1);
+  ) : ( pwr_rgb(0x6B5A3C, 1);  gfx_circle(x + 5.25 * k, y + 4.5 * k + dn, 1.95 * k, 1, 1); );
+  gfx_setfont(fnt);  pwr_rgb(on ? 0x2A2620 : 0x57524A, 1);  pwr_txt(x + w * 0.5, y + h * 0.5 + dn * 0.5 + 0.75 * k, lbl, 0);
+);
+
+// a filled triangle with anti-aliased edges
+function pwr_tri(x1, y1, x2, y2, x3, y3) (
+  gfx_triangle(x1, y1, x2, y2, x3, y3);
+  gfx_line(x1, y1, x2, y2, 1);  gfx_line(x2, y2, x3, y3, 1);  gfx_line(x3, y3, x1, y1, 1);
+);
+// FAR: a snow-capped mountain (cx = centre, by = base line), about 30 x 22 design px
+function pwr_mountain(cx, by, s) (
+  pwr_rgb(0x4A90C8, 1);  gfx_rect(cx - 21 * s, by - 1 * s, 44 * s, max(1, 2 * s), 1);   // a blue horizon at its base (JG)
+  pwr_rgb(0x6E7A86, 1);  pwr_tri(cx + 2 * s, by, cx + 17 * s, by, cx + 9 * s, by - 13 * s);        // the peak behind
+  pwr_rgb(0x8C98A4, 1);  pwr_tri(cx - 15 * s, by, cx + 11 * s, by, cx - 2 * s, by - 21 * s);
+  pwr_rgb(0xF4F7FA, 1);  pwr_tri(cx - 6 * s, by - 14 * s, cx + 2.4 * s, by - 14 * s, cx - 2 * s, by - 21 * s);   // snow
+  pwr_tri(cx - 6 * s, by - 14 * s, cx - 3.5 * s, by - 12 * s, cx - 1.5 * s, by - 14 * s);
+  pwr_tri(cx - 1.5 * s, by - 14 * s, cx + 0.8 * s, by - 11.5 * s, cx + 2.4 * s, by - 14 * s);
+  pwr_rgb(0xF4F7FA, 1);  pwr_tri(cx + 6.6 * s, by - 9.5 * s, cx + 11.4 * s, by - 9.5 * s, cx + 9 * s, by - 13 * s);
+);
+// NEAR: the website's slatted sunset (JG): a half sun on the blue horizon in bands - yellow at the top, then red,
+// magenta and blue towards the horizon - with dark slats opening up near the horizon. Drawn a pixel row at a time,
+// its edges anti-aliased, so it's smooth at every size.
+function pwr_sun(cx, by, s) local(r, y0, y, h, w, f, c, e) (
+  r = 14 * s;  y0 = by - 1 * s;                                                              // y0: the horizon's top
+  y = floor(y0 - r);
+  while (y < y0) (
+    h = (y0 - (y + 0.5)) / r;                                                                // 0 at the horizon .. 1 at the top
+    f = h * 16;                                                                              // the site's 16 rows
+    ((f > 2.4 && f < 3.4) || (f > 5.4 && f < 6.2) || (f > 8.6 && f < 9.2)) ? 0 : (           // the slats
+      c = f > 10 ? 0xF0DC4A : f > 6 ? 0xEE5A3E : f > 3 ? 0xD256C8 : 0x3D5BD8;
+      w = sqrt(max(0, sqr(r) - sqr(y0 - (y + 0.5))));
+      pwr_rgb(c, 1);  gfx_rect(floor(cx - w) + 1, y, floor(cx + w) - floor(cx - w) - 1, 1, 1);
+      e = (cx - w) - floor(cx - w);                                                          // anti-aliased ends
+      pwr_rgb(c, 1 - e);  gfx_rect(floor(cx - w), y, 1, 1, 1);
+      pwr_rgb(c, (cx + w) - floor(cx + w));  gfx_rect(floor(cx + w), y, 1, 1, 1);
+    );
+    y += 1;
+  );
+  pwr_rgb(0x4A90C8, 1);  gfx_rect(cx - 21 * s, by - 1 * s, 44 * s, max(1, 2 * s), 1);         // the blue horizon
+);
+
+function pwr_panel(x, y, s, fnt, clk, wheel) local(i, kx, ky, kw, r, t, a, sa, ca, hov, now, x0, y0, x1, y1, dx, dy, lc, wm)
+(
+  pwr_fonts(fnt, s);
+  // MAINS: OFF / UK / US
+  gfx_setfont(fnt);  pwr_rgb(0xF2F2EE, 1);  pwr_txt(x, y + 16 * s, "MAINS", -1);
+  i = 0;
+  loop(3,
+    kx = x + (110 + i * 82) * s;  kw = 70 * s;
+    pwr_key(kx, y + 2 * s, kw, 28 * s, s, floor(pwr_mode_d + 0.5) == i, i == 0 ? "OFF" : i == 1 ? "UK" : "US", fnt);
+    clk && mouse_x >= kx && mouse_x < kx + kw && mouse_y >= y + 2 * s && mouse_y < y + 30 * s ? pwr_mode_d = i;
+    i += 1;
+  );
+  // EQUATOR PROXIMITY: FAR .. NEAR (a dark cap in a light metal ring, white line pointer)
+  kx = x + 104 * s;  ky = y + 86 * s;  r = 22 * s;
+  hov = sqr(mouse_x - kx) + sqr(mouse_y - ky) <= sqr(r * 1.3);
+  t = min(max(pwr_prox_d, 0), 1);
+  clk && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || now - pwr_lclk < 0.35 ? ( pwr_prox_d = 1;  pwr_drg = 0; ) : ( pwr_drg = 1;  pwr_dy0 = mouse_y; );
+    pwr_lclk = now;
+  );
+  pwr_drg && (mouse_cap & 1) ? (                            // 200 px for full travel, Shift = fine (1000 px), 3 px dead zone
+    dy = pwr_dy0 - mouse_y;
+    pwr_dmv || abs(dy) > 3 ? (
+      pwr_dmv ? ( t = min(max(t + dy / (((mouse_cap & 8) ? 1000 : 200) * s), 0), 1);  pwr_prox_d = t; );
+      pwr_dmv = 1;  pwr_dy0 = mouse_y;
+    );
+  ) : ( pwr_drg = 0;  pwr_dmv = 0; );
+  hov && wheel != 0 ? ( t = min(max(t + wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.03), 0), 1);  pwr_prox_d = t; );
+  i = 0;  loop(4, pwr_rgb(0, 0.13);  gfx_circle(kx + (2 + i * 1.2) * s, ky + (3 + i * 1.5) * s, r + 3 * s + i * 0.6 * s, 1, 1);  i += 1; );
+  pwr_rgb(0xC9C6BE, 1);  gfx_circle(kx, ky, r + 3 * s, 1, 1);
+  pwr_rgb(0x8E8B84, 1);  gfx_circle(kx, ky, r + 3 * s, 0, 1);
+  pwr_rgb(0x24272B, 1);  gfx_circle(kx, ky, r - 1 * s, 1, 1);
+  i = 0;  loop(6, pwr_rgb(0, 0.14 * (1 - i / 6));  gfx_circle(kx, ky, r - 1 * s - i, 0, 1);  i += 1; );
+  // the dot scale: 11 dots round 270 deg
+  i = 0;  loop(11, a = (-0.75 + 1.5 * i / 10) * $pi;  pwr_rgb(0xD8D6D0, 1);  gfx_circle(kx + sin(a) * (r + 8 * s), ky - cos(a) * (r + 8 * s), 1.4 * s, 1, 1);  i += 1; );
+  a = (-0.75 + 1.5 * t) * $pi;  sa = sin(a);  ca = cos(a);
+  x0 = kx + sa * r * 0.2;  y0 = ky - ca * r * 0.2;  x1 = kx + sa * (r - 3 * s);  y1 = ky - ca * (r - 3 * s);
+  dx = ca * 1.4 * s;  dy = sa * 1.4 * s;
+  pwr_rgb(0xF4F2EC, 1);
+  gfx_triangle(x0 + dx, y0 + dy, x1 + dx, y1 + dy, x1 - dx, y1 - dy, x0 - dx, y0 - dy);
+  gfx_line(x0 + dx, y0 + dy, x1 + dx, y1 + dy, 1);  gfx_line(x0 - dx, y0 - dy, x1 - dx, y1 - dy, 1);
+  gfx_setfont(fnt + 1);  pwr_rgb(0xBDBAB2, 1);
+  pwr_txt(kx - r - 10 * s, ky + r + 14 * s, "FAR", 0);  pwr_txt(kx + r + 12 * s, ky + r + 14 * s, "NEAR", 0);
+  pwr_mountain(kx - r - 54 * s, ky + 8 * s, s);  pwr_sun(kx + r + 48 * s, ky + 8 * s, s);       // JG: a cold peak, a warm sun
+  gfx_setfont(fnt);  pwr_rgb(0xF2F2EE, 1);
+  (hov || pwr_drg) ? (
+    pwr_prox_d >= 0.999 ? strcpy(#pwr_tag, "always warm") : sprintf(#pwr_tag, "warms in about %.0f min", (60 + 240 * (1 - pwr_prox_d)) / 60);
+    pwr_txt(kx, ky + r + 36 * s, #pwr_tag, 0);
+  ) : pwr_txt(kx, ky + r + 36 * s, "EQUATOR PROXIMITY", 0);
+  // the warmth lamp: a cream ring, its amber centre glowing as the unit heats
+  lc = min(max(pwr_c_d, 0), 1);  kx = x + 300 * s;
+  lc > 0.05 ? ( i = 0;  loop(4, pwr_rgb(0xFFA030, 0.08 * lc);  gfx_circle(kx, ky, (13 + i * 3) * s, 1, 1);  i += 1; ); );
+  pwr_rgb(0x141312, 1);  gfx_circle(kx, ky, 12 * s, 1, 1);
+  pwr_rgb(0xEFE6CF, 1);  gfx_circle(kx, ky, 11 * s, 1, 1);
+  pwr_rgb(pwr_mixc(0x4A3A28, 0xFFB030, lc), 1);  gfx_circle(kx, ky, 7.5 * s, 1, 1);
+  pwr_rgb(0xFFF4D8, 0.25 + 0.6 * lc);  gfx_circle(kx - 2 * s, ky - 2 * s, 2 * s, 1, 1);
+  gfx_setfont(fnt);  pwr_rgb(0xF2F2EE, 1);  pwr_txt(kx, ky + r + 36 * s, "WARMTH", 0);
+);

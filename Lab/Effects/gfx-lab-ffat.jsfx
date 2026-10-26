@@ -2,7 +2,7 @@ desc: GFX Lab Ffat [multi-fx]
 //tags: multi-fx drive filter flanger compressor bass enhancer
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-lab-output, gfx-lab-clip, gfx-lab-lfo, gfx-lab-os (.jsfx-inc) in the same folder.
+// Requires gfx-lab-power, gfx-lab-output, gfx-lab-clip, gfx-lab-lfo, gfx-lab-os (.jsfx-inc) in the same folder.
 //
 // (The name: "ff" is fortissimo - very loud.)
 // Ffat - a fat multi-effect: drive, two filters, a band filter, the magic EQ, a flanger, a compressor and a squash,
@@ -42,6 +42,9 @@ desc: GFX Lab Ffat [multi-fx]
 // ENV       envelope follower on the input (stereo-linked, -60..0 dB -> 0..1); SPEED slows attack + release
 // FFAT      one-knob squash after everything: threshold, ratio and make-up rise together; soft 6 dB knee
 // OUTPUT    gain, DRY/WET, then the house output stage, CLIP always on (-0.3 dBFS).
+// MAINS / EQUATOR PROXIMITY (in the ? pop-up, gfx-lab-power): OFF / UK / US mains hum, supply sag and ripple, and
+//           valve warm-up / cooling. Default OFF + NEAR = the unit's own sound, bit for bit. The hum and sag go in before
+//           the drive, the warm-up's gain and tone after FFAT. BYPASS switches the heater off (the unit cools).
 // BYPASS    (top bar) crossfades (15 ms) to the dry input, delayed by the latency so it stays in time.
 // Switching a drive type, a filter type, ROUTE or ORDER dips the output for ~3 ms (no clicks); the OS key dips 5 ms.
 // Latency: 0 samples at 1x, 31 at 2x, 37 at 4x (reported).
@@ -53,6 +56,7 @@ in_pin:right input
 out_pin:left output
 out_pin:right output
 
+import gfx-lab-power.jsfx-inc
 import gfx-lab-output.jsfx-inc
 import gfx-lab-clip.jsfx-inc
 import gfx-lab-lfo.jsfx-inc
@@ -111,6 +115,7 @@ ext_noinit = 1;
 gfx_ext_retina = 1;
 !ui_dflt ? ( ui_sz = 0;  pr_cur = 1; );  ui_dflt = 1;        // pr_cur: the preset shown on the LCD
 ost_init(0);
+pwr_init();                                                     // mains + warm-up (the gfx-lab-power defaults: a valve box)
 
 // ---------- memory map ----------
 CF = 0;          // filter coefficient sets, 8 each: F1 L, F1 R, F2 L, F2 R (a1 a2 a3 k b1 b2 b3)
@@ -302,6 +307,7 @@ rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) ? (
   memset(FLA, 0, 16384);  memset(DLB, 0, 128);
 );
 rs_last = rs_now;
+pwr_block(!byp);                                                // mains + warm-up: BYPASS switches the heater off
 // GUI edits arrive as a flag; targets are rebuilt here, on the audio thread
 prm_dirty ? ( prm_dirty = 0;  update_targets(); );
 os_tf = os_f2n(os_sel);                                          // OS: the factor asked for (os_gate swaps it in)
@@ -403,6 +409,7 @@ cc <= 0 ? (
 );
 
 xl = inL;  xr = inR;
+pwr_in(xl, xr);  xl = pwr_l;  xr = pwr_r;                         // mains hum + sag, warm-up drive (OFF + NEAR: untouched)
 or_a == 0 ? ( drive_os(xl, xr);  xl = drv_l;  xr = drv_r; );
 xl = flt(xl, SB, 0);  xr = flt(xr, SB + 8, 1);
 or_a == 1 ? ( drive_os(xl, xr);  xl = drv_l;  xr = drv_r; );
@@ -482,6 +489,7 @@ c_on ? (
   xl *= cgn;  xr *= cgn;
 ) : ( grs = 0; );
 
+pwr_out(xl, xr);  xl = pwr_l;  xr = pwr_r;                        // the warm-up's gain and tone, ripple
 xl *= out_s * sw_f * os_g;  xr *= out_s * sw_f * os_g;
 xl = dry_l + (xl - dry_l) * wet_s;  xr = dry_r + (xr - dry_r) * wet_s;
 ost_out(xl, xr);  xl = ost_l;  xr = ost_r;                     // house clipper, -0.3 dBFS ceiling
@@ -500,6 +508,7 @@ rs_f < 1 ? (                                                   // resume fade (s
 @serialize
 file_var(0, pr_cur);
 file_avail(0) != 0 ? file_var(0, ui_sz);
+pwr_ser();
 
 @gfx 1080 704
 // =====================================================================
@@ -888,6 +897,9 @@ g_want = ui_sz == 1 ? 0.85 : ui_sz == 2 ? 1.3 : 1;
 sc = g_ret * max(min(g_want, min(gfx_w / (1080 * g_ret), gfx_h / (704 * g_ret))), 0.5);
 ox = (gfx_w - 1080 * sc) * 0.5;  oy = (gfx_h - 704 * sc) * 0.5;
 lmb = mouse_cap & 1;  click = lmb && !last_lmb;  kcap = 0;
+// while the ? pop-up is open, it takes the clicks and the wheel (the panel under it doesn't)
+h_click = sz_help ? click : 0;  h_wheel = sz_help ? mouse_wheel : 0;
+sz_help ? ( click = 0;  mouse_wheel = 0; );
 drag_idx < 0 && !lmb ? drag_idx = 0;
 gfx_setfont(1, "Trebuchet MS", ps(32), 'b');
 gfx_setfont(2, "Trebuchet MS", ps(14), 'b');
@@ -1090,20 +1102,24 @@ loop(4,
   );
   g_j += 1;
 );
-sz_help && click && !sz_new ? sz_help = 0;
+// the card: credits, website, manual, then MAINS / EQUATOR PROXIMITY; a click outside it closes it
+strcpy(#hl3, "Manual - https://www.gardenfx.uk/manual/");  strcat(#hl3, #ui_man);  strcat(#hl3, ".pdf");
+gfx_setfont(5);  gfx_measurestr(#hl3, g_tw, g_th);
+g_cw = max(g_tw + ps(40), ps(440));  g_ch = ps(320);  g_cx = (gfx_w - g_cw) * 0.5;  g_cy = (gfx_h - g_ch) * 0.5;
+sz_help && h_click && !sz_new && (mouse_x < g_cx || mouse_x >= g_cx + g_cw || mouse_y < g_cy || mouse_y >= g_cy + g_ch) ? ( sz_help = 0;  h_click = 0; );
+sz_new ? h_click = 0;
 sz_new = 0;
 sz_help ? (
   col(0x000000, 0.62);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
-  strcpy(#hl3, "Manual - https://www.gardenfx.uk/manual/");  strcat(#hl3, #ui_man);  strcat(#hl3, ".pdf");
-  gfx_setfont(5);  gfx_measurestr(#hl3, g_tw, g_th);
-  g_cw = max(g_tw + ps(40), ps(380));  g_ch = ps(130);  g_cx = (gfx_w - g_cw) * 0.5;  g_cy = (gfx_h - g_ch) * 0.5;
   col(0x000000, 0.5);  ui_rrs(g_cx + ps(3), g_cy + ps(5), g_cw, g_ch, ps(8));
   col(0x1C1D20, 1);    ui_rrs(g_cx, g_cy, g_cw, g_ch, ps(8));
   col(C_ACC1, 1);      gfx_rect(g_cx + ps(20), g_cy + ps(36), g_cw - ps(40), max(1, ps(1)), 1);
   gfx_setfont(6);  col(0xF2F2EE, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(14);  gfx_drawstr("Design by JGWizrad.  © John Garden 2026");
   gfx_setfont(5);  col(0xE8B23A, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(50);  gfx_drawstr("https://www.gardenfx.uk/");
   col(0xD8D6D0, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(72);  gfx_drawstr(#hl3);
-  col(0x85837E, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(102);  gfx_drawstr("Click anywhere to close.");
+  col(0x3A3C42, 1);    gfx_rect(g_cx + ps(20), g_cy + ps(100), g_cw - ps(40), max(1, ps(1)), 1);
+  pwr_panel(g_cx + ps(30), g_cy + ps(118), sc, 13, h_click, h_wheel);
+  gfx_setfont(5);  col(0x85837E, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(292);  gfx_drawstr("Click outside to close.");
 );
 !lmb ? ( drag_idx = 0;  drag_sh = 0; );
 mouse_wheel = 0;
