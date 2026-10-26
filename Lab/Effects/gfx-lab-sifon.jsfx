@@ -27,13 +27,15 @@ desc:GFX Lab Sifon [bus compressor]
 //   2nd): weight and glue that grow with level. Only the harmonics the saturation makes are added (the lows keep
 //   their level), so quiet signal passes untouched.
 // COLOUR LOW / HIGH (either, both or neither): a parallel HEAD saturation (the tape curve of HeadSmoother) on each
-//   band, driven harder as TEXTURE rises (0 - +18 dB), only its harmonics added. HIGH: the band above ~3 kHz (widening
-//   down to ~1 kHz as TEXTURE rises), mostly 2nd harmonic (sheen, air, upper-mid edge). LOW: the band below ~300 Hz.
-//   Each band also shapes the tone: HIGH a first-order shelf from 4.7 kHz (up to +3.1 dB); above 50 % TEXTURE a broad
-//   dip at 3 kHz (to -2 dB) and a shelf above 15 kHz (to +3 dB). LOW a lift below 300 Hz (up to +1.25 dB at 50 %); above
-//   50 % a shelf below 120 Hz (to +4 dB), a narrow dip at 220 Hz deepening with it (to -3 dB) and a 30 Hz subsonic
-//   filter fading in. Only harmonics are added by the saturation, so a
-//   band never loses level. Switching crossfades (30 ms). TEXTURE (0 - 100 %) drives IRON and COLOUR together.
+//   band, driven harder by its own TEXTURE dial (0 - +18 dB), only its harmonics added. HIGH: the band above ~3 kHz
+//   (widening down to ~1 kHz as its TEXTURE rises), mostly 2nd harmonic (sheen, air, upper-mid edge). LOW: the band
+//   below ~300 Hz. Each band also shelves the whole mix: HIGH a first-order shelf from 4.7 kHz (up to +3.1 dB) and,
+//   above 50 % TEXTURE, a shelf above 15 kHz (to +3 dB); LOW a lift below 300 Hz (up to +1.25 dB at 50 %) and, above
+//   50 %, a shelf below 120 Hz (peak about +3 dB) with a 30 Hz subsonic filter fading in.
+//   DIP 220 (with LOW on) / DIP 3K (with HIGH on): a fixed dip on that band's saturation (-9 dB at 220 Hz, narrow /
+//   -6 dB at 3 kHz, broad) and a dynamic dip on the clean signal that cuts only while the region stands out from the
+//   whole mix (half the excess, up to 6 dB, 5 ms / 120 ms). Off = no dips anywhere.
+//   Switching crossfades (30 ms). IRON follows LOW's TEXTURE.
 //   LOW WIDTH / HIGH WIDTH (0 - 200 %, 100 = as made): where each band's added harmonics sit - 0 = centre only,
 //   200 = sides only (only the added harmonics move, so no phase issues).
 //   SOLO: hear only the band being worked on (LOW's and / or HIGH's, or IRON's when COLOUR is off), crossfaded.
@@ -78,7 +80,7 @@ slider16:lim_in=0<0,1,1{Out,In}>-Limiter
 slider17:trim_db=0<-24,12,0.1>-Input trim (dB)
 slider18:guard=0<0,1,1{Off,On}>-Guard
 slider19:colour=0<0,3,1{Off,High,Low,Both}>-Colour
-slider20:texture=30<0,100,1>-Texture (%)
+slider20:texture=30<0,100,1>-Low texture (%)
 slider21:os_sl=1<0,2,1{1x,2x,4x}>-Oversampling
 slider22:width_pc=100<0,200,1>-Width (%)
 slider23:depth_pc=0<-100,100,1>-Depth (%)
@@ -88,6 +90,9 @@ slider26:lo_wid=100<0,200,1>-Low colour width (%)
 slider27:hi_wid=100<0,200,1>-High colour width (%)
 slider28:byp=0<0,1,1{Off,On}>-Bypass
 slider29:rmsdet=0<0,1,1{Peak,RMS}>-Detector level
+slider31:dip22=0<0,1,1{Off,On}>-Dip 220 Hz
+slider32:dip3=0<0,1,1{Off,On}>-Dip 3 kHz
+slider33:tex_hi=30<0,100,1>-High texture (%)
 
 in_pin:left input
 in_pin:right input
@@ -182,14 +187,15 @@ function tp_peak(ch, x) local(h, b, p, m, y, a, c, e, d, q, pv) (
 
 // TPT one-pole: low-pass output (G = g / (1 + g) for the running rate)
 function op_lp(x, gg) instance(s) local(v, y) ( v = (x - s) * gg; y = v + s; s = y + v; y; );
-// RBJ biquads at 1x (the COLOUR tone): 0 high-pass, 1 peak, 2 low shelf, 3 high shelf
+// RBJ biquads at the rate bq_fs (the COLOUR tone): 0 high-pass, 1 peak, 2 low shelf, 3 high shelf
 function bq_set(t, f, q, gdb) instance(b0, b1, b2, a1, a2) local(w, cw, al, a, sa, n) (
-  w = 2 * $pi * min(f, 0.45 * srate) / srate; cw = cos(w); al = sin(w) / (2 * q); a = 10 ^ (gdb / 40);
+  w = 2 * $pi * min(f, 0.45 * bq_fs) / bq_fs; cw = cos(w); al = sin(w) / (2 * q); a = 10 ^ (gdb / 40);
   t == 0 ? ( n = 1 + al; b0 = (1 + cw) / 2 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n; ) :
   t == 1 ? ( n = 1 + al / a; b0 = (1 + al * a) / n; b1 = -2 * cw / n; b2 = (1 - al * a) / n; a1 = b1; a2 = (1 - al / a) / n; ) :
   t == 2 ? ( sa = 2 * sqrt(a) * al; n = (a + 1) + (a - 1) * cw + sa;
     b0 = a * ((a + 1) - (a - 1) * cw + sa) / n; b1 = 2 * a * ((a - 1) - (a + 1) * cw) / n; b2 = a * ((a + 1) - (a - 1) * cw - sa) / n;
     a1 = -2 * ((a - 1) + (a + 1) * cw) / n; a2 = ((a + 1) + (a - 1) * cw - sa) / n; ) :
+  t == 4 ? ( n = 1 + al; b0 = al / n; b1 = 0; b2 = -b0; a1 = -2 * cw / n; a2 = (1 - al) / n; ) :
   ( sa = 2 * sqrt(a) * al; n = (a + 1) - (a - 1) * cw + sa;
     b0 = a * ((a + 1) + (a - 1) * cw + sa) / n; b1 = -2 * a * ((a - 1) + (a + 1) * cw) / n; b2 = a * ((a + 1) + (a - 1) * cw - sa) / n;
     a1 = 2 * ((a - 1) - (a + 1) * cw) / n; a2 = ((a + 1) - (a - 1) * cw - sa) / n; );
@@ -212,33 +218,63 @@ function hfund(h, x) instance(cxy, cxx) (
 function th(v) local(e) ( e = exp(2 * max(min(v, 20), -20)); (e - 1) / (e + 1); );
 function hsat(x, g, b, tb, c) ( (th(g * x + b) - tb) * c; );
 function hs_coefs() local(g) (
-  g_hs = db2g(18 * tex_s);                                 // TEXTURE drives it from 0 to +18 dB
-  tb_hi = th(0.3); c_hi = 0.25 / (th(g_hs * 0.125 + 0.3) - th(0.3 - g_hs * 0.125));
-  tb_lo = th(0.4); c_lo = 0.25 / (th(g_hs * 0.125 + 0.4) - th(0.4 - g_hs * 0.125));
-  // the tone moves above 50 % TEXTURE: HIGH a broad dip at 3 kHz and a shelf above 15 kHz; LOW a shelf below 120 Hz
-  // with a narrow dip at 220 Hz that deepens with it (the subsonic filter at 30 Hz fades in with t2)
-  t2 = max(0, 2 * tex_s - 1); tex_q = tex_s;
-  eqL.h1.bq_set(1, 3000, 0.6, -2 * t2); eqL.h2.bq_set(3, 15000, 0.707, 3 * t2);
-  eqL.l1.bq_set(2, 120, 0.707, 4 * t2); eqL.l2.bq_set(1, 220, 2.5, -3 * t2);
-  eqR.h1.bq_set(1, 3000, 0.6, -2 * t2); eqR.h2.bq_set(3, 15000, 0.707, 3 * t2);
-  eqR.l1.bq_set(2, 120, 0.707, 4 * t2); eqR.l2.bq_set(1, 220, 2.5, -3 * t2);
+  g_hl = db2g(18 * tex_s); g_hh = db2g(18 * txh_s);       // each band's TEXTURE drives it from 0 to +18 dB
+  tb_hi = th(0.3); c_hi = 0.25 / (th(g_hh * 0.125 + 0.3) - th(0.3 - g_hh * 0.125));
+  tb_lo = th(0.4); c_lo = 0.25 / (th(g_hl * 0.125 + 0.4) - th(0.4 - g_hl * 0.125));
+  // the tone moves above 50 % TEXTURE. On the whole mix (1x): HIGH a shelf above 15 kHz, LOW a shelf below 120 Hz (the
+  // subsonic filter at 30 Hz fades in with t2). On the parallel saturation only (oversampled): HIGH's harmonics dip
+  // broadly at 3 kHz, LOW's narrowly at 220 Hz, deepening with the shelves
+  t2 = max(0, 2 * tex_s - 1); t2h = max(0, 2 * txh_s - 1); tex_q = tex_s; txh_q = txh_s;
+  bq_fs = srate;
+  eqL.h2.bq_set(3, 15000, 0.707, 3 * t2h); eqL.l1.bq_set(2, 120, 0.707, 2.3 * t2);
+  eqR.h2.bq_set(3, 15000, 0.707, 3 * t2h); eqR.l1.bq_set(2, 120, 0.707, 2.3 * t2);
+  // the saturation's dips follow the DIP keys
+  gd3_q = -6 * d3_s; gd22_q = -9 * d22_s;
+  bq_fs = srate * os_f;
+  chL.hd.bq_set(1, 3000, 0.6, gd3_q); chL.ld.bq_set(1, 220, 2.5, gd22_q);
+  chR.hd.bq_set(1, 3000, 0.6, gd3_q); chR.ld.bq_set(1, 220, 2.5, gd22_q);
 );
-function hs_tone(x) instance(h1, h2, l1, l2, l3) local(y) (
-  y = x + w_red * (this.h2.bq_run(this.h1.bq_run(x)) - x);
+// the DIP keys' dynamic EQ on the clean signal (DIP 220 with LOW on, DIP 3K with HIGH on): a dip at 220 Hz (narrow) and at 3 kHz (broad) that cuts only while that
+// region stands out from the whole mix (more than a balanced, pink-like spectrum would put there), half the excess,
+// up to 6 dB. Detection on the mid (linked); the filters' gains are reworked every 16 samples and glide in between.
+function dyn_init() (
+  bq_fs = srate; dd_a.bq_set(4, 220, 2.5, 0); dd_b.bq_set(4, 3000, 0.6, 0);
+  c_dpw = coef(0.02); c_dat = coef(0.005); c_drl = coef(0.12);
+);
+function dyn_run(m) local(p22, p3) (
+  p22 = dd_a.bq_run(m); p3 = dd_b.bq_run(m);
+  dp_f += (m * m - dp_f) * c_dpw; dp_a += (p22 * p22 - dp_a) * c_dpw; dp_b += (p3 * p3 - dp_b) * c_dpw;
+  (dd_n += 1) >= 16 ? (
+    dd_n = 0;
+    dp_f > 0.0000000001 ? (
+      dx_a = min(6, max(0, 0.5 * (10 * log10(dp_a / dp_f + 0.000000000001) + 10)));
+      dx_b = min(6, max(0, 0.5 * (10 * log10(dp_b / dp_f + 0.000000000001) + 9)));
+    ) : ( dx_a = dx_b = 0; );
+    dx_a *= d22_s * w_blue; dx_b *= d3_s * w_red;     // each only with its band (LOW / HIGH) on
+    dg_a += (dx_a - dg_a) * (dx_a > dg_a ? 16 * c_dat : 16 * c_drl);
+    dg_b += (dx_b - dg_b) * (dx_b > dg_b ? 16 * c_dat : 16 * c_drl);
+    bq_fs = srate;
+    dqL.a.bq_set(1, 220, 2.5, -dg_a); dqR.a.bq_set(1, 220, 2.5, -dg_a);
+    dqL.b.bq_set(1, 3000, 0.6, -dg_b); dqR.b.bq_set(1, 3000, 0.6, -dg_b);
+    dyn_disp = max(dg_a, dg_b);
+  );
+);
+function hs_tone(x) instance(h2, l1, l3) local(y) (
+  y = x + w_red * (this.h2.bq_run(x) - x);
   y += t2 * (this.l3.bq_run(y) - y) * w_blue;
-  y + w_blue * (this.l2.bq_run(this.l1.bq_run(y)) - y);
+  y + w_blue * (this.l1.bq_run(y) - y);
 );
 // IRON + COLOUR on one oversampled sample (per-channel filter states in the instance)
-function colour_run(u) instance(ip, rp, bp, ep, hc, lc, ic, sp) local(lo, hi, bl, di, dr, dd, y, band, ev, eb) (
+function colour_run(u) instance(ip, rp, bp, ep, hc, lc, ic, sp, hd, ld) local(lo, hi, bl, di, dr, dd, y, band, ev, eb) (
   lo = this.ip.op_lp(u, cg_iron);                         // iron band, below ~150 Hz
   hi = u - this.rp.op_lp(u, cg_red);                       // HIGH band, above 3 kHz - 1 kHz (TEXTURE)
   bl = this.bp.op_lp(u, cg_blue);                          // LOW band, below ~300 Hz
   di = this.ic.hfund(sdiff(lo, k_iron, 0.12, sd_i) + lo, lo);   // the iron's harmonics, the lows' level kept
   // LOW / HIGH: a parallel HEAD saturation driven harder with TEXTURE, only its harmonics added (the bands keep
   // their level); HIGH's high-passed so the top gains sheen instead of losing its peaks
-  dd = a_lo * this.lc.hfund(hsat(bl, g_hs, 0.4, tb_lo, c_lo), bl);
-  ev = this.hc.hfund(hsat(hi, g_hs, 0.3, tb_hi, c_hi), hi);
-  dr = a_hi * (ev - this.ep.op_lp(ev, cg_red));
+  dd = a_lo * this.ld.bq_run(this.lc.hfund(hsat(bl, g_hl, 0.4, tb_lo, c_lo), bl));
+  ev = this.hc.hfund(hsat(hi, g_hh, 0.3, tb_hi, c_hi), hi);
+  dr = a_hi * this.hd.bq_run(ev - this.ep.op_lp(ev, cg_red));
   // the LOW / HIGH harmonics are handed to cw_add() (their own widths); the dry and IRON stay here
   this.dlo = w_blue * dd; this.dhi = w_red * dr;
   // + each band's lift: HIGH a first-order shelf from 4.7 kHz (+3.1 dB at 100 %), LOW a shelf below 300 Hz
@@ -256,7 +292,7 @@ function cw_add() local(m, d) (
 );
 function colour_coefs(f) local(g) (
   g = tan($pi * 150 / (srate * f)); cg_iron = g / (1 + g);
-  g = tan($pi * 3000 * 2 ^ (-1.6 * tex_s) / (srate * f)); cg_red = g / (1 + g); tex_r = tex_s;
+  g = tan($pi * 3000 * 2 ^ (-1.6 * txh_s) / (srate * f)); cg_red = g / (1 + g); tex_r = txh_s;
   g = tan($pi * 300 / (srate * f)); cg_blue = g / (1 + g);
   cg_cr = 1 - exp(-1 / (0.03 * srate * f));
   g = tan($pi * 4730 / (srate * f)); cg_sh = g / (1 + g);
@@ -302,9 +338,9 @@ function clear_lim() (
 in_init();
 sd_e = sat3d(0.4); sd_i = sat3d(0.12); sd_r = sat3d(0.05); sd_b = sat3d(0.35);
 hs_ah = 1; hs_al = 1;                                    // the HIGH / LOW harmonics' amounts
-eqL.l3.bq_set(0, 30, 0.707, 0); eqR.l3.bq_set(0, 30, 0.707, 0); hs_coefs();
+bq_fs = srate; eqL.l3.bq_set(0, 30, 0.707, 0); eqR.l3.bq_set(0, 30, 0.707, 0);
 os_design();
-os_f = os_tf = os_f2n(os_sl);
+os_f = os_tf = os_f2n(os_sl); d22_s = dip22; d3_s = dip3; tex_s = texture * 0.01; txh_s = tex_hi * 0.01; hs_coefs(); dyn_init();
 colour_coefs(os_f);
 tp_design();
 set_rate();
@@ -324,7 +360,8 @@ thr_s = thr_db; rat_s = 2; mk_s = db2g(mkup_db); bl_s = blend_pc / 100;
 top_s = topo; lk_s = lnk; cin_s = comp_in; lin_s = lim_in; ceil_s = db2g(lim_ceil);
 sc_gw = sc_tw; sc_h = 1 / (1 + sc_gw * (sc_gw + 1.4142135623730951));
 lr_s = 0.06;
-w_red = colour & 1; w_blue = (colour & 2) > 0; tex_s = texture * 0.01;
+w_red = colour & 1; w_blue = (colour & 2) > 0; tex_s = texture * 0.01; txh_s = tex_hi * 0.01;
+d22_s = dip22; d3_s = dip3; dg_a = dg_b = 0;
 lw_s = lo_wid * 0.01; hw_s = hi_wid * 0.01;
 wid_s = width_pc * 0.01; dep_s = depth_pc * 0.01; shp_s = sidehpf > 0;
 sh_gw = sh_tw = tan($pi * 80 / srate); sh_h = 1 / (1 + sh_gw * (sh_gw + 1.4142135623730951));
@@ -334,20 +371,21 @@ sh_gw = sh_tw = tan($pi * 80 / srate); sh_h = 1 / (1 + sh_gw * (sh_gw + 1.414213
 function load_preset(p) local(i) (
   thr_db = -18; ratio_i = 1; att_ms = 10; rel_ms = 300; rel_auto = 0; mkup_db = 0; blend_pc = 100; topo = 0; rmsdet = 0;
   schpf = 0; msmode = 0; lnk = 1; comp_in = 1; lim_ceil = -1; lim_rel = 0; brick = 0; lim_in = 0;
-  colour = 0; texture = 30; lo_wid = 100; hi_wid = 100; width_pc = 100; depth_pc = 0; sidehpf = 0;
+  colour = 0; texture = 30; dip22 = 0; dip3 = 0; lo_wid = 100; hi_wid = 100; width_pc = 100; depth_pc = 0; sidehpf = 0;
   p == 2 ? ( thr_db = -24; ratio_i = 0; att_ms = 30; rel_auto = 1; mkup_db = 2; topo = 1; schpf = 2; ) :
   p == 3 ? ( thr_db = -20; ratio_i = 0; att_ms = 30; rel_ms = 600; mkup_db = 1.5; schpf = 1; lim_in = 1; brick = 1; texture = 20; ) :
-  p == 4 ? ( thr_db = -30; ratio_i = 3; att_ms = 3; rel_ms = 120; mkup_db = 6; blend_pc = 50; colour = 1; texture = 60; ) :
+  p == 4 ? ( thr_db = -30; ratio_i = 3; att_ms = 3; rel_ms = 120; mkup_db = 6; blend_pc = 50; colour = 1; texture = 60; dip3 = 1; ) :
   p == 5 ? ( msmode = 1; lnk = 0; thr_db = -22; att_ms = 15; rel_auto = 1; mkup_db = 2; sidehpf = 2; width_pc = 110; ) :
-  p == 6 ? ( thr_db = -22; att_ms = 20; rel_auto = 1; mkup_db = 2; colour = 2; texture = 45; lim_in = 1; brick = 1; ) :
+  p == 6 ? ( thr_db = -22; att_ms = 20; rel_auto = 1; mkup_db = 2; colour = 2; texture = 45; dip22 = 1; lim_in = 1; brick = 1; ) :
   p == 7 ? ( thr_db = -24; ratio_i = 0; att_ms = 30; rel_auto = 1; mkup_db = 1.5; colour = 1; texture = 50; depth_pc = 30; ) :
   p == 8 ? ( thr_db = -20; ratio_i = 0; rel_auto = 1; mkup_db = 1; width_pc = 130; depth_pc = 40; sidehpf = 2; ) :
-  p == 9 ? ( topo = 1; thr_db = -26; ratio_i = 2; att_ms = 8; rel_ms = 200; mkup_db = 4; colour = 1; texture = 25; ) :
+  p == 9 ? ( topo = 1; thr_db = -26; ratio_i = 2; att_ms = 8; rel_ms = 200; mkup_db = 4; colour = 1; texture = 25; dip3 = 1; ) :
   p == 10 ? ( thr_db = -26; ratio_i = 3; att_ms = 10; rel_auto = 1; mkup_db = 5; lim_in = 1; brick = 1; lim_ceil = -0.3;
-              colour = 2; texture = 40; schpf = 2; ) :
+              colour = 2; texture = 40; dip22 = 1; schpf = 2; ) :
   p == 11 ? ( thr_db = -40; ratio_i = 5; att_ms = 1; rel_ms = 80; mkup_db = 12; blend_pc = 35; );
+  tex_hi = texture;                                        // both bands' TEXTURE from the preset's one value
   i = 1; loop(27, i != 17 && i != 18 && i != 21 && i != 25 ? ui_auto(i); i += 1; );
-  ui_auto(29);
+  ui_auto(29); ui_auto(31); ui_auto(32); ui_auto(33);
   pr_cur = p;
 );
 
@@ -382,6 +420,7 @@ rs_req ? (
   chL.ip.s = chL.rp.s = chL.bp.s = chL.ep.s = chR.ip.s = chR.rp.s = chR.bp.s = chR.ep.s = 0;
   chL.hc.cxy = chL.hc.cxx = chL.lc.cxy = chL.lc.cxx = chR.hc.cxy = chR.hc.cxx = chR.lc.cxy = chR.lc.cxx = 0;
   chL.ic.cxy = chL.ic.cxx = chR.ic.cxy = chR.ic.cxx = 0; chL.sp.s = chR.sp.s = 0;
+  chL.hd.z1 = chL.hd.z2 = chL.ld.z1 = chL.ld.z2 = chR.hd.z1 = chR.hd.z2 = chR.ld.z1 = chR.ld.z2 = 0;
   memset(DLINE, 0, 2048); memset(DRY, 0, 2048);   // the limiter keeps its gain: the best guess for now
   memset(XCH, 0, 62 * 1024);
 );
@@ -417,23 +456,28 @@ so_s += (csolo - so_s) * c_sw;
 lw_s += (lo_wid * 0.01 - lw_s) * c_kn; hw_s += (hi_wid * 0.01 - hw_s) * c_kn;
 lwm_g = min(1, 2 - lw_s); lws_g = min(1, lw_s); hwm_g = min(1, 2 - hw_s); hws_g = min(1, hw_s);
 w_red += ((colour & 1) - w_red) * c_kn; w_blue += (((colour & 2) > 0) - w_blue) * c_kn;
-tex_s += (texture * 0.01 - tex_s) * c_kn;
+tex_s += (texture * 0.01 - tex_s) * c_kn; txh_s += (tex_hi * 0.01 - txh_s) * c_kn;
 // HIGH widens as it is pushed: its band starts at 3 kHz at TEXTURE 0 and comes down to 1 kHz at 100 %
-abs(tex_s - tex_r) > 0.0005 ? ( tex_r = tex_s; tx_g = tan($pi * 3000 * 2 ^ (-1.6 * tex_s) / (srate * os_f)); cg_red = tx_g / (1 + tx_g); );
-k_iron = db2g(-17 + 27 * tex_s); k_col = db2g(-4 + 10 * tex_s); k_red = db2g(10 * tex_s);   // drive into the iron and the COLOUR bands
+abs(txh_s - tex_r) > 0.0005 ? ( tex_r = txh_s; tx_g = tan($pi * 3000 * 2 ^ (-1.6 * txh_s) / (srate * os_f)); cg_red = tx_g / (1 + tx_g); );
+k_iron = db2g(-17 + 27 * tex_s);                           // the drive into the iron (LOW's TEXTURE)
 a_hi = hs_ah; a_lo = hs_al;                                  // the COLOUR harmonics' amounts
-sh_hi = db2g(3.1 * tex_s) - 1; sh_lo = db2g(2.5 * min(tex_s, 0.5)) - 1;   // each band lifts: HIGH up to +3.1 dB, LOW +1.25 dB
-abs(tex_s - tex_q) > 0.002 || (tex_s != tex_q && tex_s == texture * 0.01) ? hs_coefs();
+sh_hi = db2g(3.1 * txh_s) - 1; sh_lo = db2g(2.5 * min(tex_s, 0.5)) - 1;   // each band lifts: HIGH up to +3.1 dB, LOW +1.25 dB
+d22_s += (dip22 - d22_s) * c_sw; d3_s += (dip3 - d3_s) * c_sw;
+abs(d22_s - dip22) < 0.0001 ? d22_s = dip22; abs(d3_s - dip3) < 0.0001 ? d3_s = dip3;
+abs(tex_s - tex_q) > 0.002 || (tex_s != tex_q && tex_s == texture * 0.01) ||
+  abs(txh_s - txh_q) > 0.002 || (txh_s != txh_q && txh_s == tex_hi * 0.01) ||
+  abs(-6 * d3_s - gd3_q) > 0.03 || abs(-9 * d22_s - gd22_q) > 0.03 ? hs_coefs();
 wid_s += (width_pc * 0.01 - wid_s) * c_kn; dep_s += (depth_pc * 0.01 - dep_s) * c_kn;
 shp_s += ((sidehpf > 0) - shp_s) * c_sw;
 sh_gw += (sh_tw - sh_gw) * c_kn; sh_h = 1 / (1 + sh_gw * (sh_gw + 1.4142135623730951));
 os_gate();
 os_chg ? (
-  colour_coefs(os_f);
+  colour_coefs(os_f); hs_coefs();
   ul.os_clr(); ur.os_clr(); dl_.os_clr(); dr_.os_clr();
   chL.ip.s = chL.rp.s = chL.bp.s = chL.ep.s = chR.ip.s = chR.rp.s = chR.bp.s = chR.ep.s = 0;
   chL.hc.cxy = chL.hc.cxx = chL.lc.cxy = chL.lc.cxx = chR.hc.cxy = chR.hc.cxx = chR.lc.cxy = chR.lc.cxx = 0;
   chL.ic.cxy = chL.ic.cxx = chR.ic.cxy = chR.ic.cxx = 0; chL.sp.s = chR.sp.s = 0;
+  chL.hd.z1 = chL.hd.z2 = chL.ld.z1 = chL.ld.z2 = chR.hd.z1 = chR.hd.z2 = chR.ld.z1 = chR.ld.z2 = 0;
   os_hold += 2 * samplesblock;                // stay silent while REAPER takes up the new latency
 );
 
@@ -512,6 +556,10 @@ os_f == 1 ? (
 dcv = cl - dcx_l + dc_c * dcy_l; dcx_l = cl; dcy_l = dcv; cl = dcv;
 dcv = cr - dcx_r + dc_c * dcy_r; dcx_r = cr; dcy_r = dcv; cr = dcv;
 cl = eqL.hs_tone(cl); cr = eqR.hs_tone(cr);                // the COLOUR tone above 50 % TEXTURE
+d22_s * w_blue + d3_s * w_red > 0.0001 ? (                // the DIP keys' dynamic dips on the clean signal
+  dyn_run(0.5 * (cl + cr));
+  cl = dqL.b.bq_run(dqL.a.bq_run(cl)); cr = dqR.b.bq_run(dqR.a.bq_run(cr));
+) : ( dg_a = dg_b = 0; dqL.a.z1 = dqL.a.z2 = dqL.b.z1 = dqL.b.z2 = dqR.a.z1 = dqR.a.z2 = dqR.b.z1 = dqR.b.z2 = 0; dd_n = 16; );
 
 // ---------- stereo field ----------
 sm = 0.5 * (cl + cr); ss = 0.5 * (cl - cr);
@@ -679,6 +727,47 @@ function bx_zero(cx, cy, r, n) local(a) (
 function bx_key(x, y, w, h, idx, col, s) (
   lk_key(x, y, w, h, slider(idx) >= 0.5, col, s) ? ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
 );
+// a horizontal slider (TEXTURE): a recessed track, the value in light blue, a cream fader cap. Drag the cap or the
+// track (the track's length = full travel; Shift = fine), wheel 3 %, double-click resets. The label shows the
+// value while touched.
+function bx_hs(x, y, w, idx, lo, hi, def, lbl, fmt) local(v, n, hov, act, cx, tw, th) (
+  v = slider(idx); n = (v - lo) / (hi - lo);
+  hov = bx_in(x - 8, y - 14, w + 16, 28);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - lastclick_t < 0.35 && lastclick_id == idx ? (
+      slider(idx) = def; ui_auto(idx); drag_id = -1; lastclick_t = 0;
+    ) : (
+      drag_id = idx; drag_x = mouse_x; drag_n = n; lastclick_t = time_precise(); lastclick_id = idx;
+    );
+  );
+  drag_id == idx ? (
+    drag_n = min(max(drag_n + (mouse_x - drag_x) / (w * sc * ((mouse_cap & 8) ? 5 : 1)), 0), 1); drag_x = mouse_x;
+    v = floor(lo + drag_n * (hi - lo) + 0.5); slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    v = min(max(v + sign(mouse_wheel) * max(1, (mouse_cap & 8) ? 1 : 3), lo), hi); slider(idx) = v; ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = (v - lo) / (hi - lo); act = hov || drag_id == idx;
+  ui_col(0x0E0F11); bx_rr(x - 1, y - 4, w + 2, 8, 3);
+  ui_col(0x17191C); bx_rr(x, y - 3, w, 6, 2);
+  ui_col(BLITE); bx_rr(x + 1, y - 2, max(1, (w - 2) * n), 4, 2);
+  cx = x + w * n;
+  bx_shadow(cx - 8, y - 13, 16, 26, 3);
+  ui_col(0x16171A); bx_rr(cx - 8, y - 13, 16, 26, 3);
+  ui_col(act ? 0xFFF8E6 : INK); bx_rr(cx - 7, y - 12, 14, 24, 2);
+  ui_cola(0x000000, 0.14); bx_r(cx + 5, y - 11, 2, 22); bx_r(cx - 6, y + 10, 12, 2);
+  ui_col(0x1A1A1A); bx_r(cx - 0.75, y - 9, 1.5, 18);
+  gfx_setfont(2); ui_col(INK);
+  act ? sprintf(#bx_hv, fmt, v) : strcpy(#bx_hv, lbl);
+  bx_tc(x + w * 0.5, y - 30, #bx_hv);
+);
+// one TEXTURE label centred under the pair of TEXTURE dials (hidden while either shows its value)
+function bx_tex(cy, r) local(t) (
+  t = drag_id == 20 || drag_id == 33 ||
+      (mouse_x - 539 * sc) ^ 2 + (mouse_y - cy * sc) ^ 2 <= ((r + 6) * sc) ^ 2 ||
+      (mouse_x - 617 * sc) ^ 2 + (mouse_y - cy * sc) ^ 2 <= ((r + 6) * sc) ^ 2;
+  !t ? ( gfx_setfont(2); ui_col(INK); bx_tc(578, cy + r + 9, "TEXTURE"); );
+);
 // a GR bar: 20 segments of 1 dB, from the left
 function bx_gr(x, y, w, h, gr, col) local(i, c, lit) (
   ui_col(0x0A0A0B); bx_r(x - 2, y - 2, w + 4, h + 4);
@@ -719,12 +808,12 @@ bx_head(16, 472, "COMPRESSOR"); bx_head(488, 180, "COLOUR"); bx_head(668, 196, "
 bx_div(488); bx_div(668); bx_div(864);
 
 // COMPRESSOR
-bx_kn(76, 178, 30, 1, -40, 0, -18, 0, BDEEP, "THRESHOLD", "%.1f dB");
-bx_zero(76, 178, 30, 22 / 40);                        // 0 VU (-18 dBFS)
-bx_kn(168, 178, 20, 3, 0.1, 75, 10, 1, BDEEP, "ATTACK", "%.1f ms");
-bx_kn(248, 178, 20, 4, 50, 2500, 300, 1, BDEEP, "RELEASE", "%.0f ms");
-bx_kn(328, 178, 20, 6, 0, 20, 0, 0, BDEEP, "MAKE-UP", "+%.1f dB");
-bx_kn(408, 178, 20, 7, 0, 100, 100, 0, BDEEP, "BLEND", "%.0f %%");
+bx_kn(66, 178, 30, 1, -40, 0, -18, 0, BDEEP, "THRESHOLD", "%.1f dB");
+bx_zero(66, 178, 30, 22 / 40);                        // 0 VU (-18 dBFS)
+bx_kn(160, 178, 20, 3, 0.1, 75, 10, 1, BDEEP, "ATTACK", "%.1f ms");
+bx_kn(253, 178, 20, 4, 50, 2500, 300, 1, BDEEP, "RELEASE", "%.0f ms");
+bx_kn(346, 178, 20, 6, 0, 20, 0, 0, 0xC9A227, "MAKE-UP", "+%.1f dB");
+bx_kn(438, 178, 20, 7, 0, 100, 100, 0, BDEEP, "BLEND", "%.0f %%");
 bx_v = bx_box(36, 264, 96, 30, "RATIO", "1.5 : 1|2 : 1|3 : 1|4 : 1|6 : 1|8 : 1", ratio_i);
 bx_v >= 0 ? ( ratio_i = bx_v; ui_auto(2); );
 bx_v = bx_box(148, 264, 96, 30, "SC HPF", "OFF|60 Hz|100 Hz|150 Hz|250 Hz", schpf);
@@ -736,11 +825,19 @@ bx_key(384, 308, 84, 32, 10, LK_BLU_LT, "M/S");
 bx_key(148, 308, 96, 32, 29, LK_BLU_LT, "RMS");
 
 // COLOUR (IRON is always on)
-lk_key(584, 130, 66, 34, colour & 1, LK_RED, "HIGH") ? ( colour = colour ~ 1; ui_auto(19); );
-lk_key(506, 130, 66, 34, (colour & 2) > 0, LK_BLU_LT, "LOW") ? ( colour = colour ~ 2; ui_auto(19); );
-bx_kn(578, 206, 26, 20, 0, 100, 30, 0, BLITE, "TEXTURE", "%.0f %%");
-bx_wkn(539, 296, 14, 26);
-bx_wkn(617, 296, 14, 27);
+// a TEXTURE dial per band (LOW left, HIGH right), the two DIP keys under them
+lk_key(584, 128, 66, 32, colour & 1, LK_RED, "HIGH") ? ( colour = colour ~ 1; ui_auto(19); );
+lk_key(506, 128, 66, 32, (colour & 2) > 0, LK_BLU_LT, "LOW") ? ( colour = colour ~ 2; ui_auto(19); );
+bx_kn(539, 200, 16, 20, 0, 100, 30, 0, BLITE, "", "%.0f %%");
+bx_kn(617, 200, 16, 33, 0, 100, 30, 0, BLITE, "", "%.0f %%");
+bx_tex(200, 16);
+// each DIP key works on its own band: dimmed (and inert) while that band is off
+cs_font = 14; cs_inert = !(colour & 2); cs_key(507, 246, 64, 28, dip22 && (colour & 2), LK_GRN, "DIP 220", 0) ? ( dip22 = !dip22; ui_auto(31); );
+!(colour & 2) ? ( ui_cola(PL, 0.5); bx_r(501, 240, 76, 40); );
+cs_inert = !(colour & 1); cs_key(585, 246, 64, 28, dip3 && (colour & 1), LK_AMB, "DIP 3K", 0) ? ( dip3 = !dip3; ui_auto(32); );
+!(colour & 1) ? ( ui_cola(PL, 0.5); bx_r(579, 240, 76, 40); );
+bx_wkn(539, 312, 14, 26);
+bx_wkn(617, 312, 14, 27);
 bx_key(596, 86, 60, 22, 25, LK_YEL, "SOLO");
 
 // STEREO FIELD
