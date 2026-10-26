@@ -1,0 +1,637 @@
+desc:GFX Fathom [loudness meter]
+//tags: meter loudness lufs true peak mastering analysis utility
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-ui and gfx-panel (.jsfx-inc) in the same folder.
+//
+// Fathom. A loudness meter in the spirit of the broadcast loudness meters, measuring to the international loudness
+// standard (ITU-R BS.1770 with the EBU R128 gating and loudness range). Named after the sailor's measure of depth: it
+// shows how full the master is. The loudness readings are taken before the limiter.
+//
+// SIGNAL FLOW
+//   input -> GAIN (-18 .. +18 dB, glided) -> TRUE-PEAK LIMITER (LIMIT key) -> out.
+//   The loudness readings show the programme after GAIN (they are measured at the input and moved by GAIN, so a GAIN
+//   change - or MATCH - shows at once, without measuring again); TRUE PEAK reads what leaves the unit.
+// MATCH: sets GAIN so that INTEGRATED lands on the TARGET (glided 30 ms), and clears TRUE PEAK (the peaks have moved).
+// LIMIT (red key, off when it loads): a true-peak brickwall at TP MAX - 1.5 ms look-ahead, the peaks between the
+//   samples found 8x, the gain down before a peak arrives, released over 150 ms. No make-up gain: it only
+//   catches peaks, it never makes the programme louder. GR shows its gain reduction. Off = no latency, audio untouched.
+// MEASUREMENT: K-weighting (the standard's two filters: a +4 dB shelf above ~1.7 kHz and a high-pass at
+//   ~38 Hz), the mean square of L + R, in 100 ms steps.
+//   MOMENTARY  the last 400 ms.     SHORT-TERM  the last 3 s (the standard), or 10 / 30 / 60 s (the WINDOW menu; until
+//              that much has played it shows the 3 s reading). LRA and the history always use 3 s.
+//   INTEGRATED the whole programme since RESET, gated as the standard says: blocks under -70 LUFS are ignored, then
+//              blocks more than 10 LU under the average of the rest.
+//   LRA        the loudness range: the spread of the short-term readings (10th to 95th percentile) after a -70 LUFS
+//              and a -20 LU relative gate (EBU Tech 3342).
+//   TRUE PEAK  the highest peak between the samples too (8x interpolated), L and R, since RESET (dBTP).
+//   PLR        true peak minus integrated loudness (how much peak headroom the loudness leaves).
+//   INTEGRATED, LRA and TRUE PEAK only gather while the transport plays; MOMENTARY and SHORT-TERM always run.
+//   RESET ON PLAY (key): clears them each time the transport starts.
+// HPF / LPF (menus): filters on what the meter hears only (the audio is untouched) - to check just the lows or the
+//   vocal range. The readings are then no longer the standard's: INTEGRATED says FILTERED. A new filter starts the
+//   readings again.
+// TARGET (the preset bar holds the delivery targets; the TARGET and TP MAX knobs fine-tune them): INTEGRATED is
+//   printed green within 1 LU of the target, blue under it, red over it; TRUE PEAK turns red above TP MAX.
+// HISTORY: the short-term loudness of the last 3 minutes, with the target as a dashed line (red above it).
+// RESET clears INTEGRATED, LRA, TRUE PEAK and the history. BYPASS (top bar) crossfades to the input (15 ms), kept in time
+//   with the latency. After REAPER's own bypass the unit clears its stale delay and fades back in from the input.
+// No drift (a measuring tool). Latency: none; with LIMIT lit 1.5 ms + 12 samples (84 at 48 kHz), reported. Switching
+//   LIMIT dips the sound for 5 ms, swaps at the silent point and comes back once the new latency has come through.
+//   Stereo pins are declared, so on a multichannel track REAPER routes channels 3 and up round Fathom and keeps them
+//   in time (as for a 2-in / 2-out VST); the plug-in's own delay for them (XCH) only acts if the pins are widened.
+// GUI: drag a knob (SHIFT = fine), wheel, double-click = default; values show while a knob is touched. Click the LCD
+//   (or PRESETS) for the target list. S / M / L / ? = size and help.
+
+slider1:gain_db=0<-18,18,0.1>-Gain (dB)
+slider2:tgt_lufs=-14<-36,-6,0.1>-Target (LUFS)
+slider3:tp_max=-1<-25,0,0.1>-True peak max (dBTP)
+slider4:byp=0<0,1,1{Off,On}>-Bypass
+slider5:lim_on=0<0,1,1{Off,On}>-True-peak limiter
+slider6:m_hpf=0<0,7,1{Off,40 Hz,80 Hz,120 Hz,250 Hz,500 Hz,1 kHz,2 kHz}>-Measure HPF
+slider7:m_lpf=0<0,5,1{Off,2 kHz,4 kHz,8 kHz,12 kHz,18 kHz}>-Measure LPF
+slider8:st_win=0<0,3,1{3 s,10 s,30 s,60 s}>-Short-term window
+slider9:auto_rst=0<0,1,1{Off,On}>-Reset on play
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+
+@init
+#ui_man = "gfx-fathom";
+ext_noinit = 1;
+
+SUBR = 0;                                     // the 100 ms sub-block energies (ring of 1024)
+HIC = 10000; HIE = 12000;                     // integrated: counts and energy sums per 0.05 LU bin (-70 .. +10 LUFS)
+HSC = 14000; HSE = 16000;                     // loudness range: the same for the short-term readings
+HBIN = 1600; BINW = 0.05;
+HIST = 30000; HLEN = 4096;                    // the short-term history (one reading per 100 ms; the panel reads it)
+TPK = 40000;                                  // true-peak interpolator taps: 7 phases x 24
+TPH = 40200;                                  // true-peak histories: limiter L / R, meter L / R (64 each)
+DLINE = 41000;                                // limiter audio delay, L / R (1024 each)
+GHIST = 43100;                                // look-ahead gain history for the moving average
+DQV = 44200; DQI = 45300;                     // sliding-minimum queue (values, times)
+DRY = 46400;                                  // the input delayed by the latency, L / R (1024 each): bypass and resume
+RMASK = 1023;
+XCH = 50000;                                  // channels 3 - 64 (1024 each): delayed by the latency too
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function coef(t) ( 1 - exp(-1 / (max(t, 0.00001) * srate)); );
+function e2l(e) ( e > 0.0000000000001 ? -0.691 + 10 * log10(e) : -200; );
+
+// K-weighting (ITU-R BS.1770): the shelf and the high-pass, designed for the running sample rate
+function kw_design() local(k, vh, vb, q, a0) (
+  k = tan($pi * 1681.974450955533 / srate); q = 0.7071752369554196;
+  vh = 10 ^ (3.999843853973347 / 20); vb = vh ^ 0.4996667741545416;
+  a0 = 1 + k / q + k * k;
+  s1b0 = (vh + vb * k / q + k * k) / a0; s1b1 = 2 * (k * k - vh) / a0; s1b2 = (vh - vb * k / q + k * k) / a0;
+  s1a1 = 2 * (k * k - 1) / a0; s1a2 = (1 - k / q + k * k) / a0;
+  k = tan($pi * 38.13547087602444 / srate); q = 0.5003270373238773;
+  a0 = 1 + k / q + k * k;
+  s2a1 = 2 * (k * k - 1) / a0; s2a2 = (1 - k / q + k * k) / a0;
+);
+// the measuring filters (HPF / LPF, 12 dB/oct Butterworth): they shape only what the meter hears
+function mf_design() local(f, k, n) (
+  f = m_hpf == 1 ? 40 : m_hpf == 2 ? 80 : m_hpf == 3 ? 120 : m_hpf == 4 ? 250 : m_hpf == 5 ? 500 : m_hpf == 6 ? 1000 : 2000;
+  k = tan($pi * f / srate); n = 1 / (1 + k * 1.4142135623730951 + k * k);
+  hb0 = n; hb1 = -2 * n; ha1 = 2 * (k * k - 1) * n; ha2 = (1 - k * 1.4142135623730951 + k * k) * n;
+  f = m_lpf == 1 ? 2000 : m_lpf == 2 ? 4000 : m_lpf == 3 ? 8000 : m_lpf == 4 ? 12000 : 18000;
+  f = min(f, 0.45 * srate);
+  k = tan($pi * f / srate); n = 1 / (1 + k * 1.4142135623730951 + k * k);
+  lb0 = k * k * n; lb1 = 2 * lb0; la1 = 2 * (k * k - 1) * n; la2 = (1 - k * 1.4142135623730951 + k * k) * n;
+  mf_h = m_hpf; mf_l = m_lpf;
+);
+function mf_run(x) instance(z1, z2, w1, w2) local(y) (
+  mf_h ? ( y = hb0 * x + z1; z1 = hb1 * x - ha1 * y + z2; z2 = hb0 * x - ha2 * y; x = y; );
+  mf_l ? ( y = lb0 * x + w1; w1 = lb1 * x - la1 * y + w2; w2 = lb0 * x - la2 * y; x = y; );
+  x;
+);
+// one channel through both stages (direct form II transposed)
+function kw_run(x) instance(z1, z2, w1, w2) local(y, u) (
+  y = s1b0 * x + z1; z1 = s1b1 * x - s1a1 * y + z2; z2 = s1b2 * x - s1a2 * y;
+  u = y + w1; w1 = -2 * y - s2a1 * u + w2; w2 = y - s2a2 * u;
+  u;
+);
+
+// true-peak interpolator: 24-tap Kaiser-windowed sinc (beta 6) at the seven 8x points between taps 11 and 12.
+// (Sifon's 16-tap Blackman read up to 0.2 dB low on hard-limited programme; this one is within 0.03 dB, high side.)
+function bessel_i0(x) local(s, t, k) (
+  s = t = 1; k = 1;
+  loop(30, t *= (x * 0.5 / k) * (x * 0.5 / k); s += t; k += 1; );
+  s;
+);
+function tp_design() local(p, k, t, w, x, s, i0b) (
+  i0b = bessel_i0(6);
+  p = 0;
+  loop(7,
+    s = 0; k = 0;
+    loop(24,
+      t = (k - 11) - (p + 1) * 0.125;
+      x = t / 12.5; w = abs(x) < 1 ? bessel_i0(6 * sqrt(1 - x * x)) / i0b : 0;
+      TPK[p * 24 + k] = (abs(t) < 0.000001 ? 1 : sin($pi * t) / ($pi * t)) * w;
+      s += TPK[p * 24 + k]; k += 1;
+    );
+    k = 0; loop(24, TPK[p * 24 + k] /= s; k += 1; );
+    p += 1;
+  );
+);
+// one new sample into channel ch's history (TPH + ch * 64, kept twice so the 24 taps read straight through)
+// -> the largest of samples n-12, n-11 and the seven 8x points between them
+function tp_peak(ch, x) local(h, b, p, m, y) (
+  h = TPH + ch * 64 + (tp_w % 24);
+  h[0] = x; h[24] = x;
+  h = TPH + ch * 64 + ((tp_w + 1) % 24);      // oldest of the 24
+  m = max(abs(h[11]), abs(h[12])); p = 0;
+  loop(7,
+    b = TPK + p * 24;
+    y = b[0] * h[0] + b[1] * h[1] + b[2] * h[2] + b[3] * h[3] + b[4] * h[4] + b[5] * h[5]
+      + b[6] * h[6] + b[7] * h[7] + b[8] * h[8] + b[9] * h[9] + b[10] * h[10] + b[11] * h[11]
+      + b[12] * h[12] + b[13] * h[13] + b[14] * h[14] + b[15] * h[15] + b[16] * h[16] + b[17] * h[17]
+      + b[18] * h[18] + b[19] * h[19] + b[20] * h[20] + b[21] * h[21] + b[22] * h[22] + b[23] * h[23];
+    m = max(m, abs(y)); p += 1;
+  );
+  m;
+);
+
+// clear the limiter's state (delay, gain history, detector)
+function clear_lim() local(k) (
+  memset(DLINE, 0, 2048); memset(GHIST, 0, 1024);
+  dq_h = dq_t = 0; g_rl = 1; wp = 0; tn = 0;
+  memset(TPH, 0, 128);
+  k = 0; loop(1024, GHIST[k] = 1; k += 1; ); g_sum = la_n;
+);
+
+// bin of a loudness value (0.05 LU bins from -70 LUFS)
+function lbin(l) ( max(0, min(HBIN - 1, floor((l + 70) / BINW))); );
+
+// clear everything that gathers (INTEGRATED, LRA, TRUE PEAK, history)
+function meter_reset() (
+  memset(HIC, 0, HBIN); memset(HIE, 0, HBIN); memset(HSC, 0, HBIN); memset(HSE, 0, HBIN);
+  memset(HIST, 0, HLEN);
+  ab_n = ab_e = 0; sb_n = sb_e = 0;
+  ib_hi = sb_hi = 0;                          // the highest bin used so far (the sums never need to look above it)
+  run_n = 0; i_val = lra_val = -200; tpl = tpr = 0;
+  hw = 0; hn = 0;
+  i_disp = -200; lra_disp = 0; lra_ok_disp = 0; tpl_disp = tpr_disp = 0; hn_disp = 0; hw_disp = 0;
+);
+
+// a 400 ms block has finished: the integrated loudness (absolute then relative gate)
+function gate_i(e) local(l, b, n, s, t) (
+  l = e2l(e);
+  l > -70 ? (
+    b = lbin(l); HIC[b] += 1; HIE[b] += e; ab_n += 1; ab_e += e; ib_hi = max(ib_hi, b);
+    t = e2l(ab_e / ab_n) - 10;
+    b = t < -70 ? 0 : lbin(t);
+    n = s = 0;
+    loop(ib_hi + 1 - b, n += HIC[b]; s += HIE[b]; b += 1; );
+    i_val = n > 0 ? e2l(s / n) : -200;
+  );
+);
+// a short-term (3 s) reading: the loudness range
+function gate_s(e) local(l, b, n, t, c, lo, hi, k) (
+  l = e2l(e);
+  l > -70 ? (
+    b = lbin(l); HSC[b] += 1; HSE[b] += e; sb_n += 1; sb_e += e; sb_hi = max(sb_hi, b);
+    t = e2l(sb_e / sb_n) - 20;
+    b = t < -70 ? 0 : lbin(t); k = b;
+    n = 0; loop(sb_hi + 1 - b, n += HSC[b]; b += 1; );
+    n > 1 ? (
+      // the 10th and 95th percentiles of the readings above the gate (bin centres)
+      c = 0; b = k; lo = hi = -1;
+      while (b <= sb_hi && hi < 0) (
+        c += HSC[b];
+        lo < 0 && c >= 0.1 * n ? lo = b;
+        c >= 0.95 * n ? hi = b;
+        b += 1;
+      );
+      lra_val = (hi - lo) * BINW;
+    ) : lra_val = 0;
+  );
+);
+
+kw_design();
+mf_design();
+tp_design();
+sub_len = floor(0.1 * srate + 0.5);
+c_kn = coef(0.03); c_sw = coef(0.015);
+memset(SUBR, 0, 1024); sub_i = 0; sub_acc = 0; sub_cnt = 0; sub_tot = 0;
+kl.z1 = kl.z2 = kl.w1 = kl.w2 = kr.z1 = kr.z2 = kr.w1 = kr.w2 = 0;
+memset(TPH, 0, 256); tp_w = 0;
+la_n = ceil(0.0015 * srate); la_w = la_n + 1; la_d = la_n + 12;   // the detector looks 12 samples back
+c_lrel = coef(0.15); dip_c = 1 / (0.005 * srate);
+clear_lim();
+meter_reset();
+m_disp = s_disp = -200;
+g_s = db2g(gain_db); by_s = byp;
+lim_eng = lim_on; pdc_delay = lim_eng ? la_d : 0; pdc_bot_ch = 0; pdc_top_ch = 2;
+dip_g = 1; dip_hold = 0; rs_f = 1; rs_c = 1 / (0.015 * srate); dw = 0; memset(DRY, 0, 2048);
+ceil_s = db2g(tp_max);
+
+// ---------- presets: the delivery targets (loudness, true-peak maximum) ----------
+#pl_pmn = "Streaming -14|Broadcast Europe -23|Broadcast US -24|Podcast -16|Film dialogue -27|Loud master -9";
+function load_preset(p) (
+  p == 1 ? ( tgt_lufs = -14; tp_max = -1; ) :
+  p == 2 ? ( tgt_lufs = -23; tp_max = -1; ) :
+  p == 3 ? ( tgt_lufs = -24; tp_max = -2; ) :
+  p == 4 ? ( tgt_lufs = -16; tp_max = -1; ) :
+  p == 5 ? ( tgt_lufs = -27; tp_max = -2; ) :
+  p == 6 ? ( tgt_lufs = -9; tp_max = -1; );
+  ui_auto(2); ui_auto(3);
+  pr_cur = p;
+);
+
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@block
+// RESET from the panel (the audio thread does the clearing)
+rst_dirty ? ( rst_dirty = 0; meter_reset(); );
+// a new measuring filter: the readings so far no longer belong together, so start again
+(m_hpf != mf_h || m_lpf != mf_l) ? (
+  mf_design(); ml.z1 = ml.z2 = ml.w1 = ml.w2 = mr.z1 = mr.z2 = mr.w1 = mr.w2 = 0;
+  memset(SUBR, 0, 1024); sub_tot = 0; meter_reset();
+);
+// RESET ON PLAY: a fresh start each time the transport starts
+auto_rst && (play_state & 1) && !playing ? meter_reset();
+st_n = st_win == 1 ? 100 : st_win == 2 ? 300 : st_win == 3 ? 600 : 30;
+tpr_dirty ? ( tpr_dirty = 0; tpl = tpr = 0; tpl_disp = tpr_disp = 0; );
+playing = play_state & 1;
+g_t = db2g(gain_db); ceil_t = db2g(tp_max);
+// resume after REAPER's bypass (or any gap in processing): clear the stale delay and fade in from the input
+rs_now = time_precise();
+rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) ? rs_req = 1;
+rs_last = rs_now;
+// the track's other channels (3 and up, e.g. stems on a multichannel bus) pass through untouched but delayed by
+// the same latency, so everything on the track stays in time
+xn = min(num_ch, 64) - 2;
+pdc_bot_ch = 0; pdc_top_ch = 2 + max(xn, 0);
+
+@sample
+rs_req ? (
+  rs_req = 0; rs_f = 0; rs_x = pdc_delay > 0 ? 0 : 1; rs_wait = pdc_delay;
+  memset(DLINE, 0, 2048); memset(DRY, 0, 2048);           // the limiter keeps its gain: the best guess for now
+  memset(XCH, 0, 62 * 1024);
+);
+rw_l = spl0; rw_r = spl1;
+// LIMIT in / out changes the latency: dip, swap at the silent point, wait for REAPER to take up the new latency
+lim_on != lim_eng ? (
+  dip_g = max(dip_g - dip_c, 0);
+  dip_g == 0 ? (
+    lim_eng = lim_on; clear_lim();
+    pdc_delay = lim_eng ? la_d : 0;
+    dip_hold = pdc_delay + 8 + 2 * samplesblock;
+  );
+) : dip_hold > 0 ? dip_hold -= 1 : dip_g < 1 ? dip_g = min(dip_g + dip_c, 1);
+g_s += (g_t - g_s) * c_kn;
+ceil_s += (ceil_t - ceil_s) * c_kn;
+xl = spl0 * g_s; xr = spl1 * g_s;
+
+// ---------- measurement (at the input; the panel adds GAIN) ----------
+kl_ = kl.kw_run(ml.mf_run(rw_l)); kr_ = kr.kw_run(mr.mf_run(rw_r));
+sub_acc += kl_ * kl_ + kr_ * kr_;
+sub_cnt += 1;
+sub_cnt >= sub_len ? (
+  SUBR[sub_i & 1023] = sub_acc / sub_len; sub_i += 1; sub_tot += 1;
+  sub_acc = 0; sub_cnt = 0;
+  e4 = (SUBR[(sub_i - 1) & 1023] + SUBR[(sub_i - 2) & 1023] + SUBR[(sub_i - 3) & 1023] + SUBR[(sub_i - 4) & 1023]) * 0.25;
+  e30 = 0; k_ = 1; loop(30, e30 += SUBR[(sub_i - k_) & 1023]; k_ += 1; );
+  eln = e30; loop(st_n - 30, eln += SUBR[(sub_i - k_) & 1023]; k_ += 1; );   // the SHORT-TERM window chosen
+  e30 /= 30; eln /= st_n;
+  m_disp = sub_tot >= 4 ? e2l(e4) : -200;
+  s_disp = sub_tot >= min(st_n, 30) ? e2l(sub_tot >= st_n ? eln : e30) : -200;
+  playing ? (
+    run_n += 1;
+    run_n >= 4 ? gate_i(e4);
+    run_n >= 30 ? (
+      gate_s(e30);
+      HIST[hw] = e2l(e30); hw = (hw + 1) & (HLEN - 1); hn = min(hn + 1, HLEN);
+    );
+    i_disp = i_val; lra_disp = lra_val; lra_ok_disp = sb_n > 1;
+    hw_disp = hw; hn_disp = hn;
+  );
+);
+
+// ---------- true-peak limiter ----------
+lim_eng ? (
+  // the true peak of the incoming pair, as a gain the next la_w samples must not exceed
+  pk = max(tp_peak(0, xl), tp_peak(1, xr));
+  gq = pk > ceil_s * 0.994 ? ceil_s * 0.994 / pk : 1;           // 0.05 dB in hand
+  while (dq_t > dq_h && DQV[(dq_t - 1) & RMASK] >= gq) ( dq_t -= 1; );
+  DQV[dq_t & RMASK] = gq; DQI[dq_t & RMASK] = tn; dq_t += 1;
+  while (DQI[dq_h & RMASK] <= tn - la_w) ( dq_h += 1; );
+  gmin = DQV[dq_h & RMASK];
+  // release (never above the minimum), then a moving average over la_n samples: the gain is down before the peak
+  g_rl = gmin < g_rl ? gmin : g_rl + (gmin - g_rl) * c_lrel;
+  g_sum += g_rl - GHIST[(wp - la_n) & RMASK]; GHIST[wp & RMASK] = g_rl;
+  lg = min(g_sum / la_n, 1);
+  DLINE[wp & RMASK] = xl; DLINE[1024 + (wp & RMASK)] = xr;
+  ol = DLINE[(wp - la_d) & RMASK] * lg; orr = DLINE[1024 + ((wp - la_d) & RMASK)] * lg;
+  wp += 1; tn += 1;
+  (wp & 65535) == 0 ? ( g_sum = 0; k_ = 0; loop(la_n, g_sum += GHIST[(wp - 1 - k_) & RMASK]; k_ += 1; ); );
+  // the last safety: never a sample over the ceiling
+  ol = max(min(ol, ceil_s), -ceil_s); orr = max(min(orr, ceil_s), -ceil_s);
+  lgr_disp = max(lgr_disp, -20 * log10(max(lg, 0.000001)));
+) : (
+  ol = xl; orr = xr;
+);
+dip_s = dip_g * dip_g * (3 - 2 * dip_g);                 // an S-curve dip: no corners
+ol *= dip_s; orr *= dip_s;
+
+// TRUE PEAK reads what leaves the unit
+playing ? (
+  tpl = max(tpl, tp_peak(2, ol)); tpr = max(tpr, tp_peak(3, orr)); tpl_disp = tpl; tpr_disp = tpr;
+) : ( TPH[128 + tp_w] = TPH[152 + tp_w] = TPH[192 + tp_w] = TPH[216 + tp_w] = 0; );   // stopped: let the history go quiet
+tp_w = (tp_w + 1) % 24;
+
+spl0 = ol; spl1 = orr;
+// the resume fade: the input as REAPER's bypass passed it (delayed by the latency) into the processed sound
+DRY[dw] = rw_l; DRY[1024 + dw] = rw_r;
+rs_f < 1 ? (
+  rs_wait > 0 ? rs_wait -= 1 : ( rs_f = min(rs_f + rs_c, 1); rs_x = min(rs_x + 3 * rs_c, 1); );
+  rs_s = rs_f * rs_f * (3 - 2 * rs_f); rs_xs = rs_x * rs_x * (3 - 2 * rs_x);
+  rs_dl = rw_l + (DRY[(dw - pdc_delay) & RMASK] - rw_l) * rs_xs;
+  rs_dr = rw_r + (DRY[1024 + ((dw - pdc_delay) & RMASK)] - rw_r) * rs_xs;
+  spl0 = rs_dl + (spl0 - rs_dl) * rs_s; spl1 = rs_dr + (spl1 - rs_dr) * rs_s;
+);
+// BYPASS: crossfades (15 ms) to the input, delayed by the latency so it stays in time
+by_s += (byp - by_s) * c_sw;
+by_s > 0.0001 ? (
+  rs_dl = DRY[(dw - pdc_delay) & RMASK]; rs_dr = DRY[1024 + ((dw - pdc_delay) & RMASK)];
+  spl0 += (rs_dl - spl0) * by_s; spl1 += (rs_dr - spl1) * by_s;
+);
+xn > 0 ? (
+  xs = rs_f < 1 ? rs_xs : 1; k_ = 0;
+  loop(xn,
+    XCH[k_ * 1024 + dw] = spl(k_ + 2);
+    spl(k_ + 2) = (spl(k_ + 2) + (XCH[k_ * 1024 + ((dw - pdc_delay) & RMASK)] - spl(k_ + 2)) * xs) * dip_s;
+    k_ += 1;
+  );
+);
+dw = (dw + 1) & RMASK;
+lat_disp = pdc_delay;
+
+@gfx 1080 470
+ui_begin(1080, 470);
+// =====================================================================
+// GUI (design space 1080 x 470; S / M / L = 85 / 100 / 130 %). Navy faceplate (#353D70) with lighter / darker
+// sections and pale blue-grey hairlines, dark recessed display boxes with large cream figures.
+// =====================================================================
+BG = 0x353D70; HDR = 0x2A3160; PL = 0x3A427A; PLD = 0x30376A; HAIR = 0x8FA0D8; INK = 0xEDE6D2; DIM = 0xB4BCE0;
+GLASS = 0x14172B; FIG = 0xF3EBD4; F_GRN = 0x6EE08E; F_BLU = 0x7FB4FF; F_RED = 0xFF6A55; AMBR = 0xF2A41E;
+sc != pl_lsc ? (
+  pl_lsc = sc;
+  pl_f2 = ui_fitfont(2, 14 * sc);
+  gfx_setfont(10, "Trebuchet MS", 30 * sc, 'b');     // the unit's name
+  gfx_setfont(11, "Trebuchet MS", 15 * sc, 'b');     // section titles
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print
+  gfx_setfont(14, "Trebuchet MS", 14 * sc, 'b');     // display labels, key legends
+  gfx_setfont(15, "Trebuchet MS", 56 * sc, 'b');     // INTEGRATED figure
+  gfx_setfont(16, "Trebuchet MS", 38 * sc, 'b');     // the other figures
+  gfx_setfont(17, "Trebuchet MS", 24 * sc, 'b');     // true peak L / R, PLR
+);
+gfx_setfont(2, "Trebuchet MS", pl_f2, 'b'); gfx_setfont(3, "Trebuchet MS", pl_f2, 'b');
+C_INK = INK; lk_font = 14; lk_font2 = 14; lk_well = 0x10121F;
+
+function pl_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function pl_rr(x, y, w, h, r) ( ui_rrs(x * sc, y * sc, w * sc, h * sc, r * sc); );
+function pl_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function pl_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function pl_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function pl_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function pl_shadow(x, y, w, h, r) local(j) (
+  j = 0; loop(4, ui_cola(0x000000, 0.13); pl_rr(x + 2 + j * 1.3, y + 3 + j * 1.7, w + j * 0.4, h + j * 0.4, r + j); j += 1; );
+);
+// a plate: shadow, a light top / left edge, a dark bottom / right edge
+function pl_plate(x, y, w, h) (
+  pl_shadow(x, y, w, h, 6);
+  ui_col(0x1C2142); pl_rr(x, y, w, h, 6);
+  ui_col(0x55609A); pl_rr(x, y, w - 1, h - 1, 6);
+  ui_col(PL); pl_rr(x + 1, y + 1, w - 2.5, h - 2.5, 5);
+);
+// a section header band: the title on the band's centre line, a hairline under it
+function pl_head(x, y, w, title) local(tw, th) (
+  ui_col(PLD); pl_r(x + 1, y + 1, w - 2, 32);
+  ui_cola(HAIR, 0.5); pl_r(x + 1, y + 33, w - 2, 1);
+  gfx_setfont(11); gfx_measurestr(title, tw, th);
+  ui_col(INK); gfx_x = (x + 16) * sc; gfx_y = (y + 17) * sc - th * 0.5; gfx_drawstr(title);
+);
+// a dark recessed display box (top and left shaded)
+function pl_glass(x, y, w, h) (
+  ui_col(0x0B0D18); pl_rr(x - 1, y - 1, w + 2, h + 2, 5);
+  ui_col(GLASS); pl_rr(x, y, w, h, 4);
+  ui_cola(0x000000, 0.45); pl_r(x + 2, y + 1, w - 4, 3); pl_r(x + 1, y + 2, 3, h - 4);
+);
+// a reading: label above the glass, the figure centred, the unit under it
+function pl_read(x, y, w, h, lbl, v, ok, unit, fnt, col) local(tw, th) (
+  gfx_setfont(14); ui_col(DIM); pl_tc(x + w * 0.5, y - 20, lbl);
+  pl_glass(x, y, w, h);
+  ok ? sprintf(#pl_s, "%.1f", v) : strcpy(#pl_s, "--");
+  gfx_setfont(fnt); ui_col(ok ? col : 0x5A6290); gfx_measurestr(#pl_s, tw, th);
+  gfx_x = (x + w * 0.5) * sc - tw * 0.5; gfx_y = (y + h * 0.5 - 9) * sc - th * 0.5; gfx_drawstr(#pl_s);
+  gfx_setfont(13); ui_col(DIM); pl_tc(x + w * 0.5, y + h - 22, unit);
+);
+function pl_kn(cx, cy, r, idx, lo, hi, def, cap, lbl, fmt) (
+  ui_kdesk = cap; ui_kdesk_r = r; ui_kdesk_p = 0;
+  ui_knob(cx * sc, cy * sc, idx, lo, hi, def, 0, lbl, fmt);
+  ui_kdesk = 0; ui_kdesk_r = 0;
+);
+function pl_key(x, y, w, h, idx, col, s) (
+  lk_key(x, y, w, h, slider(idx) >= 0.5, col, s) ? ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+);
+// a dark display box for a menu choice, its name printed to its left: the current item and a down-pointing triangle;
+// a click opens the list (items "a|b|c", 0-based v). Returns the chosen index or -1.
+function pl_box(x, y, w, h, name, menu, v) local(hov, sel, n, i, tw, th) (
+  hov = pl_in(x, y, w, h);
+  gfx_setfont(13); ui_col(DIM); pl_tr(x - 8, y + h * 0.5 - 7, name);
+  ui_col(0x0B0D18); pl_rr(x - 1, y - 1, w + 2, h + 2, 4);
+  ui_col(GLASS); pl_rr(x, y, w, h, 3);
+  ui_cola(0x000000, 0.45); pl_r(x + 1, y + 1, w - 2, 2);
+  hov ? ( ui_cola(0xFFFFFF, 0.06); pl_rr(x, y, w, h, 3); );
+  pk_pitem(menu, v + 1, #pl_di);
+  gfx_setfont(14); ui_col(F_BLU); gfx_measurestr(#pl_di, tw, th);
+  gfx_x = (x + (w - 14) * 0.5) * sc - tw * 0.5; gfx_y = (y + h * 0.5) * sc - th * 0.5; gfx_drawstr(#pl_di);
+  ui_col(DIM); ui_sstri((x + w - 16) * sc, (y + h * 0.5 - 3) * sc, (x + w - 6) * sc, (y + h * 0.5 - 3) * sc, (x + w - 11) * sc, (y + h * 0.5 + 3) * sc);
+  sel = -1;
+  pressed && hov && drag_id == 0 ? (
+    drag_id = -1;
+    strcpy(#pl_dm, ""); n = pk_pcount(menu); i = 1;
+    loop(n, i == v + 1 ? strcat(#pl_dm, "!"); strcat(#pl_dm, pk_pitem(menu, i, #pl_dt)); i < n ? strcat(#pl_dm, "|"); i += 1; );
+    gfx_x = x * sc; gfx_y = (y + h) * sc; i = gfx_showmenu(#pl_dm); i > 0 ? sel = i - 1;
+  );
+  sel;
+);
+function pl_db(g) ( g > 0.0000001 ? 20 * log10(g) : -200; );
+
+// ---------- the readings (filled by the audio thread) ----------
+// the loudness is measured at the input: GAIN moves it here (so MATCH and GAIN show at once)
+pl_i = i_disp > -199 ? i_disp + gain_db : -200; pl_m = m_disp > -199 ? m_disp + gain_db : -200;
+pl_st = s_disp > -199 ? s_disp + gain_db : -200; pl_lra = lra_disp;
+pl_gr = max(lgr_disp, pl_gr * 0.85); lgr_disp = 0;
+pl_tl_ = pl_db(tpl_disp); pl_tr_ = pl_db(tpr_disp); pl_tp = max(pl_tl_, pl_tr_);
+
+// ---------- faceplate and header ----------
+ui_col(BG); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(HDR); pl_r(0, 0, 1080, 64);
+ui_col(HAIR); pl_r(0, 63, 1080, 2); ui_col(0x161A36); pl_r(0, 65, 1080, 1);
+ui_cola(0x000000, 0.35); pl_r(1077, 0, 3, 470); pl_r(0, 467, 1080, 3);
+ui_screw(9 * sc, 9 * sc); ui_screw((1080 - 9) * sc, 9 * sc); ui_screw(9 * sc, (470 - 9) * sc); ui_screw((1080 - 9) * sc, (470 - 9) * sc);
+ui_col(INK); gfx_circle(40 * sc, 32 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(HDR); ui_keytext(40 * sc, 32 * sc, "GFX");
+gfx_setfont(10); ui_col(INK); pl_tl(68, 15, "FATHOM"); gfx_measurestr("FATHOM", pl_tw, pl_th);
+gfx_setfont(13); ui_col(DIM); pl_tl(82 + pl_tw / sc, 20, "LOUDNESS"); pl_tl(82 + pl_tw / sc, 34, "METER");
+pk_lcdstrip = 0;
+pl_k = pk_preset(340 * sc, 15 * sc, 330 * sc, 34 * sc, pr_cur, #pl_pmn);
+pl_k > 0 ? load_preset(pl_k);
+pl_key(880, 20, 84, 26, 4, LK_WHT, "BYPASS");
+ui_size_picker(998 * sc, 23 * sc);
+// ---------- header art: a giant squid in the gap before BYPASS (JG, 25 Oct 2026) ----------
+// drawn once per scale at 2x into image 117 (anti-aliased circles and quads), then blitted back at half size
+fa_x0 = 676; fa_y0 = 2; fa_w = 198; fa_h = 60; fa_z = 0.65;                // drawn at 65 % (JG: smaller), centred in the gap
+fa_sc != sc ? (
+  fa_sc = sc; fa_k = 2 * sc * fa_z; fa_iw = ceil(fa_w * fa_k) + 2; fa_ih = ceil(fa_h * fa_k) + 2;
+  gfx_setimgdim(117, fa_iw, fa_ih); gfx_dest = 117; gfx_mode = 0;
+  gfx_a = 1; gfx_a2 = 0; gfx_rect(0, 0, fa_iw, fa_ih); gfx_a2 = 1;
+  // two passes: a dark rim, then the body colour
+  fa_p = 0; loop(2,
+    // the two long feeding tentacles with their clubs, trailing furthest
+    fa_j = 0; loop(2,
+      fa_s = 0; loop(200, fa_s += 1 / 200;
+        fa_x = 102 - (98 - fa_j * 10) * fa_s;
+        fa_y = 31 + (fa_j ? 13 : -12) * fa_s + sin(fa_s * $pi * 2.3 + fa_j * 2.2) * 5 * fa_s;
+        fa_r = 1.4 - 0.6 * fa_s; fa_s > 0.8 ? fa_r = max(fa_r, 3.1 * sin($pi * (fa_s - 0.8) / 0.2));
+        ui_col(fa_p ? 0xB85A4A : 0x4A2026); gfx_circle(fa_x * fa_k, fa_y * fa_k, (fa_r + (fa_p ? 0 : 0.8)) * fa_k, 1, 1);
+      ); fa_j += 1; );
+    // eight arms, curling
+    fa_j = 0; loop(8, fa_a = fa_j - 3.5; fa_l = 54 + 10 * cos(fa_j * 1.3);
+      fa_s = 0; loop(140, fa_s += 1 / 140;
+        fa_x = 104 - fa_l * fa_s;
+        fa_y = 30 + fa_a * 1.1 + fa_a * 4.4 * fa_s + sin(fa_s * $pi * 1.6 + fa_j * 0.9) * 3.5 * fa_s;
+        fa_r = 2.7 * (1 - fa_s) + 0.45;
+        ui_col(fa_p ? (fa_j & 1 ? 0xA84F44 : 0xBC5D4C) : 0x4A2026); gfx_circle(fa_x * fa_k, fa_y * fa_k, (fa_r + (fa_p ? 0 : 0.8)) * fa_k, 1, 1);
+      ); fa_j += 1; );
+    // head
+    ui_col(fa_p ? 0xC2624F : 0x4A2026); gfx_circle(108 * fa_k, 30 * fa_k, (8 + (fa_p ? 0 : 0.8)) * fa_k, 1, 1);
+    // fins at the tail end of the mantle (behind it)
+    fa_t = 0.64; loop(60, fa_t += 0.006;
+      fa_w2 = 14 * sin($pi * (fa_t - 0.64) / 0.38);
+      fa_cx = 122 + 68 * fa_t; fa_cy = 29 - 7 * fa_t;
+      ui_col(fa_p ? 0xCC705A : 0x4A2026);
+      gfx_triangle((fa_cx - 0.6 + 0.1 * fa_w2) * fa_k, (fa_cy + fa_w2) * fa_k, (fa_cx + 0.6 + 0.1 * fa_w2) * fa_k, (fa_cy + fa_w2) * fa_k,
+                   (fa_cx + 0.6 - 0.1 * fa_w2) * fa_k, (fa_cy - fa_w2) * fa_k, (fa_cx - 0.6 - 0.1 * fa_w2) * fa_k, (fa_cy - fa_w2) * fa_k);
+      gfx_circle((fa_cx + 0.1 * fa_w2) * fa_k, (fa_cy + fa_w2) * fa_k, (fa_p ? 0.6 : 1.4) * fa_k, 1, 1);
+      gfx_circle((fa_cx - 0.1 * fa_w2) * fa_k, (fa_cy - fa_w2) * fa_k, (fa_p ? 0.6 : 1.4) * fa_k, 1, 1);
+    );
+    // mantle: a long tapering cone
+    fa_t = 0; loop(140, fa_t += 1 / 140;
+      fa_r = 10.5 * (1 - fa_t) ^ 0.6 + 0.6;
+      ui_col(fa_p ? 0xC2624F : 0x4A2026); gfx_circle((122 + 68 * fa_t) * fa_k, (29 - 7 * fa_t) * fa_k, (fa_r + (fa_p ? 0 : 0.8)) * fa_k, 1, 1);
+    );
+    fa_p += 1;
+  );
+  // light along the top of the mantle, then the skin's spots
+  fa_t = 0; loop(120, fa_t += 1 / 120;
+    fa_r = 10.5 * (1 - fa_t) ^ 0.6 + 0.6;
+    ui_col(0xDE8A6E); gfx_circle((122 + 68 * fa_t) * fa_k, (29 - 7 * fa_t - fa_r * 0.5) * fa_k, fa_r * 0.32 * fa_k, 1, 1);
+  );
+  ui_col(0x8E3E3A); fa_j = 0; loop(16, fa_t = 0.05 + 0.055 * fa_j; fa_r = 10.5 * (1 - fa_t) ^ 0.6 + 0.6;
+    gfx_circle((122 + 68 * fa_t) * fa_k, (29 - 7 * fa_t + fa_r * (0.15 + 0.5 * sin(fa_j * 2.7))) * fa_k, (0.9 + 0.4 * sin(fa_j * 1.9)) * fa_k, 1, 1);
+    fa_j += 1; );
+  // the eye
+  ui_col(0xEDE6D2); gfx_circle(106 * fa_k, 28 * fa_k, 3.8 * fa_k, 1, 1);
+  ui_col(0x141626); gfx_circle(106.4 * fa_k, 28.2 * fa_k, 2.6 * fa_k, 1, 1);
+  ui_col(0xFFFFFF); gfx_circle(105.5 * fa_k, 27.2 * fa_k, 0.8 * fa_k, 1, 1);
+  gfx_dest = -1;
+);
+gfx_a = 1; gfx_mode = 0; gfx_blit(117, 1, 0, 0, 0, fa_iw, fa_ih, (fa_x0 + fa_w * (1 - fa_z) / 2) * sc, (fa_y0 + fa_h * (1 - fa_z) / 2) * sc, fa_iw / 2, fa_ih / 2);
+
+// ---------- the readings plate ----------
+pl_plate(16, 80, 1048, 196);
+pl_head(16, 80, 1048, "LOUDNESS");
+// the measuring choices in the header band: SHORT-TERM window, HPF, LPF, RESET ON PLAY
+pl_v = pl_box(470, 85, 76, 24, "WINDOW", "3 s|10 s|30 s|60 s", st_win); pl_v >= 0 ? ( st_win = pl_v; ui_auto(8); );
+pl_v = pl_box(610, 85, 92, 24, "HPF", "OFF|40 Hz|80 Hz|120 Hz|250 Hz|500 Hz|1 kHz|2 kHz", m_hpf); pl_v >= 0 ? ( m_hpf = pl_v; ui_auto(6); );
+pl_v = pl_box(766, 85, 92, 24, "LPF", "OFF|2 kHz|4 kHz|8 kHz|12 kHz|18 kHz", m_lpf); pl_v >= 0 ? ( m_lpf = pl_v; ui_auto(7); );
+lk_font = lk_font2 = 13; pl_key(884, 85, 164, 24, 9, LK_AMB, "RESET ON PLAY"); lk_font = lk_font2 = 14;
+// INTEGRATED: green within 1 LU of the target, blue under, red over
+pl_c = pl_i < tgt_lufs - 1 ? F_BLU : pl_i > tgt_lufs + 1 ? F_RED : F_GRN;
+pl_read(36, 152, 268, 108, "INTEGRATED", pl_i, pl_i > -199, m_hpf || m_lpf ? "LUFS - FILTERED" : "LUFS", 15, pl_c);
+pl_read(324, 152, 168, 108, "SHORT-TERM", pl_st, pl_st > -70, st_win == 0 ? "LUFS" : st_win == 1 ? "LUFS - 10 s" : st_win == 2 ? "LUFS - 30 s" : "LUFS - 60 s", 16, FIG);
+pl_read(512, 152, 168, 108, "MOMENTARY", pl_m, pl_m > -70, "LUFS", 16, FIG);
+pl_read(700, 152, 132, 108, "RANGE", pl_lra, lra_ok_disp, "LU", 16, FIG);
+// TRUE PEAK: the highest of L and R large, each side under it; red above TP MAX
+gfx_setfont(14); ui_col(DIM); pl_tc(942, 132, "TRUE PEAK");
+pl_glass(852, 152, 180, 108);
+pl_c = pl_tp > tp_max ? F_RED : FIG;
+pl_tp > -100 ? sprintf(#pl_s, pl_tp > 0.05 ? "+%.1f" : "%.1f", pl_tp) : strcpy(#pl_s, "--");
+gfx_setfont(16); ui_col(pl_tp > -100 ? pl_c : 0x5A6290); pl_tc(942, 160, #pl_s);
+gfx_setfont(13); ui_col(DIM); pl_tc(942, 204, "dBTP");
+gfx_setfont(14); ui_col(DIM); pl_tl(868, 230, "L"); pl_tl(950, 230, "R");
+ui_col(pl_tl_ > tp_max ? F_RED : FIG); pl_tl_ > -100 ? sprintf(#pl_s, pl_tl_ > 0.05 ? "+%.1f" : "%.1f", pl_tl_) : strcpy(#pl_s, "--"); pl_tr(936, 230, #pl_s);
+ui_col(pl_tr_ > tp_max ? F_RED : FIG); pl_tr_ > -100 ? sprintf(#pl_s, pl_tr_ > 0.05 ? "+%.1f" : "%.1f", pl_tr_) : strcpy(#pl_s, "--"); pl_tr(1018, 230, #pl_s);
+pl_in(852, 152, 180, 108) && pressed && drag_id == 0 ? ( drag_id = -1; rst_dirty = 1; );
+
+// ---------- the history and controls plate ----------
+pl_plate(16, 292, 1048, 162);
+pl_head(16, 292, 580, "SHORT-TERM HISTORY (3 MIN)");
+ui_cola(HAIR, 0.5); pl_r(596, 293, 1, 160);
+pl_head(596, 292, 468, "TARGET");
+// the strip: -36 .. 0 LUFS, the target dashed, each column the loudest reading in its time span
+pl_x = 36; pl_y = 338; pl_w = 540; pl_h = 104;
+pl_glass(pl_x, pl_y, pl_w, pl_h);
+gfx_setfont(13);
+pl_j = 0; loop(4, pl_v = -36 + pl_j * 12; pl_yy = pl_y + pl_h - 6 - (pl_v + 36) / 36 * (pl_h - 12);
+  ui_cola(HAIR, 0.15); pl_r(pl_x + 30, pl_yy, pl_w - 36, 1);
+  ui_col(0x6A72A0); sprintf(#pl_s, "%d", pl_v); pl_tr(pl_x + 26, pl_yy - 7, #pl_s); pl_j += 1; );
+pl_ht = (max(-36, min(0, tgt_lufs)) + 36) / 36 * (pl_h - 12);
+pl_n = hn_disp; pl_wp = hw_disp; pl_cols = pl_w - 40; pl_span = 1800 / pl_cols;
+pl_c0 = 0;
+loop(pl_cols,
+  // newest on the right
+  pl_a = floor((pl_cols - 1 - pl_c0) * pl_span); pl_b = floor((pl_cols - pl_c0) * pl_span);
+  pl_v = -200; pl_q = pl_a;
+  while (pl_q < pl_b && pl_q < pl_n) ( pl_v = max(pl_v, HIST[(pl_wp - 1 - pl_q) & 4095]); pl_q += 1; );
+  pl_v += gain_db;
+  pl_v > -36 ? (
+    // pale blue up to the target, red for the part above it
+    pl_hh = (min(pl_v, 0) + 36) / 36 * (pl_h - 12);
+    ui_cola(F_BLU, 0.7); pl_r(pl_x + 32 + pl_c0, pl_y + pl_h - 6 - min(pl_hh, pl_ht), 1, min(pl_hh, pl_ht));
+    pl_hh > pl_ht ? ( ui_cola(F_RED, 0.9); pl_r(pl_x + 32 + pl_c0, pl_y + pl_h - 6 - pl_hh, 1, pl_hh - pl_ht); );
+  );
+  pl_c0 += 1;
+);
+ui_col(AMBR); pl_j = 0; loop(32, pl_r(pl_x + 32 + pl_j * 16, pl_y + pl_h - 6 - pl_ht, 9, 1.5); pl_j += 1; );
+// TARGET: the target and the true-peak maximum, the GAIN; MATCH, LIMIT, the limiter's GR, PLR; RESET in the band
+pl_kn(648, 380, 22, 2, -36, -6, -14, 0x7FB4FF, "TARGET", "%.1f LUFS");
+pl_kn(732, 380, 22, 3, -25, 0, -1, F_RED, "TP MAX", "%.1f dBTP");
+pl_kn(816, 380, 22, 1, -18, 18, 0, INK, "GAIN", "%+.1f dB");
+lk_key(988, 298, 62, 22, 0, LK_AMB, "RESET") ? rst_dirty = 1;
+lk_key(872, 338, 82, 28, 0, LK_YEL, "MATCH") ? (
+  i_disp > -199 ? (
+    slider(1) = max(-18, min(18, floor((tgt_lufs - i_disp) * 10 + 0.5) / 10)); ui_auto(1);
+    tpr_dirty = 1;
+  );
+);
+pl_key(966, 338, 82, 28, 5, LK_RED, "LIMIT");
+gfx_setfont(13); ui_col(DIM); pl_tl(872, 380, "GR");
+// GR: 20 segments of 0.5 dB, from the left
+ui_col(0x0A0B16); pl_r(896, 380, 152, 14);
+pl_j = 0; loop(20,
+  pl_gr >= pl_j * 0.5 + 0.25 ? ui_col(F_RED) : ui_cola(F_RED, 0.15);
+  pl_r(898 + pl_j * 7.4, 382, 5.6, 10); pl_j += 1; );
+ui_col(DIM); pl_tl(872, 410, "PLR");
+pl_i > -199 && pl_tp > -100 ? sprintf(#pl_s, "%.1f", pl_tp - pl_i) : strcpy(#pl_s, "--");
+gfx_setfont(17); ui_col(FIG); pl_tl(908, 403, #pl_s);
+gfx_setfont(13); ui_col(DIM);
+lim_on ? sprintf(#pl_s, "LATENCY %d", lat_disp) : strcpy(#pl_s, "NO LATENCY"); pl_tr(1048, 410, #pl_s);
+
+pk_end();
+ui_end();

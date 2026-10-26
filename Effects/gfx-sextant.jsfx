@@ -1,0 +1,502 @@
+desc:GFX Sextant [analyser]
+//tags: analyser analyzer spectrum meter mastering analysis utility
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-ui and gfx-panel (.jsfx-inc) in the same folder.
+//
+// Sextant. A spectrum, stereo and level analyser in the spirit of the classic psychoacoustic analysers. Named after the
+// navigator's instrument: it shows where the master sits in frequency, in the stereo field and in level.
+//
+// SIGNAL FLOW
+//   The audio passes through untouched (bit for bit). The audio thread only copies L and R into a ring buffer; all the
+//   analysis is worked in the panel's drawing code, so with the window closed it costs nothing.
+// SPECTRUM: an 8192-point FFT (Blackman-Harris window) of L + R, summed into 1/3-octave (31) or 1/6-octave (61) bands
+//   from 20 Hz to 20 kHz. Each band reads its level in dB: a full-scale sine reads 0 dB in its band, and pink noise
+//   reads flat (the same power in every band).
+//   WEIGHT: Z (flat), A, B or C - the standard sound-level curves, which lean the bands the way the ear hears them at
+//   different levels (A for quiet listening, C nearly flat).
+//   DETECT: RMS (the average, smoothed by SPEED: fast 0.125 s, medium 0.5 s, slow 1.5 s) or PEAK (rises at once, falls
+//   by 30 / 15 / 6 dB a second).
+//   HOLD: a cream mark on each band's highest level, held 1.5 s then falling. TILT: a guide line falling 4.5 dB per
+//   octave (the slope a balanced master tends to follow), placed through the bars.
+//   Hover over the bars: the band under the pointer lights, with its centre frequency and level shown above.
+//   FREEZE: holds the picture (all three windows).
+// STEREO: the goniometer - L and R plotted against each other, turned 45 degrees: a mono signal is a vertical line, a
+//   wide one a round cloud, out-of-phase content lies flat. It scales itself to the level, so the shape always shows.
+//   CORRELATION -1 .. +1 (300 ms): +1 mono, 0 unrelated sides, below 0 the sides cancel in mono (the bar turns red).
+//   LOW (below 150 Hz): the same for the lows only - where mono cancellation hurts first (club systems, phones).
+//   BALANCE: which side is louder (RMS, 300 ms), the needle's centre = equal.
+// LEVELS: L and R peak bars (-60 .. 0 dBFS) with the RMS of both between them (300 ms), floating peak holds (1.2 s);
+//   the highest peak of each side is printed under its bar - click the meter to clear them. Unweighted.
+// No drift (a measuring tool). Latency: none. No BYPASS key: the audio is never changed.
+// GUI: click a display box for its list; keys light when on. Click the LCD (or PRESETS) for the view presets.
+//   S / M / L / ? = size and help.
+
+slider1:weight=0<0,3,1{Z (flat),A,B,C}>-Weighting
+slider2:detect=0<0,1,1{RMS,Peak}>-Detector
+slider3:speed=1<0,2,1{Fast,Medium,Slow}>-Speed
+slider4:bands=0<0,1,1{1/3 octave,1/6 octave}>-Bands
+slider5:hold=1<0,1,1{Off,On}>-Peak hold
+slider6:tilt=0<0,1,1{Off,On}>-Tilt guide
+slider7:freeze=0<0,1,1{Off,On}>-Freeze
+
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+
+@init
+#ui_man = "gfx-sextant";
+ext_noinit = 1;
+
+RLEN = 16384;
+RINGL = 131072; RINGR = 147456;               // the audio thread's ring buffers, L / R
+FFTB = 65536;                                 // FFT buffer (8192 complex = 16384 slots, inside one 64k block)
+FN = 8192;
+WIN = 90000;                                  // the window (8192)
+WGT = 100000;                                 // the weighting, as a power factor per bin (4096)
+BV = 110000; BH = 110100; BT = 110200; BP = 110300;   // per band: level (power), hold (dB), hold time, raw power
+memset(RINGL, 0, RLEN); memset(RINGR, 0, RLEN);
+NOM = 110400;                                 // the 1/3-octave bands' nominal centres (the hover readout's names)
+nm_i = 0; loop(31, NOM[nm_i] = nm_i == 0 ? 20 : nm_i == 1 ? 25 : nm_i == 2 ? 31.5 : nm_i == 3 ? 40 : nm_i == 4 ? 50 :
+  nm_i == 5 ? 63 : nm_i == 6 ? 80 : nm_i == 7 ? 100 : nm_i == 8 ? 125 : nm_i == 9 ? 160 : 10 * NOM[nm_i - 10]; nm_i += 1; );
+rw = 0;
+
+// ---------- STEREO / LEVELS: the running averages (300 ms) and a 150 Hz low-pass (4th order) for LOW ----------
+function lp_design() local(k, q1, q2, n) (
+  k = tan($pi * 150 / srate);
+  q1 = 0.5411961001461970; q2 = 1.3065629648763766;       // Butterworth 4th order: two stages
+  n = 1 / (1 + k / q1 + k * k); l1b0 = k * k * n; l1a1 = 2 * (k * k - 1) * n; l1a2 = (1 - k / q1 + k * k) * n;
+  n = 1 / (1 + k / q2 + k * k); l2b0 = k * k * n; l2a1 = 2 * (k * k - 1) * n; l2a2 = (1 - k / q2 + k * k) * n;
+);
+function lp_run(x) instance(z1, z2, w1, w2) local(y, u) (
+  y = l1b0 * x + z1; z1 = 2 * l1b0 * x - l1a1 * y + z2; z2 = l1b0 * x - l1a2 * y;
+  u = l2b0 * y + w1; w1 = 2 * l2b0 * y - l2a1 * u + w2; w2 = l2b0 * y - l2a2 * u;
+  u;
+);
+lp_design();
+c_avg = 1 - exp(-1 / (0.3 * srate));
+e_ll = e_rr = e_lr = f_ll = f_rr = f_lr = 0;
+
+
+// ---------- presets: views ----------
+#sx_pmn = "Mastering: 1/3 octave, RMS|Mixing: 1/6 octave, fast|Peaks: 1/6 octave, peak|As heard: A-weighted|Tonal balance: tilt guide";
+function load_preset(p) (
+  weight = 0; detect = 0; speed = 1; bands = 0; hold = 1; tilt = 0;
+  p == 2 ? ( bands = 1; speed = 0; ) :
+  p == 3 ? ( bands = 1; detect = 1; speed = 1; ) :
+  p == 4 ? ( weight = 1; ) :
+  p == 5 ? ( tilt = 1; speed = 2; hold = 0; );
+  ui_auto(1); ui_auto(2); ui_auto(3); ui_auto(4); ui_auto(5); ui_auto(6);
+  pr_cur = p;
+);
+
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+
+@sample
+RINGL[rw] = spl0; RINGR[rw] = spl1;
+rw = (rw + 1) & (RLEN - 1);
+rw_disp = rw;
+e_ll += (spl0 * spl0 - e_ll) * c_avg; e_rr += (spl1 * spl1 - e_rr) * c_avg; e_lr += (spl0 * spl1 - e_lr) * c_avg;
+lo_l = lpl.lp_run(spl0); lo_r = lpr.lp_run(spl1);
+f_ll += (lo_l * lo_l - f_ll) * c_avg; f_rr += (lo_r * lo_r - f_rr) * c_avg; f_lr += (lo_l * lo_r - f_lr) * c_avg;
+ell_disp = e_ll; err_disp = e_rr; elr_disp = e_lr; fll_disp = f_ll; frr_disp = f_rr; flr_disp = f_lr;
+pkl_d = max(pkl_d, abs(spl0)); pkr_d = max(pkr_d, abs(spl1));
+
+@gfx 1080 500
+ui_begin(1080, 500);
+// =====================================================================
+// GUI (design space 1080 x 500; S / M / L = 85 / 100 / 130 %). Graphite faceplate, dark display glass, light-blue
+// traces, cream print.
+// =====================================================================
+BG = 0x26282B; HDR = 0x1D1F22; PL = 0x33363A; PLD = 0x2B2E31; HAIR = 0x8DBBEA; INK = 0xEDE6D2; DIM = 0xA9A391;
+GLASS = 0x101215; TRACE = 0x8DBBEA; TRACE2 = 0xC9E2FA; CREAM = 0xF3EBD4; AMBR = 0xF2A41E;
+sc != sx_lsc ? (
+  sx_lsc = sc;
+  sx_f2 = ui_fitfont(2, 14 * sc);
+  gfx_setfont(10, "Trebuchet MS", 30 * sc, 'b');
+  gfx_setfont(11, "Trebuchet MS", 15 * sc, 'b');
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');
+  gfx_setfont(14, "Trebuchet MS", 14 * sc, 'b');
+);
+gfx_setfont(2, "Trebuchet MS", sx_f2, 'b'); gfx_setfont(3, "Trebuchet MS", sx_f2, 'b');
+C_INK = INK; lk_font = 14; lk_font2 = 14; lk_well = 0x111214;
+
+function sx_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function sx_rr(x, y, w, h, r) ( ui_rrs(x * sc, y * sc, w * sc, h * sc, r * sc); );
+function sx_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function sx_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function sx_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function sx_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function sx_shadow(x, y, w, h, r) local(j) (
+  j = 0; loop(4, ui_cola(0x000000, 0.13); sx_rr(x + 2 + j * 1.3, y + 3 + j * 1.7, w + j * 0.4, h + j * 0.4, r + j); j += 1; );
+);
+function sx_plate(x, y, w, h) (
+  sx_shadow(x, y, w, h, 6);
+  ui_col(0x16171A); sx_rr(x, y, w, h, 6);
+  ui_col(0x4A4E53); sx_rr(x, y, w - 1, h - 1, 6);
+  ui_col(PL); sx_rr(x + 1, y + 1, w - 2.5, h - 2.5, 5);
+);
+function sx_head(x, y, w, title) local(tw, th) (
+  ui_col(PLD); sx_r(x + 1, y + 1, w - 2, 32);
+  ui_cola(HAIR, 0.45); sx_r(x + 1, y + 33, w - 2, 1);
+  gfx_setfont(11); gfx_measurestr(title, tw, th);
+  ui_col(INK); gfx_x = (x + 16) * sc; gfx_y = (y + 17) * sc - th * 0.5; gfx_drawstr(title);
+);
+function sx_glass(x, y, w, h) (
+  ui_col(0x08090B); sx_rr(x - 1, y - 1, w + 2, h + 2, 5);
+  ui_col(GLASS); sx_rr(x, y, w, h, 4);
+  ui_cola(0x000000, 0.5); sx_r(x + 2, y + 1, w - 4, 3); sx_r(x + 1, y + 2, 3, h - 4);
+);
+// a dark display box for a menu choice, its name printed to its left; a click opens the list. Returns the choice or -1.
+function sx_box(x, y, w, h, name, menu, v) local(hov, sel, n, i, tw, th) (
+  hov = sx_in(x, y, w, h);
+  gfx_setfont(13); ui_col(DIM); sx_tr(x - 8, y + h * 0.5 - 7, name);
+  ui_col(0x08090B); sx_rr(x - 1, y - 1, w + 2, h + 2, 4);
+  ui_col(GLASS); sx_rr(x, y, w, h, 3);
+  ui_cola(0x000000, 0.5); sx_r(x + 1, y + 1, w - 2, 2);
+  hov ? ( ui_cola(0xFFFFFF, 0.06); sx_rr(x, y, w, h, 3); );
+  pk_pitem(menu, v + 1, #sx_di);
+  gfx_setfont(14); ui_col(TRACE); gfx_measurestr(#sx_di, tw, th);
+  gfx_x = (x + (w - 14) * 0.5) * sc - tw * 0.5; gfx_y = (y + h * 0.5) * sc - th * 0.5; gfx_drawstr(#sx_di);
+  ui_col(DIM); ui_sstri((x + w - 16) * sc, (y + h * 0.5 - 3) * sc, (x + w - 6) * sc, (y + h * 0.5 - 3) * sc, (x + w - 11) * sc, (y + h * 0.5 + 3) * sc);
+  sel = -1;
+  pressed && hov && drag_id == 0 ? (
+    drag_id = -1;
+    strcpy(#sx_dm, ""); n = pk_pcount(menu); i = 1;
+    loop(n, i == v + 1 ? strcat(#sx_dm, "!"); strcat(#sx_dm, pk_pitem(menu, i, #sx_dt)); i < n ? strcat(#sx_dm, "|"); i += 1; );
+    gfx_x = x * sc; gfx_y = (y + h) * sc; i = gfx_showmenu(#sx_dm); i > 0 ? sel = i - 1;
+  );
+  sel;
+);
+function sx_key(x, y, w, h, idx, col, s) (
+  lk_key(x, y, w, h, slider(idx) >= 0.5, col, s) ? ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+);
+// the standard sound-level weightings, as a power factor at f
+function sx_wpow(f, w) local(f2, r) (
+  f2 = f * f;
+  w == 1 ? ( r = 148693636 * f2 * f2 / ((f2 + 424.36) * sqrt((f2 + 11599.29) * (f2 + 544496.41)) * (f2 + 148693636)); r *= 1.2589254; ) :
+  w == 2 ? ( r = 148693636 * f2 * f / ((f2 + 424.36) * sqrt(f2 + 25122.25) * (f2 + 148693636)); r *= 1.0197859; ) :
+  w == 3 ? ( r = 148693636 * f2 / ((f2 + 424.36) * (f2 + 148693636)); r *= 1.0069316; ) : r = 1;
+  r * r;
+);
+
+// ---------- set-up: the window, the weighting (on change) ----------
+!sx_init ? (
+  sx_init = 1; sx_ml = sx_mr = sx_hl = sx_hr = sx_xl = sx_xr = -200;
+  // 4-term Blackman-Harris
+  sx_i = 0; sx_s2 = 0;
+  loop(FN, sx_t = 2 * $pi * sx_i / FN;
+    WIN[sx_i] = 0.35875 - 0.48829 * cos(sx_t) + 0.14128 * cos(2 * sx_t) - 0.01168 * cos(3 * sx_t);
+    sx_s2 += WIN[sx_i] * WIN[sx_i]; sx_i += 1; );
+  sx_norm = 4 / (FN * sx_s2);                         // |X|^2 -> 2 x mean square (a full-scale sine = 1 = 0 dB)
+  sx_wv = -1; sx_t0 = time_precise();
+  memset(BV, 0, 100); memset(BT, 0, 100);
+  sx_i = 0; loop(100, BH[sx_i] = -200; sx_i += 1; );
+);
+weight != sx_wv || srate != sx_sr ? (
+  sx_wv = weight; sx_sr = srate; sx_i = 0;
+  loop(FN / 2, WGT[sx_i] = sx_wpow(max(sx_i, 0.5) * srate / FN, weight); sx_i += 1; );
+);
+sx_nb = bands ? 61 : 31; sx_step = bands ? 1 / 6 : 1 / 3;
+bands != sx_bv ? ( sx_bv = bands; memset(BV, 0, 100); sx_k = 0; loop(100, BH[sx_k] = -200; sx_k += 1; ); );
+
+// ---------- the analysis (each frame, unless FREEZE) ----------
+sx_now = time_precise(); sx_dt = max(1 / 120, min(0.25, sx_now - sx_t0)); sx_t0 = sx_now;
+!freeze ? (
+  sx_w = rw_disp; sx_i = 0;
+  loop(FN,
+    sx_k = (sx_w - FN + sx_i) & (RLEN - 1);
+    FFTB[sx_i * 2] = (RINGL[sx_k] + RINGR[sx_k]) * 0.5 * WIN[sx_i]; FFTB[sx_i * 2 + 1] = 0;
+    sx_i += 1; );
+  fft(FFTB, FN); fft_permute(FFTB, FN);
+  sx_bw = srate / FN;
+  sx_tc_ = speed == 0 ? 0.125 : speed == 1 ? 0.5 : 1.5;
+  sx_a = 1 - exp(-sx_dt / sx_tc_);
+  sx_fall = (speed == 0 ? 30 : speed == 1 ? 15 : 6) * sx_dt;
+  sx_b = 0;
+  loop(sx_nb,
+    // the band's edges, and the bins' overlap with them (so the narrow low bands still read right)
+    sx_fc = 1000 * 2 ^ ((sx_b - (bands ? 34 : 17)) * sx_step);     // 19.7 Hz .. 20.2 kHz
+    sx_lo = sx_fc * 2 ^ (-0.5 * sx_step); sx_hi = sx_fc * 2 ^ (0.5 * sx_step);
+    sx_k0 = max(1, floor(sx_lo / sx_bw - 0.5)); sx_k1 = min(FN / 2 - 1, ceil(sx_hi / sx_bw + 0.5));
+    sx_p = 0; sx_k = sx_k0;
+    loop(sx_k1 - sx_k0 + 1,
+      sx_ov = min(sx_hi, (sx_k + 0.5) * sx_bw) - max(sx_lo, (sx_k - 0.5) * sx_bw);
+      sx_ov > 0 ? sx_p += (sqr(FFTB[sx_k * 2]) + sqr(FFTB[sx_k * 2 + 1])) * WGT[sx_k] * min(1, sx_ov / sx_bw);
+      sx_k += 1; );
+    sx_p *= sx_norm;
+    BP[sx_b] = sx_p;
+    detect ? (
+      // PEAK: up at once, down at the SPEED's rate
+      sx_d = sx_p > 0.0000000001 ? 10 * log10(sx_p) : -200;
+      sx_c = BV[sx_b] > 0.0000000001 ? 10 * log10(BV[sx_b]) - sx_fall : -200;
+      BV[sx_b] = 10 ^ (max(sx_d, sx_c) / 10);
+    ) : (
+      BV[sx_b] < 0.0000000000001 ? BV[sx_b] = sx_p : BV[sx_b] += (sx_p - BV[sx_b]) * sx_a;
+    );
+    sx_b += 1; );
+);
+
+// ---------- faceplate and header ----------
+ui_col(BG); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(HDR); sx_r(0, 0, 1080, 64);
+ui_col(HAIR); sx_r(0, 63, 1080, 2); ui_col(0x101113); sx_r(0, 65, 1080, 1);
+ui_cola(0x000000, 0.35); sx_r(1077, 0, 3, 500); sx_r(0, 497, 1080, 3);
+ui_screw(9 * sc, 9 * sc); ui_screw((1080 - 9) * sc, 9 * sc); ui_screw(9 * sc, (500 - 9) * sc); ui_screw((1080 - 9) * sc, (500 - 9) * sc);
+ui_col(INK); gfx_circle(40 * sc, 32 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(HDR); ui_keytext(40 * sc, 32 * sc, "GFX");
+gfx_setfont(10); ui_col(INK); sx_tl(68, 15, "SEXTANT"); gfx_measurestr("SEXTANT", sx_tw, sx_th);
+gfx_setfont(13); ui_col(HAIR); sx_tl(82 + sx_tw / sc, 26, "ANALYSER");
+pk_lcdstrip = 1;
+sx_kp = pk_preset(340 * sc, 15 * sc, 330 * sc, 34 * sc, pr_cur, #sx_pmn);
+sx_kp > 0 ? load_preset(sx_kp);
+sx_key(880, 20, 84, 26, 7, LK_BLU_LT, "FREEZE");
+ui_size_picker(998 * sc, 23 * sc);
+// ---------- header art: a brass sextant in the gap before FREEZE (JG, 25 Oct 2026) ----------
+// drawn once per scale at 2x into image 117 (anti-aliased circles and quads), then blitted back at half size
+function sa_ln(x1, y1, x2, y2, w) local(dx, dy, l, nx, ny) (
+  dx = x2 - x1; dy = y2 - y1; l = max(sqrt(dx * dx + dy * dy), 0.001); nx = -dy / l * w * 0.5; ny = dx / l * w * 0.5;
+  gfx_triangle((x1 + nx) * sa_k, (y1 + ny) * sa_k, (x2 + nx) * sa_k, (y2 + ny) * sa_k, (x2 - nx) * sa_k, (y2 - ny) * sa_k, (x1 - nx) * sa_k, (y1 - ny) * sa_k);
+);
+function sa_dot(x, y, r) ( gfx_circle(x * sa_k, y * sa_k, r * sa_k, 1, 1); );
+// a band of the limb between radii r1 and r2 from angle a1 to a2 (0 = straight down from the pivot)
+function sa_band(r1, r2, a1, a2) local(n, d, t) (
+  n = 40; d = (a2 - a1) / n; t = a1;
+  loop(n,
+    gfx_triangle((sa_cx + r1 * sin(t)) * sa_k, (sa_cy + r1 * cos(t)) * sa_k, (sa_cx + r2 * sin(t)) * sa_k, (sa_cy + r2 * cos(t)) * sa_k,
+                 (sa_cx + r2 * sin(t + d)) * sa_k, (sa_cy + r2 * cos(t + d)) * sa_k, (sa_cx + r1 * sin(t + d)) * sa_k, (sa_cy + r1 * cos(t + d)) * sa_k);
+    t += d; );
+);
+sa_x0 = 676; sa_y0 = 2; sa_w = 198; sa_h = 60; sa_z = 0.65;                // drawn at 65 % (JG: smaller), centred in the gap
+sa_sc != sc ? (
+  sa_sc = sc; sa_k = 2 * sc * sa_z; sa_iw = ceil(sa_w * sa_k) + 2; sa_ih = ceil(sa_h * sa_k) + 2;
+  gfx_setimgdim(117, sa_iw, sa_ih); gfx_dest = 117; gfx_mode = 0;
+  gfx_a = 1; gfx_a2 = 0; gfx_rect(0, 0, sa_iw, sa_ih); gfx_a2 = 1;
+  sa_cx = 99; sa_cy = 3; sa_e = 0.56;                   // pivot, half the limb's angle (32 degrees)
+  // frame: two radius bars, a centre spoke and an inner brace, dark rim first
+  sa_p = 0; loop(2,
+    ui_col(sa_p ? 0xB8913E : 0x2A2214); sa_q = sa_p ? 0 : 1.4;
+    sa_ln(sa_cx, sa_cy, sa_cx + 47 * sin(-sa_e), sa_cy + 47 * cos(-sa_e), 3.2 + sa_q);
+    sa_ln(sa_cx, sa_cy, sa_cx + 47 * sin(sa_e), sa_cy + 47 * cos(sa_e), 3.2 + sa_q);
+    sa_ln(sa_cx, sa_cy + 6, sa_cx, sa_cy + 46, 2 + sa_q);
+    sa_band(28 - sa_q * 0.5, 30.5 + sa_q * 0.5, -sa_e, sa_e);
+    sa_band(45 - sa_q * 0.5, 53 + sa_q * 0.5, -sa_e - 0.03, sa_e + 0.03);
+    sa_p += 1; );
+  // the scale on the limb: silver strip, a tick every 2 degrees, longer every 10
+  ui_col(0xDAD5C6); sa_band(48.5, 52.5, -sa_e, sa_e);
+  ui_col(0x2A2214); sa_j = -16; loop(33, sa_t = sa_j * 0.0349; sa_l = sa_j % 5 == 0 ? 3.6 : 2;
+    sa_ln(sa_cx + 52.5 * sin(sa_t), sa_cy + 52.5 * cos(sa_t), sa_cx + (52.5 - sa_l) * sin(sa_t), sa_cy + (52.5 - sa_l) * cos(sa_t), 0.45);
+    sa_j += 1; );
+  // telescope, aimed at the horizon mirror on the left bar
+  ui_col(0x2A2214); sa_ln(103, 21, 138, 21, 7.4); sa_ln(136, 21, 146, 21, 9.4); sa_ln(101, 21, 105, 21, 8.4);
+  ui_col(0xC9A250); sa_ln(103, 21, 138, 21, 6); ui_col(0xA88434); sa_ln(136, 21, 146, 21, 8); sa_ln(101, 21, 105, 21, 7);
+  ui_col(0xE4C77E); sa_ln(105, 19.4, 136, 19.4, 1.2);
+  ui_col(0x7A6026); sa_ln(118, 18, 118, 24, 1); sa_ln(127, 18, 127, 24, 1);
+  // horizon mirror: half silvered, half clear
+  sa_hx = sa_cx + 22 * sin(-sa_e) - 2; sa_hy = sa_cy + 22 * cos(-sa_e) - 1;
+  ui_col(0x2A2214); gfx_rect((sa_hx - 4.5) * sa_k, (sa_hy - 6) * sa_k, 9 * sa_k, 12 * sa_k);
+  ui_col(0xCFDCE6); gfx_rect((sa_hx - 3.5) * sa_k, (sa_hy - 5) * sa_k, 3.5 * sa_k, 10 * sa_k);
+  ui_col(0x4E6272); gfx_rect(sa_hx * sa_k, (sa_hy - 5) * sa_k, 3.5 * sa_k, 10 * sa_k);
+  // three sun shades, hinged on the frame
+  ui_col(0x8E3A26); gfx_rect(70 * sa_k, 3 * sa_k, 6 * sa_k, 4 * sa_k);
+  ui_col(0x3E6E48); gfx_rect(70 * sa_k, 8 * sa_k, 6 * sa_k, 4 * sa_k);
+  ui_col(0x34507A); gfx_rect(70 * sa_k, 13 * sa_k, 6 * sa_k, 4 * sa_k);
+  ui_col(0xB8913E); sa_ln(76, 8, sa_cx - 3, sa_cy + 6, 1.2);
+  // index arm in steel, swung a few degrees, with its vernier and reading glass
+  sa_t = 0.21; sa_ex = sa_cx + 52 * sin(sa_t); sa_ey = sa_cy + 52 * cos(sa_t);
+  ui_col(0x1E2024); sa_ln(sa_cx, sa_cy, sa_ex, sa_ey, 5);
+  ui_col(0x9CA2AA); sa_ln(sa_cx, sa_cy, sa_ex, sa_ey, 3.6);
+  ui_col(0xCDD2D8); sa_ln(sa_cx + 0.8, sa_cy, sa_ex + 0.8, sa_ey, 0.9);
+  ui_col(0x1E2024); sa_dot(sa_ex, sa_ey, 3.4); ui_col(0xB8BEC6); sa_dot(sa_ex, sa_ey, 2.6);
+  sa_gx = sa_cx + 40 * sin(sa_t) + 8; sa_gy = sa_cy + 40 * cos(sa_t);
+  ui_col(0x1E2024); sa_ln(sa_cx + 46 * sin(sa_t), sa_cy + 46 * cos(sa_t), sa_gx, sa_gy, 1.4);
+  sa_dot(sa_gx, sa_gy, 4.2); ui_col(0x8FB4CC); sa_dot(sa_gx, sa_gy, 3.1); ui_col(0xE6F0F6); sa_dot(sa_gx - 1, sa_gy - 1, 0.9);
+  // index mirror and the pivot
+  ui_col(0x1E2024); gfx_rect((sa_cx - 5) * sa_k, (sa_cy - 3) * sa_k, 10 * sa_k, 6 * sa_k);
+  ui_col(0xBCCBD6); gfx_rect((sa_cx - 4) * sa_k, (sa_cy - 2) * sa_k, 8 * sa_k, 4 * sa_k);
+  ui_col(0x1E2024); sa_dot(sa_cx, sa_cy + 5, 2.4); ui_col(0xD0B060); sa_dot(sa_cx, sa_cy + 5, 1.5);
+  gfx_dest = -1;
+);
+gfx_a = 1; gfx_mode = 0; gfx_blit(117, 1, 0, 0, 0, sa_iw, sa_ih, (sa_x0 + sa_w * (1 - sa_z) / 2) * sc, (sa_y0 + sa_h * (1 - sa_z) / 2) * sc, sa_iw / 2, sa_ih / 2);
+
+// ---------- the plate: SPECTRUM | STEREO | LEVELS ----------
+sx_plate(16, 80, 1048, 404);
+sx_head(16, 80, 668, "SPECTRUM");
+ui_cola(HAIR, 0.45); sx_r(684, 81, 1, 402);
+sx_head(684, 80, 210, "STEREO");
+ui_cola(HAIR, 0.45); sx_r(894, 81, 1, 402);
+sx_head(894, 80, 170, "LEVELS");
+
+// the SPECTRUM's choices in its header band
+sx_v = sx_box(196, 85, 82, 24, "WEIGHT", "Z|A|B|C", weight); sx_v >= 0 ? ( weight = sx_v; ui_auto(1); );
+sx_v = sx_box(330, 85, 74, 24, "BANDS", "1/3|1/6", bands); sx_v >= 0 ? ( bands = sx_v; ui_auto(4); );
+sx_v = sx_box(442, 85, 76, 24, "", "RMS|PEAK", detect); sx_v >= 0 ? ( detect = sx_v; ui_auto(2); );
+sx_v = sx_box(532, 85, 76, 24, "", "FAST|MED|SLOW", speed); sx_v >= 0 ? ( speed = sx_v; ui_auto(3); );
+lk_font = lk_font2 = 13;
+sx_key(618, 85, 56, 24, 5, LK_WHT, "HOLD");
+lk_font = lk_font2 = 14;
+
+// the display: 20 Hz - 20 kHz, -84 .. 0 dB
+sx_x = 36; sx_y = 132; sx_gw = 628; sx_gh = 332;
+sx_glass(sx_x, sx_y, sx_gw, sx_gh);
+sx_px = sx_x + 40; sx_pw = sx_gw - 52; sx_py = sx_y + 12; sx_ph = sx_gh - 44;
+gfx_setfont(13);
+sx_j = 0; loop(8, sx_d = -sx_j * 12; sx_yy = sx_py + (-sx_d) / 84 * sx_ph;
+  ui_cola(HAIR, sx_j == 0 ? 0.25 : 0.1); sx_r(sx_px, sx_yy, sx_pw, 1);
+  ui_col(0x6C7480); sprintf(#sx_s, "%d", sx_d); sx_tr(sx_px - 8, sx_yy - 7, #sx_s); sx_j += 1; );
+// the frequency scale (log, from the lowest band's lower edge to the highest band's upper edge, so the bars line up)
+sx_flo = 1000 * 2 ^ ((bands ? -34.5 : -17.5) * sx_step); sx_fhi = 1000 * 2 ^ ((bands ? 26.5 : 13.5) * sx_step);
+sx_j = 0; loop(10,
+  sx_f = sx_j == 0 ? 20 : sx_j == 1 ? 50 : sx_j == 2 ? 100 : sx_j == 3 ? 200 : sx_j == 4 ? 500 : sx_j == 5 ? 1000 : sx_j == 6 ? 2000 : sx_j == 7 ? 5000 : sx_j == 8 ? 10000 : 20000;
+  sx_xx = sx_px + log(sx_f / sx_flo) / log(sx_fhi / sx_flo) * sx_pw;
+  ui_cola(HAIR, 0.08); sx_r(sx_xx, sx_py, 1, sx_ph);
+  ui_col(0x6C7480); sx_f >= 1000 ? sprintf(#sx_s, "%dk", sx_f / 1000) : sprintf(#sx_s, "%d", sx_f);
+  sx_tc(sx_xx, sx_py + sx_ph + 8, #sx_s); sx_j += 1; );
+// the bars, the hold marks
+sx_cw = sx_pw / sx_nb; sx_b = 0; sx_sum = 0; sx_cnt = 0;
+loop(sx_nb,
+  sx_d = BV[sx_b] > 0.0000000001 ? 10 * log10(BV[sx_b]) : -200;
+  sx_xx = sx_px + sx_b * sx_cw;
+  sx_hh = max(0, min(84, sx_d + 84)) / 84 * sx_ph;
+  sx_hh > 0 ? (
+    ui_cola(TRACE, 0.55); sx_r(sx_xx + 1, sx_py + sx_ph - sx_hh, sx_cw - 2, sx_hh);
+    ui_col(TRACE2); sx_r(sx_xx + 1, sx_py + sx_ph - sx_hh, sx_cw - 2, 2);
+  );
+  // HOLD: the highest level, held 1.5 s, then falling
+  !freeze ? (
+    sx_d > BH[sx_b] ? ( BH[sx_b] = sx_d; BT[sx_b] = 1.5; ) :
+    BT[sx_b] > 0 ? BT[sx_b] -= sx_dt : BH[sx_b] -= 12 * sx_dt;
+  );
+  hold && BH[sx_b] > -84 ? ( ui_col(CREAM); sx_r(sx_xx + 1, sx_py + sx_ph - (min(84, BH[sx_b] + 84)) / 84 * sx_ph, sx_cw - 2, 2); );
+  // for TILT: the bars' average against the slope
+  sx_d > -84 ? ( sx_sum += sx_d + 4.5 * (sx_b - (bands ? 34 : 17)) * sx_step; sx_cnt += 1; );
+  sx_b += 1; );
+// TILT: a guide falling 4.5 dB per octave, placed through the bars
+tilt && sx_cnt > 0 ? (
+  sx_off = sx_sum / sx_cnt;
+  sx_d0 = sx_off - 4.5 * log(sx_flo / 1000) / log(2); sx_d1 = sx_off - 4.5 * log(sx_fhi / 1000) / log(2);
+  ui_cola(AMBR, 0.9);
+  ui_ssline(sx_px * sc, (sx_py + max(0, min(84, -sx_d0)) / 84 * sx_ph) * sc, (sx_px + sx_pw) * sc,
+    (sx_py + max(0, min(84, -sx_d1)) / 84 * sx_ph) * sc, 1.6 * sc, 1);
+);
+gfx_setfont(13); ui_col(0x6C7480); sx_tl(sx_px + 8, sx_py + 6, weight == 0 ? "dB (Z)" : weight == 1 ? "dB (A)" : weight == 2 ? "dB (B)" : "dB (C)");
+lk_font = lk_font2 = 13; sx_key(sx_px + sx_pw - 62, sx_py + 6, 58, 22, 6, LK_AMB, "TILT"); lk_font = lk_font2 = 14;
+freeze ? ( gfx_setfont(14); ui_col(TRACE2); sx_tc(sx_px + sx_pw * 0.5, sx_py + 8, "FROZEN"); );
+// hovering over the bars: the band lights and its centre frequency and level show at the top
+sx_in(sx_px, sx_py, sx_pw, sx_ph) ? (
+  sx_hb = max(0, min(sx_nb - 1, floor((mouse_x / sc - sx_px) / sx_cw)));
+  ui_cola(0xFFFFFF, 0.1); sx_r(sx_px + sx_hb * sx_cw, sx_py, sx_cw, sx_ph);
+  sx_f = 1000 * 2 ^ ((sx_hb - (bands ? 34 : 17)) * sx_step);
+  !bands ? (
+    sx_f = NOM[sx_hb];
+    sx_f < 1000 ? sprintf(#sx_s, sx_f == floor(sx_f) ? "%d Hz" : "%.1f Hz", sx_f) :
+      ( sx_k = sx_f / 1000; sprintf(#sx_s, abs(sx_k - floor(sx_k + 0.5)) < 0.001 ? "%.0f kHz" : abs(sx_k * 10 - floor(sx_k * 10 + 0.5)) < 0.001 ? "%.1f kHz" : "%.2f kHz", sx_k); );
+  ) : (
+    sx_f < 1000 ? sprintf(#sx_s, "%d Hz", sx_f + 0.5) : sprintf(#sx_s, sx_f < 10000 ? "%.2f kHz" : "%.1f kHz", sx_f / 1000);
+  );
+  sx_d = BV[sx_hb] > 0.0000000001 ? 10 * log10(BV[sx_hb]) : -200;
+  sx_d > -84 ? sprintf(#sx_t, "%s   %.1f dB", #sx_s, sx_d) : sprintf(#sx_t, "%s   -- dB", #sx_s);
+  sx_yy = sx_py + (freeze ? 30 : 6);
+  ui_col(0x08090B); sx_rr(sx_px + sx_pw * 0.5 - 86, sx_yy, 172, 24, 3);
+  ui_cola(HAIR, 0.5); gfx_rect((sx_px + sx_pw * 0.5 - 86) * sc, sx_yy * sc, 172 * sc, 24 * sc, 0);
+  gfx_setfont(14); ui_col(CREAM); sx_tc(sx_px + sx_pw * 0.5, sx_yy + 4, #sx_t);
+);
+
+// ---------- STEREO ----------
+sx_glass(704, 132, 170, 332);
+!freeze ? (
+  sx_ell = ell_disp; sx_err = err_disp; sx_elr = elr_disp; sx_fll = fll_disp; sx_frr = frr_disp; sx_flr = flr_disp;
+  sx_cor = sx_ell * sx_err > 0.000000000001 ? sx_elr / sqrt(sx_ell * sx_err) : 0;
+  sx_lco = sx_fll * sx_frr > 0.000000000001 ? sx_flr / sqrt(sx_fll * sx_frr) : 0;
+  sx_bal = sx_ell + sx_err > 0.000000000001 ? (sqrt(sx_err) - sqrt(sx_ell)) / (sqrt(sx_err) + sqrt(sx_ell)) : 0;
+  sx_on = sx_ell + sx_err > 0.000000000001; sx_lon = sx_fll + sx_frr > 0.000000000001;
+);
+// the goniometer: the last 2048 samples, scaled to 3x their RMS (never past the peak, glided), mono = vertical
+sx_gx = 789; sx_gy = 222; sx_gr = 74;
+ui_cola(HAIR, 0.12); sx_r(sx_gx - sx_gr, sx_gy, sx_gr * 2, 1); sx_r(sx_gx, sx_gy - sx_gr, 1, sx_gr * 2);
+ui_cola(HAIR, 0.08);
+ui_ssline((sx_gx - sx_gr * 0.7) * sc, (sx_gy - sx_gr * 0.7) * sc, (sx_gx + sx_gr * 0.7) * sc, (sx_gy + sx_gr * 0.7) * sc, 1 * sc, 0);
+ui_ssline((sx_gx + sx_gr * 0.7) * sc, (sx_gy - sx_gr * 0.7) * sc, (sx_gx - sx_gr * 0.7) * sc, (sx_gy + sx_gr * 0.7) * sc, 1 * sc, 0);
+gfx_setfont(13); ui_col(0x6C7480);
+sx_tc(sx_gx, sx_gy - sx_gr - 4, "M"); sx_tl(sx_gx - sx_gr * 0.7 - 12, sx_gy - sx_gr * 0.7 - 14, "L");
+sx_tl(sx_gx + sx_gr * 0.7 + 4, sx_gy - sx_gr * 0.7 - 14, "R"); sx_tl(sx_gx + sx_gr - 10, sx_gy + 2, "S");
+!freeze ? (
+  sx_w = rw_disp; sx_m = sx_qm = sx_qs = 0; sx_i = 0;
+  loop(2048, sx_k = (sx_w - 2048 + sx_i) & (RLEN - 1);
+    sx_mx = RINGL[sx_k] + RINGR[sx_k]; sx_my = RINGL[sx_k] - RINGR[sx_k];
+    sx_m = max(sx_m, max(abs(sx_mx), abs(sx_my))); sx_qm += sx_mx * sx_mx; sx_qs += sx_my * sx_my; sx_i += 1; );
+  sx_m = min(sx_m, 3 * sqrt(max(sx_qm, sx_qs) / 2048));
+  sx_gain = sx_m > sx_gain ? sx_m : sx_gain + (sx_m - sx_gain) * 0.05;
+  sx_gw0 = sx_w;
+);
+sx_gain > 0.00001 ? (
+  sx_s = sx_gr * 0.95 / sx_gain; ui_cola(TRACE2, 0.45); sx_i = 0;
+  loop(1024, sx_k = (sx_gw0 - 2048 + sx_i * 2) & (RLEN - 1);
+    sx_mx = (RINGR[sx_k] - RINGL[sx_k]) * sx_s; sx_my = (RINGL[sx_k] + RINGR[sx_k]) * sx_s;
+    sx_mx = max(-sx_gr, min(sx_gr, sx_mx)); sx_my = max(-sx_gr, min(sx_gr, sx_my));
+    gfx_rect((sx_gx + sx_mx) * sc, (sx_gy - sx_my) * sc, max(1, 1.5 * sc), max(1, 1.5 * sc));
+    sx_i += 1; );
+);
+// a -1 .. +1 bar with a centre line; the needle red below 0
+function sx_cbar(y, lbl, v, on) local(x0, w, xx) (
+  x0 = 716; w = 146;
+  gfx_setfont(13); ui_col(DIM); sx_tl(x0, y - 18, lbl);
+  ui_col(0x08090B); sx_r(x0, y, w, 12);
+  ui_cola(0xE0463A, 0.18); sx_r(x0 + 1, y + 1, w * 0.5 - 1, 10);
+  ui_cola(TRACE, 0.12); sx_r(x0 + w * 0.5, y + 1, w * 0.5 - 1, 10);
+  ui_cola(HAIR, 0.4); sx_r(x0 + w * 0.5, y - 2, 1, 16);
+  on ? (
+    xx = x0 + (v + 1) * 0.5 * w;
+    ui_col(v < 0 ? 0xFF5A4A : TRACE2); sx_r(xx - 2, y - 3, 4, 18);
+  );
+  gfx_setfont(13); ui_col(0x6C7480); sx_tl(x0, y + 15, "-1"); sx_tr(x0 + w, y + 15, "+1");
+);
+sx_cbar(330, "CORRELATION", sx_cor, sx_on);
+sx_cbar(380, "LOW (BELOW 150 Hz)", sx_lco, sx_lon);
+// BALANCE: the needle left / right of centre
+gfx_setfont(13); ui_col(DIM); sx_tl(716, 412, "BALANCE");
+ui_col(0x08090B); sx_r(716, 430, 146, 12); ui_cola(HAIR, 0.4); sx_r(789, 427, 1, 18);
+sx_on ? ( ui_col(TRACE2); sx_r(789 + sx_bal * 73 - 2, 427, 4, 18); );
+ui_col(0x6C7480); sx_tl(716, 445, "L"); sx_tr(862, 445, "R");
+
+// ---------- LEVELS ----------
+sx_glass(914, 132, 130, 332);
+sx_now2 = time_precise(); sx_ldt = max(1 / 120, min(0.25, sx_now2 - sx_lt0)); sx_lt0 = sx_now2;
+!freeze ? (
+  sx_pl = pkl_d; sx_pr = pkr_d; pkl_d = pkr_d = 0;
+  sx_dl = sx_pl > 0.0000001 ? 20 * log10(sx_pl) : -200; sx_dr = sx_pr > 0.0000001 ? 20 * log10(sx_pr) : -200;
+  sx_ml = max(sx_dl, sx_ml - 24 * sx_ldt); sx_mr = max(sx_dr, sx_mr - 24 * sx_ldt);
+  sx_drm = sx_ell + sx_err > 0.000000000001 ? 10 * log10((sx_ell + sx_err) * 0.5) : -200;
+  // floating peak holds: 1.2 s, then down 0.6 dB a frame
+  sx_dl > sx_hl ? ( sx_hl = sx_dl; sx_htl = 1.2; ) : sx_htl > 0 ? sx_htl -= sx_ldt : sx_hl -= 0.6;
+  sx_dr > sx_hr ? ( sx_hr = sx_dr; sx_htr = 1.2; ) : sx_htr > 0 ? sx_htr -= sx_ldt : sx_hr -= 0.6;
+  sx_xl = max(sx_xl, sx_dl); sx_xr = max(sx_xr, sx_dr);
+);
+sx_by = 160; sx_bh = 252;
+function sx_lv(d) ( max(0, min(60, d + 60)) / 60 * sx_bh; );
+gfx_setfont(13); ui_col(0x6C7480);
+sx_j = 0; loop(6, sx_d = -sx_j * 12; sx_yy = sx_by + sx_bh - sx_lv(sx_d);
+  ui_cola(HAIR, 0.1); sx_r(926, sx_yy, 106, 1); ui_col(0x6C7480); sprintf(#sx_s, "%d", sx_d); sx_tr(1040, sx_yy - 7, #sx_s); sx_j += 1; );
+ui_col(0x6C7480); sx_tc(944, 142, "L"); sx_tc(968, 142, "RMS"); sx_tc(992, 142, "R");
+function sx_bar(x, d, col, hd) local(hh) (
+  ui_col(0x08090B); sx_r(x, sx_by, 16, sx_bh);
+  hh = sx_lv(d);
+  hh > 0 ? ( ui_col(col); gfx_a = 0.85; sx_r(x + 1, sx_by + sx_bh - hh, 14, hh); );
+  hd > -60 ? ( ui_col(hd > -0.1 ? 0xFF5A4A : CREAM); sx_r(x + 1, sx_by + sx_bh - sx_lv(hd) - 1, 14, 2); );
+);
+sx_bar(936, sx_ml, sx_ml > -0.1 ? 0xFF5A4A : TRACE, sx_hl);
+sx_bar(960, sx_drm, AMBR, -200);
+sx_bar(984, sx_mr, sx_mr > -0.1 ? 0xFF5A4A : TRACE, sx_hr);
+gfx_setfont(14);
+ui_col(sx_xl > -0.1 ? 0xFF5A4A : CREAM); sx_xl > -100 ? sprintf(#sx_s, sx_xl > 0.05 ? "+%.1f" : "%.1f", sx_xl) : strcpy(#sx_s, "--"); sx_tc(944, 428, #sx_s);
+ui_col(sx_xr > -0.1 ? 0xFF5A4A : CREAM); sx_xr > -100 ? sprintf(#sx_s, sx_xr > 0.05 ? "+%.1f" : "%.1f", sx_xr) : strcpy(#sx_s, "--"); sx_tc(992, 428, #sx_s);
+gfx_setfont(13); ui_col(0x6C7480); sx_tc(968, 444, "PEAK dBFS");
+sx_in(914, 132, 130, 332) && pressed && drag_id == 0 ? ( drag_id = -1; sx_xl = sx_xr = -200; sx_hl = sx_hr = -200; );
+
+pk_end();
+ui_end();
