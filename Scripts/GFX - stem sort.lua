@@ -1,7 +1,8 @@
 -- @description GFX - stem sort (a folder of stems to a sorted, coloured session)
 -- @author JGWizrad / Garden FX (GFX)
--- @version 1.0
+-- @version 1.1
 -- @changelog
+--   NAMES: a style for the folder names (=BASS=, [BASS], -- BASS -- ... or your own), in capitals or Title case.
 --   First release: a folder of stems to a sorted, coloured session (folders, tempo, pans, mutes, wet / dry,
 --   tidy names, STRIP that keeps tails, silent-stem check, KEY action).
 -- @about
@@ -20,6 +21,8 @@
 --   gaps under 1.5 s stay, each cut gets a short fade). While the window is open it listens to every stem: a stem
 --   with nothing on it (never above -70 dBFS) comes in muted, marked SILENT. KEY makes MAKE SESSION an action of its
 --   own: a shortcut then asks for the folder and makes the session with the window's settings, no window needed.
+--   NAMES picks how the folders are named, so they stand out from the stems: BASS, =BASS=, [BASS], -- BASS -- and
+--   more, or your own (type how BASS should look), in capitals or Title case. Remembered for next time.
 --   Your stem files are only read: never moved, renamed or changed.
 --   Needs nothing but REAPER (no SWS, no js extension).
 
@@ -511,6 +514,18 @@ local function strip_item(item, start, keep, len)
   end
 end
 
+-- folder name styles: NAME stands for the folder's name. No < or > (REAPER reads a leading < oddly).
+local FSTYLES = { 'NAME', '=NAME=', '[NAME]', '(NAME)', '{NAME}', '-- NAME --', '== NAME ==', '## NAME ##',
+                  '** NAME **', '| NAME |', ':: NAME ::', '~ NAME ~', '_NAME_', '+ NAME' }
+local function folder_name(g, opt)
+  local n = g.name
+  if opt.fcase == 'title' then n = n:lower():gsub('(%a)(%w*)', function(a, b) return a:upper() .. b end) end
+  local st = opt.fstyle or 'NAME'
+  local a, b = st:find('NAME', 1, true)
+  if not a then return n end
+  return st:sub(1, a - 1) .. n .. st:sub(b + 1)
+end
+
 local function build(list, opt, bpm)
   local rows = session_rows(list)
   if #rows == 0 then return 0 end
@@ -546,7 +561,7 @@ local function build(list, opt, bpm)
     reaper.SetMediaTrackInfo_Value(tr, 'I_FOLDERDEPTH', nxt - r.level)
     if r.folder then
       local g = r.folder
-      reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME', g.name, true)
+      reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME', folder_name(g, opt), true)
       reaper.SetMediaTrackInfo_Value(tr, 'I_CUSTOMCOLOR', native(g.col))
       if g.mute then reaper.SetMediaTrackInfo_Value(tr, 'B_MUTE', 1) end
     else
@@ -755,7 +770,9 @@ end
 local DW, DH = 520, 704
 local function opt_get(k) return reaper.GetExtState(SECTION, k) ~= "0" end   -- all lit unless switched off
 local opt = { newtab = opt_get("newtab"), tidy = opt_get("tidy"), pan = opt_get("pan"),
-              strip = reaper.GetExtState(SECTION, "strip") == "1" }          -- STRIP starts dark
+              strip = reaper.GetExtState(SECTION, "strip") == "1",           -- STRIP starts dark
+              fstyle = reaper.GetExtState(SECTION, "fstyle"), fcase = reaper.GetExtState(SECTION, "fcase") }
+if opt.fstyle == '' then opt.fstyle = 'NAME' end
 local stems, dir, bpm, bpm_from = {}, nil, nil, nil
 local status, scroll = 'OPEN A FOLDER', 0
 local heard = 0                     -- stems listened to so far (silent check, STRIP)
@@ -794,6 +811,36 @@ local function dropped()
   end
   gfx.getdropfile(-1)
   if #files > 0 then load(folder, files) end
+end
+
+-- NAMES: the menu of folder-name styles, shown on BASS; Custom = type how BASS should look
+local function names_menu()
+  local items = {}
+  local ex = { name = 'BASS' }
+  for _, st in ipairs(FSTYLES) do
+    items[#items + 1] = (opt.fstyle == st and '!' or '') .. folder_name(ex, { fstyle = st, fcase = opt.fcase })
+  end
+  local custom = true
+  for _, st in ipairs(FSTYLES) do if st == opt.fstyle then custom = false end end
+  items[#items + 1] = '|' .. (custom and '!' or '') .. 'Your own...'
+  items[#items + 1] = '|' .. (opt.fcase ~= 'title' and '!' or '') .. 'CAPITALS'
+  items[#items + 1] = (opt.fcase == 'title' and '!' or '') .. 'Title case'
+  gfx.x, gfx.y = gfx.mouse_x, gfx.mouse_y
+  local c = gfx.showmenu(table.concat(items, '|'))
+  local n = #FSTYLES
+  if c >= 1 and c <= n then opt.fstyle = FSTYLES[c]
+  elseif c == n + 1 then
+    local now = folder_name(ex, { fstyle = opt.fstyle, fcase = 'caps' })
+    local ok, v = reaper.GetUserInputs('GFX stem sort', 1, 'Type how BASS should look:,extrawidth=60', now)
+    if not ok then return end
+    local a, b = v:upper():find('BASS', 1, true)
+    if not a then reaper.MB('Put the word BASS in it, styled as you like (for example =BASS=).', 'GFX stem sort', 0); return end
+    opt.fstyle = v:sub(1, a - 1) .. 'NAME' .. v:sub(b + 1)
+  elseif c == n + 2 then opt.fcase = 'caps'
+  elseif c == n + 3 then opt.fcase = 'title'
+  else return end
+  reaper.SetExtState(SECTION, 'fstyle', opt.fstyle, true)
+  reaper.SetExtState(SECTION, 'fcase', opt.fcase or '', true)
 end
 
 local function set_tempo()
@@ -864,7 +911,7 @@ local function list_view(x, y, w, h)
       local ix = x + 12 + r.level * 18
       rr(ix, ry + 2, w - 24 - r.level * 18, rh - 3, 3, g.col)
       gfx.setfont(2)
-      text(ix + 8, ry + 4, g.name, 0xFFFFFF)
+      text(ix + 8, ry + 4, folder_name(g, opt), 0xFFFFFF)
       gfx.setfont(4)
       text(x + w - 20, ry + 5, (g.mute and 'MUTED  ' or '') .. r.n, 0xFFFFFF, 2)
     else
@@ -938,9 +985,12 @@ local function draw()
 
   local y, kh, gap = listy + listh + 16, 44, 8
   local u = (w0 - gap * 3) / 4
+  u = 100
   if key('open', 'OPEN', x0, y, u, kh, 0x6F6F76, 0xF4F1E8) then open_folder() end
   if key('tempo', 'TEMPO', x0 + u + gap, y, u, kh, 0x5B7393, 0xF4F1E8) then set_tempo() end
-  if key('make', 'MAKE SESSION', x0 + (u + gap) * 2, y, u * 2 + gap, kh, 0xE48A2A, 0x1E1E1E) then make() end
+  if key('names', 'NAMES', x0 + (u + gap) * 2, y, u, kh, 0x5B7393, 0xF4F1E8) then names_menu() end
+  local mx = x0 + (u + gap) * 3
+  if key('make', 'MAKE SESSION', mx, y, x0 + w0 - mx, kh, 0xE48A2A, 0x1E1E1E) then make() end
   y = y + kh + 10
   local u4 = (w0 - gap * 3) / 4
   for i, k in ipairs({ { 'newtab', 'NEW TAB' }, { 'tidy', 'TIDY' }, { 'pan', 'PAN L / R' }, { 'strip', 'STRIP' } }) do
