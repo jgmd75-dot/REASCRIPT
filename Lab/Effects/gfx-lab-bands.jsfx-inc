@@ -1,0 +1,111 @@
+// gfx-lab-bands.jsfx-inc - the band split shared by the band-split dynamics (Lab: Cherwell Drum Gate, SEN20,
+// Cherwell Transient). JG, 26 Oct 2026: a gate / shaper that treats the lows, mids and highs differently.
+//
+// SPLIT: 4th-order (24 dB/oct) Linkwitz-Riley crossovers, zero latency. Two or three bands:
+//   x > [split 1] > LOW + rest;  rest > [split 2] > MID + HIGH;  LOW goes through split 2's all-pass so the three
+//   stay in phase. With every band at the same gain the sum is flat (an all-pass: same level at every frequency,
+//   only the phase turns round the split points). In two-band mode a unit gives MID the HIGH band's gain, so the
+//   same three bands make a two-way split with no switching (and nothing to click).
+//   bs_coef(f1, f2)    coefficients for both splits (globals, one crossover per unit; audio thread only)
+//   s.bs_split(x)      -> s.lo, s.mi, s.hi (one instance per channel, and per key channel)
+//   bs_clear()         is per instance: s.bs_clear() empties the filters (resume after REAPER's bypass)
+// GATE: one gate per band (open above thr_o, closes below thr_c once HOLD has run out, linear in dB):
+//   g.thr_o / g.thr_c (dBFS), g.hold_n (samples), g.up / g.dn (dB per sample), g.flr (dB), g.duck (0 / 1),
+//   g.adp (1 = programme-adaptive release: x 0.6 after a short hit .. x 1.4 after a long note, as SEN20)
+//   g.bg_gate(kdb) -> g.gdb (the band's gain in dB), g.opn (1 while the key holds it open)
+//   g.bg_follow(lead) instead: LINK - the band opens with another band's gate (lead = that gate's opn)
+// TRANSIENT: one level-independent detector per band (fast and slow followers compared in dB, as Cherwell
+//   Transient): bt_init() once, t.bt_speed(k) per band (k = 1 standard, > 1 slower), t.bt_det(v) -> t.onset / t.tail
+//   (dB, 0 - 18).
+// Requires nothing else. Prefix bs_ / bg_ / bt_.
+
+@init
+function bs_coef(f1, f2) local(g) (
+  bs_k = 1.4142135623730951;
+  f1 = max(10, min(f1, srate * 0.45));  f2 = max(f1 * 1.01, min(f2, srate * 0.45));
+  g = tan($pi * f1 / srate);  bs_a1 = 1 / (1 + g * (g + bs_k));  bs_a2 = g * bs_a1;  bs_a3 = g * bs_a2;
+  g = tan($pi * f2 / srate);  bs_b1 = 1 / (1 + g * (g + bs_k));  bs_b2 = g * bs_b1;  bs_b3 = g * bs_b2;
+);
+
+// TPT state-variable stages written out (no nested instances): A = split 1 on x (gives LP and HP at once),
+// B = LP of A's LP, C = HP of A's HP, D = split 2 on HIGH-of-1, E = LP of D's LP, F = HP of D's HP, G = all-pass on LOW
+function bs_split(x) instance(a1, a2, b1, b2, c1, c2, d1, d2, e1, e2, f1, f2, g1, g2, lo, mi, hi)
+  local(v1, v2, v3, l, h, r)
+(
+  v3 = x - a2;  v1 = bs_a1 * a1 + bs_a2 * v3;  v2 = a2 + bs_a2 * a1 + bs_a3 * v3;  a1 = 2 * v1 - a1;  a2 = 2 * v2 - a2;
+  l = v2;  h = x - bs_k * v1 - v2;
+  v3 = l - b2;  v1 = bs_a1 * b1 + bs_a2 * v3;  v2 = b2 + bs_a2 * b1 + bs_a3 * v3;  b1 = 2 * v1 - b1;  b2 = 2 * v2 - b2;
+  lo = v2;
+  v3 = h - c2;  v1 = bs_a1 * c1 + bs_a2 * v3;  v2 = c2 + bs_a2 * c1 + bs_a3 * v3;  c1 = 2 * v1 - c1;  c2 = 2 * v2 - c2;
+  r = h - bs_k * v1 - v2;
+  v3 = r - d2;  v1 = bs_b1 * d1 + bs_b2 * v3;  v2 = d2 + bs_b2 * d1 + bs_b3 * v3;  d1 = 2 * v1 - d1;  d2 = 2 * v2 - d2;
+  l = v2;  h = r - bs_k * v1 - v2;
+  v3 = l - e2;  v1 = bs_b1 * e1 + bs_b2 * v3;  v2 = e2 + bs_b2 * e1 + bs_b3 * v3;  e1 = 2 * v1 - e1;  e2 = 2 * v2 - e2;
+  mi = v2;
+  v3 = h - f2;  v1 = bs_b1 * f1 + bs_b2 * v3;  v2 = f2 + bs_b2 * f1 + bs_b3 * v3;  f1 = 2 * v1 - f1;  f2 = 2 * v2 - f2;
+  hi = h - bs_k * v1 - v2;
+  v3 = lo - g2;  v1 = bs_b1 * g1 + bs_b2 * v3;  v2 = g2 + bs_b2 * g1 + bs_b3 * v3;  g1 = 2 * v1 - g1;  g2 = 2 * v2 - g2;
+  lo -= 2 * bs_k * v1;                                        // all-pass: x - 2k bp
+);
+function bs_clear() instance(a1, a2, b1, b2, c1, c2, d1, d2, e1, e2, f1, f2, g1, g2) (
+  a1 = a2 = b1 = b2 = c1 = c2 = d1 = d2 = e1 = e2 = f1 = f2 = g1 = g2 = 0;
+);
+
+// one band's gate (see the header)
+function bg_gate(kdb) instance(thr_o, thr_c, hold_n, hold_c, up, dn, flr, duck, adp, opn, open_t, gdb, want) (
+  kdb > thr_o ? (
+    !opn ? open_t = 0;
+    opn = 1;  hold_c = hold_n;
+  ) : kdb < thr_c ? (
+    hold_c > 0 ? hold_c -= 1 : opn = 0;
+  ) : (
+    opn ? hold_c = hold_n;
+  );
+  opn ? open_t += 1 / srate;
+  want = duck ? !opn : opn;
+  want ? gdb = min(0, gdb + up)
+       : gdb = max(flr, gdb - (adp ? dn / (0.6 + 0.8 * min(1, open_t / 0.6)) : dn));
+  gdb;
+);
+
+// LINK: a band whose gate follows another band's (lead = the leading gate's opn). It opens while the lead is open
+// and closes once its own HOLD has run out after the lead shuts; its own ATTACK / RELEASE / RANGE (its THRESH unused)
+function bg_follow(lead) instance(hold_n, hold_c, up, dn, flr, duck, adp, opn, open_t, gdb, want) (
+  lead ? (
+    !opn ? open_t = 0;
+    opn = 1;  hold_c = hold_n;
+  ) : (
+    hold_c > 0 ? hold_c -= 1 : opn = 0;
+  );
+  opn ? open_t += 1 / srate;
+  want = duck ? !opn : opn;
+  want ? gdb = min(0, gdb + up)
+       : gdb = max(flr, gdb - (adp ? dn / (0.6 + 0.8 * min(1, open_t / 0.6)) : dn));
+  gdb;
+);
+
+// one band's transient detector (see the header)
+function bt_init() (
+  bt_hold_r = exp(-1 / (0.008 * srate));
+  bt_tl_up = 1 - exp(-1 / (0.003 * srate));
+);
+function bt_speed(k) instance(fa_a, fa_r, sa_a, sa_r, fr_a, fr_r, sr_a, sr_r) (
+  fa_a = 1 - exp(-1 / (0.25 * k * 0.001 * srate));  fa_r = 1 - exp(-1 / (25 * k * 0.001 * srate));
+  sa_a = 1 - exp(-1 / (20 * k * 0.001 * srate));    sa_r = 1 - exp(-1 / (25 * k * 0.001 * srate));
+  fr_a = 1 - exp(-1 / (0.5 * k * 0.001 * srate));   fr_r = 1 - exp(-1 / (30 * k * 0.001 * srate));
+  sr_a = 1 - exp(-1 / (0.5 * k * 0.001 * srate));   sr_r = 1 - exp(-1 / (320 * k * 0.001 * srate));
+);
+function bt_det(v) instance(fa_a, fa_r, sa_a, sa_r, fr_a, fr_r, sr_a, sr_r, lvh, efa, esa, efr, esr, tl, onset, tail) (
+  lvh = v > lvh ? v : lvh * bt_hold_r;                        // instant-attack peak hold (~8 ms): the ripple out
+  v = lvh;
+  efa += (v - efa) * (v > efa ? fa_a : fa_r);
+  esa += (v - esa) * (v > esa ? sa_a : sa_r);
+  efr += (v - efr) * (v > efr ? fr_a : fr_r);
+  esr += (v - esr) * (v > esr ? sr_a : sr_r);
+  onset = efa > 0.00001 && esa > 0.00001 ? max(0, min(18, 8.685889638065035 * log(efa / esa))) : 0;
+  tail  = efr > 0.00001 && esr > 0.00001 ? max(0, min(18, 8.685889638065035 * log(esr / efr))) : 0;
+  esa < 0.00003 ? ( onset = 0;  tail = 0; );                 // silence: nothing to shape
+  // the tail term: gone the moment the level rises (a new hit), building back gently (3 ms)
+  v > efr * 1.02 ? tl = 0 : tl += (tail - tl) * (tail > tl ? bt_tl_up : 1);
+  tail = tl;
+);
