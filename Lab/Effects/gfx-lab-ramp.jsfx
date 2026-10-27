@@ -12,8 +12,8 @@ desc:GFX Lab Ramp [guitar amp]
 //   PREAMP     AMP HEAD    all-valve, CLEAN / DRIVE channels, BRIGHT, a tone stack and a spring tank.
 //              FULLERTON   black-panel NORMAL / VIBRATO channels (JUMPER), the passive stack, a three-spring tank and
 //                          the optical tremolo.
-//              MALI 120    solid-state NORMAL / EFFECT channels, the fizzy op-amp DISTORTION, a short spring and the
-//                          bucket-brigade chorus / vibrato (with MONO IN: dry left, chorus right, as the original).
+//              MALI 120    solid-state NORMAL / EFFECT channels, the op-amp DISTORTION (smoothed: JG found the
+//                          original's too harsh) and a short spring; its chorus / vibrato is the FX LOOP's (JG, 27 Oct 2026).
 //              GR-120      the cascaded graphic preamp: GAIN, BASS / TREBLE, FREQ CONTOUR, the six-band GRAPHIC and a
 //                          DOOM / LEAD voicing.
 //   POWER AMP  AMP HEAD    EL34-style push-pull, shared supply sag, PRESENCE, MASTER.
@@ -34,7 +34,7 @@ desc:GFX Lab Ramp [guitar amp]
 //   4x = 37). 1x keeps each original's own host-rate anti-aliasing (ADAA on every valve, the drive-tracking pre-filter,
 //   the post-shelves); the GR-120 pieces always ran at 2x, so they match their original at 2x.
 // DRIFT (0 - 100 %, 50 % = standard; JG, 27 Oct 2026): each piece brings the drift of its original - the preamp
-//   valves' bias, the power valves' balance and the supply's breathing, the Mali's chorus clock and rails.
+//   valves' bias, the power valves' balance and the supply's breathing, the Mali's distortion bias and rails.
 // IN / OUT: TRIM (GUARD), MONO IN, GATE (fully down = off), OUTPUT, and the house output stage (CLIP, always on).
 // GUI: each slot (PREAMP, POWER AMP, CABINET) has a display box - click it for the menu - and the piece in it wears its
 //   own amp's colours. Drag a knob (Shift = fine), double-click or Ctrl-click = default; values show while touched.
@@ -613,11 +613,13 @@ function fl_powrate() (
 );
 // ================================================================ MALI 120 (gfx-mali-120, the 120 model)
 ML_BB = 16384; ML_BM = ML_BB - 1;
-function ml_hcF(u) ( abs(u) <= 1 ? 0.5 * u * u : abs(u) - 0.5; );
+// the clip: a cubic soft clip (JG, 27 Oct 2026: the original's hard clip was too harsh), with ADAA
+function ml_hcF(u) ( abs(u) <= 1 ? 1.5 * (0.5 * u * u - u * u * u * u / 12) : abs(u) - 0.375; );
+function ml_sc(u) ( u = min(max(u, -1), 1); 1.5 * (u - u * u * u / 3); );
 function ml_clip(u) instance(x1, Fa, b1) local(Fv, y, d) (
   u += ml_bias; Fv = ml_hcF(u); d = u - x1;
-  y = abs(d) > 0.00001 ? (Fv - Fa) / d : min(max(0.5 * (u + x1), -1), 1);
-  y -= 0.5 * (ml_bias + b1);
+  y = abs(d) > 0.00001 ? (Fv - Fa) / d : ml_sc(0.5 * (u + x1));
+  y -= ml_sc(0.5 * (ml_bias + b1));
   x1 = u; Fa = Fv; b1 = ml_bias;
   y;
 );
@@ -636,9 +638,9 @@ function ml_pre_set() instance(nbr, nb, nm, nt, nv1, nv2, ebr, eb, em, et, ev1, 
   this.eb.am_bq(4, 110, 0.7, ml_ebd, rp_fs); this.em.am_bq(2, ml_mf, 0.75, ml_emd, rp_fs); this.et.am_bq(3, 3200, 0.7, ml_etd, rp_fs);
   this.ev1.am_bq(2, 1300, 0.7, ml_vmid, rp_fs); this.ev2.am_bq(3, 6500, 0.7, ml_vglass, rp_fs);
   this.ehp.am_bq(1, 110, 0.7, 0, rp_fs);
-  this.dpe.am_bq(3, 1500, 0.7, 9, rp_fs);
-  this.dlp.am_bq(0, 6200, 1.05, 0, rp_fs);
-  this.dlp2.am_bq(0, 10500, 0.6, 0, rp_fs);
+  this.dpe.am_bq(3, 1500, 0.7, 5, rp_fs);      // (the original: +9 dB; smoothed)
+  this.dlp.am_bq(0, 4500, 0.8, 0, rp_fs);      // (6200 Hz, Q 1.05)
+  this.dlp2.am_bq(0, 8000, 0.6, 0, rp_fs);     // (10500 Hz)
   this.dhp.am_bq(1, 30, 0.7, 0, rp_fs);
 );
 function ml_pre_clr() instance(nbr, nb, nm, nt, nv1, nv2, ebr, eb, em, et, ev1, ev2, ehp, dpe, dlp, dlp2, dhp, gn, ge, db, rw, on, oe) (
@@ -673,22 +675,7 @@ function ml_pre(x) instance(on, oe, gn, ge, db, rw, nbr, nb, nm, nt, nv1, nv2, e
     oe = y + this.rv.rp_spring_run(y, 0.7, ml_sa, ml_se) * rw;
   ) : ( ge = 0; oe = 0; );
 );
-function ml_bbd(x, d) instance(buf, wp, p1, p2, q) local(rp, i, f, xm1, x0, x1, x2, y) (
-  p1 += (x - p1) * ml_bc; p2 += (p1 - p2) * ml_bc;
-  buf[wp] = p2;
-  rp = wp - d; rp < 0 ? rp += ML_BB;
-  i = floor(rp); f = rp - i;
-  xm1 = buf[(i + ML_BM) & ML_BM]; x0 = buf[i & ML_BM]; x1 = buf[(i + 1) & ML_BM]; x2 = buf[(i + 2) & ML_BM];
-  wp = (wp + 1) & ML_BM;
-  y = (((0.5 * (x2 - xm1) + 1.5 * (x0 - x1)) * f + (xm1 - 2.5 * x0 + 2 * x1 - 0.5 * x2)) * f + 0.5 * (x1 - xm1)) * f + x0;
-  y = min(max(y, -3), 3); y = y * (27 + y * y) / (27 + 9 * y * y);
-  this.q.am_run(y);
-);
-function ml_shape(p, vib) local(t) (
-  p -= floor(p);
-  vib ? sin(2 * $pi * p) : ( t = 4 * abs(p - 0.5) - 1; t * (1.5 - 0.5 * t * t); );
-);
-// ---- MALI preamp, both sides: (xl, xr) -> ml_sL / ml_sR (the two speakers' feeds; the chorus is in here)
+// ---- MALI preamp, both sides: (xl, xr) -> ml_sL / ml_sR (the two speakers' feeds; its chorus / vibrato moved to the FX LOOP)
 function ml_prerun(xl, xr) (
   rp_mono ? (
     PL.ml_pre(xl);
@@ -697,18 +684,7 @@ function ml_prerun(xl, xr) (
     PL.ml_pre(xl); PR.ml_pre(xr);
     ml_nL = PL.on; ml_nR = PR.on; ml_eL = PL.oe; ml_eR = PR.oe;
   );
-  ml_cs += (ml_cent * ml_clk - ml_cs) * ml_sm2;
-  ml_ds += (ml_dept * ml_clk - ml_ds) * ml_sm2;
-  ml_mL += (ml_tL - ml_mL) * ml_sm; ml_mR += (ml_tR - ml_mR) * ml_sm;
-  ml_ph += ml_inc; ml_ph >= 1 ? ml_ph -= 1;
-  ml_lv = ml_shape(ml_ph, ml_vib);
-  ml_wL = BL.ml_bbd(ml_eL, (ml_cs + ml_ds * ml_lv) * ml_msr);
-  rp_mono ? ml_wR = ml_wL : (
-    ml_lv2 = ml_vib ? ml_lv : ml_shape(ml_ph + 0.25, 0);
-    ml_wR = BR.ml_bbd(ml_eR, (ml_cs + ml_ds * ml_lv2) * ml_msr);
-  );
-  ml_sL = ml_nL + ml_eL + (ml_wL - ml_eL) * ml_mL;
-  ml_sR = ml_nR + ml_eR + (ml_wR - ml_eR) * ml_mR;
+  ml_sL = ml_nL + ml_eL; ml_sR = ml_nR + ml_eR;
 );
 // ---- MALI power amp, one side (OL / OR): the clean solid-state stage, the rails clip hard, a touch of sag
 function ml_pow(x) instance(env) local(a, r, k, y) (
@@ -737,11 +713,10 @@ function ml_spk(y) instance(s1, s2, s3, s4, s5, s6, s7) (
   y = this.s5.am_run(y); y = this.s6.am_run(y); this.s7.am_run(y);
 );
 function ml_mem() (
-  BL.buf = rp_alloc(ML_BB); BR.buf = rp_alloc(ML_BB);
   ml_rvn = floor(0.09 * 4 * srate) + 64;
   ml_rvL = rp_alloc(ml_rvn); ml_rvR = rp_alloc(ml_rvn);
 );
-function ml_preupd() local(v, cents) (
+function ml_preupd() local(v) (
   ml_nrm = RP_ST[44] != 1;
   ml_eff = RP_ST[44] != 0;
   ml_gn = sqr(RP_ST[45] / 10) * 4; ml_ge = sqr(RP_ST[50] / 10) * 4;
@@ -754,35 +729,21 @@ function ml_preupd() local(v, cents) (
   ml_gd = 10 ^ ((6 + 4.4 * v) / 20); ml_cd = max(1 / ml_gd, 0.13);
   ml_db = min(v * 2, 1);
   ml_rw = (RP_ST[56] / 10) ^ 1.5 * 1.5;
-  ml_mod = RP_ST[57] | 0;
-  ml_vib = ml_mod == 2;
-  ml_mod == 2 ? (
-    ml_rate = 0.5 * 20 ^ (RP_ST[58] / 10);
-    cents = 50 * (RP_ST[59] / 10) ^ 1.3;
-    ml_dept = min((2 ^ (cents / 1200) - 1) / (2 * $pi * ml_rate) * 1000, 6);
-    ml_cent = ml_dept + 1.3;
-  ) : ( ml_rate = 0.72; ml_cent = 4.6; ml_dept = 1.9; );
-  ml_tL = ml_mod == 2 ? 1 : ml_mod == 1 ? (rp_mono ? 0 : 0.5) : 0;
-  ml_tR = ml_mod == 2 ? 1 : ml_mod == 1 ? (rp_mono ? 1 : 0.5) : 0;
   PL.ml_pre_set(); PR.ml_pre_set();
 );
 function ml_powupd() (
   ml_rail0 = 1; ml_mk = 0.8;
   ml_pm = 10 ^ ((RP_ST[60] - 5) * 3 / 20); ml_pmk = ml_pm ^ -0.55;      // MASTER (new): +/-15 dB, 5 = as the original
 );
-// DRIFT: the chorus rate and clock (the preamp), the rails and their sag (the power amp)
+// DRIFT: the distortion's bias (the preamp), the rails and their sag (the power amp)
 function ml_drift() local(di) (
   di = 0.25 * dm_s * samplesblock / srate;
-  ml_rate_d = ml_rate * (1 + 0.05 * dm_a * drR.drift_tick(di));
-  ml_clk = 1 + 0.03 * dm_a * drC.drift_tick(di);
   ml_rail = ml_rail0 * (1 + 0.015 * dm_a * drS.drift_tick(di));
   ml_sag = 0.035 * dm_a;
   ml_bias = 0.1 + 0.03 * dm_a * drB.drift_tick(di);
-  ml_inc = ml_rate_d / rp_fs;
 );
 
 function ml_prerate() (
-  memset(BL.buf, 0, ML_BB); memset(BR.buf, 0, ML_BB); BL.wp = BR.wp = 0; BL.p1 = BL.p2 = BR.p1 = BR.p2 = 0;
   PL.rv.am_spring_init(ml_rvL, rp_fs); PR.rv.am_spring_init(ml_rvR, rp_fs);
   PL.rv.n1 = floor(0.0291 * rp_fs); PL.rv.n2 = floor(0.0337 * rp_fs);
   PR.rv.n1 = floor(0.0306 * rp_fs); PR.rv.n2 = floor(0.0352 * rp_fs);
@@ -791,14 +752,8 @@ function ml_prerate() (
   PL.rv.rp_spring_clr(); PR.rv.rp_spring_clr();
   ml_sa = rp_apa(4.263158 * os_f / 1); ml_se = rp_apa(3 * os_f);   // (0.62 and 0.5 at 1x, as the original)
   PL.ml_pre_clr(); PR.ml_pre_clr();
-  BL.q.am_bq(0, 8500, 0.65, 0, rp_fs); BR.q.am_bq(0, 8500, 0.65, 0, rp_fs); BL.q.rp_bqclr(); BR.q.rp_bqclr();
-  ml_bc = 1 - exp(-2 * $pi * 11000 / rp_fs);
   ml_sm = 1 - exp(-1 / (0.02 * rp_fs));
-  ml_sm2 = 1 - exp(-1 / (0.08 * rp_fs));
-  ml_msr = rp_fs / 1000;
-  ml_ph = 0;
   ml_preupd();
-  ml_cs = ml_cent; ml_ds = ml_dept; ml_mL = ml_tL; ml_mR = ml_tR;
 );
 function ml_powrate() (
   ml_satt = 1 - exp(-1 / (0.005 * rp_fs)); ml_srel = 1 - exp(-1 / (0.15 * rp_fs));
@@ -1451,9 +1406,9 @@ RP_DF[53] = 5;   // MALI pre Effect bass
 RP_DF[54] = 0;   // MALI pre Effect bright
 RP_DF[55] = 0;   // MALI pre Distortion
 RP_DF[56] = 2;   // MALI pre Reverb
-RP_DF[57] = 0;   // MALI pre Modulation
-RP_DF[58] = 5;   // MALI pre Vibrato speed
-RP_DF[59] = 5;   // MALI pre Vibrato depth
+RP_DF[57] = 0;   // (unused, was MALI pre Modulation: moved to the FX LOOP)
+RP_DF[58] = 5;   // (unused, was MALI pre Vibrato speed)
+RP_DF[59] = 5;   // (unused, was MALI pre Vibrato depth)
 RP_DF[60] = 5;   // MALI power Master
 RP_DF[61] = 0;   // GR-120 pre Voicing
 RP_DF[62] = 5;   // GR-120 pre Gain
@@ -1490,9 +1445,9 @@ function rp_preset(n) (
   n == 2 ? (                                                   // Fullerton Clean: the vibrato channel, its own tank
     slider12 = -2.6; slider1 = 1; slider2 = 1; slider3 = 3;
     rp_s(27, 1); rp_s(34, 4); rp_s(35, 6.5); rp_s(36, 4.5); rp_s(37, 4); rp_s(39, 3.5);
-  ) : n == 3 ? (                                               // Mali Chorus: the normal channel with the chorus on
-    slider12 = 3.3; slider1 = 2; slider2 = 2; slider3 = 4;
-    rp_s(44, 0); rp_s(45, 5); rp_s(46, 6); rp_s(47, 5); rp_s(48, 5); rp_s(49, 1); rp_s(57, 1); rp_s(56, 2.5);
+  ) : n == 3 ? (                                               // Mali Chorus: the normal channel, the loop chorus on
+    slider12 = 6.8; slider1 = 2; slider2 = 2; slider3 = 4;
+    rp_s(44, 0); rp_s(45, 5); rp_s(46, 6); rp_s(47, 5); rp_s(48, 5); rp_s(49, 1); rp_s(56, 2.5); slider38 = 1;
   ) : n == 4 ? (                                               // Head Crunch: DRIVE, the closed 4x12
     slider12 = -8.9; slider1 = 0; slider2 = 0; slider3 = 2;
     rp_s(18, 6); rp_s(20, 1); rp_s(21, 6); rp_s(22, 6); rp_s(23, 5.5); rp_s(24, 1); rp_s(25, 6); rp_s(26, 6);
@@ -1513,7 +1468,7 @@ function rp_preset(n) (
     rp_s(18, 7); rp_s(20, 1); rp_s(22, 5.5); rp_s(23, 6); rp_s(24, 0); rp_s(73, 1); rp_s(74, 5); rp_s(75, 5);
     slider38 = 1; slider39 = 0; slider40 = 4; slider41 = 6;
   ) : n == 9 ? (                                               // Fizz Wall: the Mali's distortion into the GR's EL34s
-    slider12 = -4.9; slider1 = 2; slider2 = 3; slider3 = 6;
+    slider12 = -4.3; slider1 = 2; slider2 = 3; slider3 = 6;
     rp_s(44, 1); rp_s(50, 6); rp_s(51, 5); rp_s(52, 6); rp_s(53, 6); rp_s(55, 7); rp_s(56, 0); rp_s(74, 4); rp_s(75, 5);
   ) : n == 10 ? (                                              // Surf Trem: the Fullerton's normal channel, a wet tank, stereo trem
     slider12 = -8.8; slider1 = 1; slider2 = 2; slider3 = 4;
@@ -1554,7 +1509,7 @@ dw1.drift_init(0.8 + rand(1) * 0.5); dw2.drift_init(0.8 + rand(1) * 0.5); dw3.dr
 dw5.drift_init(0.8 + rand(1) * 0.5); dw6.drift_init(0.8 + rand(1) * 0.5); dw7.drift_init(0.8 + rand(1) * 0.5); dw8.drift_init(0.8 + rand(1) * 0.5);
 dwr.drift_init(0.8 + rand(1) * 0.5);
 lpC.drift_init(0.8 + rand(1) * 0.5); lpR.drift_init(0.8 + rand(1) * 0.5);
-drR.drift_init(0.8 + rand(1) * 0.5); drC.drift_init(0.8 + rand(1) * 0.5); drS.drift_init(0.8 + rand(1) * 0.5); drB.drift_init(0.8 + rand(1) * 0.5);
+drS.drift_init(0.8 + rand(1) * 0.5); drB.drift_init(0.8 + rand(1) * 0.5);
 g1dw1.drift_init(0.8 + rand(1) * 0.5); g1dw2.drift_init(0.8 + rand(1) * 0.5); g1dw3.drift_init(0.8 + rand(1) * 0.5); g1dw4.drift_init(0.8 + rand(1) * 0.5);
 g1dw5.drift_init(0.8 + rand(1) * 0.5); g1dw6.drift_init(0.8 + rand(1) * 0.5); g1dw7.drift_init(0.8 + rand(1) * 0.5); g1dw8.drift_init(0.8 + rand(1) * 0.5);
 rp_start();
@@ -2133,8 +2088,8 @@ rg_p = floor(slider1 + 0.5);
 rg_disp(28, 128, 156, 48, 1, PRE_LIST, "MODULE",
   rg_p == 0 ? "ALL VALVE" : rg_p == 1 ? "BLACK PANEL" : rg_p == 2 ? "SOLID STATE" : "CASCADED VALVE");
 gfx_setfont(5);  rg_col(rg_cink2, 1);
-rg_tl(rg_px(28), rg_py(206), rg_p == 0 ? "Clean / drive channels," : rg_p == 1 ? "Two channels, a three-" : rg_p == 2 ? "Two channels, the fizz" : "Gain, the graphic and");
-rg_tl(rg_px(28), rg_py(224), rg_p == 0 ? "tone stack, spring tank" : rg_p == 1 ? "spring tank, the opto" : rg_p == 2 ? "box, spring, chorus" : "a DOOM / LEAD voicing");
+rg_tl(rg_px(28), rg_py(206), rg_p == 0 ? "Clean / drive channels," : rg_p == 1 ? "Two channels, a three-" : rg_p == 2 ? "Two channels, op-amp" : "Gain, the graphic and");
+rg_tl(rg_px(28), rg_py(224), rg_p == 0 ? "tone stack, spring tank" : rg_p == 1 ? "spring tank, the opto" : rg_p == 2 ? "drive, spring tank" : "a DOOM / LEAD voicing");
 rg_tl(rg_px(28), rg_py(242), rg_p == 1 ? "tremolo" : "");
 
 rg_x0 = 208;  rg_y0 = 74;
@@ -2174,30 +2129,23 @@ rg_p == 0 ? (
 ) : rg_p == 2 ? (
   rg_module(rg_x0, rg_y0, 856, 210, 2, "MALI 120", "PREAMP  -  SOLID STATE");
   rg_c = floor(slider(rpi(44)) + 0.5);
-  // INPUT (normal / effect / both), NORMAL channel (top row), EFFECT channel (bottom row), CHORUS / VIBRATO (right)
+  // INPUT (normal / effect / both), NORMAL channel (top row), EFFECT channel (bottom row)
   rg_small(rg_x0 + 62, rg_y0 + 52, "INPUT");
   rg_rad(rg_x0 + 20, rg_y0 + 68, 84, 26, rpi(44), 0, rg_kc, "NORMAL");
   rg_rad(rg_x0 + 20, rg_y0 + 108, 84, 26, rpi(44), 1, rg_kc, "EFFECT");
   rg_rad(rg_x0 + 20, rg_y0 + 148, 84, 26, rpi(44), 2, rg_kc, "BOTH");
   rg_tog(rg_x0 + 120, rg_y0 + 66, 76, 28, rpi(49), rg_kc, "BRIGHT");
-  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 240, rg_y0 + 80, 18, rpi(45), 0, 10, 5, rg_ks, 0, "VOLUME", "%.1f");
-  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 316, rg_y0 + 80, 18, rpi(46), 0, 10, 5, rg_ks, 0, "TREBLE", "%.1f");
-  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 392, rg_y0 + 80, 18, rpi(47), 0, 10, 5, rg_ks, 0, "MIDDLE", "%.1f");
-  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 468, rg_y0 + 80, 18, rpi(48), 0, 10, 5, rg_ks, 0, "BASS", "%.1f");
+  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 260, rg_y0 + 80, 18, rpi(45), 0, 10, 5, rg_ks, 0, "VOLUME", "%.1f");
+  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 356, rg_y0 + 80, 18, rpi(46), 0, 10, 5, rg_ks, 0, "TREBLE", "%.1f");
+  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 452, rg_y0 + 80, 18, rpi(47), 0, 10, 5, rg_ks, 0, "MIDDLE", "%.1f");
+  rg_kdim = rg_c == 1;  rg_kn(rg_x0 + 548, rg_y0 + 80, 18, rpi(48), 0, 10, 5, rg_ks, 0, "BASS", "%.1f");
   rg_tog(rg_x0 + 120, rg_y0 + 140, 76, 28, rpi(54), rg_kc, "BRIGHT");
-  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 240, rg_y0 + 154, 18, rpi(50), 0, 10, 5, rg_ks, 0, "VOLUME", "%.1f");
-  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 316, rg_y0 + 154, 18, rpi(51), 0, 10, 5, rg_ks, 0, "TREBLE", "%.1f");
-  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 392, rg_y0 + 154, 18, rpi(52), 0, 10, 5, rg_ks, 0, "MIDDLE", "%.1f");
-  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 468, rg_y0 + 154, 18, rpi(53), 0, 10, 5, rg_ks, 0, "BASS", "%.1f");
-  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 556, rg_y0 + 154, 18, rpi(55), 0, 10, 0, rg_ks, 0, "DISTORTION", "%.1f");
-  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 644, rg_y0 + 154, 18, rpi(56), 0, 10, 2, rg_ks, 0, "REVERB", "%.1f");
-  rg_div(rg_x0 + 690, rg_y0 + 50, rg_y0 + 196);
-  rg_sub(rg_x0 + 704, rg_y0 + 58, "CHORUS - VIB");
-  rg_rad(rg_x0 + 704, rg_y0 + 158, 44, 28, rpi(57), 0, rg_kc, "OFF");
-  rg_rad(rg_x0 + 752, rg_y0 + 158, 44, 28, rpi(57), 1, rg_kc, "CHO");
-  rg_rad(rg_x0 + 800, rg_y0 + 158, 44, 28, rpi(57), 2, rg_kc, "VIB");
-  rg_kdim = slider(rpi(57)) < 1.5;  rg_kn(rg_x0 + 734, rg_y0 + 100, 16, rpi(58), 0, 10, 5, rg_ks, 0, "SPEED", "%.1f");
-  rg_kdim = slider(rpi(57)) < 1.5;  rg_kn(rg_x0 + 814, rg_y0 + 100, 16, rpi(59), 0, 10, 5, rg_ks, 0, "DEPTH", "%.1f");
+  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 260, rg_y0 + 154, 18, rpi(50), 0, 10, 5, rg_ks, 0, "VOLUME", "%.1f");
+  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 356, rg_y0 + 154, 18, rpi(51), 0, 10, 5, rg_ks, 0, "TREBLE", "%.1f");
+  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 452, rg_y0 + 154, 18, rpi(52), 0, 10, 5, rg_ks, 0, "MIDDLE", "%.1f");
+  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 548, rg_y0 + 154, 18, rpi(53), 0, 10, 5, rg_ks, 0, "BASS", "%.1f");
+  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 664, rg_y0 + 154, 18, rpi(55), 0, 10, 0, rg_ks, 0, "DISTORTION", "%.1f");
+  rg_kdim = rg_c == 0;  rg_kn(rg_x0 + 760, rg_y0 + 154, 18, rpi(56), 0, 10, 2, rg_ks, 0, "REVERB", "%.1f");
 ) : (
   rg_module(rg_x0, rg_y0, 856, 210, 3, "GR-120", "PREAMP  -  CASCADED VALVE");
   rg_kn(rg_x0 + 84, rg_y0 + 112, 30, rpi(62), 0, 10, 5, rg_ks, 0, "GAIN", "%.1f");
