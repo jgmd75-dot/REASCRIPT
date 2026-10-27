@@ -1,0 +1,777 @@
+desc: GFX Lab Cherwell Lift [loudness]
+//tags: mastering loudness enhancer band-split
+//author: JGWizrad / Garden FX (GFX)
+// Requires gfx-lab-os, gfx-lab-bands, gfx-lab-bypass (.jsfx-inc) in the same folder.
+//
+// Cherwell series - clinical mid-90s digital console processing.
+// Lift: loudness / density enhancer in the spirit of the classic
+// "inflate" processor. Raises low and mid-level detail (apparent loudness)
+// while 0 dBFS peaks map back to 0 dBFS, so it adds weight without
+// squashing transients. Brand / product names live in comments only.
+//
+// Lab rework (Oct 2026, v0.3, from the Stable Cherwell Lift): BAND CURVES. With BAND SPLIT on, the lows, mids and
+// highs each get their own Lift: LIFT (0 - 200 % of EFFECT) and CURVE (added to the main CURVE), two movable
+// split points with readouts (x10 key: the mid / high split follows the low / mid split x 10, 220 Hz -> 2.2 kHz,
+// so the range 600 Hz - 8 kHz; JG), and SOLO per band to hear what each one does. The original never let the lows be
+// fattened differently from the top. Defaults (LIFT 100 %, CURVE 0, splits 240 Hz / 2.4 kHz) = the Stable unit.
+//
+// SIGNAL FLOW: INPUT > [BAND SPLIT off: one curve | on: LR4 split (LOW / MID / HIGH, the low band through the
+// upper split's all-pass so the three stay in phase), a curve per band, summed] > CLIP 0 dB > OUTPUT > BYPASS fade.
+// Shaper: odd-symmetric polynomial on |x| <= 1, f(1) = 1, small-signal
+// gain from 1.0x (CURVE -50) to 2.0x (CURVE +50). EFFECT blends dry/shaped.
+// CLIP 0 dB holds the shaper at 1 above full scale; with CLIP off, signal
+// above 0 dBFS folds back (as on the original). With BAND SPLIT on, CLIP 0 dB
+// also holds the summed bands at 0 dBFS (the Stable split peaked up to +1.3 dBFS).
+// OS (1x / 2x / 4x): the shaper (and the EFFECT blend, so dry and shaped
+// stay in time) runs oversampled; 1x is the plain curve at the base rate.
+// Every change glides (EFFECT / CURVE / LIFT 20 ms, splits 30 ms, BAND SPLIT / SOLO / BYPASS 10 - 15 ms crossfades).
+// BYPASS: a cream house lamp key in the top bar, left of the OS key (fade from gfx-lab-bypass): lit = bypassed, a 15 ms crossfade to
+// the input delayed by the latency. It replaces the Stable unit's amber IN key in the key row (JG: one bypass, where
+// it's expected; old slider 7 removed).
+// GUI: transfer display (one curve, or the three band curves in their colours), INPUT / EFFECT / CURVE,
+// CLIP 0 dB, BAND SPLIT, OUTPUT fader, IN / OUT meters, the BANDS plate (greyed while BAND SPLIT is off), BYPASS and
+// OS keys, preset bar.
+// No DRIFT, no mains / warm-up (mastering unit, JG). No LINK (the shaper has no detector: each channel is shaped on
+// its own, as on the original).
+// Latency: 0 samples at 1x, 31 at 2x, 37 at 4x (reported).
+//
+
+import gfx-lab-os.jsfx-inc
+import gfx-lab-bands.jsfx-inc
+import gfx-lab-bypass.jsfx-inc
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+slider1:in_db=0<-6,12,0.1>-Input (dB)
+slider2:effect=0<0,100,0.1>-Effect (%)
+slider3:curve=0<-50,50,0.1>-Curve
+slider4:clip=1<0,1,1{Off,On}>-Clip 0 dB
+slider5:split=0<0,1,1{Off,On}>-Band Split
+slider6:out_db=0<-12,3,0.1>-Output (dB)
+slider8:0<0,2,1{1x,2x,4x}>-Oversampling
+slider9:x1_hz=240<60,800,1>-Low / mid split (Hz)
+slider10:x2_hz=2400<1000,10000,10>-Mid / high split (Hz)
+slider11:lo_amt=100<0,200,0.1>-Low lift (%)
+slider12:lo_crv=0<-50,50,0.1>-Low curve
+slider13:mi_amt=100<0,200,0.1>-Mid lift (%)
+slider14:mi_crv=0<-50,50,0.1>-Mid curve
+slider15:hi_amt=100<0,200,0.1>-High lift (%)
+slider16:hi_crv=0<-50,50,0.1>-High curve
+slider17:solo=0<0,3,1{Off,Low,Mid,High}>-Solo
+slider18:x10=0<0,1,1{Off,On}>-Mid / high split follows x10
+slider19:byp=0<0,1,1{Off,On}>-Bypass
+
+@init
+#ui_man = "gfx-lab-cherwell-lift";
+ext_noinit = 1;
+pr_cur = 1;              // preset shown on the LCD (saved with the project)
+gfx_ext_retina = 1;
+first_run = 1;
+os_design();
+os_base = 0;  os_tf = os_f = os_f2n(slider8);  os_gsetup();
+by_setup(19);             // BYPASS (gfx-lab-bypass: 15 ms fade to the input, delayed by the latency)
+
+// =====================================================================
+// DSP building blocks
+// =====================================================================
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function g2db(x) ( 8.685889638065035 * log(max(x, 0.000000001)); );
+
+// ---------- the Lift shaper ----------
+// On s = |x| <= 1:  p(s) = A s + B s^2 + C s^3 - D (s^2 - 2 s^3 + s^4)
+// with A..D from CURVE so that p(0) = 0 and p(1) = 1. Each band has its own A..D (k = 0 full band / 1 low / 2 mid /
+// 3 high, in CF[k * 4 ..]) and its own EFFECT (EF[k]).
+CF = 1200;  EF = 1220;
+function lift_f(x, k) local(s, y, c) (
+  s = abs(x);  c = CF + k * 4;
+  s <= 1 ? ( y = s * (c[0] + s * (c[1] + s * c[2])) - c[3] * s * s * (1 - 2 * s + s * s); ) :
+  clip   ? ( y = 1; ) :
+  s < 2  ? ( y = 2 * s - s * s; ) :
+           ( y = 0; );
+  x < 0 ? -y : y;
+);
+// One sample through band k's curve, blended with the dry by that band's EFFECT (at the OS rate)
+function lift_b(x, k) ( x + EF[k] * (lift_f(x, k) - x); );
+
+// ---------- one channel ----------
+// The bands are split at the base rate (gfx-lab-bands: LR4 at split 1, the upper part again at split 2, the low
+// band through split 2's all-pass), raised to the OS rate one by one, shaped, summed and brought back down once
+// (the down filter is linear, so one does for the sum). BAND SPLIT crossfades (sp_s, 15 ms) between the full-band
+// and the split paths; only the path(s) in use run, and a path is cleared as its fade starts. SOLO weights the
+// bands (gs1..gs3, 10 ms glides). With CLIP 0 dB on, the summed bands are held at 0 dBFS.
+function chan(x) instance(uf, ul, um, uh, dn, bs, o0, o1, o2, o3)
+  local(i, y, z)
+(
+  sp_s > 0 || split ? (
+    bs.bs_split(x);
+    ul.os_up(bs.lo);  um.os_up(bs.mi);  uh.os_up(bs.hi);
+  );
+  sp_s < 1 || !split ? uf.os_up(x);
+  i = 0;
+  loop(os_f,
+    y = sp_s < 1 ? (1 - sp_s) * lift_b(uf.os_s(i), 0) : 0;
+    sp_s > 0 ? (
+      z = gs1 * lift_b(ul.os_s(i), 1) + gs2 * lift_b(um.os_s(i), 2) + gs3 * lift_b(uh.os_s(i), 3);
+      clip ? z = max(-1, min(1, z));
+      y += sp_s * z;
+    );
+    i == 0 ? o0 = y : i == 1 ? o1 = y : i == 2 ? o2 = y : o3 = y;
+    i += 1;
+  );
+  dn.os_dn(o0, o1, o2, o3);
+);
+function band_clr() instance(ul, um, uh, bs) ( ul.os_clr();  um.os_clr();  uh.os_clr();  bs.bs_clear(); );
+function full_clr() instance(uf) ( uf.os_clr(); );
+function ch_clr() instance(uf, ul, um, uh, dn) ( uf.os_clr();  ul.os_clr();  um.os_clr();  uh.os_clr();  dn.os_clr(); );
+
+// shaper coefficients for band k from a (smoothed) curve value -0.5 .. +0.5
+function set_curve(k, cp) local(c) (
+  c = CF + k * 4;
+  c[0] = 1.5 + cp;
+  c[1] = -2 * cp;
+  c[2] = cp - 0.5;
+  c[3] = 0.0625 - 0.25 * cp + 0.25 * cp * cp;
+);
+// every band's curve and EFFECT from the smoothed main and band values
+function band_set() (
+  set_curve(0, cp_s);
+  set_curve(1, max(-0.5, min(0.5, cp_s + bc1_s)));
+  set_curve(2, max(-0.5, min(0.5, cp_s + bc2_s)));
+  set_curve(3, max(-0.5, min(0.5, cp_s + bc3_s)));
+  EF[0] = eff_s;
+  EF[1] = min(1, eff_s * ba1_s);  EF[2] = min(1, eff_s * ba2_s);  EF[3] = min(1, eff_s * ba3_s);
+);
+
+function update_params() (
+  cp_t = curve / 100;
+  bc1_t = lo_crv / 100;  bc2_t = mi_crv / 100;  bc3_t = hi_crv / 100;
+  ba1_t = lo_amt / 100;  ba2_t = mi_amt / 100;  ba3_t = hi_amt / 100;
+  x1_t = max(60, min(800, x1_hz));  x2_t = x10 ? x1_t * 10 : max(1000, min(10000, x2_hz));   // x10: 220 Hz -> 2.2 kHz
+
+  in_t  = db2g(in_db);
+  out_t = db2g(out_db);
+  eff_t = effect / 100;
+  sm    = 1 - exp(-1 / (0.02 * srate));        // 20 ms parameter smoothing
+  smx   = 1 - exp(-16 / (0.03 * srate));       // 30 ms split glide, worked every 16 samples
+  ramp_step = 1 / (0.010 * srate);
+  sp_step = 1 / (0.015 * srate);
+
+  os_tf = os_f2n(slider8);
+
+  first_run ? (
+    in_s = in_t;  out_s = out_t;  eff_s = eff_t;  sp_s = split;  cp_s = cp_t;
+    bc1_s = bc1_t;  bc2_s = bc2_t;  bc3_s = bc3_t;  ba1_s = ba1_t;  ba2_s = ba2_t;  ba3_s = ba3_t;
+    x1_s = x1_t;  x2_s = x2_t;  bs_coef(x1_s, x2_s);
+    gs1 = solo == 0 || solo == 1;  gs2 = solo == 0 || solo == 2;  gs3 = solo == 0 || solo == 3;
+    band_set();
+    first_run = 0;
+  );
+);
+
+@slider
+update_params();
+
+@block
+// GUI edits arrive as a flag; parameters are only ever rebuilt on the audio thread
+prm_dirty ? ( prm_dirty = 0;  update_params(); );
+inpk_disp  = max(inpk_disp, inpk);    inpk = 0;
+outpk_disp = max(outpk_disp, outpk);  outpk = 0;
+
+@sample
+by_in();
+in_s  += (in_t  - in_s)  * sm;
+out_s += (out_t - out_s) * sm;
+// EFFECT, CURVE and the band LIFT / CURVE glide; the curves are only re-worked while something moves
+bnd_mv = eff_s != eff_t || cp_s != cp_t || bc1_s != bc1_t || bc2_s != bc2_t || bc3_s != bc3_t ||
+         ba1_s != ba1_t || ba2_s != ba2_t || ba3_s != ba3_t;
+bnd_mv ? (
+  eff_s += (eff_t - eff_s) * sm;  abs(eff_t - eff_s) < 0.00001 ? eff_s = eff_t;
+  cp_s  += (cp_t  - cp_s)  * sm;  abs(cp_t  - cp_s)  < 0.00001 ? cp_s  = cp_t;
+  bc1_s += (bc1_t - bc1_s) * sm;  abs(bc1_t - bc1_s) < 0.00001 ? bc1_s = bc1_t;
+  bc2_s += (bc2_t - bc2_s) * sm;  abs(bc2_t - bc2_s) < 0.00001 ? bc2_s = bc2_t;
+  bc3_s += (bc3_t - bc3_s) * sm;  abs(bc3_t - bc3_s) < 0.00001 ? bc3_s = bc3_t;
+  ba1_s += (ba1_t - ba1_s) * sm;  abs(ba1_t - ba1_s) < 0.00001 ? ba1_s = ba1_t;
+  ba2_s += (ba2_t - ba2_s) * sm;  abs(ba2_t - ba2_s) < 0.00001 ? ba2_s = ba2_t;
+  ba3_s += (ba3_t - ba3_s) * sm;  abs(ba3_t - ba3_s) < 0.00001 ? ba3_s = ba3_t;
+  band_set();
+);
+// the split points glide (coefficients re-worked every 16 samples while they move)
+(x1_s != x1_t || x2_s != x2_t) && (xs_n += 1) >= 16 ? (
+  xs_n = 0;
+  x1_s += (x1_t - x1_s) * smx;  abs(x1_t - x1_s) < 0.05 ? x1_s = x1_t;
+  x2_s += (x2_t - x2_s) * smx;  abs(x2_t - x2_s) < 0.5  ? x2_s = x2_t;
+  bs_coef(x1_s, x2_s);
+);
+// SOLO glides each band in or out (10 ms)
+gs1 += ((solo == 0 || solo == 1) - gs1) * sm * 2;  abs(gs1 - (solo == 0 || solo == 1)) < 0.00001 ? gs1 = (solo == 0 || solo == 1);
+gs2 += ((solo == 0 || solo == 2) - gs2) * sm * 2;  abs(gs2 - (solo == 0 || solo == 2)) < 0.00001 ? gs2 = (solo == 0 || solo == 2);
+gs3 += ((solo == 0 || solo == 3) - gs3) * sm * 2;  abs(gs3 - (solo == 0 || solo == 3)) < 0.00001 ? gs3 = (solo == 0 || solo == 3);
+os_gate();
+split  && sp_s == 0 ? ( chL.band_clr();  chR.band_clr(); );
+!split && sp_s == 1 ? ( chL.full_clr();  chR.full_clr(); );
+sp_s != split ? ( sp_s = split > sp_s ? min(1, sp_s + sp_step) : max(0, sp_s - sp_step); );   // BAND SPLIT crossfade
+os_chg ? ( chL.ch_clr();  chR.ch_clr(); );
+
+xL = spl0 * in_s;  xR = spl1 * in_s;
+inpk = max(inpk, max(abs(xL), abs(xR)));
+
+yL = chL.chan(xL) * out_s;
+yR = chR.chan(xR) * out_s;
+yL *= os_g;  yR *= os_g;
+
+outpk = max(outpk, max(abs(yL), abs(yR)));
+spl0 = yL;  spl1 = yR;
+by_out();
+
+@serialize
+file_var(0, pr_cur);
+
+@gfx 1000 520
+// GUI copy of lift_f (the threads must not share a function: its locals are shared storage)
+function g_lift(x) local(s, y) (
+  s = abs(x);
+  s <= 1 ? ( y = s * (gA + s * (gB + s * gC)) - gD * s * s * (1 - 2 * s + s * s); ) :
+  clip   ? ( y = 1; ) :
+  s < 2  ? ( y = 2 * s - s * s; ) :
+           ( y = 0; );
+  x < 0 ? -y : y;
+);
+function gdb(x) ( 8.685889638065035 * log(max(x, 0.000000001)); );   // GUI copy of g2db (audio and GUI threads must not share functions)
+// =====================================================================
+// GUI — Cherwell series, "Quad" scheme: viridian faceplate, sage-green accents,
+// knurled knobs with lime caps, dark transfer-curve display, lamp keys.
+// =====================================================================
+function col(h, a) (
+  gfx_r = floor(h / 65536) / 255;
+  gfx_g = (floor(h / 256) % 256) / 255;
+  gfx_b = (h % 256) / 255;
+  gfx_a = a;
+);
+function shade(h, f) local(r, g, b) (
+  r = min(255, floor(floor(h / 65536) * f));
+  g = min(255, floor((floor(h / 256) % 256) * f));
+  b = min(255, floor((h % 256) * f));
+  r * 65536 + g * 256 + b;
+);
+function px(v) ( ox + v * sc; );
+function py(v) ( oy + v * sc; );
+function ps(v) ( v * sc; );
+function text_c(x, y, str) local(w, h) (
+  gfx_measurestr(str, w, h);
+  gfx_x = x - w * 0.5;  gfx_y = y - h * 0.5;
+  gfx_drawstr(str);
+);
+function param_touched(idx) ( slider_automate(2 ^ (idx - 1)); gui_dirty = 1; );
+
+function rivet(x, y) (
+  col(0x8A9098, 1);  gfx_circle(px(x), py(y), ps(3.5), 1, 1);
+  col(0xF2F4F6, 0.6); gfx_circle(px(x) - ps(1), py(y) - ps(1), ps(1.2), 1, 1);
+);
+
+// Knob pointer as one filled bar (constant width at any angle)
+function pointer(x, y, sa, ca, r0, r1, hw) local(ax, ay, bx, by, dx, dy) (
+  ax = x + sa * r0;  ay = y - ca * r0;
+  bx = x + sa * r1;  by = y - ca * r1;
+  dx = ca * hw;      dy = sa * hw;
+  gfx_triangle(ax + dx, ay + dy, bx + dx, by + dy, bx - dx, by - dy, ax - dx, ay - dy);
+  gfx_line(ax + dx, ay + dy, bx + dx, by + dy, 1);
+  gfx_line(ax - dx, ay - dy, bx - dx, by - dy, 1);
+);
+
+// House white knob: flat satin cap, one soft edge highlight, dark pointer,
+// thin smooth track and smooth value arc (bipolar ranges arc from zero).
+// fmt: 0 dB, 1 %, 2 plain number, 3 frequency (log travel, whole Hz). nl = numeric scale labels.
+// Shift = fine (5x finer), Ctrl-click or double-click = default.
+function knob(cx, cy, r, idx, vmin, vmax, def, lbl, fmt, nl)
+  local(x, y, rr, v, t, hov, dx, dy, now, a0, a1, ta, tv, b, j, w, h, ty, lr, fr, fn, lg)
+(
+  x = px(cx);  y = py(cy);  rr = ps(r);
+  dx = mouse_x - x;  dy = mouse_y - y;
+  hov = dx * dx + dy * dy <= sqr(rr * 1.2);
+  click && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : (
+      drag_idx = idx;  drag_y = mouse_y;  drag_v = slider(idx);  drag_sh = mouse_cap & 8;
+    );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  lg = fmt == 3;
+  drag_idx == idx ? (
+    (mouse_cap & 8) != drag_sh ? ( drag_sh = mouse_cap & 8;  drag_y = mouse_y;  drag_v = slider(idx); );   // Shift re-bases
+    fn = drag_sh ? 5 : 1;
+    lg ? (
+      v = vmin * (vmax / vmin) ^ (log(max(drag_v, vmin) / vmin) / log(vmax / vmin) + (drag_y - mouse_y) / (ps(240) * fn));
+      v = floor(max(vmin, min(vmax, v)) + 0.5);
+    ) : (
+      v = drag_v + (drag_y - mouse_y) * (vmax - vmin) / (ps(240) * fn);
+      v = floor(max(vmin, min(vmax, v)) * 10 + 0.5) / 10;
+    );
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+
+  v = slider(idx);
+  t = lg ? log(max(v, vmin) / vmin) / log(vmax / vmin) : (v - vmin) / (vmax - vmin);
+  a0 = -0.75 * $pi;  a1 = 0.75 * $pi;
+  b  = !lg && vmin < 0 && vmax > 0 ? -vmin / (vmax - vmin) : 0;
+  ta = a0 + b * (a1 - a0);
+  tv = a0 + t * (a1 - a0);
+
+  // scale labels
+  gfx_setfont(5);  col(0xE4F0EF, 1);
+  lr = rr + ps(22);  j = 0;
+  loop(nl,
+    fr = nl > 1 ? j / (nl - 1) : 0.5;
+    b = a0 + fr * (a1 - a0);
+    sprintf(#sl, "%d", floor(vmin + fr * (vmax - vmin) + 0.5));
+    text_c(x + sin(b) * lr, y - cos(b) * lr, #sl);
+    j += 1;
+  );
+  // scale ticks
+  col(0xE4F0EF, 0.75);  j = 0;
+  loop(11,
+    b = a0 + j / 10 * (a1 - a0);
+    gfx_line(x + sin(b) * (rr + ps(4)), y - cos(b) * (rr + ps(4)),
+             x + sin(b) * (rr + ps(9)), y - cos(b) * (rr + ps(9)), 1);
+    j += 1;
+  );
+  // knob: dark knurled skirt with grey ribs, yellow centre cap, yellow pointer across the skirt
+  col(0x000000, 0.3);   gfx_circle(x + ps(2), y + ps(3), rr, 1, 1);
+  col(0x24272C, 1);     gfx_circle(x, y, rr, 1, 1);
+  j = 0;
+  loop(48,
+    b = tv + j * $pi / 24;
+    col(j % 2 ? 0x34383E : 0x4C5158, 1);
+    gfx_line(x + sin(b) * rr * 0.62, y - cos(b) * rr * 0.62,
+             x + sin(b) * rr * 0.95, y - cos(b) * rr * 0.95, 1);
+    j += 1;
+  );
+  col(0x1A1C20, 1);     gfx_circle(x, y, rr, 0, 1);
+  col(0x1A1C20, 1);     gfx_circle(x, y, rr * 0.6, 1, 1);
+  kn_cap ? (                                                 // band knobs: a flat cap in the band's colour (JG)
+    col(kn_cap, 1);     gfx_circle(x, y, rr * 0.54, 1, 1);
+  ) : (
+    col(0xA8B98A, 0.82);  gfx_circle(x, y, rr * 0.54, 1, 1);   // translucent: the dark skirt shows through
+  );
+  col(0xEAF6C2, 0.55);  gfx_arc(x, y, rr * 0.46, -1.9, -0.3, 1);
+  col(kn_cap ? shade(kn_cap, 0.6) : 0x6E8A30, 0.8);   gfx_circle(x, y, rr * 0.54, 0, 1);
+  // lime indicator with a soft glow
+  b = ps(r > 34 ? 1.7 : 1.3);
+  col(0xCDEB7A, 0.12);  pointer(x, y, sin(tv), cos(tv), rr * 0.54, rr * 1.04, b * 3.2);
+  col(0xCDEB7A, 0.25);  pointer(x, y, sin(tv), cos(tv), rr * 0.55, rr * 1.01, b * 2);
+  col(0xDDF59A, 1);     pointer(x, y, sin(tv), cos(tv), rr * 0.56, rr * 0.99, b);
+  // label
+  gfx_setfont(6);  col(0xE4F0EF, 1);
+  text_c(x, y + rr + ps(30), lbl);
+  // value on hover only (house rule)
+  hov || drag_idx == idx ? (
+    fmt == 0 ? sprintf(#kv, "%+.1f dB", v) :
+    fmt == 1 ? sprintf(#kv, "%.1f%%", v) :
+    fmt == 3 ? ( v >= 1000 ? sprintf(#kv, "%.2f kHz", v / 1000) : sprintf(#kv, "%d Hz", v); ) :
+               sprintf(#kv, "%+.1f", v);
+    gfx_setfont(3);  gfx_measurestr(#kv, w, h);
+    ty = y - lr - ps(12) - h;
+    col(0x0E3A40, 0.95);  gfx_rect(x - w * 0.5 - ps(6), ty - ps(3), w + ps(12), h + ps(6), 1);
+    col(0xE4F0EF, 1);     text_c(x, ty + h * 0.5, #kv);
+  );
+);
+
+// ---------- house lamp keys (34-series), ported from gfx-ui lk_key / lk_fit ----------
+// Coloured lens in a dark well; off = darker milky lens with vignette and dark legend,
+// lit = feathered glow and spill onto the panel. Adapted to this panel's px/py/ps layout.
+LK_AMB = 0xF2A41E;  LK_SAGE = 0xA0AF84;  LK_RED = 0xD8332E;  LK_YEL = 0xF2D23A;  LK_WHT = 0xE9E2CC;  lk_well = 0x141518;
+KC_LOW = 0xC08850;  KC_MID = 0x8EC6F0;  KC_HI = 0xEC7A6E;     // band knob caps: the softer band colours of the title underlines (JG)
+BC_LOW = 0xC08850;  BC_MID = 0x8EC6F0;  BC_HI = 0xEC7A6E;   // band colours: LF brown (lit for the dark display), LMF blue, HF red
+function ui_mix(c1, c2, t) (
+  floor(floor(c1 / 65536) * (1 - t) + floor(c2 / 65536) * t) * 65536 +
+  floor((floor(c1 / 256) % 256) * (1 - t) + (floor(c2 / 256) % 256) * t) * 256 +
+  floor((c1 % 256) * (1 - t) + (c2 % 256) * t);
+);
+function ui_rrs(x, y, w, h, r) local(i, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  i = 0;
+  loop(r,
+    d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);
+    gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);
+    i += 1;
+  );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+function lk_rr(x, y, w, h, r) ( ui_rrs(px(x), py(y), ps(w), ps(h), ps(r)); );
+function ui_keytext(cx, cy, str) local(w, h) (
+  gfx_measurestr(str, w, h); gfx_x = floor(cx - w * 0.5 + 0.5); gfx_y = floor(cy - h * 0.58 + 0.5); gfx_drawstr(str);
+);
+function lk_key(x, y, w, h, on, c, str) local(hov, hit, k, lens, dn, i, t, dx, dy) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov;
+  dn = hov && lmb ? 1 : 0;                                  // the cap sinks a pixel while held
+  k = min(w / 54, h / 40);
+  lens = shade(ui_mix(c, 0xCFC9BC, 0.5), 0.76);
+  on ? lens = c;
+  on ? (
+    col(c, 0.10); lk_rr(x - 9 * k, y - 9 * k, w + 18 * k, h + 18 * k, 10 * k);
+    col(c, 0.18); lk_rr(x - 6 * k, y - 6 * k, w + 12 * k, h + 12 * k, 8 * k);
+  );
+  col(lk_well, 1);           lk_rr(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k, 5 * k);
+  col(shade(lens, 0.55), 1); lk_rr(x, y + 1 / sc, w, h, 4 * k);
+  y += (dn - 1) / sc;
+  on ? (
+    col(lens, 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    i = 1;
+    loop(4,
+      t = 0.07 * i * (1 + 0.6 * max(1 - k, 0));
+      dx = (i == 1 ? 3 : i == 2 ? 6 : i == 3 ? 10 : 14) * k;
+      dy = (i == 1 ? 2 : i == 2 ? 4 : i == 3 ? 7 : 9) * k;
+      col(ui_mix(c, 0xFFFFFF, t), 1); lk_rr(x + dx, y + dy, w - 2 * dx, h - 1 / sc - 2 * dy, 4 * k);
+      i += 1;
+    );
+  ) : (
+    col(shade(lens, 0.62), 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    col(shade(lens, 0.78), 1); lk_rr(x + 2 * k, y + 2 * k, w - 4 * k, h - 5 * k, 4 * k);
+    col(shade(lens, 0.92), 1); lk_rr(x + 5 * k, y + 4 * k, w - 10 * k, h - 10 * k, 4 * k);
+    col(lens, 1);              lk_rr(x + 9 * k, y + 7 * k, w - 18 * k, h - 17 * k, 4 * k);
+  );
+  col(0xFFFFFF, on ? 0.45 : 0.22);  gfx_rect(px(x + 4 * k), py(y), ps(w - 8 * k), max(1, ps(1.5)));
+  hov && !dn ? ( col(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1 / sc, 4 * k); );
+  gfx_setfont(2);  col(shade(c, on ? 0.30 : 0.17), 1);
+  ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
+  hit;
+);
+function lk_fit(x, y, w, h, on, c, str) local(k) (
+  k = min(w / 62, h / 48);
+  lk_key(x + 4 * k, y + 4 * k, w - 8 * k, h - 8 * k, on, c, str);
+);
+
+// Vertical slider (output): dark knurled cap with the knobs' glowing lime line.
+// Drag up/down; Ctrl-click or double-click = default; value tag on hover only.
+function vslider(x, y0, h, idx, vmin, vmax, def, lbl) local(vx, vy0, vh, v, t, cy, hov, now, j, d, yy, w, th) (
+  vx = px(x);  vy0 = py(y0);  vh = ps(h);
+  v = slider(idx);  t = (v - vmin) / (vmax - vmin);  cy = vy0 + vh * (1 - t);
+  hov = abs(mouse_x - vx) < ps(16) && abs(mouse_y - cy) < ps(15);
+  click && hov ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.3) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : (
+      drag_idx = idx;  drag_y = mouse_y;  drag_v = v;
+    );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  drag_idx == idx ? (
+    v = drag_v + (drag_y - mouse_y) * (vmax - vmin) / vh;
+    v = floor(max(vmin, min(vmax, v)) * 10 + 0.5) / 10;
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = slider(idx);  t = (v - vmin) / (vmax - vmin);  cy = vy0 + vh * (1 - t);
+
+  // scale: a tick and number every 3 dB
+  gfx_setfont(5);  j = 0;
+  loop(floor((vmax - vmin) / 3 + 0.5) + 1,
+    d = vmax - j * 3;
+    yy = vy0 + vh * (1 - (d - vmin) / (vmax - vmin));
+    col(0xE4F0EF, 0.75);  gfx_line(vx - ps(14), yy, vx - ps(9), yy, 1);  gfx_line(vx + ps(9), yy, vx + ps(14), yy, 1);
+    d > 0 ? sprintf(#sl, "+%d", d) : sprintf(#sl, "%d", d);  col(0xE4F0EF, 1);  text_c(vx - ps(26), yy, #sl);
+    j += 1;
+  );
+  // sunken slot
+  col(0x08363C, 1);  gfx_rect(vx - ps(4), vy0 - ps(4), ps(8), vh + ps(8), 1);
+  col(0x061E22, 1);  gfx_rect(vx - ps(2), vy0 - ps(2), ps(4), vh + ps(4), 1);
+  col(0x4E959E, 1);  gfx_rect(vx - ps(4), vy0 + vh + ps(3), ps(8), ps(1), 1);
+  // cap
+  col(0x000000, 0.35);  gfx_rect(vx - ps(13), cy - ps(12), ps(28), ps(27), 1);
+  col(0x24272C, 1);     gfx_rect(vx - ps(15), cy - ps(14), ps(30), ps(28), 1);
+  col(0x4C5158, 1);     j = 0;
+  loop(6, gfx_line(vx - ps(12), cy - ps(11) + j * ps(4.4), vx + ps(12), cy - ps(11) + j * ps(4.4), 1); j += 1; );
+  col(0x5A5F67, 1);     gfx_rect(vx - ps(15), cy - ps(14), ps(30), ps(1), 1);
+  col(0xCDEB7A, 0.12);  gfx_rect(vx - ps(15), cy - ps(3.5), ps(30), ps(7), 1);
+  col(0xCDEB7A, 0.25);  gfx_rect(vx - ps(15), cy - ps(2), ps(30), ps(4), 1);
+  col(0xDDF59A, 1);     gfx_rect(vx - ps(15), cy - ps(1), ps(30), ps(2), 1);
+  // label
+  gfx_setfont(6);  col(0xE4F0EF, 1);  text_c(vx - ps(6), vy0 + vh + ps(22), lbl);
+  // value on hover only (house rule)
+  hov || drag_idx == idx ? (
+    sprintf(#kv, "%+.1f dB", v);
+    gfx_setfont(3);  gfx_measurestr(#kv, w, th);
+    col(0x0E3A40, 0.95);  gfx_rect(vx - ps(22) - w - ps(12), cy - th * 0.5 - ps(3), w + ps(12), th + ps(6), 1);
+    col(0xE4F0EF, 1);     text_c(vx - ps(22) - w * 0.5 - ps(6), cy, #kv);
+  );
+);
+
+// Vertical LED meter, -48..+3 dB in 1.5 dB segments
+function vmeter(x, y0, h, db, lbl) local(n, sh, j, d, yy) (
+  n = 34;  sh = h / n;
+  col(0x11151B, 1);  gfx_rect(px(x - 3), py(y0 - 3), ps(22), ps(h + 6), 1);
+  j = 0;
+  loop(n,
+    d = -48 + (j + 1) * 1.5;
+    yy = y0 + h - (j + 1) * sh;
+    d > 0 ? col(0xE0503A, db >= d - 1.5 ? 1 : 0.15) :
+    d > -6 ? col(0xE8C060, db >= d - 1.5 ? 1 : 0.15) :
+             col(0xA0AF84, db >= d - 1.5 ? 1 : 0.15);
+    gfx_rect(px(x), py(yy) + 1, ps(16), ps(sh) - 1, 1);
+    j += 1;
+  );
+  gfx_setfont(5);  col(0xE4F0EF, 1);  text_c(px(x + 8), py(y0 + h + 14), lbl);
+);
+
+// ---------- house preset bar (ported from gfx-panel pk_preset): [PRESETS][<][>][LCD] ----------
+// PRESETS, or a click on the LCD, opens the list; the arrows step through it. menu = "Name 1|...|Name n".
+// The list ends with "Reset all to defaults" (returns n + 1). Returns the preset to load, 0 for none.
+// Keys are this unit's lamp keys (PB_KEY lens, PB_INK arrows); the LCD is the house amber one.
+function pb_count(menu) local(k, n) ( n = 1;  k = 0;  loop(strlen(menu), str_getchar(menu, k) == 124 ? n += 1;  k += 1; );  n; );
+function pb_item(menu, i, dst) local(k, k0, n, c, len) (
+  strcpy(dst, "");  len = strlen(menu);  k = 0;  k0 = 0;  n = 1;
+  loop(len + 1,
+    c = k < len ? str_getchar(menu, k) : 124;
+    c == 124 ? ( n == i ? strcpy_substr(dst, menu, k0, k - k0);  n += 1;  k0 = k + 1; );
+    k += 1;
+  );
+  dst;
+);
+function pb_tri(cx, cy, s, dir) (
+  gfx_triangle(px(cx + dir * s), py(cy), px(cx - dir * s), py(cy - s), px(cx - dir * s), py(cy + s));
+);
+function preset_bar(x, y, h, lw, cur, menu) local(n, sel, open, lx, tw, th, i) (
+  n = pb_count(menu);  sel = 0;  open = 0;
+  lk_fit(x, y, 100, h, 0, PB_KEY, "PRESETS") ? open = 1;
+  lk_fit(x + 102, y, 46, h, 0, PB_KEY, "") ? ( sel = cur <= 1 || cur > n ? n : cur - 1; );
+  lk_fit(x + 150, y, 46, h, 0, PB_KEY, "") ? ( sel = cur >= n || cur < 1 ? 1 : cur + 1; );
+  col(PB_INK, 1);  pb_tri(x + 125, y + h * 0.5 - 0.5, 5, -1);  pb_tri(x + 173, y + h * 0.5 - 0.5, 5, 1);
+  // the LCD: black bezel, dark amber glass, the patch name only
+  lx = x + 206;
+  col(0x000000, 0.3);  gfx_rect(px(lx + 2), py(y + 5), ps(lw), ps(h - 6), 1);
+  col(0x050505, 1);    gfx_rect(px(lx), py(y + 3), ps(lw), ps(h - 6), 1);
+  gfx_gradrect(px(lx + 3), py(y + 6), ps(lw - 6), ps(h - 12), 0.17, 0.10, 0.02, 1, 0, 0, 0, 0, -0.06 / ps(h), -0.04 / ps(h), -0.01 / ps(h), 0);
+  col(0xFFFFFF, 0.06); gfx_line(px(lx + 4), py(y + 7), px(lx + lw - 5), py(y + 7), 1);
+  cur >= 1 && cur <= n ? pb_item(menu, cur, #pb_nm) : strcpy(#pb_nm, "--");
+  gfx_setfont(8);  col(0xE8A33A, 1);  gfx_measurestr(#pb_nm, tw, th);
+  gfx_x = px(lx + 10);  gfx_y = py(y + h * 0.5) - th * 0.5;  gfx_drawstr(#pb_nm);
+  click && mouse_x >= px(lx) && mouse_x < px(lx + lw) && mouse_y >= py(y) && mouse_y < py(y + h) ? open = 1;
+  open ? (
+    strcpy(#pb_m, "");  i = 1;
+    loop(n, i == cur ? strcat(#pb_m, "!");  strcat(#pb_m, pb_item(menu, i, #pb_t));  strcat(#pb_m, "|");  i += 1; );
+    strcat(#pb_m, "Reset all to defaults");
+    gfx_x = px(x);  gfx_y = py(y + h);  i = gfx_showmenu(#pb_m);  i > 0 ? sel = i;
+  );
+  sel;
+);
+
+// ---------- presets (OUTPUT evens the loudness; GUI thread only) ----------
+// p_band: splits, then LIFT % / CURVE for LOW, MID, HIGH (SOLO off)
+function p_band(f1, f2, la, lc, ma, mc, ha, hc) (
+  slider(9) = f1;  slider(10) = f2;  slider(11) = la;  slider(12) = lc;  slider(13) = ma;  slider(14) = mc;
+  slider(15) = ha;  slider(16) = hc;  slider(17) = 0;  slider(18) = 0;
+);
+function load_preset(p) (
+  p == 1 ? ( slider(1) = 0;  slider(2) = 0;  slider(3) = 0;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Init
+  p == 2 ? ( slider(1) = 0;  slider(2) = 30;  slider(3) = 0;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Gentle Lift
+  p == 3 ? ( slider(1) = 0;  slider(2) = 15;  slider(3) = -20;  slider(4) = 1;  slider(5) = 1;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Transparent Polish
+  p == 4 ? ( slider(1) = 0;  slider(2) = 25;  slider(3) = -10;  slider(4) = 1;  slider(5) = 1;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Mix Bus Sheen
+  p == 5 ? ( slider(1) = 0;  slider(2) = 45;  slider(3) = 10;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Vocal Forward
+  p == 6 ? ( slider(1) = 3;  slider(2) = 80;  slider(3) = 20;  slider(4) = 1;  slider(5) = 1;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Drum Density
+  p == 7 ? ( slider(1) = 0;  slider(2) = 60;  slider(3) = -30;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Bass Thickener
+  p == 8 ? ( slider(1) = 0;  slider(2) = 50;  slider(3) = -50;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Soft Warmth
+  p == 9 ? ( slider(1) = 0;  slider(2) = 55;  slider(3) = 50;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Edge and Bite
+  p == 10 ? ( slider(1) = 3;  slider(2) = 70;  slider(3) = 0;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Master: Loud
+  p == 11 ? ( slider(1) = 6;  slider(2) = 100;  slider(3) = 0;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) :   // Master: Hot Clip
+  p == 12 ? ( slider(1) = 0;  slider(2) = 50;  slider(3) = 0;  slider(4) = 1;  slider(5) = 1;  slider(6) = -0.5;  p_band(200, 2400, 160, -20, 80, 0, 40, -10); ) :   // Bands: Weighty Lows
+  p == 13 ? ( slider(1) = 0;  slider(2) = 40;  slider(3) = 0;  slider(4) = 1;  slider(5) = 1;  slider(6) = 0;  p_band(240, 5000, 30, 0, 80, 0, 180, 20); ) :   // Bands: Bright Air
+  p == 14 ? ( slider(1) = 0;  slider(2) = 50;  slider(3) = 0;  slider(4) = 1;  slider(5) = 1;  slider(6) = -0.5;  p_band(300, 3000, 60, 0, 170, 10, 70, 0); ) :   // Bands: Dense Mids
+  p == 15 ? ( slider(1) = 0;  slider(2) = 35;  slider(3) = -10;  slider(4) = 1;  slider(5) = 1;  slider(6) = 0;  p_band(180, 3500, 120, 0, 100, 0, 70, -10); ) :   // Bands: Master Glue
+  p == 16 ? ( slider(1) = 0;  slider(2) = 0;  slider(3) = 0;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  p_band(240, 2400, 100, 0, 100, 0, 100, 0); ) : 0;   // Reset all to defaults
+  slider_automate(262143);   // sliders 1 - 18
+  gui_dirty = 1;
+);
+PRESET_MENU = "Init|Gentle Lift|Transparent Polish|Mix Bus Sheen|Vocal Forward|Drum Density|Bass Thickener|Soft Warmth|Edge and Bite|Master: Loud|Master: Hot Clip|Bands: Weighty Lows|Bands: Bright Air|Bands: Dense Mids|Bands: Master Glue";
+PB_KEY = 0xA0AF84;  PB_INK = 0x0E3A40;
+
+// ---------- frame setup ----------
+sc = min(gfx_w / 1000, gfx_h / 520);
+ox = (gfx_w - 1000 * sc) * 0.5;
+oy = (gfx_h - 520 * sc) * 0.5;
+lmb = mouse_cap & 1;
+click = lmb && !last_lmb;
+
+// Trebuchet MS bold sized by width (as ui_fitfont: "THRESHOLD" = 5.28 x size on every system), house sizes:
+// knob labels and key legends 16, section titles 18, small print 13 design px (JG: text read small in REAPER)
+function fit_font(idx, size) local(fs, w, h, target) (
+  target = 5.28 * size;  fs = size;
+  loop(3,
+    gfx_setfont(idx, "Trebuchet MS", fs, 'b');  gfx_measurestr("THRESHOLD", w, h);
+    fs = min(max(fs * target / max(w, 1), size * 0.75), size * 1.8);
+  );
+  fs;
+);
+sc != ff_sc ? (
+  ff_sc = sc;
+  fit_font(1, ps(28));    // title
+  fit_font(2, ps(16));    // key legends
+  fit_font(3, ps(14));    // hover values
+  fit_font(4, ps(18));    // LIFT, GFX, band titles
+  fit_font(5, ps(13));    // scale figures, meter labels, readouts
+  fit_font(6, ps(16));    // knob labels
+);
+gfx_setfont(8, "Courier New", ps(17), 'b');
+
+in_m  = max(inpk_disp,  in_m * 0.85);   inpk_disp = 0;
+out_m = max(outpk_disp, out_m * 0.85);  outpk_disp = 0;
+
+// ---------- faceplate (fills the window) ----------
+col(0x15616D, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+j = 0;   // pinstripe, top bar only (from the top edge down to the green line)
+loop(12,
+  col(j % 3 == 0 ? 0xFFFFFF : 0x0E4A53, 0.10);
+  gy = py(1 + j * 4);
+  gfx_line(px(0), gy, px(1000), gy, 1);
+  j += 1;
+);
+col(0x3F8590, 1);  gfx_rect(px(0), py(0), ps(1000), ps(1.5), 1);
+col(0x426A5A, 1);  gfx_rect(px(0), py(46), ps(1000), ps(5), 1);          // Oxford-green line under the title
+col(0x000000, 0.18); gfx_rect(px(0), py(514), ps(1000), ps(6), 1);       // darker bottom edge
+col(0x000000, 0.12); gfx_rect(px(995), py(0), ps(5), ps(514), 1);         // and right edge
+rivet(12, 18);  rivet(988, 18);  rivet(12, 502);  rivet(988, 502);
+
+gfx_setfont(1);  col(0xA0AF84, 1);  gfx_x = px(40);  gfx_y = py(9);   gfx_drawstr("CHERWELL");
+gfx_setfont(4);  col(0xE4F0EF, 1);  gfx_x += ps(14);  gfx_y = py(16);  gfx_drawstr("LIFT");
+gfx_setfont(4);  col(0xA0AF84, 1);  gfx_x = px(930); gfx_y = py(16);  gfx_drawstr("GFX");
+// BYPASS: a cream house lamp key (LK_WHT), lit = bypassed; the fade is gfx-lab-bypass's (by_in / by_out)
+lk_fit(754, 8, 94, 30, byp, LK_WHT, "BYPASS") ? ( slider(19) = byp ? 0 : 1;  param_touched(19); );
+os_key(ox / sc + 884, oy / sc + 12, 8, 0xE4F0EF, 7) ? gui_dirty = 1;   // OS 1x / 2x / 4x (font slot 7 is free)
+
+// ---------- preset bar, in the title bar ----------
+pb_k = preset_bar(257, 8, 30, 280, pr_cur, PRESET_MENU);
+pb_k > 0 ? ( load_preset(pb_k);  pr_cur = pb_k > 15 ? 1 : pb_k; );
+
+// ---------- transfer-curve display ----------
+dx0 = 40;  dy0 = 66;  dw = 230;  dh = 200;
+// outer 90s sunken bevel: dark top + left, light bottom + right
+col(0x0F525C, 1);  gfx_rect(px(dx0 - 10), py(dy0 - 10), ps(dw + 20), ps(dh + 20), 1);
+col(0x08363C, 1);  gfx_rect(px(dx0 - 10), py(dy0 - 10), ps(dw + 20), ps(2), 1);
+                   gfx_rect(px(dx0 - 10), py(dy0 - 8),  ps(2), ps(dh + 18), 1);
+col(0x4E959E, 1);  gfx_rect(px(dx0 - 8),  py(dy0 + dh + 8), ps(dw + 18), ps(2), 1);
+                   gfx_rect(px(dx0 + dw + 8), py(dy0 - 8), ps(2), ps(dh + 16), 1);
+col(0xA0AF84, 1);  gfx_rect(px(dx0 - 4), py(dy0 - 4), ps(dw + 8), ps(dh + 8), 1);
+col(0x0B2F35, 1);  gfx_rect(px(dx0), py(dy0), ps(dw), ps(dh), 1);
+col(0x1F4C52, 1);  j = 1;
+loop(4,
+  gfx_line(px(dx0 + dw * j / 5), py(dy0), px(dx0 + dw * j / 5), py(dy0 + dh), 1);
+  gfx_line(px(dx0), py(dy0 + dh - dh * j / 5), px(dx0 + dw), py(dy0 + dh - dh * j / 5), 1);
+  j += 1;
+);
+// 0 dBFS marks (x = 1.0 of a 1.25 span)
+col(0x3E6E72, 1);
+gfx_line(px(dx0 + dw * 0.8), py(dy0), px(dx0 + dw * 0.8), py(dy0 + dh), 1);
+gfx_line(px(dx0), py(dy0 + dh * 0.2), px(dx0 + dw), py(dy0 + dh * 0.2), 1);
+// unity reference
+col(0x5C8A8C, 1);
+gfx_line(px(dx0), py(dy0 + dh), px(dx0 + dw), py(dy0), 1);
+// current transfer: dry + EFFECT * (shaper - dry); with BAND SPLIT on, one curve per band in its colour
+function g_curve(e, gcp) local(j, k, s, yv, gx, gy, o) (
+  gA = 1.5 + gcp;  gB = -2 * gcp;  gC = gcp - 0.5;  gD = 0.0625 - 0.25 * gcp + 0.25 * gcp * gcp;   // set_curve's sums, GUI side
+  k = 0;
+  loop(2,                                                   // two passes half a design px apart: a 2 px line
+    o = k * max(1, ps(0.8));  j = 0;
+    loop(101,
+      s = 1.25 * j / 100;
+      yv = s + e * (g_lift(s) - s);
+      gx = px(dx0 + dw * j / 100);
+      gy = py(dy0 + dh - dh * min(1.25, max(0, yv)) / 1.25) + o;
+      j == 0 ? ( gfx_x = gx;  gfx_y = gy; ) : gfx_lineto(gx, gy, 1);
+      j += 1;
+    );
+    k += 1;
+  );
+);
+e = effect / 100;
+split ? (
+  col(BC_HI, 1);   g_curve(min(1, e * hi_amt / 100), max(-0.5, min(0.5, (curve + hi_crv) / 100)));
+  col(BC_MID, 1);  g_curve(min(1, e * mi_amt / 100), max(-0.5, min(0.5, (curve + mi_crv) / 100)));
+  col(BC_LOW, 1);  g_curve(min(1, e * lo_amt / 100), max(-0.5, min(0.5, (curve + lo_crv) / 100)));
+) : (
+  col(0xE4F0EF, 1);  g_curve(e, curve / 100);
+);
+gfx_setfont(5);  col(0x8FB0A8, 1);
+gfx_x = px(dx0 + 6);  gfx_y = py(dy0 + 4);  gfx_drawstr("OUT");
+gfx_x = px(dx0 + dw - 24);  gfx_y = py(dy0 + dh - 18);  gfx_drawstr("IN");
+gfx_setfont(5);  col(0xE4F0EF, 1);  text_c(px(dx0 + dw * 0.5), py(dy0 + dh + 20), "TRANSFER");
+
+// ---------- knobs ----------
+knob(360, 140, 30,  1,  -6,  12, 0, "INPUT",  0, 4);
+knob(520, 140, 42,  2,   0, 100, 0, "EFFECT", 1, 5);
+knob(680, 140, 30,  3, -50,  50, 0, "CURVE",  2, 3);
+
+// ---------- keys ----------
+lk_fit(392, 254, 112, 40, clip,  LK_RED, "CLIP 0 dB") ? ( slider(4) = clip ? 0 : 1;  param_touched(4); );
+lk_fit(516, 254, 132, 40, split, LK_SAGE, "BAND SPLIT") ? ( slider(5) = split ? 0 : 1; param_touched(5); );
+
+// ---------- meters ----------
+vslider(862, 70, 190, 6, -12, 3, 0, "OUTPUT");
+vmeter(906, 70, 190, gdb(in_m),  "IN");
+vmeter(940, 70, 190, gdb(out_m), "OUT");
+
+// ---------- BAND CURVES plate: LOW | SPLIT | MID | SPLIT | HIGH ----------
+// a sunken panel (dark top + left, light bottom + right); drawn greyed while BAND SPLIT is off (still editable)
+bx0 = 20;  by0 = 322;  bw = 960;  bh = 180;
+col(0x0F525C, 1);  gfx_rect(px(bx0), py(by0), ps(bw), ps(bh), 1);
+col(0x08363C, 1);  gfx_rect(px(bx0), py(by0), ps(bw), ps(2), 1);  gfx_rect(px(bx0), py(by0), ps(2), ps(bh), 1);
+col(0x4E959E, 1);  gfx_rect(px(bx0), py(by0 + bh - 2), ps(bw), ps(2), 1);  gfx_rect(px(bx0 + bw - 2), py(by0), ps(2), ps(bh), 1);
+// thin inked dividers between the bands and the split dials
+col(0x08363C, 0.8);
+gfx_rect(px(270), py(by0 + 14), ps(1), ps(bh - 28), 1);  gfx_rect(px(390), py(by0 + 14), ps(1), ps(bh - 28), 1);
+gfx_rect(px(620), py(by0 + 14), ps(1), ps(bh - 28), 1);  gfx_rect(px(740), py(by0 + 14), ps(1), ps(bh - 28), 1);
+
+// band title (with a colour bar under it, the band's curve colour) and its SOLO key
+function band_head(cx, str, c, k) local(tw, th) (
+  gfx_setfont(4);  col(0xE4F0EF, 1);  gfx_measurestr(str, tw, th);
+  gfx_x = px(cx - 26) - tw;  gfx_y = py(by0 + 24) - th * 0.5;  gfx_drawstr(str);
+  col(c, 1);  gfx_rect(px(cx - 26) - tw, py(by0 + 36), tw, ps(3), 1);
+  lk_fit(cx - 14, by0 + 9, 74, 34, solo == k, LK_YEL, "SOLO") ? ( slider(17) = solo == k ? 0 : k;  param_touched(17); );
+);
+band_head(155, "LOW", BC_LOW, 1);
+band_head(505, "MID", BC_MID, 2);
+band_head(855, "HIGH", BC_HI, 3);
+kn_cap = KC_LOW;
+knob(100, 428, 26, 11, 0, 200, 100, "LIFT",  1, 0);
+knob(210, 428, 26, 12, -50, 50, 0,  "CURVE", 2, 0);
+kn_cap = KC_MID;
+knob(450, 428, 26, 13, 0, 200, 100, "LIFT",  1, 0);
+knob(560, 428, 26, 14, -50, 50, 0,  "CURVE", 2, 0);
+kn_cap = KC_HI;
+knob(800, 428, 26, 15, 0, 200, 100, "LIFT",  1, 0);
+knob(910, 428, 26, 16, -50, 50, 0,  "CURVE", 2, 0);
+kn_cap = 0;
+
+// split dials: the title above, a light readout box with the frequency under (always shown, house exception)
+// fol > 0: the dial follows that frequency (x10), drawn greyed and not draggable
+function split_dial(cx, tx, idx, vmin, vmax, def, fol) local(v, tw, th, ck) (
+  gfx_setfont(6);  col(0xE4F0EF, 1);  text_c(px(tx), py(by0 + 24), "SPLIT");
+  fol > 0 ? (
+    v = max(vmin, min(vmax, fol));
+    slider(idx) != v ? ( slider(idx) = v;  slider_automate(2 ^ (idx - 1)); );   // so x10 off carries on from here
+    ck = click;  click = 0;
+  );
+  knob(cx, 418, 22, idx, vmin, vmax, def, "", 3, 0);
+  fol > 0 ? ( click = ck;  col(0x0F525C, 0.5);  gfx_circle(px(cx), py(418), ps(36), 1, 1); );
+  v = fol > 0 ? fol : slider(idx);
+  v >= 1000 ? sprintf(#rd, v % 100 ? "%.2f kHz" : "%.1f kHz", v / 1000) : sprintf(#rd, "%d Hz", v);
+  col(0x08363C, 1);  gfx_rect(px(cx - 44), py(463), ps(88), ps(26), 1);
+  col(0xD8E6D2, 1);  gfx_rect(px(cx - 43), py(464), ps(87), ps(25), 1);
+  col(0xB9CBB4, 1);  gfx_rect(px(cx - 43), py(464), ps(87), ps(2), 1);  gfx_rect(px(cx - 43), py(464), ps(2), ps(25), 1);
+  gfx_setfont(5);  col(0x0E3A40, 1);  text_c(px(cx), py(477), #rd);
+);
+split_dial(330, 302, 9, 60, 800, 240, 0);
+split_dial(680, 680, 10, 1000, 10000, 2400, x10 ? floor(x1_hz + 0.5) * 10 : 0);
+lk_fit(336, by0 + 9, 50, 34, x10, LK_SAGE, "x10") ? ( slider(18) = !x10;  param_touched(18); );   // on the dial that leads (JG)
+
+!split ? ( col(0x15616D, 0.5);  gfx_rect(px(bx0), py(by0), ps(bw), ps(bh), 1); );
+
+// ---------- end of frame ----------
+!lmb ? drag_idx = 0;
+last_lmb = lmb;
+gui_dirty ? ( prm_dirty = 1;  gui_dirty = 0; );   // rebuilt in @block, never on the GUI thread
