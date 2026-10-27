@@ -1,0 +1,77 @@
+desc:GFX Lab Bypass - the mastering units' own BYPASS key (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// gfx-lab-bypass - the Lab copy of the Stable gfx-bypass (made from it unchanged, 27 Oct 2026, for UMX-2).
+// A click-free BYPASS for a whole unit (JG, 25 Oct 2026: every mastering unit has its own, so it never needs
+// REAPER's on / off, which clicks). The unit keeps running; its output crossfades (15 ms, smoothstep) to the untouched
+// input, delayed by the unit's reported latency (pdc_delay) so the two stay in time. Fully bypassed, the
+// output is the input exactly. If the latency changes (an OS change) the dry read glides to the new delay (5 ms).
+//
+// API
+//   by_setup(idx)               @init: idx = the unit's Bypass slider ({Off,On}, lit = bypassed)
+//   by_in()                     first thing in @sample: takes the untouched input (spl0 / spl1)
+//   by_out()                    last thing in @sample: writes the delay line and crossfades spl0 / spl1
+//   by_key(x, y, idx, fnt)      (panel) the BYPASS key: a 72 x 22 lamp key in a dark well (lit = a cream glow,
+//                               dark = grey glass with a light legend), design units x the unit's sc; returns 1 on
+//                               the click that toggled it (it writes the slider and automates sliders 1 - 63; a
+//                               unit whose Bypass slider is above 63 automates it by name on that return)
+//   by_keyw(x, y, w, idx, fnt)  the same key w wide (64 where the panel is tight)
+// The delay line takes 2 x 16384 slots at BY_BUF (8000000, clear of every unit's memory).
+
+@init
+BY_BUF = 8000000; BY_N = 16384;                   // room for 16383 samples of latency (MSAT LIN PHASE: 9212 at 192 kHz)
+function by_setup(idx) (
+  by_idx = idx; by_st = 1 / (0.015 * srate); by_gs = 1 / (0.005 * srate);
+  by_x = slider(idx) >= 0.5; by_w = 0; by_d = by_d0 = pdc_delay; by_m = 1;
+  memset(BY_BUF, 0, 2 * BY_N);
+);
+function by_in() ( by_il = spl0; by_ir = spl1; );
+function by_out() local(s, a, b, m) (
+  BY_BUF[by_w] = by_il; BY_BUF[BY_N + by_w] = by_ir;
+  pdc_delay != by_d ? ( by_d0 = by_d; by_d = pdc_delay; by_m = 0; );
+  by_m < 1 ? by_m = min(by_m + by_gs, 1);
+  by_x = slider(by_idx) >= 0.5 ? min(by_x + by_st, 1) : max(by_x - by_st, 0);
+  by_x > 0 ? (
+    s = by_x * by_x * (3 - 2 * by_x);
+    a = (by_w - by_d) & (BY_N - 1);
+    by_m < 1 ? (
+      b = (by_w - by_d0) & (BY_N - 1); m = by_m * by_m * (3 - 2 * by_m);
+      spl0 += (BY_BUF[b] + (BY_BUF[a] - BY_BUF[b]) * m - spl0) * s;
+      spl1 += (BY_BUF[BY_N + b] + (BY_BUF[BY_N + a] - BY_BUF[BY_N + b]) * m - spl1) * s;
+    ) : (
+      spl0 += (BY_BUF[a] - spl0) * s; spl1 += (BY_BUF[BY_N + a] - spl1) * s;
+    );
+  );
+  by_w = (by_w + 1) & (BY_N - 1);
+);
+
+// ---------- the panel ----------
+function by_rect(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function by_keyw(x, y, w, idx, fnt) local(on, h, hov, hit, tw, th, j) (
+  on = slider(idx) >= 0.5; h = 22; ui_vu_dim = on;                 // the meter lamps dim while bypassed (gfx-ui / gfx-glow)
+  hov = mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = hov && (mouse_cap & 1) && !by_mdn; by_mdn = mouse_cap & 1;
+  // soft drop shadow (light from the top left), the halo when lit, the well
+  j = 0; loop(4, gfx_set(0, 0, 0, 0.13); by_rect(x + 2 + j * 1.3, y + 3 + j * 1.6, w + j * 0.5, h + j * 0.5); j += 1; );
+  on ? ( gfx_set(0.91, 0.89, 0.8, 0.25); by_rect(x - 3, y - 3, w + 6, h + 6); );
+  gfx_set(0.02, 0.02, 0.02, 1); by_rect(x, y, w, h);
+  on ? (
+    gfx_set(0.914, 0.886, 0.8, 1); by_rect(x + 2, y + 2, w - 4, h - 4);                              // cream lens
+    gfx_set(1, 0.98, 0.92, 0.45); by_rect(x + 8, y + 6, w - 16, h - 12);                             // paler centre
+    gfx_set(1, 1, 1, 0.35); by_rect(x + 2, y + 2, w - 4, 1);
+    gfx_set(0, 0, 0, 0.08); by_rect(x + 2, y + h - 4, w - 4, 2); by_rect(x + w - 4, y + 2, 2, h - 4);  // vignette
+  ) : (
+    gfx_set(0.33, 0.34, 0.35, 1); by_rect(x + 2, y + 2, w - 4, h - 4);                               // dark grey glass
+    gfx_set(0, 0, 0, 0.16); by_rect(x + 2, y + h - 5, w - 4, 3); by_rect(x + w - 5, y + 2, 3, h - 4);
+    gfx_set(1, 1, 1, 0.12); by_rect(x + 2, y + 2, w - 4, 1);
+  );
+  hov ? ( gfx_set(1, 1, 1, 0.08); by_rect(x + 2, y + 2, w - 4, h - 4); );
+  // the legend: dark on the lit lens, light on the dark one
+  gfx_setfont(fnt, "Trebuchet MS", 14 * sc, 'b');
+  on ? gfx_set(0.13, 0.11, 0.09, 1) : gfx_set(0.82, 0.83, 0.84, 1);
+  gfx_measurestr("BYPASS", tw, th); gfx_x = (x + w * 0.5) * sc - tw * 0.5; gfx_y = (y + h * 0.5) * sc - th * 0.5 + 0.5 * sc;
+  gfx_drawstr("BYPASS");
+  hit ? ( slider(idx) = on ? 0 : 1; idx <= 63 ? slider_automate(2 ^ (idx - 1)); );
+  hit;
+);
+function by_key(x, y, idx, fnt) ( by_keyw(x, y, 72, idx, fnt); );
