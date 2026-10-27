@@ -22,6 +22,7 @@ desc:GFX C2ME [channel strip]
 // Calibration: 0 dBu = -18 dBFS.
 //
 // STATUS: Stable v2.0 (from the Lab, Oct 2026). v0.2 (WIDTH).
+// v2.0.1 (27 Oct 2026): bug fix - no click when a filter leaves / reaches OFF or a band swaps SHELF / BELL.
 
 in_pin:left input
 in_pin:right input
@@ -201,8 +202,13 @@ function eq_high() ( el = HMFL.eq_t(HFL.eq_t(el));  er = HMFR.eq_t(HFR.eq_t(er))
 function eq_low()  ( el = LFL.eq_t(LMFL.eq_t(el));  er = LFR.eq_t(LMFR.eq_t(er)); );
 // the filters, both sides (work on fl / fr)
 function filters() (
-  hpf_on ? ( HPL.svf_t(fl);  fl = HPL.hp;  HPR.svf_t(fr);  fr = HPR.hp; );
-  lpf_on ? ( LPL.svf_t(fl);  fl = LPL.lp;  LPR.svf_t(fr);  fr = LPR.lp; );
+  // v2.0.1: the filters always run (their state stays current) and fade in / out over 10 ms when a
+  // dial leaves or reaches OFF - switching them in cold clicked on some preset changes
+  hp_s += (hpf_on - hp_s) * xs_c;  lp_s += (lpf_on - lp_s) * xs_c;
+  HPL.svf_t(fl);  HPR.svf_t(fr);
+  hp_s >= 0.99999 ? ( fl = HPL.hp;  fr = HPR.hp; ) : hp_s > 0.00001 ? ( fl += (HPL.hp - fl) * hp_s;  fr += (HPR.hp - fr) * hp_s; );
+  LPL.svf_t(fl);  LPR.svf_t(fr);
+  lp_s >= 0.99999 ? ( fl = LPL.lp;  fr = LPR.lp; ) : lp_s > 0.00001 ? ( fl += (LPL.lp - fl) * lp_s;  fr += (LPR.lp - fr) * lp_s; );
 );
 
 // =====================================================================
@@ -264,6 +270,7 @@ function update_params() (
   ho_c = 1 - exp(-2 * $pi * min(16000, srate * 0.45) / srate);
   sm_c = 1 - exp(-CR / (0.03 * srate));    // control glide: ~30 ms
   xs_c = cms(10);                           // per-sample crossfades (polarity, in / out keys)
+  dk_c = CR / (0.005 * srate);              // v2.0.1 shape-swap duck: 5 ms down, 5 ms up
   t_wid = width / 100;  wd_c = cms(20);     // WIDTH: side gain, glided over ~20 ms (no zipper)
   A.ch_blk(rel_s);  B.ch_blk(rel_s);
   op_d = (ts(OP_B + 0.0001) - ts(OP_B - 0.0001)) / 0.0002;
@@ -274,9 +281,10 @@ function update_params() (
     XFL.ik = XFR.ik = XF_K;
     A.mks = A.mk;  B.mks = B.mk;  A.ow = A.on;  B.ow = B.on;  A.sw = A.cin;  B.sw = B.cin;
     mix_s = mix_t;  ord_cur = order >= 0.5;  wid_s = t_wid;  first_run = 0;
+    hp_s = hpf_on;  lp_s = lpf_on;  hf_k = hf_bell >= 0.5 ? 0 : 2;  lf_k = lf_bell >= 0.5 ? 0 : 1;  hf_w = lf_w = 1;
   );
 );
-function control_tick() local(hs, ls) (
+function control_tick() local(hs, ls, hg, lg) (
   s_hpf += (t_hpf - s_hpf) * sm_c;   s_lpf += (t_lpf - s_lpf) * sm_c;
   s_hfg += (t_hfg - s_hfg) * sm_c;   s_hff += (t_hff - s_hff) * sm_c;
   s_hmfg += (t_hmfg - s_hmfg) * sm_c;  s_hmff += (t_hmff - s_hmff) * sm_c;
@@ -284,11 +292,16 @@ function control_tick() local(hs, ls) (
   s_lfg += (t_lfg - s_lfg) * sm_c;   s_lff += (t_lff - s_lff) * sm_c;
   HPL.svf_c(exp(s_hpf));  HPR.svf_c(exp(s_hpf));
   LPL.svf_c(exp(s_lpf));  LPR.svf_c(exp(s_lpf));
+  // v2.0.1: a SHELF / BELL change ducks that band to flat (~5 ms), swaps the shape, and brings it back
+  // (swapping the shape under a live filter clicked)
   hs = hf_bell >= 0.5 ? 0 : 2;  ls = lf_bell >= 0.5 ? 0 : 1;
-  HFL.eq_c(hs, exp(s_hff), s_hfg, hs ? SHELF_Q : pq(s_hfg));    HFR.eq_c(hs, exp(s_hff), s_hfg, hs ? SHELF_Q : pq(s_hfg));
+  hs != hf_k ? ( hf_w = max(0, hf_w - dk_c);  hf_w <= 0 ? hf_k = hs; ) : hf_w = min(1, hf_w + dk_c);
+  ls != lf_k ? ( lf_w = max(0, lf_w - dk_c);  lf_w <= 0 ? lf_k = ls; ) : lf_w = min(1, lf_w + dk_c);
+  hs = hf_k;  ls = lf_k;  hg = s_hfg * hf_w;  lg = s_lfg * lf_w;
+  HFL.eq_c(hs, exp(s_hff), hg, hs ? SHELF_Q : pq(hg));          HFR.eq_c(hs, exp(s_hff), hg, hs ? SHELF_Q : pq(hg));
   HMFL.eq_c(0, exp(s_hmff), s_hmfg, pq(s_hmfg));                HMFR.eq_c(0, exp(s_hmff), s_hmfg, pq(s_hmfg));
   LMFL.eq_c(0, exp(s_lmff), s_lmfg, pq(s_lmfg));                LMFR.eq_c(0, exp(s_lmff), s_lmfg, pq(s_lmfg));
-  LFL.eq_c(ls, exp(s_lff), s_lfg, ls ? SHELF_Q : pq(s_lfg));    LFR.eq_c(ls, exp(s_lff), s_lfg, ls ? SHELF_Q : pq(s_lfg));
+  LFL.eq_c(ls, exp(s_lff), lg, ls ? SHELF_Q : pq(lg));          LFR.eq_c(ls, exp(s_lff), lg, ls ? SHELF_Q : pq(lg));
 );
 
 @slider
