@@ -1,0 +1,456 @@
+desc:Duo57 [lo-fi/limiter] (GFX)
+//tags: lo-fi disc lacquer shellac 78 wire recorder am radio limiter valve vintage series57
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel and gfx-s57 (.jsfx-inc) in the same folder.
+//
+// DUO57 (Series 57). Two units in one case, the 1957 counterpart of Duo81: where Duo81 crunches with early
+// digital, Duo57 degrades with the media of the valve age and clamps with a valve programme limiter.
+//   DISC  - the medium the sound passes through:
+//     LACQUER  a lacquer disc cut on a mastering lathe: the cutter is driven through the recording pre-emphasis,
+//              so the top clips first; a wide band; light surface hiss and the odd tick; slow wow at 33 1/3.
+//     SHELLAC  a 78: a narrow band with the horn-like presence hump, loud surface noise and crackle, wow at 78.
+//     WIRE     a wire recorder: narrow and nasal, tape-like saturation, hiss, fast flutter and dropouts.
+//     RADIO    AM broadcast: a narrow band, modulator overload, static and slow fading.
+//     DRIVE (into the cutter / the head / the modulator; level matched), BANDWIDTH (100 % = the medium's widest),
+//     WEAR (the noise, crackle and dropouts), WOW (speed variation), MONO (folds to mono, as the media were).
+//   LIMIT - a valve programme limiter: INPUT drives the signal into a fixed threshold (about -10 dBFS peak),
+//     a soft knee at about 20:1, RECOVERY 0.1 - 5 s (programme dependent: a fast part and a slow part), a valve
+//     make-up stage and OUTPUT. The GR meter shows the reduction.
+//   ORDER  DISC > LIMIT (the default) or LIMIT > DISC. MIX blends with the dry signal (latency matched).
+// ULM / COPENHAGEN (the face): ULM - the media brighter and cleaner, the limiter quicker and firmer.
+//   COPENHAGEN - the media darker and warmer (a little low-end weight), the limiter slower and softer, the valve
+//   stage rounder. Level matched; presets leave the face alone; switching fades out and back in.
+// DRIFT (0 - 100 %, 50 % = standard): the turntable / capstan speed and the limiter valve's bias wander.
+// The whole chain runs at 2x (linear-phase half-bands). Latency (reported): the oversampling plus the speed line.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-s57.jsfx-inc
+
+slider1:0<-24,12,0.1>-Input trim (dB)
+slider2:1<0,1,1{Off,On}>-Input guard
+slider3:1<0,1,1{Out,In}>-Disc in
+slider4:0<0,3,1{Lacquer,Shellac,Wire,Radio}>-Medium
+slider5:6<0,24,0.1>-Drive (dB)
+slider6:70<0,100,1>-Bandwidth (%)
+slider7:25<0,100,1>-Wear (%)
+slider8:20<0,100,1>-Wow (%)
+slider9:0<0,1,1{Off,On}>-Mono
+slider10:1<0,1,1{Out,In}>-Limit in
+slider11:6<0,24,0.1>-Limit input (dB)
+slider12:0.8<0.1,5,0.01>-Recovery (s)
+slider13:0<-12,12,0.1>-Limit output (dB)
+slider14:0<0,1,1{Disc first,Limit first}>-Order
+slider15:100<0,100,1>-Mix (%)
+slider16:0<-24,12,0.1>-Output (dB)
+slider17:50<0,100,1>-Drift (%)
+slider18:0<0,100,1>-Band sat (%)
+slider19:30<0,100,1>-Bias (output stage, %)
+slider20:120<40,400,1>-Sat low band (Hz)
+slider21:6000<2000,16000,10>-Sat high band (Hz)
+slider22:-0.3<-24,0,0.1>-Ceiling (dB)
+slider23:0<0,1,1{Ulm,Copenhagen}>-Face
+slider24:prs_sel=0<0,12,1{No preset,Init,Fresh Lacquer,Dusty 78,Wire Memo,AM Broadcast,Broadcast Limiter,Crushed Acetate,Shellac Drums,Wire Ghost,Late-Night Radio,Parallel Disc,Radio Smash}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-duo57";
+s57_lamp = 1;                                           // Series 57 keys drawn as the house lamp keys
+ext_noinit = 1;
+s57_mem = 0;
+
+// ---------- the oversampler (2x) ----------
+u5_H = s57_alloc(64); s57_hbdesign(u5_H, 63, 8);
+u5uL.s57_upinit(63, u5_H, 64); u5uR.s57_upinit(63, u5_H, 64); u5dL.s57_dninit(63, u5_H, 64); u5dR.s57_dninit(63, u5_H, 64);
+u5_OSL = 31;                                            // the 2x pair's latency at 1x (measured)
+u5_WB = 200;                                            // the speed line's resting delay, 2x samples
+u5_LAT = u5_OSL + u5_WB / 2;
+u5_DRY = s57_alloc(512);
+u5wL.s57_dlinit(1024); u5wR.s57_dlinit(1024);
+
+// ---------- the media ----------
+// per medium: HP (Hz), widest top (Hz), narrowest top (Hz), the pre-emphasis (dB), the presence peak (Hz, dB, Q),
+// hiss (dB), crackle rate (/s at WEAR 100), wow (Hz, depth %), flutter (Hz, depth %), dropouts (/s at WEAR 100),
+// saturation type (0 stylus, 1 acoustic, 2 tape, 3 modulator)
+function u5_medium(m) (
+  m == 0 ? ( u5_mhp = 25;  u5_mtw = 16000; u5_mtn = 6000; u5_mpe = 6; u5_mpf = 3000; u5_mpg = 0;   u5_mpq = 0.7;
+             u5_mhs = -62; u5_mcr = 6;   u5_mwf = 0.555; u5_mwd = 0.12; u5_mff = 6;   u5_mfd = 0.03; u5_mdo = 0;   u5_mst = 0; ) :
+  m == 1 ? ( u5_mhp = 90;  u5_mtw = 7000;  u5_mtn = 3000; u5_mpe = 3; u5_mpf = 2400; u5_mpg = 4.5; u5_mpq = 1.2;
+             u5_mhs = -40; u5_mcr = 40;  u5_mwf = 1.3;   u5_mwd = 0.25; u5_mff = 11;  u5_mfd = 0.05; u5_mdo = 0;   u5_mst = 1; ) :
+  m == 2 ? ( u5_mhp = 140; u5_mtw = 6000;  u5_mtn = 2800; u5_mpe = 4; u5_mpf = 2800; u5_mpg = 2.5; u5_mpq = 1;
+             u5_mhs = -46; u5_mcr = 2;   u5_mwf = 0.9;   u5_mwd = 0.2;  u5_mff = 9;   u5_mfd = 0.22; u5_mdo = 1.5; u5_mst = 2; ) :
+           ( u5_mhp = 110; u5_mtw = 7500;  u5_mtn = 3200; u5_mpe = 0; u5_mpf = 1800; u5_mpg = 2;   u5_mpq = 0.8;
+             u5_mhs = -48; u5_mcr = 12;  u5_mwf = 0;     u5_mwd = 0;    u5_mff = 0;   u5_mfd = 0;    u5_mdo = 0;   u5_mst = 3; );
+);
+// the drive's make-up (dB at DRIVE 0 .. 24 in 3 dB steps, per saturation type; measured on pink noise)
+u5_MK = s57_alloc(40);
+function u5_row(k, a, b, c, d, e, f, g, h, i) local(p) (
+  p = u5_MK + k * 9; p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e; p[5] = f; p[6] = g; p[7] = h; p[8] = i;
+);
+u5_row(0, 2.26, -1.01, -3.97, -6.62, -8.96, -10.98, -12.69, -14.09, -15.17);
+u5_row(1, 3.16, 0.35, -2.29, -4.78, -7.11, -9.27, -11.28, -13.13, -14.81);
+u5_row(2, 4.20, 0.88, -2.17, -4.95, -7.46, -9.70, -11.66, -13.36, -14.78);
+u5_row(3, 3.87, 0.40, -2.81, -5.77, -8.48, -10.93, -13.13, -15.08, -16.77);
+// COPENHAGEN's darker media sit a little lower or higher than ULM's (dB, per medium; added for COPENHAGEN)
+function u5_fmk(m) ( m == 0 ? -1.06 : m == 1 ? 0.85 : m == 2 ? 1.20 : 0.58; );
+function u5_mkdb(t, d) local(p, i, f, q) (
+  p = min(max(d, 0), 24) / 3; i = min(floor(p), 7); f = p - i; q = u5_MK + t * 9;
+  q[i] * (1 - f) + q[i + 1] * f + (u5_fc ? u5_fmk(t) : 0)
+    - (t == 0 ? 0.19 : t == 1 ? 0.08 : t == 2 ? 0.13 : 0.1) * sqr(p / 8);   // (the anti-aliased curves: a touch louder)
+);
+// the saturations (at 2x): the stylus clips hard-ish and a little unevenly, the acoustic horn compresses softly,
+// tape is symmetric and round, the modulator flat-tops the positive peaks (over-modulation) and pinches the negative
+function u5_sat(x, t) (
+  t == 0 ? ( x >= 0 ? s57_th(x * 1.1) / 1.1 : s57_th(x * 0.9) / 0.9 ) :
+  t == 1 ? ( x / (1 + 0.6 * abs(x)) ) :
+  t == 2 ? ( s57_th(x) ) :
+           ( x >= 0 ? min(x, 0.9 + 0.1 * s57_th((x - 0.9) * 10)) : -s57_th(-x * 1.25) / 1.25 );
+);
+
+// their antiderivatives (F(0) = 0), for the anti-aliased (first-order ADAA) stages; s57_th's is u5_Fth
+function u5_Fth(x) local(q) ( q = x * x; q < 9 ? q * 0.05555555555555556 + 1.3333333333333333 * log(1 + q * 0.3333333333333333) : abs(x) - 0.6516075; );
+function u5_satF(x, t) local(a) (
+  t == 0 ? ( x >= 0 ? u5_Fth(x * 1.1) * 0.8264462809917355 : u5_Fth(x * 0.9) * 1.2345679012345678 ) :
+  t == 1 ? ( a = abs(x); a * 1.6666666666666667 - log(1 + 0.6 * a) * 2.7777777777777778 ) :
+  t == 2 ? ( u5_Fth(x) ) :
+           ( x >= 0 ? ( x <= 0.9 ? 0.5 * x * x : 0.405 + 0.9 * (x - 0.9) + 0.01 * u5_Fth((x - 0.9) * 10) ) : u5_Fth(x * 1.25) * 0.64 );
+);
+// a saturation anti-aliased: (F(x) - F(x1)) / (x - x1) (the curve at the midpoint when the two are within 1e-5), with
+// half the step of the plain curve added back (no droop, no delay; a straight curve passes exactly)
+function u5_aa(x, t) instance(x1, ad1, cv1, t1) local(ad, cv, d, y) (
+  t !== t1 ? ( ad1 = u5_satF(x1, t); cv1 = u5_sat(x1, t); t1 = t; );
+  ad = u5_satF(x, t); cv = u5_sat(x, t); d = x - x1;
+  y = abs(d) > 0.00001 ? (ad - ad1) / d : u5_sat(0.5 * (x + x1), t);
+  y += 0.5 * (cv - cv1);
+  x1 = x; ad1 = ad; cv1 = cv;
+  y;
+);
+// ---------- one channel of the DISC at 2x ----------
+// pre (the medium's EQ and the drive) -> the speed line (wow and flutter) -> the band -> noise, crackle, dropouts
+function u5_disc_pre(x) instance(hp, pe, de, sa) local(y) (
+  y = hp.s57_bq(x);
+  y = pe.s57_bq(y);                                     // the recording pre-emphasis
+  y = sa.u5_aa(y * u5_g, u5_mst) * u5_gm;               // (anti-aliased)
+  de.s57_bq(y);                                         // and its de-emphasis
+);
+function u5_disc_post(x, n) instance(lp1, lp2, pk, cr, ck) local(y, c) (
+  y = lp1.s57_bq(x); y = lp2.s57_bq(y); y = pk.s57_bq(y);
+  // the surface: hiss (through the same band), the crackle (a click rung through a short resonance)
+  c = 0; rand(1) < u5_pcr ? ( ck = (rand(2) - 1) * u5_cra * (0.3 + rand(1)); );
+  c = cr.s57_bq(ck); ck *= 0.35;
+  y += n * u5_hsa + c;
+  y * u5_lvl;
+);
+
+// ---------- settings ----------
+function u5_update() (
+  in_setup(slider1, slider2 >= 0.5);
+  u5_tdisc = slider3 >= 0.5; u5_tmed = slider4; u5_tmono = slider9 >= 0.5; u5_tlim = slider10 >= 0.5;
+  u5_tord = slider14 >= 0.5; u5_tfc = slider23 >= 0.5;
+  u5_tg = 10 ^ (slider5 / 20); u5_tgm = 10 ^ (u5_mkdb(u5_mst, slider5) / 20);
+  u5_bw = slider6 / 100; u5_wear = slider7 / 100; u5_wow = slider8 / 100;
+  u5_tli = 10 ^ (slider11 / 20); u5_rec = slider12 * (u5_fc ? 1.6 : 0.8); u5_tlo = 10 ^ ((slider13 - 3) / 20);   // (3 dB under: unity at the default INPUT on a mix)
+  u5_tmix = slider15 / 100; u5_tog = 10 ^ (slider16 / 20);
+  drift_macro(slider17);
+  ost_setup(slider18 / 100, slider19 / 100, slider20, slider21, slider22, 1);
+  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = u5_LAT;
+  u5_lkf = s57_kt(u5_rec * 0.25, u5_fs2); u5_lks = s57_kt(0.05, u5_fs2); u5_lkr = s57_kt(u5_rec, u5_fs2);   // (cached)
+);
+// the filters follow the medium, BANDWIDTH and the face
+function u5_filters() local(top, fs) (
+  fs = u5_fs2;
+  top = u5_mtn * (u5_mtw / u5_mtn) ^ u5_bw * (u5_fc ? 0.8 : 1);
+  u5_top = top;
+  u5L.hp.s57_bqset(1, u5_mhp, 0, 0.6, fs); u5R.hp.s57_bqset(1, u5_mhp, 0, 0.6, fs);
+  u5L.pe.s57_bqset(5, 2500, u5_mpe, 0.7, fs); u5R.pe.s57_bqset(5, 2500, u5_mpe, 0.7, fs);
+  u5L.de.s57_bqset(5, 2500, -u5_mpe, 0.7, fs); u5R.de.s57_bqset(5, 2500, -u5_mpe, 0.7, fs);
+  u5L.lp1.s57_bqset(0, top, 0, 0.54, fs); u5R.lp1.s57_bqset(0, top, 0, 0.54, fs);
+  u5L.lp2.s57_bqset(0, top * (u5_med == 0 ? 1.6 : 1.05), 0, 1.31, fs); u5R.lp2.s57_bqset(0, top * (u5_med == 0 ? 1.6 : 1.05), 0, 1.31, fs);
+  u5L.pk.s57_bqset(u5_fc ? 4 : 3, u5_fc ? 160 : u5_mpf, u5_fc ? 1.5 + u5_mpg * 0.6 : u5_mpg, u5_mpq, fs);
+  u5R.pk.s57_bqset(u5_fc ? 4 : 3, u5_fc ? 160 : u5_mpf, u5_fc ? 1.5 + u5_mpg * 0.6 : u5_mpg, u5_mpq, fs);
+  u5L.cr.s57_bqset(2, 3500, 0, 1.4, fs); u5R.cr.s57_bqset(2, 4100, 0, 1.4, fs);
+  // the limiter's character
+  u5_lka = s57_kt(u5_fc ? 0.0025 : 0.0006, fs);
+  u5_knee = u5_fc ? 12 : 6;
+  u5_vb = u5_fc ? 0.12 : 0.04;
+);
+function u5_srinit() (
+  u5_sr = srate; u5_fs2 = 2 * srate;
+  u5_sm = s57_kt(0.02, srate);
+  u5_fd = 1 / (0.006 * srate);
+  u5_medium(u5_med); u5_filters();
+  ost_init(0);
+);
+
+in_init();
+u5_med = u5_tmed = slider4; u5_fc = u5_tfc = slider23 >= 0.5;
+u5_srinit();
+u5_dfS.drift_init(0.7 + rand(0.4)); u5_dfB.drift_init(0.8 + rand(0.4));
+u5o.ost_ch_init(); u5p.ost_ch_init();
+u5_update();
+u5_disc = u5_tdisc; u5_mono = u5_tmono; u5_lim = u5_tlim; u5_ord = u5_tord;
+u5_g = u5_tg; u5_gm = u5_tgm; u5_li = u5_tli; u5_lo = u5_tlo; u5_mix = u5_tmix; u5_og = u5_tog;
+u5_fade = 1; u5_fst = 0; u5_hold = 0; u5_dw = 0; u5_env = 0; u5_envs = 0; u5_gr = 1; u5_ph = 0; u5_fph = 0; u5_lvl = 1; u5_lvt = 1;
+
+// ---------- presets ----------
+function u5_set(dsc, med, drv, bw, wr, wo, mo, lim, li, rc, lo, ord, mx, ou) (
+  slider3 = dsc; slider4 = med; slider5 = drv; slider6 = bw; slider7 = wr; slider8 = wo; slider9 = mo;
+  slider10 = lim; slider11 = li; slider12 = rc; slider13 = lo; slider14 = ord; slider15 = mx; slider16 = ou;
+  slider_automate(65532);                               // sliders 3 - 16
+);
+#u5_pm = "Init|Fresh Lacquer|Dusty 78|Wire Memo|AM Broadcast|Broadcast Limiter|Crushed Acetate|Shellac Drums|Wire Ghost|Late-Night Radio|Parallel Disc|Radio Smash";
+function load_preset(p) (
+  //                  dsc med drv bw  wr  wo  mo lim li  rc   lo  ord mix out
+  p == 1  ? u5_set(1, 0,  6, 70, 25, 20, 0, 1,  6, 0.8,  0, 0, 100, 0) :      // Init
+  p == 2  ? u5_set(1, 0,  4, 95, 10, 10, 0, 0,  6, 0.8,  0, 0, 100, 0) :      // Fresh Lacquer
+  p == 3  ? u5_set(1, 1, 8, 60, 55, 30, 1, 1, 6, 1.2, 0.4, 0, 100, 0) :      // Dusty 78
+  p == 4  ? u5_set(1, 2, 10, 50, 40, 45, 1, 1, 8, 1.0, -1, 0, 100, 0) :      // Wire Memo
+  p == 5  ? u5_set(1, 3, 10, 55, 30, 0, 1, 1, 10, 0.5, 2.2, 1, 100, 0) :      // AM Broadcast
+  p == 6  ? u5_set(0, 0, 6, 70, 25, 20, 0, 1, 10, 0.6, -1.8, 0, 100, 0) :      // Broadcast Limiter
+  p == 7  ? u5_set(1, 0, 20, 45, 45, 25, 0, 1, 12, 0.4, -3, 0, 100, 0) :      // Crushed Acetate
+  p == 8  ? u5_set(1, 1, 14, 70, 35, 10, 0, 1, 16, 0.3, -3.1, 1, 100, 0) :      // Shellac Drums
+  p == 9  ? u5_set(1, 2, 16, 30, 70, 80, 1, 1, 6, 2.0, 0.7, 0, 100, 0) :      // Wire Ghost
+  p == 10 ? u5_set(1, 3, 6, 35, 50, 0, 1, 1, 8, 3.0, 0.7, 0, 100, 0) :      // Late-Night Radio
+  p == 11 ? u5_set(1, 1, 12, 50, 40, 25, 1, 1, 14, 0.5, 1.5, 0, 40, 0) :      // Parallel Disc
+  p == 12 ? u5_set(1, 3, 22, 60, 25, 0, 1, 1, 20, 0.2, 5.8, 1, 100, 0) :      // Radio Smash
+  p == 13 ? (                                                                  // Reset all to defaults
+    u5_set(1, 0, 6, 70, 25, 20, 0, 1, 6, 0.8, 0, 0, 100, 0);
+    slider1 = 0; slider2 = 1; slider17 = 50; slider18 = 0; slider19 = 30; slider20 = 120; slider21 = 6000; slider22 = -0.3;
+    slider_automate(4194303);                                 // sliders 1 - 22 (not the face)
+  );
+  pr_cur = p;
+);
+
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+u5_update();
+
+@block
+prs_chk();
+srate != u5_sr ? u5_srinit();
+u5_update();
+// a new medium or face, the units in or out, the order, MONO: fade out, switch at the silent point, fade in
+(u5_tmed != u5_med || u5_tfc != u5_fc || u5_tdisc != u5_disc || u5_tlim != u5_lim || u5_tord != u5_ord || u5_tmono != u5_mono) && u5_fst == 0 ? u5_fst = 1;
+// the drive's make-up follows the medium (the target only changes with the medium at the silent point)
+u5_tgm = 10 ^ (u5_mkdb(u5_mst, slider5) / 20);
+// DRIFT: the speed and the limiter valve's bias
+u5_di = 0.12 * dm_s * samplesblock / srate;
+u5_dsp = dm_a * 0.06 * u5_dfS.drift_tick(u5_di);
+u5_db = dm_a * 0.04 * u5_dfB.drift_tick(u5_di);
+// the surface: crackle probability per 2x sample, its size; the hiss level; the dropouts
+u5_pcr = u5_mcr * u5_wear * (0.3 + 2 * u5_wear) / u5_fs2 * (u5_disc ? 1 : 0);
+u5_cra = 0.5 * (u5_fc ? 0.8 : 1);
+u5_hsa = 10 ^ ((u5_mhs + 30 * (u5_wear - 0.5) - (u5_fc ? 0 : 3)) / 20) * (u5_wear > 0.001) * 4;
+// the speed line: wow + flutter + drift, in 2x samples (depth in % of speed)
+u5_wa = u5_wow * u5_mwd * 0.01 * u5_fs2 / (2 * $pi * max(u5_mwf, 0.3)) * (u5_fc ? 1.1 : 0.85);
+u5_fa = u5_wow * u5_mfd * 0.01 * u5_fs2 / (2 * $pi * max(u5_mff, 1));
+u5_wi = u5_mwf / u5_fs2 * (1 + u5_dsp); u5_fi = u5_mff / u5_fs2;
+// the radio fades slowly; the wire drops out
+u5_med == 3 ? ( u5_rfp += samplesblock / srate * 0.07; u5_lvt = 1 - u5_wear * 0.45 * (0.5 + 0.5 * sin(2 * $pi * u5_rfp) * sin(2 * $pi * u5_rfp * 0.37)); ) :
+u5_med == 2 ? ( rand(1) < u5_mdo * u5_wear * u5_wear * samplesblock / srate ? u5_dot = 0.25 + rand(0.3); u5_dot *= 0.9; u5_lvt = 1 - u5_dot * 0.8; ) :
+( u5_lvt = 1; );
+!u5_disc ? u5_lvt = 1;
+// the meters
+u5a_gr = max(u5a_gr, u5_grm); u5_grm = 0;
+u5a_vo = max(u5a_vo, u5_vo);
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@sample
+// ---------- glides ----------
+u5_g += (u5_tg - u5_g) * u5_sm; u5_gm += (u5_tgm - u5_gm) * u5_sm;
+u5_li += (u5_tli - u5_li) * u5_sm; u5_lo += (u5_tlo - u5_lo) * u5_sm;
+u5_mix += (u5_tmix - u5_mix) * u5_sm; u5_og += (u5_tog - u5_og) * u5_sm;
+u5_lvl += (u5_lvt - u5_lvl) * u5_sm;
+// ---------- the fade ----------
+u5_fst == 1 ? ( u5_fade -= u5_fd; u5_fade <= 0 ? (
+  u5_fade = 0; u5_disc = u5_tdisc; u5_lim = u5_tlim; u5_ord = u5_tord; u5_mono = u5_tmono;
+  ( u5_tmed != u5_med || u5_tfc != u5_fc ) ? ( u5_med = u5_tmed; u5_fc = u5_tfc; u5_medium(u5_med); u5_filters(); u5_update(); u5_gm = u5_tgm = 10 ^ (u5_mkdb(u5_mst, slider5) / 20); );
+  u5L.lp1.s57_bqclr(); u5L.lp2.s57_bqclr(); u5R.lp1.s57_bqclr(); u5R.lp2.s57_bqclr(); u5_env = 0; u5_envs = 0; u5_gr = 1;
+  u5_hold = u5_LAT + 16; u5_fst = 2; ); ) :
+u5_fst == 2 ? ( u5_hold -= 1; u5_hold <= 0 ? u5_fst = 3; ) :
+u5_fst == 3 ? ( u5_fade += u5_fd; u5_fade >= 1 ? ( u5_fade = 1; u5_fst = 0; ); );
+
+// ---------- input ----------
+in_process(spl0, spl1);
+u5_xl = in_l; u5_xr = in_r;
+u5_DRY[u5_dp] = u5_xl; u5_DRY[256 + u5_dp] = u5_xr;
+u5_rp = (u5_dp - u5_LAT) & 255; u5_yld = u5_DRY[u5_rp]; u5_yrd = u5_DRY[256 + u5_rp]; u5_dp = (u5_dp + 1) & 255;
+
+// ---------- the chain, at 2x ----------
+// one 2x sample of both channels: in u5_a / u5_b, out u5_a / u5_b
+function u5_limit() local(pk, over, k, grd, t) (
+  u5_a *= u5_li; u5_b *= u5_li;
+  pk = max(abs(u5_a), abs(u5_b));
+  // the detector: a quick attack, a programme-dependent recovery (a fast part and a slow part)
+  u5_env += (pk - u5_env) * (pk > u5_env ? u5_lka : u5_lkf);
+  u5_envs += (pk - u5_envs) * (pk > u5_envs ? u5_lks : u5_lkr);
+  t = max(u5_env * 0.6 + u5_envs * 0.4, 0.000001);
+  over = 20 * log10(t) + 10;                             // dB over the threshold (-10 dBFS)
+  k = u5_knee;
+  grd = over <= -k / 2 ? 0 : over >= k / 2 ? over * 0.95 : 0.95 * sqr(over + k / 2) / (2 * k);
+  u5_gr = 10 ^ (-grd / 20);
+  u5_grm = max(u5_grm, grd);
+  // the valve make-up stage (a touch of even harmonics, more in COPENHAGEN), then OUTPUT
+  t = u5_vb + u5_db;
+  u5_a = (s57_th(u5_a * u5_gr * 1.2 + t) - s57_th(t)) / 1.2 * u5_lo;   // (gentle: plain at 2x measures clean)
+  u5_b = (s57_th(u5_b * u5_gr * 1.2 + t) - s57_th(t)) / 1.2 * u5_lo;
+);
+function u5_discs() local(m, n1, n2, d) (
+  u5_disc ? (
+    u5_a = u5L.u5_disc_pre(u5_a); u5_b = u5R.u5_disc_pre(u5_b);
+    u5_mono ? ( m = (u5_a + u5_b) * 0.5; u5_a = u5_b = m; );
+  );
+  // the speed line (always in the path, so the latency never changes)
+  u5_ph += u5_wi; u5_ph >= 1 ? u5_ph -= 1; u5_fph += u5_fi * (1 + 0.3 * sin(2 * $pi * u5_ph * 3.1)); u5_fph >= 1 ? u5_fph -= 1;
+  d = u5_WB + (u5_disc ? u5_wa * sin(2 * $pi * u5_ph) + u5_fa * sin(2 * $pi * u5_fph) : 0);
+  u5wL.s57_dlw(u5_a); u5wR.s57_dlw(u5_b);
+  u5_a = u5wL.s57_dlr3(d); u5_b = u5wR.s57_dlr3(d + (u5_mono ? 0 : u5_wa * 0.02));
+  u5_disc ? (
+    n1 = u5nL.s57_pink(); n2 = u5_mono ? n1 : u5nR.s57_pink();
+    u5_a = u5L.u5_disc_post(u5_a, n1);
+    u5_b = u5_mono ? u5_a : u5R.u5_disc_post(u5_b, n2);
+  );
+);
+function u5_step() (
+  !u5_ord ? ( u5_discs(); u5_lim ? u5_limit(); ) : ( u5_lim ? u5_limit(); u5_discs(); );
+);
+
+u5uL.s57_up(u5_xl); u5uR.s57_up(u5_xr);
+u5_a = u5uL.o0; u5_b = u5uR.o0; u5_step(); u5_q0l = u5_a; u5_q0r = u5_b;
+u5_a = u5uL.o1; u5_b = u5uR.o1; u5_step(); u5_q1l = u5_a; u5_q1r = u5_b;
+u5_yl = u5dL.s57_dn(u5_q0l, u5_q1l); u5_yr = u5dR.s57_dn(u5_q0r, u5_q1r);
+
+// ---------- MIX, the fade, OUTPUT, the house output stage ----------
+u5_yl = (u5_yld + (u5_yl - u5_yld) * u5_mix) * u5_fade; u5_yr = (u5_yrd + (u5_yr - u5_yrd) * u5_mix) * u5_fade;
+u5_vo = max(u5_vo * 0.9995, abs(u5_yl) + abs(u5_yr));
+u5_yl = u5o.ost_band(u5_yl) * u5_og; u5_yr = u5p.ost_band(u5_yr) * u5_og;
+ost_out(u5_yl, u5_yr);
+spl0 = abs(ost_l) < 0.00000000000000000001 ? 0 : ost_l;
+spl1 = abs(ost_r) < 0.00000000000000000001 ? 0 : ost_r;
+
+@gfx 960 400
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+ui_begin(960, 400);
+s57_pal(slider23);
+s57_fonts();
+s57_face(960, 400);
+k_ = s57_header(960, "DUO57", "SERIES 57", "LO-FI / LIMITER", #u5_pm, 23);
+k_ > 0 ? prs_dirty = (k_);
+
+// ---------- the signal path along the foot ----------
+s57_path(960, 372, 4);
+s57_small(30, 378, "IN"); s57_small(330, 378, slider14 < 0.5 ? "DISC" : "LIMIT"); s57_small(634, 378, slider14 < 0.5 ? "LIMIT" : "DISC"); s57_small(892, 378, "OUT");
+
+// ---------- DISC (a raised plate) ----------
+s57_plate(20, 68, 420, 292);
+s57_title(32, 76, "DISC");
+s57_inkey(84, 77, 3);
+// the medium keys
+m_ = 0; loop(4,
+  s57_lcol = m_ == 0 ? LK_RED : m_ == 1 ? LK_ORA : m_ == 2 ? LK_GRN : LK_BLU_LT; s57_key(32 + m_ * 100, 104, 94, 22, slider4 == m_, m_ == 0 ? "LACQUER" : m_ == 1 ? "SHELLAC" : m_ == 2 ? "WIRE" : "RADIO") ? s57_set(4, m_);
+  m_ += 1; );
+// the turntable (or the radio's dial): it turns while the disc is in
+u5_rot += (slider3 >= 0.5) * (slider4 == 1 ? 0.13 : slider4 == 2 ? 0.2 : 0.06);
+cx_ = 118; cy_ = 236;
+slider4 <= 1 ? (
+  ui_cola(0x000000, 0.2); gfx_circle((cx_ + 2) * sc, (cy_ + 3) * sc, 78 * sc, 1, 1);
+  ui_col(0x1A1A1C); gfx_circle(cx_ * sc, cy_ * sc, 78 * sc, 1, 1);
+  i_ = 0; loop(9, ui_cola(0xFFFFFF, 0.05 + 0.02 * (i_ & 1)); gfx_circle(cx_ * sc, cy_ * sc, (34 + i_ * 4.8) * sc, 0, 1); i_ += 1; );
+  // the sheen sweeping round
+  ui_cola(0xFFFFFF, 0.12); s57_ln(cx_ + cos(u5_rot) * 30, cy_ + sin(u5_rot) * 30, cx_ + cos(u5_rot) * 76, cy_ + sin(u5_rot) * 76, 3);
+  ui_cola(0xFFFFFF, 0.06); s57_ln(cx_ - cos(u5_rot) * 30, cy_ - sin(u5_rot) * 30, cx_ - cos(u5_rot) * 76, cy_ - sin(u5_rot) * 76, 3);
+  ui_col(slider4 == 0 ? S57_ORNG : 0x7A2E22); gfx_circle(cx_ * sc, cy_ * sc, 28 * sc, 1, 1);
+  ui_col(S57_CREAM); gfx_circle(cx_ * sc, cy_ * sc, 3 * sc, 1, 1);
+  gfx_setfont(13); ui_col(0xFFF7EE); s57_tc(cx_ + sin(u5_rot) * 14, cy_ - cos(u5_rot) * 14, "57");
+) : slider4 == 2 ? (
+  // the wire spools
+  i_ = 0; loop(2,
+    ui_col(0x3A3A3E); gfx_circle((cx_ - 40 + i_ * 80) * sc, (cy_ - 10) * sc, 34 * sc, 1, 1);
+    ui_col(0x9EA3AA); gfx_circle((cx_ - 40 + i_ * 80) * sc, (cy_ - 10) * sc, (22 + 6 * i_) * sc, 1, 1);
+    ui_col(0x3A3A3E); gfx_circle((cx_ - 40 + i_ * 80) * sc, (cy_ - 10) * sc, 8 * sc, 1, 1);
+    ui_col(S57_CREAM); s57_ln(cx_ - 40 + i_ * 80, cy_ - 10, cx_ - 40 + i_ * 80 + cos(u5_rot * (1.5 - i_ * 0.5)) * 8, cy_ - 10 + sin(u5_rot * (1.5 - i_ * 0.5)) * 8, 2);
+    i_ += 1; );
+  ui_col(0x7E848C); s57_ln(cx_ - 40, cy_ + 12, cx_ + 40, cy_ + 18, 1);
+  ui_col(S57_INK); s57_rr(cx_ - 14, cy_ + 34, 28, 16, 2);
+  gfx_setfont(13); ui_col(S57_DIM); s57_tc(cx_, cy_ + 64, "WIRE");
+) : (
+  // the radio dial
+  ui_col(S57_INK); s57_rr(cx_ - 82, cy_ - 50, 164, 100, 6);
+  ui_col(S57_AMBD); s57_r(cx_ - 76, cy_ - 44, 152, 88);
+  i_ = 0; loop(8, ui_cola(S57_AMBW, 0.15); s57_r(cx_ - 76 + i_ * 4, cy_ - 44 + i_ * 2, 152 - i_ * 8, 88 - i_ * 4); i_ += 1; );
+  i_ = 0; loop(13, ui_col(S57_INK); s57_r(cx_ - 64 + i_ * 10.6, cy_ - 30, 1, i_ % 3 == 0 ? 8 : 4); i_ += 1; );
+  gfx_setfont(13); ui_col(S57_INK); s57_tc(cx_ - 64, cy_ - 12, "55"); s57_tc(cx_, cy_ - 12, "100"); s57_tc(cx_ + 64, cy_ - 12, "160");
+  s57_tc(cx_, cy_ + 26, "MEDIUM WAVE");
+  ui_col(S57_NDL); s57_r(cx_ - 30 + sin(u5_rot * 0.05) * 3, cy_ - 40, 1.8, 80);
+);
+s57_lcol = LK_RED; s57_key(76, 330, 84, 22, slider9 >= 0.5, "MONO") ? s57_set(9, slider9 >= 0.5 ? 0 : 1);
+s57_knob(264, 196, 22, 5, 0, 24, 6, 0, slider4 == 3 ? "MODULATION" : "DRIVE", "%.1f dB", 0);
+s57_knob(374, 196, 22, 6, 0, 100, 70, 0, "BANDWIDTH", "%.0f%%", 0);
+s57_knob(264, 296, 22, 7, 0, 100, 25, 0, "WEAR", "%.0f%%", 0);
+s57_knob(374, 296, 22, 8, 0, 100, 20, 0, slider4 == 3 ? "(NO WOW)" : "WOW", "%.0f%%", 0);
+// DISC out: the plate slightly greyed, its IN key drawn again on top
+slider3 < 0.5 ? ( ui_cola(S57_PLATE, 0.5); s57_rr(20, 68, 420, 292, 3); s57_inkey(84, 77, 3); );
+
+// ---------- LIMIT (a recessed well) ----------
+s57_well(456, 68, 300, 292);
+s57_title(468, 76, "LIMIT");
+s57_inkey(526, 77, 10);
+u5mG.s57_gredge(468, 102, 276, 66, slider10 >= 0.5 ? u5a_gr : 0, "GAIN REDUCTION");
+u5a_gr *= 0.5;
+s57_knob(520, 236, 26, 11, 0, 24, 6, 0, "INPUT", "%.1f dB", 0);
+s57_knob(606, 236, 26, 12, 0.1, 5, 0.8, 1, "RECOVERY", "%.2f s", 0);
+s57_knob(692, 236, 26, 13, -12, 12, 0, 0, "OUTPUT", "%+.1f dB", 0);
+s57_small(468, 316, "A VALVE PROGRAMME LIMITER: INPUT DRIVES THE");
+s57_small(468, 330, "SIGNAL INTO A FIXED THRESHOLD.");
+// LIMIT out: the well slightly greyed, its IN key drawn again on top
+slider10 < 0.5 ? ( ui_cola(S57_WELL, 0.5); s57_r(456, 68, 300, 292); s57_inkey(526, 77, 10); );
+
+// ---------- the output (a raised plate) ----------
+s57_plate(772, 68, 168, 292);
+s57_title(784, 76, "IN · OUT");
+u5ok.s57_orderkey(784, 100, 120, 22, slider14 < 0.5 ? "DISC > LIMIT" : "LIMIT > DISC") ? s57_set(14, slider14 >= 0.5 ? 0 : 1);
+s57_knob(816, 160, 13, 1, -24, 12, 0, 0, "INPUT", "%+.1f dB", 0);
+gfx_setfont(13); ui_col(S57_INK); s57_tc(898, 142, "GUARD");
+s57_lcol = LK_YEL; s57_key(874, 152, 48, 20, slider2 >= 0.5, slider2 >= 0.5 ? "ON" : "OFF") ? s57_set(2, slider2 >= 0.5 ? 0 : 1);
+in_grd > 0.5 ? ( pk_led(929 * sc, 162 * sc, 3 * sc, 1, S57_ORNG); ); in_grd = 0;
+s57_knob(816, 236, 18, 15, 0, 100, 100, 0, "MIX", "%.0f%%", 0);
+s57_knob(898, 236, 18, 16, -24, 12, 0, 0, "OUTPUT", "%+.1f dB", 0);
+s57_knob(816, 312, 13, 17, 0, 100, 50, 0, "DRIFT", "%.0f%%", 0);
+s57_knob(898, 312, 13, 18, 0, 100, 0, 0, "SAT", "%.0f%%", 0);
+ost_clipped ? pk_led(926 * sc, 296 * sc, 3.5 * sc, 1, 0xFF3A22); ost_clipped = 0;
+
+s57_cheeks(960, 400);
+pk_end();
+ui_end();

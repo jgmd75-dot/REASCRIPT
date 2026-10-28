@@ -1,0 +1,593 @@
+desc:FYRE [drive] (GFX)
+//tags: boost treble booster fuzz germanium silicon stompbox guitar british reorder
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn and gfx-clip (.jsfx-inc) in the same folder.
+//
+// FYRE. A vintage British 3-in-1 tone rack: a clean boost with sparkle, a single-transistor treble booster and a thick
+// two-stage fuzz, in any order (the sound is designed from scratch). Linked stereo: two identical signal paths sharing
+// every control and the bias drift. WIDTH (lit key, INPUT): the right side's parts sit slightly off the left.
+//
+//   MAZE (dark hot pink) - a clean boost: a 20 Hz coupling high-pass, BOOST (0 .. +20 dB, not compensated: it is a
+//          boost), an op-amp stage with plenty of headroom whose slightly lopsided soft limit adds a little harmonic
+//          weight only when hit hard (ADAA), and TONE: a sparkle shelf from 3.2 kHz up (5 = flat, 10 = +9 dB, 0 = -6 dB).
+//   TREBLE (light green) - a single-transistor treble booster: the input coupling cap picks the RANGE - TREBLE (a
+//          first-order high-pass at 1.6 kHz), FULL (80 Hz: a full-range boost), MID (a 550 Hz high-pass and a 3.5 kHz
+//          low-pass: a mid hump) - into the transistor, BOOST (gain x2 .. x40, audio taper), and the transistor type:
+//          GE (germanium: soft, lopsided, a lower ceiling and a darker top at 9 kHz) or SI (silicon: harder, nearly
+//          symmetric, more open to 12 kHz). House clipper: ADAA knee clipper, drive-tracking pre-filter, knee tracking on.
+//   FUZZ (royal blue) - a two-transistor fuzz: a low input impedance (a 6 kHz top loss), a soft, lopsided first stage
+//          driven by FUZZ (gain x3 .. x60), then a hard, asymmetric second stage that squares the wave; BIAS (the second
+//          stage's bias: 0 = smooth, 5 = standard, 10 = starved and sputtering, its dead zone gating the decay). It
+//          cleans up as the input drops (your guitar's volume knob, or INPUT). TONE (a tilt from 1.5 kHz: dark to
+//          bright), VOL (5 = matched, 10 = +6 dB, 0 = silent). House clipper: ADAA, pre-filter, knee off.
+//   ORDER  the ◄ / ► keys on each module move it left or right; the signal runs left to right in the order shown. A
+//          change runs the new chain alongside the old one for 40 ms (it settles on the signal), then crossfades into it
+//          over 25 ms: no click. A further change waits for the crossfade to finish.
+//   IN keys on each module fade it in / out (10 ms).
+//   OVERSAMPLING  the whole chain runs at 2x (polyphase IIR half-bands, flat to 20 kHz, minimum phase: no latency).
+//   DRIFT  (0 - 100 %, 50 % = standard, 0 = none): "bias" - the transistors' bias points wander slowly with temperature
+//          (the treble booster and both fuzz stages, each on its own slow path; the MAZE's op-amp barely), and the fuzz's
+//          bias sags a little on hard hits (drawn down in ~40 ms, ~1 s to recover). The panel shows the fuzz's bias.
+//   INPUT  INPUT trim (-24 .. +12 dB), WIDTH. OUTPUT: LEVEL (5 = matched, 10 = +6 dB, 0 = silent), BYPASS (faded),
+//          the house output stage (soft CLIP always on, ceiling -0.3 dBFS), IN / OUT meters.
+//   PRESETS  12 (Init + 11) plus Reset all to defaults. A preset sets the three modules (keys, knobs), the ORDER and
+//          LEVEL; INPUT, WIDTH and DRIFT are left alone (Reset all restores them too).
+
+slider1:0<-24,12,0.1>-Input trim (dB)
+slider2:0<0,1,1{Off,On}>-Width
+slider3:0<0,5,1{Maze-Treble-Fuzz,Maze-Fuzz-Treble,Treble-Maze-Fuzz,Treble-Fuzz-Maze,Fuzz-Maze-Treble,Fuzz-Treble-Maze}>-Order
+slider4:1<0,1,1{Out,In}>-Maze in
+slider5:5<0,10,0.1>-Maze boost
+slider6:5<0,10,0.1>-Maze tone
+slider7:1<0,1,1{Out,In}>-Treble in
+slider8:5<0,10,0.1>-Treble boost
+slider9:0<0,2,1{Treble,Full,Mid}>-Treble range
+slider10:0<0,1,1{Germanium,Silicon}>-Transistor
+slider11:1<0,1,1{Out,In}>-Fuzz in
+slider12:6<0,10,0.1>-Fuzz
+slider13:5<0,10,0.1>-Fuzz bias
+slider14:5<0,10,0.1>-Fuzz tone
+slider15:5<0,10,0.1>-Fuzz volume
+slider16:5<0,10,0.1>-Level
+slider17:0<0,1,1{Off,On}>-Bypass
+slider18:50<0,100,1>-Drift (%)
+slider19:prs_sel=0<0,12,1{No preset,Init,Clean Sparkle,Treble Bite,Silicon Treble,Full Range Push,Mid Push,Thick Fuzz,Cleans Up,Treble Into Fuzz,Fuzz Into Boost,Sputter Gate,Wall of Fyre}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-drift.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-clip.jsfx-inc
+
+@init
+#ui_man = "gfx-fyre";                                 // the ? pop-up links to this manual
+ext_noinit = 1;
+clp_aa = 1; clp_pf_on = 1; clp_kt_on = 1;             // gfx-clip: ADAA, pre-filters, knee tracking (the treble stage)
+
+// ---------- small helpers ----------
+function fy_op(f, fs) ( 1 - exp(-2 * $pi * min(f, 0.49 * fs) / fs); );          // one-pole coefficient
+function fy_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );                          // denormal housekeeping
+
+// ---------- 2x oversampling: polyphase IIR half-band (two allpass chains, 12 coefficients; minimum phase) ----------
+fy_h0 = 0.036681502164; fy_h1 = 0.136547624632; fy_h2 = 0.274631759379; fy_h3 = 0.423138617437;
+fy_h4 = 0.561098697879; fy_h5 = 0.677540049974; fy_h6 = 0.769741833863; fy_h7 = 0.839889624850;
+fy_h8 = 0.892260818004; fy_h9 = 0.931541959963; fy_h10 = 0.962094548378; fy_h11 = 0.987816370733;
+function hb_up(x) instance(ua0, ua1, ua2, ua3, ua4, ua5, ux0, ux1, ux2, ux3, ux4, ux5, ub0, ub1, ub2, ub3, ub4, ub5, uy0, uy1, uy2, uy3, uy4, uy5, o0, o1) local(t, y) (
+  t = x;
+  y = fy_h0 * (t - ua0) + ux0; ux0 = t; ua0 = y; t = y;
+  y = fy_h2 * (t - ua1) + ux1; ux1 = t; ua1 = y; t = y;
+  y = fy_h4 * (t - ua2) + ux2; ux2 = t; ua2 = y; t = y;
+  y = fy_h6 * (t - ua3) + ux3; ux3 = t; ua3 = y; t = y;
+  y = fy_h8 * (t - ua4) + ux4; ux4 = t; ua4 = y; t = y;
+  y = fy_h10 * (t - ua5) + ux5; ux5 = t; ua5 = y; o0 = y;
+  t = x;
+  y = fy_h1 * (t - ub0) + uy0; uy0 = t; ub0 = y; t = y;
+  y = fy_h3 * (t - ub1) + uy1; uy1 = t; ub1 = y; t = y;
+  y = fy_h5 * (t - ub2) + uy2; uy2 = t; ub2 = y; t = y;
+  y = fy_h7 * (t - ub3) + uy3; uy3 = t; ub3 = y; t = y;
+  y = fy_h9 * (t - ub4) + uy4; uy4 = t; ub4 = y; t = y;
+  y = fy_h11 * (t - ub5) + uy5; uy5 = t; ub5 = y; o1 = y;
+);
+function hb_dn(s0, s1) instance(da0, da1, da2, da3, da4, da5, dx0, dx1, dx2, dx3, dx4, dx5, db0, db1, db2, db3, db4, db5, dy0, dy1, dy2, dy3, dy4, dy5) local(t, y, p) (
+  t = s1;
+  y = fy_h0 * (t - da0) + dx0; dx0 = t; da0 = y; t = y;
+  y = fy_h2 * (t - da1) + dx1; dx1 = t; da1 = y; t = y;
+  y = fy_h4 * (t - da2) + dx2; dx2 = t; da2 = y; t = y;
+  y = fy_h6 * (t - da3) + dx3; dx3 = t; da3 = y; t = y;
+  y = fy_h8 * (t - da4) + dx4; dx4 = t; da4 = y; t = y;
+  y = fy_h10 * (t - da5) + dx5; dx5 = t; da5 = y; p = y;
+  t = s0;
+  y = fy_h1 * (t - db0) + dy0; dy0 = t; db0 = y; t = y;
+  y = fy_h3 * (t - db1) + dy1; dy1 = t; db1 = y; t = y;
+  y = fy_h5 * (t - db2) + dy2; dy2 = t; db2 = y; t = y;
+  y = fy_h7 * (t - db3) + dy3; dy3 = t; db3 = y; t = y;
+  y = fy_h9 * (t - db4) + dy4; dy4 = t; db4 = y; t = y;
+  y = fy_h11 * (t - db5) + dy5; dy5 = t; db5 = y;
+  0.5 * (p + y);
+);
+function hb_utidy() instance(ua0, ua1, ua2, ua3, ua4, ua5, ux0, ux1, ux2, ux3, ux4, ux5, ub0, ub1, ub2, ub3, ub4, ub5, uy0, uy1, uy2, uy3, uy4, uy5) (
+  ua0 = fy_tn(ua0); ua1 = fy_tn(ua1); ua2 = fy_tn(ua2); ua3 = fy_tn(ua3); ua4 = fy_tn(ua4); ua5 = fy_tn(ua5);
+  ux0 = fy_tn(ux0); ux1 = fy_tn(ux1); ux2 = fy_tn(ux2); ux3 = fy_tn(ux3); ux4 = fy_tn(ux4); ux5 = fy_tn(ux5);
+  ub0 = fy_tn(ub0); ub1 = fy_tn(ub1); ub2 = fy_tn(ub2); ub3 = fy_tn(ub3); ub4 = fy_tn(ub4); ub5 = fy_tn(ub5);
+  uy0 = fy_tn(uy0); uy1 = fy_tn(uy1); uy2 = fy_tn(uy2); uy3 = fy_tn(uy3); uy4 = fy_tn(uy4); uy5 = fy_tn(uy5);
+);
+function hb_dtidy() instance(da0, da1, da2, da3, da4, da5, dx0, dx1, dx2, dx3, dx4, dx5, db0, db1, db2, db3, db4, db5, dy0, dy1, dy2, dy3, dy4, dy5) (
+  da0 = fy_tn(da0); da1 = fy_tn(da1); da2 = fy_tn(da2); da3 = fy_tn(da3); da4 = fy_tn(da4); da5 = fy_tn(da5);
+  dx0 = fy_tn(dx0); dx1 = fy_tn(dx1); dx2 = fy_tn(dx2); dx3 = fy_tn(dx3); dx4 = fy_tn(dx4); dx5 = fy_tn(dx5);
+  db0 = fy_tn(db0); db1 = fy_tn(db1); db2 = fy_tn(db2); db3 = fy_tn(db3); db4 = fy_tn(db4); db5 = fy_tn(db5);
+  dy0 = fy_tn(dy0); dy1 = fy_tn(dy1); dy2 = fy_tn(dy2); dy3 = fy_tn(dy3); dy4 = fy_tn(dy4); dy5 = fy_tn(dy5);
+);
+
+// ---------- the order: six permutations of M (0), T (1), F (2) ----------
+FY_PERM = 0;
+FY_PERM[0] = 0; FY_PERM[1] = 1; FY_PERM[2] = 2;      // M T F
+FY_PERM[3] = 0; FY_PERM[4] = 2; FY_PERM[5] = 1;      // M F T
+FY_PERM[6] = 1; FY_PERM[7] = 0; FY_PERM[8] = 2;      // T M F
+FY_PERM[9] = 1; FY_PERM[10] = 2; FY_PERM[11] = 0;    // T F M
+FY_PERM[12] = 2; FY_PERM[13] = 0; FY_PERM[14] = 1;   // F M T
+FY_PERM[15] = 2; FY_PERM[16] = 1; FY_PERM[17] = 0;   // F T M
+function fy_perm_of(a, b, c) local(i, k) (           // the order index holding a, b, c (left to right)
+  k = 0; i = 0;
+  loop(6, FY_PERM[i * 3] == a && FY_PERM[i * 3 + 1] == b && FY_PERM[i * 3 + 2] == c ? k = i; i += 1; );
+  k;
+);
+
+// =====================================================================
+// THE MODULES - each runs at 2x. Instance state per side and per chain set; coefficients shared (globals), the
+// side-dependent parts (WIDTH) come in as fy_sd (0 = left, 1 = right).
+// =====================================================================
+// ---- MAZE: clean boost with sparkle ----
+function mz_run(x) instance(hp, lo, dc) local(h, v, y) (
+  h = x - hp; hp += mz_khp * (x - hp);                                 // 20 Hz coupling
+  v = h * (fy_sd ? mz_gR : mz_gL);                                     // BOOST
+  y = this.c.clp_run(v * 0.625 + mz_b) * 1.6 - mz_r;                   // the op-amp's roomy, slightly lopsided limit (ADAA)
+  lo += mz_klo * (y - lo); y = lo + mz_hs * (y - lo);                  // TONE: the sparkle shelf from 3.2 kHz
+  y;
+);
+function mz_reset() instance(hp, lo, dc) ( hp = lo = dc = 0; this.c.clp_reset(); );
+function mz_tidy() instance(hp, lo, dc) ( hp = fy_tn(hp); lo = fy_tn(lo); this.c.clp_tidy(); );
+function mz_cfg() ( this.c.clp_set(1, 1, 0.9, 0); mz_r = this.c.clp_crv(mz_b) * 1.6; );   // (the stage's rest value: no DC step)
+
+// ---- TREBLE: single-transistor treble booster ----
+function tb_run(x) instance(hp, lp, ol, dc, rest) local(h, v, y) (
+  h = x - hp; hp += tb_khps * (x - hp);                                // the input coupling cap: RANGE (glided)
+  lp += tb_klp * (h - lp); h += tb_mids * (lp - h);                    // MID: the low-pass that makes the hump (faded)
+  v = this.c.clp_pf_run(h);                                            // the drive-tracking pre-filter (into the clipper only)
+  y = this.c.clp_run(v * (fy_sd ? tb_GR : tb_GL) + (fy_sd ? tb_bR : tb_bL)) - rest;   // the biased transistor
+  ol += tb_kol * (y - ol);                                             // its top
+  y = ol - dc; dc += tb_kdc * (ol - dc);                               // output coupling
+  y * tb_outs;
+);
+function tb_reset() instance(hp, lp, ol, dc, rest) ( hp = lp = ol = dc = 0; this.c.clp_reset(); this.c.clp_pf_reset(); );
+function tb_tidy() instance(hp, lp, ol, dc) ( hp = fy_tn(hp); lp = fy_tn(lp); ol = fy_tn(ol); dc = fy_tn(dc); this.c.clp_tidy(); );
+function tb_cfg(drv, b, fs, n) instance(rest) (
+  tb_si ? ( this.c.clp_set(2, 0.78, 0.72, 0); this.c.clp_kt_cfg(0.08, 0.18); )
+        : ( this.c.clp_set(2, 0.85, 0.5, 0);  this.c.clp_kt_cfg(0.22, 0.38); );
+  this.c.clp_knee(this.c.clp_kt_block(drv, fs, n));
+  this.c.clp_pf_cfg(40000, 12000, -1, 120); this.c.clp_pf_block(drv, fs, n);
+  rest = this.c.clp_crv(b);
+);
+
+// ---- FUZZ: two-transistor fuzz ----
+function fz_run(x) instance(ld, hs, s1, s2, tl, dc, rA, rB) local(v, h, a, y) (
+  ld += fz_kld * (x - ld);                                             // the low input impedance: a top loss
+  v = this.cA.clp_pf_run(ld);
+  h = v - hs; hs += fz_khp * (v - hs);                                 // coupling
+  a = this.cA.clp_run(h * fz_GAs + fz_bA) - rA;                        // stage 1: soft, lopsided
+  s1 += fz_kL1 * (a - s1); s2 += fz_kH1 * (s1 - s2);                   // interstage: top and coupling
+  y = this.cB.clp_run(fz_GB * (s1 - s2) + (fy_sd ? fz_bBR : fz_bBL)) - rB;   // stage 2: hard, asymmetric, biased
+  tl += fz_ktl * (y - tl); y = tl + fz_tg * (y - tl);                  // TONE: the tilt from 1.5 kHz
+  y = y - dc; dc += fz_kdc * (y - dc);
+  y * fz_vol;
+);
+function fz_reset() instance(ld, hs, s1, s2, tl, dc) ( ld = hs = s1 = s2 = tl = dc = 0; this.cA.clp_reset(); this.cA.clp_pf_reset(); this.cB.clp_reset(); );
+function fz_tidy() instance(ld, hs, s1, s2, tl, dc) (
+  ld = fy_tn(ld); hs = fy_tn(hs); s1 = fy_tn(s1); s2 = fy_tn(s2); tl = fy_tn(tl); dc = fy_tn(dc);
+  this.cA.clp_tidy(); this.cB.clp_tidy();
+);
+function fz_cfg(drv, bB, d, fs, n) instance(rA, rB) (
+  this.cA.clp_set(1, 1, 0.7, 0);
+  this.cB.clp_set(2, 0.62, 0.42, d); this.cB.clp_knee(0.12);
+  this.cA.clp_pf_cfg(18000, 11000, -2, 180); this.cA.clp_pf_block(drv, fs, n);
+  rA = this.cA.clp_crv(fz_bA); rB = this.cB.clp_crv(bB);
+);
+
+// ---------- one chain set: the three modules in the order o, each faded by its IN key ----------
+function set_run(x, o) local(k, m, y) (
+  y = x; k = 0;
+  loop(3,
+    m = FY_PERM[o * 3 + k];
+    m == 0 ? ( fy_gM > 0 ? y += fy_eM * (this.mz.mz_run(y) - y); ) :
+    m == 1 ? ( fy_gT > 0 ? y += fy_eT * (this.tb.tb_run(y) - y); ) :
+             ( fy_gF > 0 ? y += fy_eF * (this.fz.fz_run(y) - y); );
+    k += 1;
+  );
+  y;
+);
+function set_reset() ( this.mz.mz_reset(); this.tb.tb_reset(); this.fz.fz_reset(); );
+function set_tidy() ( this.mz.mz_tidy(); this.tb.tb_tidy(); this.fz.fz_tidy(); );
+// prime every clipper at its resting input (after a reset): the first anti-aliased sample then reads the rest value
+function set_prime(bT, bF) (
+  this.mz.c.x1 = mz_b; this.mz.c.ad1 = this.mz.c.clp_ad(mz_b);
+  this.tb.c.x1 = bT; this.tb.c.ad1 = this.tb.c.clp_ad(bT);
+  this.fz.cA.x1 = fz_bA; this.fz.cA.ad1 = this.fz.cA.clp_ad(fz_bA);
+  this.fz.cB.x1 = bF; this.fz.cB.ad1 = this.fz.cB.clp_ad(bF);
+);
+function set_cfg(bT, bF, d, n) (
+  this.mz.mz_cfg();
+  this.tb.tb_cfg(fy_vtb, bT, fy_fs2, n);
+  this.fz.fz_cfg(fy_vfz, bF, d, fy_fs2, n);
+);
+
+// ---------- one side: up 2x, the chain (two sets while the order crossfades), down ----------
+function side_run(x) local(a, b, y0, y1) (
+  this.hu.hb_up(x);
+  a = fy_cur ? this.sB.set_run(this.hu.o0, fy_oCur) : this.sA.set_run(this.hu.o0, fy_oCur);
+  b = fy_cur ? this.sB.set_run(this.hu.o1, fy_oCur) : this.sA.set_run(this.hu.o1, fy_oCur);
+  fy_xf > 0 ? (                                                        // crossfading into the other set (the new order)
+    y0 = fy_cur ? this.sA.set_run(this.hu.o0, fy_oNew) : this.sB.set_run(this.hu.o0, fy_oNew);
+    y1 = fy_cur ? this.sA.set_run(this.hu.o1, fy_oNew) : this.sB.set_run(this.hu.o1, fy_oNew);
+    a += fy_ex * (y0 - a); b += fy_ex * (y1 - b);
+  );
+  this.hd.hb_dn(a, b);
+);
+function side_tidy() ( this.hu.hb_utidy(); this.hd.hb_dtidy(); this.sA.set_tidy(); this.sB.set_tidy(); );
+
+// ---------- presets ----------
+#fy_pm = "Init|Clean Sparkle|Treble Bite|Silicon Treble|Full Range Push|Mid Push|Thick Fuzz|Cleans Up|Treble Into Fuzz|Fuzz Into Boost|Sputter Gate|Wall of Fyre";
+function fy_mods(o, mi, mb, mt, ti, tb, tr, ts, fi, ff, fb, ft, fv, lv) (
+  slider3 = o; slider4 = mi; slider5 = mb; slider6 = mt; slider7 = ti; slider8 = tb; slider9 = tr; slider10 = ts;
+  slider11 = fi; slider12 = ff; slider13 = fb; slider14 = ft; slider15 = fv; slider16 = lv;
+);
+function load_preset(p) local(i) (
+  fy_mods(0, 1, 5, 5, 1, 5, 0, 0, 1, 6, 5, 5, 5, 5);                              // Init
+  p == 2  ? fy_mods(0, 1, 4, 7, 0, 5, 0, 0, 0, 6, 5, 5, 5, 3) :                    // Clean Sparkle
+  p == 3  ? fy_mods(2, 1, 3, 5, 1, 6, 0, 0, 0, 6, 5, 5, 5, 2.7) :                    // Treble Bite
+  p == 4  ? fy_mods(2, 0, 5, 5, 1, 7, 0, 1, 0, 6, 5, 5, 5, 3.3) :                    // Silicon Treble
+  p == 5  ? fy_mods(2, 1, 4, 5, 1, 6, 1, 0, 0, 6, 5, 5, 5, 2.3) :                    // Full Range Push
+  p == 6  ? fy_mods(2, 0, 5, 5, 1, 7, 2, 0, 0, 6, 5, 5, 5, 3.3) :                    // Mid Push
+  p == 7  ? fy_mods(4, 0, 5, 5, 0, 5, 0, 0, 1, 7, 4, 4, 5, 4.7) :                    // Thick Fuzz
+  p == 8  ? fy_mods(4, 1, 3, 6, 0, 5, 0, 0, 1, 5, 4, 5, 5.5, 3.6) :                  // Cleans Up
+  p == 9  ? fy_mods(3, 0, 5, 5, 1, 6, 0, 0, 1, 6, 5, 6, 5, 6.5) :                    // Treble Into Fuzz
+  p == 10 ? fy_mods(4, 1, 6, 6, 0, 5, 0, 0, 1, 6, 5, 5, 4.5, 2.9) :                  // Fuzz Into Boost
+  p == 11 ? fy_mods(4, 0, 5, 5, 0, 5, 0, 0, 1, 9, 9.5, 5, 5.5, 4.7) :                // Sputter Gate
+  p == 12 ? fy_mods(2, 1, 7, 6, 1, 8, 1, 1, 1, 9, 5, 6, 5, 4.7) :                    // Wall of Fyre
+  p == 13 ? ( slider1 = 0; slider2 = 0; slider17 = 0; slider18 = 50; );            // Reset all to defaults
+  i = 1; loop(18, ui_auto(i); i += 1; );
+  pr_cur = p == 13 ? 1 : p;
+);
+
+// ---------- state ----------
+function fy_srinit() (
+  fy_sr = srate; fy_fs2 = 2 * srate;
+  mz_khp = fy_op(20, fy_fs2); mz_klo = fy_op(3200, fy_fs2);
+  tb_kol = fy_op(9000, fy_fs2); tb_kdc = fy_op(15, fy_fs2); tb_klp = fy_op(3500, fy_fs2);
+  fz_kld = fy_op(6000, fy_fs2); fz_khp = fy_op(60, fy_fs2); fz_kL1 = fy_op(7000, fy_fs2); fz_kH1 = fy_op(40, fy_fs2);
+  fz_ktl = fy_op(1500, fy_fs2); fz_kdc = fy_op(15, fy_fs2);
+  fy_fst = 1 / (0.01 * srate);                        // IN keys and BYPASS: 10 ms
+  fy_xst = 1 / (0.025 * srate);                       // the order crossfade: 25 ms
+  fy_gsm = 1 - exp(-1 / (0.012 * srate));             // gains: 12 ms
+  fy_rsm = 1 - exp(-1 / (0.04 * srate));              // the RANGE sweep: 40 ms
+  fy_eat = 1 - exp(-1 / (0.04 * srate)); fy_ert = 1 - exp(-1 / (1.0 * srate));   // the fuzz bias sag: draw / recovery
+  ost_init(0);
+);
+fy_srinit();
+in_init();
+ostL.ost_ch_init();
+dT.drift_init(0.8 + rand(0.4)); dF.drift_init(0.8 + rand(0.4)); dF2.drift_init(0.8 + rand(0.4)); dM.drift_init(0.8 + rand(0.4));
+drift_macro(50);
+chL.sA.set_reset(); chL.sB.set_reset(); chR.sA.set_reset(); chR.sB.set_reset();
+fy_cur = 0; fy_oCur = fy_oNew = slider3; fy_xf = 0;
+fy_gM = slider4 >= 0.5; fy_gT = slider7 >= 0.5; fy_gF = slider11 >= 0.5; fy_gBy = slider17 >= 0.5;
+fy_snap = 1;
+
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@block
+prs_chk();
+srate != fy_sr ? fy_srinit();
+in_setup(slider1, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);                // the house output stage: CLIP, always on
+drift_macro(slider18);
+fy_n2 = 2 * samplesblock;
+// the order: a change starts the crossfade into the other set (from rest); one more change waits for the fade
+fy_ot = floor(min(max(slider3, 0), 5) + 0.5);
+fy_xf <= 0 && fy_ot != fy_oCur ? (
+  fy_snap ? ( fy_oCur = fy_ot; ) : (
+    fy_oNew = fy_ot; fy_xf = 0.000001; fy_wu = floor(0.04 * srate);
+    fy_cur ? ( chL.sA.set_reset(); chR.sA.set_reset(); fy_prime = 1; ) : ( chL.sB.set_reset(); chR.sB.set_reset(); fy_prime = 2; );
+  );
+);
+// targets
+fy_tM = slider4 >= 0.5; fy_tT = slider7 >= 0.5; fy_tF = slider11 >= 0.5; fy_tBy = slider17 >= 0.5;
+fy_q = min(max(slider5, 0), 10) / 10;  fy_qmt = min(max(slider6, 0), 10) / 10;
+fy_qtb = min(max(slider8, 0), 10) / 10; fy_qfz = min(max(slider12, 0), 10) / 10;
+fy_qbi = min(max(slider13, 0), 10) / 10; fy_qft = min(max(slider14, 0), 10) / 10; fy_qfv = min(max(slider15, 0), 10) / 10;
+fy_qlv = min(max(slider16, 0), 10) / 10;
+// knob glides (30 ms), per block
+fy_gl = fy_snap ? 1 : 1 - exp(-samplesblock / (0.03 * srate));
+fy_vmz += (fy_q - fy_vmz) * fy_gl; fy_vmt += (fy_qmt - fy_vmt) * fy_gl; fy_vtb += (fy_qtb - fy_vtb) * fy_gl;
+fy_vfz += (fy_qfz - fy_vfz) * fy_gl; fy_vbi += (fy_qbi - fy_vbi) * fy_gl; fy_vft += (fy_qft - fy_vft) * fy_gl;
+fy_vfv += (fy_qfv - fy_vfv) * fy_gl;
+fy_wd += ((slider2 >= 0.5) - fy_wd) * fy_gl;
+// DRIFT: the bias paths (one each for the treble stage, the two fuzz stages and the op-amp)
+fy_dT = 0.035 * dm_a * dT.drift_tick(0.06 * dm_s * samplesblock / srate);
+fy_dF = 0.05 * dm_a * dF.drift_tick(0.05 * dm_s * samplesblock / srate);
+fy_dF2 = 0.03 * dm_a * dF2.drift_tick(0.07 * dm_s * samplesblock / srate);
+fy_dM = 0.01 * dm_a * dM.drift_tick(0.04 * dm_s * samplesblock / srate);
+// MAZE: BOOST 0 .. +20 dB, TONE shelf -6 .. +9 dB, its op-amp bias
+mz_gL = 10 ^ (20 * fy_vmz / 20); mz_gR = 10 ^ (20 * min(fy_vmz * (1 + 0.06 * fy_wd), 1) / 20);
+fy_t = fy_vmt * (1 - 0.06 * fy_wd);
+mz_hs = 10 ^ ((fy_vmt <= 0.5 ? -6 + 12 * fy_vmt : 18 * (fy_vmt - 0.5)) / 20);
+mz_b = 0.04 + fy_dM;
+// TREBLE: RANGE, transistor, BOOST (audio taper x2 .. x40), the bias
+tb_si = slider10 >= 0.5; tb_mid = floor(slider9 + 0.5) == 2;
+tb_khp = fy_op(floor(slider9 + 0.5) == 0 ? 1600 : floor(slider9 + 0.5) == 1 ? 80 : 550, fy_fs2);
+tb_kol = fy_op(tb_si ? 12000 : 9000, fy_fs2);
+fy_t = (10 ^ (2 * fy_vtb) - 1) / 99;
+tb_GL = 2 + 38 * fy_t; tb_GR = 2 + 38 * min(fy_t * (1 + 0.1 * fy_wd), 1);
+fy_bT = (tb_si ? 0.03 : 0.08) + fy_dT;
+tb_bL = fy_bT; tb_bR = fy_bT + 0.03 * fy_wd;
+tb_out = (tb_si ? 0.9 : 1.05) * (floor(slider9 + 0.5) == 1 ? 0.235 : floor(slider9 + 0.5) == 2 ? 0.45 : 1);   // (FULL and MID pass more: trimmed to sit with TREBLE)
+// FUZZ: FUZZ (x3 .. x60), BIAS (stage 2, with its sag), TONE, VOL
+fz_GA = 3 * 20 ^ fy_vfz; fz_GB = 1.3;
+fz_bA = 0.12 + fy_dF;
+fy_sag = fy_env * 0.12 * dm_a;                                           // the bias sags with what the fuzz draws
+fy_bB = (fy_vbi <= 0.5 ? 0.08 - 0.06 * fy_vbi : 0.05 - 0.5 * ((fy_vbi - 0.5) * 2) ^ 1.5) + fy_dF2 - fy_sag;
+fz_bBL = fy_bB; fz_bBR = fy_bB + 0.04 * fy_wd;
+fy_dz = 0.12 * max(fy_vbi - 0.5, 0) * 2;                                // the dead zone grows past BIAS 5: the gate
+fz_tg = 0.15 + 2.2 * fy_vft * fy_vft;
+fz_vol = 0.083 * (fy_vfv <= 0.5 ? sqr(fy_vfv / 0.5) : 1 + (fy_vfv - 0.5) * 2) / (0.6 + 0.4 * fz_tg);
+// LEVEL (the unit): 5 = matched, 10 = +6 dB, 0 = silent
+fy_lv = fy_qlv <= 0.5 ? sqr(fy_qlv / 0.5) : 1 + (fy_qlv - 0.5) * 2;
+// coefficients into every set (the fading set too)
+chL.sA.set_cfg(tb_bL, fz_bBL, fy_dz, fy_n2); chL.sB.set_cfg(tb_bL, fz_bBL, fy_dz, fy_n2);
+chR.sA.set_cfg(tb_bR, fz_bBR, fy_dz, fy_n2); chR.sB.set_cfg(tb_bR, fz_bBR, fy_dz, fy_n2);
+// a set that has just been reset starts at rest (only that set: the one playing keeps its state)
+fy_snap || fy_prime == 1 ? ( chL.sA.set_prime(tb_bL, fz_bBL); chR.sA.set_prime(tb_bR, fz_bBR); );
+fy_snap || fy_prime == 2 ? ( chL.sB.set_prime(tb_bL, fz_bBL); chR.sB.set_prime(tb_bR, fz_bBR); );
+fy_prime = 0;
+fy_snap ? ( fz_GAs = fz_GA; fy_lvs = fy_lv; tb_outs = tb_out; tb_khps = tb_khp; tb_mids = tb_mid; );
+fy_snap = 0;
+// denormal housekeeping
+chL.side_tidy(); chR.side_tidy();
+fy_env = fy_tn(fy_env);
+ostL.dcx = fy_tn(ostL.dcx); ostL.dcy = fy_tn(ostL.dcy);
+// the panel's mailboxes
+fya_pi = max(fya_pi, fy_pi); fy_pi = 0; fya_po = max(fya_po, fy_po); fy_po = 0;
+fya_bias = fy_bB;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+in_process(spl0, spl1);
+fy_xl = in_l; fy_xr = in_r;
+abs(fy_xl) < 0.000000000000001 ? fy_xl = 0;
+abs(fy_xr) < 0.000000000000001 ? fy_xr = 0;
+fy_pi = max(fy_pi, max(abs(fy_xl), abs(fy_xr)));
+// IN keys and BYPASS: 10 ms fades (a module coming back in starts from rest)
+fy_gM != fy_tM ? ( fy_gM == 0 ? ( chL.sA.mz.mz_reset(); chL.sB.mz.mz_reset(); chR.sA.mz.mz_reset(); chR.sB.mz.mz_reset(); );
+                   fy_gM = fy_tM ? min(fy_gM + fy_fst, 1) : max(fy_gM - fy_fst, 0); );
+fy_gT != fy_tT ? ( fy_gT == 0 ? ( chL.sA.tb.tb_reset(); chL.sB.tb.tb_reset(); chR.sA.tb.tb_reset(); chR.sB.tb.tb_reset(); );
+                   fy_gT = fy_tT ? min(fy_gT + fy_fst, 1) : max(fy_gT - fy_fst, 0); );
+fy_gF != fy_tF ? ( fy_gF == 0 ? ( chL.sA.fz.fz_reset(); chL.sB.fz.fz_reset(); chR.sA.fz.fz_reset(); chR.sB.fz.fz_reset(); );
+                   fy_gF = fy_tF ? min(fy_gF + fy_fst, 1) : max(fy_gF - fy_fst, 0); );
+fy_gBy != fy_tBy ? ( fy_gBy = fy_tBy ? min(fy_gBy + fy_fst, 1) : max(fy_gBy - fy_fst, 0); );
+// the order crossfade
+fy_xf > 0 ? ( fy_wu > 0 ? fy_wu -= 1 : ( fy_xf += fy_xst; fy_xf >= 1 ? ( fy_xf = 0; fy_cur = 1 - fy_cur; fy_oCur = fy_oNew; ); ); );
+// the fades eased into S-curves (smooth at both ends)
+fy_eM = fy_gM * fy_gM * (3 - 2 * fy_gM); fy_eT = fy_gT * fy_gT * (3 - 2 * fy_gT); fy_eF = fy_gF * fy_gF * (3 - 2 * fy_gF);
+fy_ex = fy_xf * fy_xf * (3 - 2 * fy_xf); fy_eB = fy_gBy * fy_gBy * (3 - 2 * fy_gBy);
+// gains (12 ms)
+fz_GAs += (fz_GA - fz_GAs) * fy_gsm;
+fy_lvs += (fy_lv - fy_lvs) * fy_gsm;
+tb_outs += (tb_out - tb_outs) * fy_gsm;
+tb_khps *= (tb_khp / tb_khps) ^ fy_rsm;                                 // (an exponential glide: the corner sweeps, 40 ms)
+tb_mids += (tb_mid - tb_mids) * fy_rsm;
+// the chain, both sides
+fy_sd = 0; fy_yl = chL.side_run(fy_xl);
+fy_sd = 1; fy_yr = chR.side_run(fy_xr);
+fy_a = max(abs(fy_yl), abs(fy_yr)) * fy_gF; fy_env += (fy_a > fy_env ? fy_eat : fy_ert) * (fy_a - fy_env);
+fy_yl *= fy_lvs; fy_yr *= fy_lvs;
+fy_gBy > 0 ? ( fy_yl += fy_eB * (fy_xl - fy_yl); fy_yr += fy_eB * (fy_xr - fy_yr); );
+fy_yl != fy_yl ? fy_yl = 0; fy_yr != fy_yr ? fy_yr = 0;
+ost_out(fy_yl, fy_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+fy_po = max(fy_po, max(abs(spl0), abs(spl1)));
+
+@gfx 1306 388
+ui_begin(1306, 388);
+// =====================================================================
+// GUI - dark charcoal rack (design space 1306 x 388; S / M / L). INPUT, the three modules in their running order,
+// OUTPUT; a DRIFT / meter strip below. Each module's ◄ / ► keys move it left or right (the order is the signal's).
+// Knobs: drag (SHIFT = fine), wheel, double-click = default; the label shows the value while the knob is touched.
+// =====================================================================
+sc != fg_lsc ? (
+  fg_lsc = sc;
+  gfx_setfont(11, "Trebuchet MS", 18 * sc, 'b');     // section titles
+  gfx_setfont(12, "Trebuchet MS", 14 * sc, 'b');     // knob labels / values
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print
+  gfx_setfont(14, "Trebuchet MS", 13 * sc, 'b');     // keys
+  gfx_setfont(15, "Trebuchet MS", 27 * sc, 'b');     // the unit's name
+);
+FG_FACE = 0x2A2B2F; FG_PLATE = 0x212226; FG_EDGE = 0x404249; FG_INK = 0xEEF0F3; FG_DIM = 0x9DA3AC; FG_TRAY = 0x1C1D20;
+FG_PNK = 0xD8237E; FG_GRN = 0x93E8A0; FG_BLU = 0x3C64F0; FG_SIL = 0xB8BEC8;
+
+function fg_rr(x, y, w, h, r) local(x1, y1, x2, y2, rr) (
+  x1 = floor(x * sc + 0.5); y1 = floor(y * sc + 0.5); x2 = floor((x + w) * sc + 0.5); y2 = floor((y + h) * sc + 0.5);
+  rr = min(floor(r * sc + 0.5), floor((min(x2 - x1, y2 - y1)) * 0.5));
+  gfx_a < 1 ? ui_rrs(x1, y1, x2 - x1, y2 - y1, rr) : (
+    gfx_rect(x1 + rr, y1, x2 - x1 - 2 * rr, y2 - y1);
+    gfx_rect(x1, y1 + rr, rr + 1, y2 - y1 - 2 * rr); gfx_rect(x2 - rr - 1, y1 + rr, rr + 1, y2 - y1 - 2 * rr);
+    gfx_circle(x1 + rr, y1 + rr, rr, 1, 1); gfx_circle(x2 - rr - 1, y1 + rr, rr, 1, 1);
+    gfx_circle(x1 + rr, y2 - rr - 1, rr, 1, 1); gfx_circle(x2 - rr - 1, y2 - rr - 1, rr, 1, 1);
+  );
+);
+function fg_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function fg_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function fg_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function fg_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function fg_in(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+// a flat lit key (the caption on it); returns 1 when clicked. dim: drawn but not live (an end of the row)
+function fg_key(x, y, w, h, on, col, s) local(hov, hit) (
+  hov = fg_in(x, y, w, h); hit = pressed && hov && drag_id == 0; hit ? drag_id = -1;
+  ui_cola(0x000000, 0.35); fg_rr(x + 1, y + 2, w, h, 4);
+  on ? ( ui_cola(col, 0.22); fg_rr(x - 3, y - 3, w + 6, h + 6, 6); );
+  ui_col(on ? col : 0x16171A); fg_rr(x, y, w, h, 4);
+  !on ? ( ui_col(ui_mix(col, 0x16171A, 0.75)); fg_rr(x, y, w, max(2, 2 / sc), 1); );
+  hov ? ( ui_cola(0xFFFFFF, 0.1); fg_rr(x, y, w, h, 4); );
+  gfx_setfont(14); ui_col(on ? (col == FG_BLU || col == FG_PNK ? 0xFFFFFF : 0x15171A) : ui_mix(col, FG_INK, 0.45));
+  ui_keytext((x + w * 0.5) * sc, (y + h * 0.5) * sc, s);
+  hit;
+);
+function fg_arrow(x, y, w, h, live, col, s) local(hov, hit) (    // a ◄ / ► key: dim at the end of the row
+  live ? fg_key(x, y, w, h, 0, col, s) : (
+    ui_col(0x1A1B1E); fg_rr(x, y, w, h, 4);
+    gfx_setfont(14); ui_col(0x3A3C42); ui_keytext((x + w * 0.5) * sc, (y + h * 0.5) * sc, s); 0;
+  );
+);
+function fg_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+function fg_sec(x0, w, title, sub, col) (
+  ui_cola(0x000000, 0.4); fg_rr(x0 + 1, 74, w, 226, 8);
+  ui_col(FG_EDGE); fg_rr(x0, 72, w, 226, 8);
+  ui_col(FG_PLATE); fg_rr(x0 + 1.5, 73.5, w - 3, 223, 7);
+  ui_col(col); fg_r(x0 + 18, 84, 4, 22);
+  gfx_setfont(11); ui_col(FG_INK); fg_tl(x0 + 30, 85, title);
+  gfx_setfont(13); ui_col(FG_DIM); fg_tl(x0 + 18, 114, sub);
+  dy_bg = FG_PLATE; dy_ink = FG_INK;
+);
+// a knob: coloured cap; the label shows the value while touched (centre cy, label at ly)
+function fg_knob(cx, cy, ly, r, idx, lo, hi, def, col, lbl, val) (
+  dy_kst = 36; dy_knob(cx, cy, r, idx, lo, hi, def, 0, col, "", "");
+  gfx_setfont(12); ui_col(dy_act ? col : FG_INK); fg_tc(cx, ly, dy_act ? val : lbl);
+);
+function fg_k10(cx, cy, ly, r, idx, def, col, lbl) ( sprintf(#fgv, "%.1f", slider(idx)); fg_knob(cx, cy, ly, r, idx, 0, 10, def, col, lbl, #fgv); );
+function fg_inset(x, y, w, h) ( pk_inset(x * sc, y * sc, w * sc, h * sc, FG_TRAY); );
+// move module m one place left (dir -1) or right (+1)
+function fg_move(m, dir) local(p, a, b, c, q, t) (
+  p = 0; q = floor(min(max(slider3, 0), 5) + 0.5);
+  FY_PERM[q * 3 + 1] == m ? p = 1; FY_PERM[q * 3 + 2] == m ? p = 2;
+  a = FY_PERM[q * 3]; b = FY_PERM[q * 3 + 1]; c = FY_PERM[q * 3 + 2];
+  dir < 0 && p == 1 ? ( t = a; a = b; b = t; ) : dir < 0 && p == 2 ? ( t = b; b = c; c = t; ) :
+  dir > 0 && p == 0 ? ( t = a; a = b; b = t; ) : dir > 0 && p == 1 ? ( t = b; b = c; c = t; );
+  slider3 = fy_perm_of(a, b, c); ui_auto(3);
+);
+
+// one module's panel at slot s (0 .. 2)
+function fg_module(m, s) local(x0, w, col, pos) (
+  w = 280; x0 = 206 + s * 292;
+  col = m == 0 ? FG_PNK : m == 1 ? FG_GRN : FG_BLU;
+  fg_sec(x0, w, m == 0 ? "MAZE" : m == 1 ? "TREBLE" : "FUZZ", m == 0 ? "CLEAN BOOST" : m == 1 ? "TREBLE BOOSTER" : "TWO-TRANSISTOR FUZZ", col);
+  fg_arrow(x0 + w - 18 - 56 - 70, 82, 30, 26, s > 0, col, "◄") ? fg_move(m, -1);
+  fg_arrow(x0 + w - 18 - 56 - 36, 82, 30, 26, s < 2, col, "►") ? fg_move(m, 1);
+  m == 0 ? (
+    fg_key(x0 + w - 18 - 56, 82, 56, 26, slider4 >= 0.5, col, "IN") ? fg_tog(4);
+    fg_k10(x0 + 92, 214, 268, 40, 5, 5, col, "BOOST");
+    fg_k10(x0 + 210, 214, 268, 28, 6, 5, col, "TONE");
+  ) : m == 1 ? (
+    fg_key(x0 + w - 18 - 56, 82, 56, 26, slider7 >= 0.5, col, "IN") ? fg_tog(7);
+    pos = floor(slider9 + 0.5);
+    fg_key(x0 + 18, 134, 78, 26, pos == 0, col, "TREBLE") ? ( slider9 = 0; ui_auto(9); );
+    fg_key(x0 + 101, 134, 78, 26, pos == 1, col, "FULL") ? ( slider9 = 1; ui_auto(9); );
+    fg_key(x0 + 184, 134, 78, 26, pos == 2, col, "MID") ? ( slider9 = 2; ui_auto(9); );
+    fg_key(x0 + 18, 184, 60, 26, slider10 < 0.5, col, "GE") ? ( slider10 = 0; ui_auto(10); );
+    fg_key(x0 + 18, 220, 60, 26, slider10 >= 0.5, col, "SI") ? ( slider10 = 1; ui_auto(10); );
+    gfx_setfont(12); ui_col(FG_INK); fg_tc(x0 + 48, 268, "TYPE");
+    fg_k10(x0 + 182, 222, 268, 34, 8, 5, col, "BOOST");
+  ) : (
+    fg_key(x0 + w - 18 - 56, 82, 56, 26, slider11 >= 0.5, col, "IN") ? fg_tog(11);
+    fg_k10(x0 + 66, 214, 268, 38, 12, 6, col, "FUZZ");
+    fg_k10(x0 + 164, 162, 192, 20, 13, 5, col, "BIAS");
+    fg_k10(x0 + 240, 162, 192, 20, 14, 5, col, "TONE");
+    fg_k10(x0 + 202, 238, 268, 20, 15, 5, col, "VOL");
+  );
+);
+
+// =====================================================================
+// Draw
+// =====================================================================
+ui_col(FG_FACE); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0x000000, 0.2); fg_r(0, 58, 1306, 1);
+ui_cola(0xFFFFFF, 0.05); fg_r(0, 59, 1306, 1);
+
+// ---------- header ----------
+ui_col(FG_INK); gfx_circle(48 * sc, 30 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(FG_FACE); ui_keytext(48 * sc, 30 * sc, "GFX");
+gfx_setfont(15); ui_col(FG_INK); fg_tl(76, 13, "FYRE"); gfx_measurestr("FYRE", fg_tw, fg_th);
+fg_x = 88 + fg_tw / sc;
+ui_col(FG_PNK); fg_r(fg_x, 20, 8, 8); ui_col(FG_GRN); fg_r(fg_x + 11, 20, 8, 8); ui_col(FG_BLU); fg_r(fg_x + 22, 20, 8, 8);
+gfx_setfont(13); ui_col(FG_DIM); fg_tl(fg_x, 33, "BRITISH 3-IN-1 TONE RACK");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+fg_k = pk_preset(520 * sc, 14 * sc, 430 * sc, 30 * sc, pr_cur, #fy_pm);
+fg_k > 0 ? prs_dirty = fg_k;
+ui_size_picker(1210 * sc, 20 * sc);
+
+// ---------- INPUT ----------
+fg_sec(24, 170, "INPUT", "", FG_SIL);
+fg_key(48, 124, 122, 28, slider2 >= 0.5, FG_SIL, "WIDTH") ? fg_tog(2);
+sprintf(#fgv, "%+.1f dB", slider1); fg_knob(109, 214, 268, 32, 1, -24, 12, 0, FG_SIL, "INPUT", #fgv);
+
+// ---------- the three modules, in their running order ----------
+fg_o = floor(min(max(slider3, 0), 5) + 0.5);
+fg_module(FY_PERM[fg_o * 3], 0);
+fg_module(FY_PERM[fg_o * 3 + 1], 1);
+fg_module(FY_PERM[fg_o * 3 + 2], 2);
+
+// ---------- OUTPUT ----------
+fg_sec(1082, 200, "OUTPUT", "", FG_SIL);
+fg_key(1100, 124, 164, 28, slider17 >= 0.5, 0xFF6A3A, "BYPASS") ? fg_tog(17);
+fg_k10(1182, 214, 268, 32, 16, 5, FG_SIL, "LEVEL");
+
+// ---------- DRIFT / meter strip ----------
+dy_bg = FG_TRAY; dy_ink = FG_INK;
+fg_inset(24, 310, 376, 66);
+sprintf(#fgv, "%d%%", floor(slider18 + 0.5)); dy_kst = 36; dy_knob(62, 343, 20, 18, 0, 100, 50, 0, FG_SIL, "", "");
+gfx_setfont(12); ui_col(dy_act ? FG_SIL : FG_INK); fg_tl(92, 328, dy_act ? #fgv : "DRIFT");
+gfx_setfont(13); ui_col(FG_DIM); fg_tl(92, 350, "TRANSISTOR BIAS");
+fg_b = min(max((fya_bias + 0.45) / 0.6, 0), 1);
+pk_led(236 * sc, 334 * sc, 6 * sc, 1, ui_mix(FG_BLU, 0xFF6A3A, 1 - fg_b));
+gfx_setfont(14); ui_col(FG_INK); sprintf(#fgs, "FUZZ BIAS %+.2f", fya_bias); fg_tl(250, 327, #fgs);
+fg_inset(412, 310, 870, 66);
+fg_pi = fya_pi; fya_pi = 0; fg_po = fya_po; fya_po = 0;
+fgmI.ui_ledm(470 * sc, 328 * sc, 696 * sc, 9 * sc, fg_pi);
+fgmO.ui_ledm(470 * sc, 350 * sc, 696 * sc, 9 * sc, fg_po);
+gfx_setfont(13); ui_col(FG_DIM); fg_tr(456, 326, "IN"); fg_tr(456, 348, "OUT");
+ui_col(FG_INK); fg_tl(1180, 326, "CLIP"); ui_col(FG_DIM); fg_tl(1180, 348, "-0.3 dB");
+
+pk_end();
+ui_end();

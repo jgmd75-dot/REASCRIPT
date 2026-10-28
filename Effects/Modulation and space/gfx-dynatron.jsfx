@@ -1,0 +1,476 @@
+desc:Dynatron [flanger/phaser] (GFX)
+//tags: flanger phaser envelope filter wah modulation
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-lfo, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate and gfx-instrument (.jsfx-inc) in the same folder.
+//
+// A three-in-one bubble/jet modulator after the classic two-tape-machine studio trick (one machine slightly
+// detuned, crossfaded by hand or
+// by how hard you played) - the sound is designed from scratch.
+//   MODE   - FLANGE (a wide-sweep studio flange, REGEN for the jet sound), PHASE (a 6-stage all-pass
+//            sweep), FILTER (a resonant state-variable auto-wah / envelope filter, LP / BP / HP).
+//   SWEEP SOURCE - LFO (the usual sweep), HOLD (freeze the sweep, place it by hand with CENTRE),
+//            ENVELOPE (your playing drives the sweep - the two-machine trick: louder = further, SENS
+//            sets how hard you have to dig in).
+//   CENTRE - where the sweep sits at rest. DEPTH - how far it travels.
+//   FDBK / RESONANCE - FLANGE and PHASE: feedback (negative = hollow/nasal, positive = thick, ringing,
+//            jet-like). FILTER: resonance / Q (turn it up for a squelchy, near self-oscillating peak).
+//   SPREAD - the right channel's sweep offset from the left (stereo width).
+//   LFO    - SHAPE (Sine / Triangle / Square / Random), RATE MODE (Free / Sync / Flow), RATE.
+//   DRIFT  - slow random wander of the rate, depth and centre (a hand on the tape, an old clock).
+// MIX / LOW CUT / OUTPUT sit on the panel, as does IN TRIM / GUARD.
+
+import gfx-drift.jsfx-inc
+import gfx-lfo.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+
+slider1:0<0,2,1{Flange,Phase,Filter}>-Mode
+slider2:1<0,3,1{Sine,Triangle,Square,Random}>-Shape
+slider3:0<0,2,1{Free,Sync,Flow}>-Rate mode
+slider4:0.25<0.02,10,0.01>-Free rate (Hz)
+slider5:2<0,15,1{4 bars,2 bars,1 bar,1/2,1/2 D,1/2 T,1/4,1/4 D,1/4 T,1/8,1/8 D,1/8 T,1/16,1/16 D,1/16 T,1/32}>-Sync rate
+slider6:40<0,100,1>-Centre (%)
+slider7:70<0,100,1>-Depth (%)
+slider8:50<-95,95,1>-Fdbk / Resonance (%)
+slider9:0<0,180,1>-Spread (deg)
+slider10:50<0,100,1>-Mix (%)
+slider11:0<0,2,1{LFO,Hold,Envelope}>-Sweep
+slider12:50<0,100,1>-Envelope sens (%)
+slider13:1<0,2,1{Lowpass,Bandpass,Highpass}>-Filter type
+slider14:5<0,50,1>-Rate drift (%)
+slider15:10<0,50,1>-Depth drift (%)
+slider16:5<0,50,1>-Centre drift (%)
+slider17:0.25<0.02,2,0.01>-Drift speed (Hz)
+slider18:0<-24,12,0.1>-Output (dB)
+slider19:0<0,100,1>-Band sat (%)
+slider20:30<0,100,1>-Bias (%)
+slider21:120<40,400,1>-Sat low band (Hz)
+slider22:6000<2000,16000,10>-Sat high band (Hz)
+slider23:-0.3<-24,0,0.1>-(unused, was output ceiling)
+slider24:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider25:0<-24,12,0.1>-Input trim (dB)
+slider26:1<0,1,1{Off,On}>-Input guard
+slider27:20<20,500,1>-Wet low cut (Hz, 20 = off)
+slider28:50<0,100,1>-Drift (%)
+slider29:prs_sel=0<0,10,1{No preset,Classic Bubble Flange,Dyna Flange,Smooth Phase Sweep,Square Throb Phase,Vocal Auto-Wah,Random Bubble Filter,Stepped Jump Flange,Synced Wide Phase,Envelope Squelch,Hollow Negative Flange}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-dynatron";
+
+// clean below -3 dBFS, rounds off peaks above (keeps high feedback / resonance from running away)
+function sat(x) local(a) (
+  a = abs(x);
+  a < 0.7 ? x : sign(x) * (0.7 + 0.3 * lfo_tanh((a - 0.7) / 0.3));
+);
+
+// fractional delay read, 4-point Hermite (FLANGE)
+function dread(buf, d) local(rp, i, f, xm1, x0, x1, x2) (
+  rp = wp - d;
+  rp < 0 ? rp += tsize;
+  i = floor(rp); f = rp - i;
+  xm1 = buf[(i + tsize - 1) & tmask];
+  x0  = buf[i & tmask];
+  x1  = buf[(i + 1) & tmask];
+  x2  = buf[(i + 2) & tmask];
+  ((((0.5 * (x2 - xm1) + 1.5 * (x0 - x1)) * f
+     + (xm1 - 2.5 * x0 + 2 * x1 - 0.5 * x2)) * f
+     + 0.5 * (x1 - xm1)) * f + x0);
+);
+
+// fixed 6-stage all-pass chain (PHASE)
+function ap_chain(x, base, a) local(i, y) (
+  i = 0;
+  loop(NST,
+    y = a * x + apx[base + i] - a * apy[base + i];
+    apx[base + i] = x; apy[base + i] = y;
+    x = y; i += 1;
+  );
+  x;
+);
+
+// TPT state-variable filter (FILTER): self-oscillates smoothly at high Q
+function svf_set(f, q) instance(g, k, a1, a2, a3) local(gg) (
+  gg = tan($pi * min(max(f, 20), srate * 0.49) / srate);
+  k = 1 / max(q, 0.05);
+  a1 = 1 / (1 + gg * (gg + k));
+  a2 = gg * a1;
+  a3 = gg * a2;
+  g = gg;
+);
+function svf_tick(x, typ) instance(a1, a2, a3, k, ic1eq, ic2eq) local(v1, v2, v3, lp, bp, hp) (
+  v3 = x - ic2eq;
+  v1 = a1 * ic1eq + a2 * v3;
+  v2 = ic2eq + a2 * ic1eq + a3 * v3;
+  ic1eq = 2 * v1 - ic1eq;
+  ic2eq = 2 * v2 - ic2eq;
+  lp = v2; bp = v1; hp = x - k * bp - lp;
+  typ == 0 ? lp : (typ == 1 ? bp : hp);
+);
+
+// LOW CUT: a 12 dB/oct high-pass on the wet signal only
+function wlc(x) instance(x1, x2, y1, y2) local(y) (
+  y = wl_b0 * (x - 2 * x1 + x2) - wl_a1 * y1 - wl_a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y; y;
+);
+function wlc_set(f) local(w0, al, n) (
+  w0 = 2 * $pi * min(f, srate * 0.45) / srate; al = sin(w0) / (2 * 0.7071); n = 1 + al;
+  wl_b0 = (1 + cos(w0)) * 0.5 / n; wl_a1 = -2 * cos(w0) / n; wl_a2 = (1 - al) / n;
+);
+function update() (
+  wl_on = slider27 > 20.5; wl_on ? wlc_set(slider27);
+  mode = slider1;
+  shape = slider2;
+  syncmode = slider3;
+  frate = slider4;
+  div = floor(slider5 + 0.5);
+  cent_t = slider6 / 100;
+  depth_t = slider7 / 100;
+  fb_t = slider8 / 100;
+  spread = slider9 / 360;
+  mix_t = slider10 / 100;
+  sweep = slider11;
+  sens = slider12 / 100;
+  ftype = slider13;
+  drift_macro(slider28);                 // DRIFT dial: 50% = the usual amount, 100% = twice, 0 = none
+  rd = slider14 / 100 * dm_a; dd = min(slider15 / 100 * dm_a, 1); cd = slider16 / 100 * dm_a;
+  dspd = slider17 * dm_s;
+  out_t = 10 ^ (slider18 / 20);
+  in_setup(slider25, slider26);
+  ost_setup(slider19 / 100, slider20 / 100, slider21, slider22, slider23, 0);   // output stage: straight through
+  lfoL.lfo_setup(shape, 0.2);
+  lfoR.lfo_setup(shape, 0.2);
+  mode == 1 ? ( ffmin = 100; ffmax = 2400; foct = 3.0; ) : ( ffmin = 150; ffmax = 4000; foct = 3.2; );
+);
+
+// ---------- presets (leave drift speed, output and the I/O rows alone) ----------
+// mode, shape, rate mode, rate, sync div, centre, depth, fdbk, spread, mix, sweep, sens, filter type
+function setp(m, sh, sy, fr, dv, ce, de, fb, sp, mx, sw, se, ft) (
+  slider1 = m; slider2 = sh; slider3 = sy; slider4 = fr; slider5 = dv; slider6 = ce; slider7 = de;
+  slider8 = fb; slider9 = sp; slider10 = mx; slider11 = sw; slider12 = se; slider13 = ft;
+);
+function pname(p) (
+  p == 1 ? "Classic Bubble Flange" :
+  p == 2 ? "Dyna Flange" :
+  p == 3 ? "Smooth Phase Sweep" :
+  p == 4 ? "Square Throb Phase" :
+  p == 5 ? "Vocal Auto-Wah" :
+  p == 6 ? "Random Bubble Filter" :
+  p == 7 ? "Stepped Jump Flange" :
+  p == 8 ? "Synced Wide Phase" :
+  p == 9 ? "Envelope Squelch" :
+  p == 10 ? "Hollow Negative Flange" :
+  "Reset all to defaults";
+);
+function load_preset(p) (
+  p == 1  ? setp(0, 1, 0, 0.25, 2, 40, 70,  50,   0, 50, 0, 50, 1) :    // Classic Bubble Flange
+  p == 2  ? setp(0, 1, 0, 0.12, 2, 35, 90,  80,  90, 55, 0, 50, 1) :    // Dyna Flange
+  p == 3  ? setp(1, 0, 0, 0.3,  2, 50, 80,  30,   0, 50, 0, 50, 1) :    // Smooth Phase Sweep
+  p == 4  ? setp(1, 1, 0, 0.15, 2, 45, 90,  60, 120, 50, 0, 50, 1) :    // Square Throb Phase
+  p == 5  ? setp(2, 0, 0, 0.2,  2, 30, 85,  40,   0, 70, 0, 60, 1) :    // Vocal Auto-Wah
+  p == 6  ? setp(2, 3, 0, 0.6,  2, 25, 100, 70,  60, 80, 0, 80, 1) :    // Random Bubble Filter
+  p == 7  ? setp(0, 3, 0, 1.2,  2, 50, 60,  20,   0, 45, 0, 50, 0) :    // Stepped Jump Flange
+  p == 8  ? setp(1, 0, 1, 0.5,  6, 55, 70,   0, 180, 50, 0, 50, 1) :    // Synced Wide Phase
+  p == 9  ? setp(2, 1, 0, 0.1,  2, 20, 90,  90,   0, 65, 2, 70, 1) :    // Envelope Squelch
+  p == 10 ? setp(0, 0, 0, 0.08, 2, 45, 75, -60,   0, 50, 0, 50, 0);     // Hollow Negative Flange
+  p >= 1 && p <= 10 ? slider_automate(8191);    // sliders 1-13
+  p == 11 ? (                                   // Reset all to defaults
+    setp(0, 1, 0, 0.25, 2, 40, 70, 50, 0, 50, 0, 50, 1);
+    slider14 = 5; slider15 = 10; slider16 = 5; slider17 = 0.25; slider18 = 0;
+    slider19 = 0; slider20 = 30; slider21 = 120; slider22 = 6000; slider23 = -0.3; slider24 = 1;
+    slider25 = 0; slider26 = 1;
+    slider27 = 20;
+    slider28 = 50;
+    slider_automate(268435455);
+  );
+);
+
+// ---------- memory ----------
+NST = 6;
+apx = 0; apy = 16;                        // allpass state: L = 0-5 / 16-21, R = 6-11 / 22-27
+tsize = 8192; tmask = tsize - 1;
+fbL_b = 1024; fbR_b = fbL_b + tsize;       // flange lines (with regen)
+memset(0, 0, fbR_b + tsize);
+wp = 0;
+
+// ---------- state ----------
+sm = 1 - exp(-1 / (0.03 * srate));
+lpc = 1 - exp(-2 * $pi * min(9000, srate * 0.45) / srate);
+env_a = 1 - exp(-1 / (0.005 * srate)); env_r = 1 - exp(-1 / (0.18 * srate));
+lfoL.lfo_init(); lfoR.lfo_init();
+drR.drift_init(0.8 + rand(0.5));
+drD.drift_init(0.8 + rand(0.5));
+drC.drift_init(0.8 + rand(0.5));
+ost_init(40000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+vuc = 1 - exp(-1 / (0.01 * srate)); vu_ms = 0;
+!ui_dflt ? ui_thm = 9; !ui_dflt ? ui_hw = 1;    // default for new instances: saved projects keep their own
+pkL = 0; pkR = 0;
+cur_preset = 1;
+PRESET_N = 10;
+
+update();
+cent_s = cent_t; depth_s = depth_t; fb_s = fb_t; mix_s = mix_t; out_s = out_t;
+fL = 0; fR = 0; apfbL = 0; apfbR = 0; lpL = 0; lpR = 0;
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+// the @slider work, also run after a preset swap in @block (PRESET parameter)
+function prs_sl() (
+update();
+);
+function prs_chk() local(k) (
+  prs_dirty > 0 ? ( prs_pk = prs_dirty; prs_dirty = 0; prs_q = 1; ) : prs_ok ? (
+    prs_sel = max(0, min(10, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( prs_pk = prs_sel; prs_q = 0; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+  // PRESET parameter: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+  prs_pk > 0 ? (
+    prs_g <= 0 ? (
+      k = prs_pk; prs_pk = 0; load_preset(k); prs_sl();
+      prs_q ? ( k <= 10 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
+      prs_gs = 1 / (0.030 * srate);
+    ) : prs_gs = -1 / (0.005 * srate);
+  );
+);
+prs_ok = 0; prs_dirty = 0; prs_pk = 0; prs_g = 1; prs_gs = 0;
+
+@slider
+prs_chk();
+prs_sl();
+
+@block
+prs_chk();
+update();
+lfoL.lfo_block(syncmode, div, frate);
+lfoR.lfo_block(syncmode, div, frate);
+
+@serialize
+file_var(0, ui_thm);
+file_var(0, ui_sz);
+file_var(0, ui_hw);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@sample
+// input stage: DC block, trim, guard
+in_process(spl0, spl1);
+inL = in_l; inR = in_r;
+vu_ms += (0.5 * (inL * inL + inR * inR) - vu_ms) * vuc;
+
+// drift
+dinc = dspd / srate;
+vR = drR.drift_tick(dinc); vD = drD.drift_tick(dinc); vC = drC.drift_tick(dinc);
+
+// smoothing
+cent_s  += (cent_t  - cent_s)  * sm;
+depth_s += (depth_t - depth_s) * sm;
+fb_s    += (fb_t    - fb_s)    * sm;
+mix_s   += (mix_t   - mix_s)   * sm;
+out_s   += (out_t   - out_s)   * sm;
+
+// the envelope follower (drives the sweep in ENVELOPE mode, any MODE)
+lv = max(abs(inL), abs(inR));
+env += (lv - env) * (lv > env ? env_a : env_r);
+
+// the sweep: LFO, frozen (HOLD) or the input's envelope (ENVELOPE) - the two-machine trick
+lvL = lfoL.lfo_tick(0, rd, vR);
+lvR = lfoR.lfo_tick(spread, rd, vR);
+sweep == 1 ? ( uL = 0; uR = 0; ) :
+sweep == 2 ? ( uL = min(env * (1 + 12 * sens), 1) * 2 - 1; uR = uL; ) : ( uL = lvL; uR = lvR; );
+
+de = depth_s * (1 - dd * (0.5 + 0.5 * vD));
+coct = cd * vC * 1.5;
+
+mode == 0 ? (
+  // ---------- FLANGE: wide-sweep studio flange with regen ----------
+  c_ms = 0.15 * (14 / 0.15) ^ cent_s;
+  dL = min(max(c_ms * 2 ^ (2 * de * uL + coct), 0.075), 18.2) * srate / 1000;
+  dR = min(max(c_ms * 2 ^ (2 * de * uR + coct), 0.075), 18.2) * srate / 1000;
+  fbL_b[wp] = inL + fb_s * fL; fbR_b[wp] = inR + fb_s * fR;
+  wL = dread(fbL_b, dL); wR = dread(fbR_b, dR);
+  lpL += (wL - lpL) * lpc; lpR += (wR - lpR) * lpc;
+  fL = sat(lpL); fR = sat(lpR);
+  wp = (wp + 1) & tmask;
+  wetL = lpL; wetR = lpR;
+  fbc = fb_s > 0 ? 1 / (1 + 1.2 * fb_s * fb_s) : 1 / (1 + 0.2 * fb_s * fb_s);
+  dispMain = dL / srate * 1000;
+) : mode == 1 ? (
+  // ---------- PHASE: 6-stage all-pass sweep ----------
+  fcc = ffmin * (ffmax / ffmin) ^ cent_s;
+  fcL = min(max(fcc * 2 ^ (de * foct * uL + coct), 20), srate * 0.45);
+  fcR = min(max(fcc * 2 ^ (de * foct * uR + coct), 20), srate * 0.45);
+  tL = tan($pi * fcL / srate); aL = (tL - 1) / (tL + 1);
+  tR = tan($pi * fcR / srate); aR = (tR - 1) / (tR + 1);
+  yL = ap_chain(inL + fb_s * apfbL, 0,  aL);
+  yR = ap_chain(inR + fb_s * apfbR, 6, aR);
+  apfbL = sat(yL); apfbR = sat(yR);
+  wetL = yL; wetR = yR;
+  fbc = sqrt(1 - fb_s * fb_s);
+  dispMain = fcL;
+) : (
+  // ---------- FILTER: resonant envelope / LFO swept state-variable filter ----------
+  fcc = ffmin * (ffmax / ffmin) ^ cent_s;
+  fcL = min(max(fcc * 2 ^ (de * foct * uL + coct), 20), srate * 0.45);
+  fcR = min(max(fcc * 2 ^ (de * foct * uR + coct), 20), srate * 0.45);
+  q = 0.5 + 24.5 * abs(fb_s) * abs(fb_s);
+  svfL.svf_set(fcL, q); svfR.svf_set(fcR, q);
+  wetL = sat(svfL.svf_tick(inL, ftype)); wetR = sat(svfR.svf_tick(inR, ftype));
+  fbc = 1;
+  dispMain = fcL;
+);
+
+oL = wl_on ? inL + mix_s * (WLL.wlc(wetL * fbc) - WDL.wlc(inL)) : (1 - mix_s) * inL + mix_s * wetL * fbc;
+oR = wl_on ? inR + mix_s * (WLR.wlc(wetR * fbc) - WDR.wlc(inR)) : (1 - mix_s) * inR + mix_s * wetR * fbc;
+
+// output stage: band saturation -> output gain (no clip: straight through)
+oL = ostL.ost_band(oL) * in_comp * out_s;
+oR = ostR.ost_band(oR) * in_comp * out_s;
+ost_out(oL, oR);
+spl0 = ost_l;
+spl1 = ost_r;
+pkL = max(pkL, abs(spl0)); pkR = max(pkR, abs(spl1));
+prs_gs != 0 ? ( prs_g += prs_gs; prs_g <= 0 ? ( prs_g = 0; prs_gs = 0; ) : prs_g >= 1 ? ( prs_g = 1; prs_gs = 0; ); );
+prs_g < 1 ? ( prs_w = prs_g * prs_g * (3 - 2 * prs_g); spl0 *= prs_w; spl1 *= prs_w; );   // PRESET parameter duck: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+
+@gfx 1060 400
+prs_cur_d > 0 ? ( cur_preset = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+ui_begin(1060, 400);
+
+// ---------- DRAFT: dove-grey/purple rack face, three modes share one set of knobs ----------
+FACE = 0x2A262E; INK = 0xEDEAF2; DIM = 0x948FA0;
+CFL = 0x3AC6C4; CPH = 0xB15CE0; CFI = 0xF0A830;
+ORG = mode == 0 ? CFL : (mode == 1 ? CPH : CFI);
+dy_ink = INK; dy_bg = FACE;
+function setv(idx, v) ( slider(idx) = v; ui_auto(idx); );
+// panel keys: house lamp keys (gfx-ui); legends in font slot 15 (set once per scale change)
+function dt_key(x, y, w, h, on, col, s) local(hit) (
+  sc != dt_lsc ? ( dt_lsc = sc; gfx_setfont(15, "Trebuchet MS", 9 * sc, 'b'); );
+  lk_well = 0x141518; lk_font = 15; lk_font2 = 15;
+  hit = lk_fit(x, y, w, h, on, col, s);
+  gfx_setfont(4);   // (the font the old keys left current)
+  hit;
+);
+function dt_ck(x, y, w, h, on, s) local(hit) (   // cream selector key (gfx-ui ck_key), legend in slot 15
+  sc != dt_lsc ? ( dt_lsc = sc; gfx_setfont(15, "Trebuchet MS", 9 * sc, 'b'); );
+  ck_font = 15;
+  hit = ck_key(x, y, w, h, on, s);
+  gfx_setfont(4);
+  hit;
+);
+
+ui_col(0x0A0A0B); gfx_rect(0, 0, gfx_w, gfx_h);
+rd_plate(0, 0, 1060, 400, FACE, 0);
+ui_col(ORG); gfx_rect(0, 66 * sc, 1060 * sc, 2 * sc);
+
+// ---------- header: badge, title, the preset LCD (click it for every preset), size ----------
+rd_badge(60, 32, 15, ORG, FACE);
+rd_title(84, 14, "DYNATRON", 26, INK);
+rd_sub(260, 30, "DYNAMIC FLANGE  ·  PHASE  ·  FILTER", DIM, 1);
+pm_ = rd_sq(556, 20, 78, 30, 0, 0x6A7484, "PRESETS");   // PRESETS, prev / next, then the LCD (click either for every preset)
+rd_sq(640, 20, 30, 30, 0, 0x6A7484, "◄") ? (
+  cur_preset = cur_preset <= 1 ? PRESET_N : cur_preset - 1;
+  prs_dirty = (cur_preset);
+);
+rd_sq(674, 20, 30, 30, 0, 0x6A7484, "►") ? (
+  cur_preset = cur_preset >= PRESET_N ? 1 : cur_preset + 1;
+  prs_dirty = (cur_preset);
+);
+pk_lcd(712 * sc, 12 * sc, 232 * sc, 46 * sc, 0);
+ui_col(pk_lcdc);
+pk_lcdfont(9, 27 * sc); gfx_measurestr(pname(cur_preset), ltw_, lth_); pk_fitstr(pname(cur_preset), 724 * sc, 35 * sc - lth_ * 0.5, 27 * sc, 212 * sc);
+pm_ || (pressed && drag_id == 0 && mouse_x >= 712 * sc && mouse_x < 944 * sc && mouse_y >= 12 * sc && mouse_y < 58 * sc) ? (
+  drag_id = -1;
+  strcpy(#pmenu, ""); k_ = 1;
+  loop(11, k_ == cur_preset ? strcat(#pmenu, "!"); strcat(#pmenu, pname(k_)); k_ < 11 ? strcat(#pmenu, "|"); k_ += 1; );
+  gfx_x = 556 * sc; gfx_y = 58 * sc;
+  k_ = gfx_showmenu(#pmenu);
+  k_ > 0 ? ( prs_dirty = (k_); k_ <= PRESET_N ? cur_preset = k_; );
+);
+ui_size_picker(956 * sc, 26 * sc);
+
+// ---------- band 1: MODE / SWEEP SOURCE / FILTER TYPE ----------
+rd_lbl(179, 80, "MODE", INK, 1);
+dt_key(44, 96, 86, 28, mode == 0, LK_BLU, "FLANGE") ? setv(1, 0);
+dt_key(136, 96, 86, 28, mode == 1, LK_ORA, "PHASE")  ? setv(1, 1);
+dt_key(228, 96, 86, 28, mode == 2, LK_GRN, "FILTER") ? setv(1, 2);
+rd_lbl(479, 80, "SWEEP SOURCE", INK, 1);
+dt_ck(344, 96, 86, 28, sweep == 0, "LFO")  ? setv(11, 0);
+dt_ck(436, 96, 86, 28, sweep == 1, "HOLD") ? setv(11, 1);
+dt_ck(528, 96, 86, 28, sweep == 2, "ENV")  ? setv(11, 2);
+rd_lbl(764, 80, "FILTER TYPE", INK, mode == 2 ? 1 : 0.4);
+ck_inert = mode != 2; dt_ck(644, 96, 76, 28, ftype == 0, "LP") ? setv(13, 0);
+ck_inert = mode != 2; dt_ck(726, 96, 76, 28, ftype == 1, "BP") ? setv(13, 1);
+ck_inert = mode != 2; dt_ck(808, 96, 76, 28, ftype == 2, "HP") ? setv(13, 2);
+mode != 2 ? ( ui_cola(FACE, 0.6); gfx_rect(640 * sc, 92 * sc, 248 * sc, 36 * sc); );   // only used in FILTER mode
+// the sweep readout: delay time (FLANGE) or cutoff (PHASE / FILTER)
+pk_lcd(904 * sc, 82 * sc, 112 * sc, 46 * sc, 0);
+pk_lcdfont(9, 10 * sc); ui_col(pk_lcdc);
+gfx_x = 914 * sc; gfx_y = 88 * sc; gfx_drawstr(mode == 0 ? "DELAY" : "CUTOFF");
+mode == 0 ? sprintf(#rdo, "%.2f ms", dispMain) : sprintf(#rdo, "%.0f Hz", dispMain);
+pk_lcdfont(9, 15 * sc); gfx_x = 914 * sc; gfx_y = 104 * sc; gfx_drawstr(#rdo);
+
+ui_cola(INK, 0.2); gfx_rect(44 * sc, 140 * sc, 972 * sc, 1 * sc);
+
+// ---------- band 2: the sweep (shared across all three modes) ----------
+rd_sub(44, 150, "SWEEP", ORG, 1);
+sprintf(#v, "%.0f%%", slider6); dy_knob(170, 200, 28, 6, 0, 100, 40, 0, CFL, "CENTRE", #v);
+sprintf(#v, "%.0f%%", slider7); dy_knob(330, 200, 28, 7, 0, 100, 70, 0, CFL, "DEPTH", #v);
+fbk_lbl = mode == 2 ? "RESONANCE" : "FEEDBACK";
+mode == 2 ? sprintf(#v, "%.0f%%", abs(slider8)) : sprintf(#v, "%+.0f%%", slider8);
+dy_knob(490, 200, 28, 8, -95, 95, 50, 0, CFI, fbk_lbl, #v);
+sprintf(#v, "%.0f deg", slider9); dy_knob(650, 200, 28, 9, 0, 180, 0, 0, CPH, "SPREAD", #v);
+sprintf(#v, "%.0f%%", slider12); dy_knob(810, 200, 28, 12, 0, 100, 50, 0, CPH, "SENS", #v);
+sweep != 2 ? ( ui_cola(FACE, 0.55); gfx_circle(810 * sc, 200 * sc, 38 * sc, 1, 1); );   // SENS only matters for ENV
+rd_lbl(810, 262, sweep == 2 ? "" : "(ENV only)", DIM, 0.8);
+
+ui_cola(INK, 0.2); gfx_rect(44 * sc, 276 * sc, 972 * sc, 1 * sc);
+
+// ---------- band 3: IN / OUT, LFO, MASTER, meters ----------
+rd_lbl(143, 284, "IN / OUT", INK, 1);
+rd_ioc1 = 0x2A2A2E; rd_ioc2 = CFI; rd_ioc3 = 0xC83A2A;
+rd_io(44, 300, 25, 26, 19, 24);
+
+rd_lbl(392, 284, "LFO", INK, 1);
+dt_ck(272, 300, 38, 22, shape == 0, "SIN") ? setv(2, 0);
+dt_ck(314, 300, 38, 22, shape == 1, "TRI") ? setv(2, 1);
+dt_ck(356, 300, 38, 22, shape == 2, "SQR") ? setv(2, 2);
+dt_ck(398, 300, 38, 22, shape == 3, "RND") ? setv(2, 3);
+dt_key(272, 334, 52, 22, syncmode == 0, LK_BLU, "FREE") ? setv(3, 0);
+dt_key(328, 334, 52, 22, syncmode == 1, LK_BLU, "SYNC") ? setv(3, 1);
+dt_key(384, 334, 52, 22, syncmode == 2, LK_BLU, "FLOW") ? setv(3, 2);
+rd_lbl(354, 362, "SHAPE  ·  RATE MODE", DIM, 0.9);
+dy_kst = 7;
+syncmode == 1 ? (
+  dy_step = 16; dy_steps = "";
+  dy_knob(492, 326, 22, 5, 0, 15, 2, 0, DIM, "RATE", lfo_div_name(floor(slider5 + 0.5)));
+) : (
+  sprintf(#v, "%.2f Hz", slider4); dy_knob(492, 326, 22, 4, 0.02, 10, 0.25, 1, DIM, "RATE", sweep == 1 ? "stopped" : #v);
+);
+
+rd_lbl(726, 284, "MASTER", INK, 1);
+sprintf(#v, "%.0f%%", slider10); dy_knob(612, 326, 22, 10, 0, 100, 50, 0, 0x3A72C8, "MIX", #v);
+sprintf(#v, "%.0f%%", slider28); dy_knob(688, 326, 22, 28, 0, 100, 50, 0, DIM, "DRIFT", #v);
+slider27 <= 20.5 ? strcpy(#v, "off") : sprintf(#v, "%.0f Hz", slider27);
+dy_kf = 1; dy_knob(764, 326, 22, 27, 20, 500, 20, 1, 0, "HPF", #v);
+sprintf(#v, "%+.1f dB", slider18); dy_knob(840, 326, 22, 18, -24, 12, 0, 0, DIM, "OUTPUT", #v);
+
+ui_col(0x1A1B1E); gfx_rect(930 * sc, 290 * sc, 70 * sc, 72 * sc);
+mL.ui_ledm(936 * sc, 294 * sc, 28 * sc, 64 * sc, pkL); mR.ui_ledm(966 * sc, 294 * sc, 28 * sc, 64 * sc, pkR);
+pkL *= 0.85; pkR *= 0.85;
+rd_lbl(965, 368, "OUT", INK, 1);
+
+pk_end();
+ui_end();

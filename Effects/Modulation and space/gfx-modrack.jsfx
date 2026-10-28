@@ -1,0 +1,786 @@
+desc:Mod Rack [modulation rack] (GFX)
+// gfx-modrack - 2U Chorus / Tremolo / Vibe / Delay with Circuit-Bend Mod Pots
+//tags: modulation chorus tremolo vibe delay multi-effect
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-ui and gfx-panel (.jsfx-inc) in the same folder.
+//
+// Four modules run in PARALLEL on the input. Each module returns only its *change* to the
+// signal (its "delta"); the dry signal always passes. Three L / C / R toggles per module
+// choose where that change goes:
+//   L  processes the left channel  -> left
+//   R  processes the right channel -> right
+//   C  processes the mono sum      -> centre (both sides)
+//   L + R      stereo field (chorus: 90-degree stereo LFO)
+//   C + L/R    spread: phase-offset voices (chorus/trem/vibe) or delay taps at 3/4 T, T, 5/4 T
+//   all off    module muted
+// A module at zero depth / mix also contributes nothing.
+// Dry + Master Mix x (sum of modules) -> Output trim -> safety limiter (-0.3 dBFS) -> clamp.
+//
+// DRIFT: slow, independent random wander of each module's LFO rate (up to +/-20%).
+// SYNC: click a RATE or TIME label to cycle Hz / ms -> Straight -> Dotted -> Triplet.
+//   Note values 4 bars .. 1/32 follow the project tempo. While REAPER plays, synced LFOs are
+//   phase-locked to the beat grid (drift does not apply). Synced delay times cap at 1.5 s.
+
+slider1:0<0,7,1{Init,Lush Chorus,Seasick Tape,Surf Trem,Vibe Throb,Dub Echo,Rotary Wash,Runaway}>-Preset
+slider2:20<0,100,1>-Drift (%)
+slider3:0<-24,12,0.1>-Output (dB)
+slider5:100<0,100,1>-Master Mix (%)
+
+slider10:0.8<0.05,8,0.01>-Chorus Rate (Hz)
+slider11:50<0,100,1>-Chorus Depth (%)
+slider12:0<0,100,1>-Chorus Mix (%)
+slider13:0<0,100,1>-Chorus Clock Stretch (%)
+slider15:1<0,1,1{Off,On}>-Chorus L
+slider16:0<0,1,1{Off,On}>-Chorus C
+slider17:1<0,1,1{Off,On}>-Chorus R
+slider18:0<0,3,1{Off,Straight,Dotted,Triplet}>-Chorus Sync
+slider19:2<0,7,1{4 Bars,2 Bars,1 Bar,1/2,1/4,1/8,1/16,1/32}>-Chorus Sync Rate
+
+slider20:4<0.1,15,0.01>-Tremolo Rate (Hz)
+slider21:0<0,100,1>-Tremolo Depth (%)
+slider22:0<0,100,1>-Tremolo Square Chop (%)
+slider25:1<0,1,1{Off,On}>-Tremolo L
+slider26:0<0,1,1{Off,On}>-Tremolo C
+slider27:1<0,1,1{Off,On}>-Tremolo R
+slider28:0<0,3,1{Off,Straight,Dotted,Triplet}>-Tremolo Sync
+slider29:5<0,7,1{4 Bars,2 Bars,1 Bar,1/2,1/4,1/8,1/16,1/32}>-Tremolo Sync Rate
+
+slider30:1.5<0.1,12,0.01>-Vibe Rate (Hz)
+slider31:0<0,100,1>-Vibe Depth (%)
+slider32:0<0,100,1>-Vibe Asymmetrical Lamp (%)
+slider35:1<0,1,1{Off,On}>-Vibe L
+slider36:0<0,1,1{Off,On}>-Vibe C
+slider37:1<0,1,1{Off,On}>-Vibe R
+slider38:0<0,3,1{Off,Straight,Dotted,Triplet}>-Vibe Sync
+slider39:4<0,7,1{4 Bars,2 Bars,1 Bar,1/2,1/4,1/8,1/16,1/32}>-Vibe Sync Rate
+
+slider40:350<20,1500,1>-Delay Time (ms)
+slider41:30<0,95,1>-Delay Feedback (%)
+slider42:0<0,100,1>-Delay Mix (%)
+slider43:0<0,100,1>-Delay Runaway Clock (%)
+slider45:1<0,1,1{Off,On}>-Delay L
+slider46:0<0,1,1{Off,On}>-Delay C
+slider47:1<0,1,1{Off,On}>-Delay R
+slider48:0<0,3,1{Off,Straight,Dotted,Triplet}>-Delay Sync
+slider49:4<0,7,1{4 Bars,2 Bars,1 Bar,1/2,1/4,1/8,1/16,1/32}>-Delay Sync Rate
+
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+
+@init
+gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+// =====================================================================
+// Memory (all buffers and filter states allocated from nextmem)
+// =====================================================================
+nextmem = 0;
+function alloc(n) local(ptr) ( ptr = nextmem; nextmem += n; ptr; );
+
+TWO_PI = 2*$pi;
+THIRD = 1/3;
+
+// Exact tanh via exp (argument clamped so exp never overflows)
+function tanh(v) ( v = max(-20, min(20, v)); 1 - 2/(exp(2*v) + 1); );
+
+function db2g(d) ( 10^(d/20); );
+
+// Sync division -> length in quarter notes (bar = quarter notes per bar, set in @block)
+// md: 1 straight, 2 dotted (x1.5), 3 triplet (x2/3)
+function divqn(i, md) (
+  (i == 0 ? 4*bar : i == 1 ? 2*bar : i == 2 ? bar : i == 3 ? 2 : i == 4 ? 1 : i == 5 ? 0.5 : i == 6 ? 0.25 : 0.125)
+  * (md == 2 ? 1.5 : md == 3 ? 2/3 : 1);
+);
+function opc(fc) ( 1 - exp(-TWO_PI*min(fc, srate*0.45)/srate); );   // one-pole coefficient
+
+// 4-point Hermite read from a circular buffer at fractional position pos
+function hread(buf, n, pos) local(i, f, xm1, x0, x1, x2, c1, c2, c3) (
+  pos < 0 ? pos += n;
+  pos >= n ? pos -= n;
+  i = floor(pos); f = pos - i;
+  xm1 = buf[(i - 1 + n) % n]; x0 = buf[i]; x1 = buf[(i + 1) % n]; x2 = buf[(i + 2) % n];
+  c1 = 0.5*(x1 - xm1);
+  c2 = xm1 - 2.5*x0 + 2*x1 - 0.5*x2;
+  c3 = 0.5*(x2 - xm1) + 1.5*(x0 - x1);
+  ((c3*f + c2)*f + c1)*f + x0;
+);
+
+// Smoothed random generator: state p[0] countdown, p[1] target, p[2] output (-1..1)
+function rgen(p, period, coef) (
+  p[0] -= 1;
+  p[0] <= 0 ? ( p[0] = period*srate; p[1] = rand(2) - 1; );
+  p[2] += coef*(p[1] - p[2]);
+  p[2];
+);
+
+// Chorus BBD lines (60 ms max at 192 kHz fits in 16384)
+CHN = 16384;
+chA = alloc(CHN); chB = alloc(CHN); chC = alloc(CHN);    // L, R, centre (mono) lines
+// Delay lines (2.2 s)
+DLN = floor(srate*2.2) + 8;
+dlA = alloc(DLN); dlB = alloc(DLN); dlC = alloc(DLN);    // L, R, centre (mono) lines
+memset(chA, 0, CHN*3); memset(dlA, 0, DLN*3);
+
+// Per-module voice states: 3 voices x 16 slots
+vsC = alloc(48); vsT = alloc(48); vsV = alloc(48);
+memset(vsC, 0, 48); memset(vsV, 0, 48);
+vsT[0] = 1; vsT[16] = 1; vsT[32] = 1;           // tremolo gain states start at unity
+chPre = alloc(3); memset(chPre, 0, 3);          // chorus BBD input filters (L, R, C)
+dls = alloc(6); memset(dls, 0, 6);              // delay loop filters (lp, hp) for L, R, C
+
+// Random generators: 4 drift wanders + chorus warble + chorus sea-sick + delay clock
+rg = alloc(24); memset(rg, 0, 24);
+rgD1 = rg; rgD2 = rg + 3; rgD3 = rg + 6; rgD4 = rg + 9;
+rgCw = rg + 12; rgCs = rg + 15; rgDr = rg + 18;
+cDrift = 1 - exp(-1/(3.0*srate));
+cWarb  = 1 - exp(-1/(0.15*srate));
+cSea   = 1 - exp(-1/(3.0*srate));
+cDrnd  = 1 - exp(-1/(0.8*srate));
+
+// Vibe stage base frequencies (Hz) - unequal, photocell-vibe-style
+vbFb = alloc(4); vbFb[0] = 60; vbFb[1] = 180; vbFb[2] = 480; vbFb[3] = 1300;
+vbLp  = opc(160);
+vbAt  = 1 - exp(-1/(0.008*srate));             // lamp heats fast
+
+// Delay loop filters
+dlLc = opc(3500); dlHc = opc(70);
+dlTs = 1 - exp(-1/(0.25*srate));               // tape-style time glide (pitch bends on time moves)
+dlT = slider40;
+
+// Limiter
+limRel = exp(-1/(0.15*srate));
+limEnv = 0;
+
+// Meters (GUI)
+mOut = 0; mLim = 0;
+drag_id = -1; pcap = 0; lastS = 0;
+gfx_ext_retina = 1;
+
+// =====================================================================
+// Module voices
+// =====================================================================
+
+// Chorus voice: modulated BBD read + clock sample-and-hold (aliasing) + warm post filter
+// vs: [0] clock accumulator, [1] held sample, [2..3] post low-pass
+function chvoice(buf, phoff, vs) local(lf, dms, y) (
+  lf = sin(TWO_PI*(chPh + phoff));
+  dms = chBase + chDep*lf + chWarb;
+  y = hread(buf, CHN, chW - max(1, dms)*srate*0.001);
+  chClkOn ? (
+    vs[0] += chClkInc;
+    vs[0] >= 1 ? ( vs[0] -= 1; vs[1] = y; );
+    y = vs[1];
+  );
+  vs[2] += chPc*(y - vs[2]);
+  vs[3] += chPc*(vs[2] - vs[3]);
+  vs[3];
+);
+function chpre(x, sp) ( sp[0] += chPc*(x - sp[0]); sp[0]; );
+
+// Tremolo voice gain: sine morphing to square (tanh shaping), optical lag
+function trgain(phoff, vs) local(sv, sh, g) (
+  sv = sin(TWO_PI*(trPh + phoff));
+  sh = trK > 1.01 ? tanh(trK*sv)/trTk : sv;
+  g = 1 - trDep*(0.5 - 0.5*sh);
+  vs[0] += trLag*(g - vs[0]);
+  vs[0];
+);
+
+// Vibe voice: lamp-driven 4-stage photocell allpass, chorus-mode sum, low-end thump
+// vs: [0..7] allpass states, [8] lamp, [9] low-pass for thump
+function vbvoice(x, phoff, vs) local(p, pw, lf, c, r, oc, k, y, f, t, a1, xi) (
+  p = vbPh + phoff; p -= floor(p);
+  pw = p < vbSk ? 0.5*p/vbSk : 0.5 + 0.5*(p - vbSk)/(1 - vbSk);   // asymmetric sweep
+  lf = 0.5 - 0.5*cos(TWO_PI*pw);
+  c = lf > vs[8] ? vbAt : vbRl;                                 // fast heat, slow cool
+  vs[8] += c*(lf - vs[8]);
+  r = vs[8];
+  oc = vbOct*r;
+  y = x; k = 0;
+  loop(4,
+    f = min(srate*0.45, vbFb[k]*2^oc);
+    t = tan($pi*f/srate); a1 = (t - 1)/(t + 1);
+    xi = y;
+    y = a1*xi + vs[k*2] - a1*vs[k*2 + 1];
+    vs[k*2] = xi; vs[k*2 + 1] = y;
+    k += 1;
+  );
+  vs[9] += vbLp*(x - vs[9]);
+  vbWet*(0.5*(y - x) + vbTh*(2*r - 1)*vs[9]);
+);
+
+// Delay feedback path: warm low-pass, high-pass, tape/BBD saturation
+function dlloop(y, sp) local(v) (
+  sp[0] += dlLc*(y - sp[0]);
+  sp[1] += dlHc*(sp[0] - sp[1]);
+  v = sp[0] - sp[1];
+  tanh(v*fbE*1.15)/1.15;
+);
+
+// =====================================================================
+// Presets
+// =====================================================================
+// Route shorthand: 0 L+R, 1 C, 2 L, 3 R, 4 L+C+R  -> the module's three L / C / R toggles
+function setrt(base, rt) (
+  slider(base + 5) = (rt == 0 || rt == 2 || rt == 4);
+  slider(base + 6) = (rt == 1 || rt == 4);
+  slider(base + 7) = (rt == 0 || rt == 3 || rt == 4);
+);
+function pc(rate, dep, mix, md, rt) ( slider10 = rate; slider11 = dep; slider12 = mix; slider13 = md; setrt(10, rt); );
+function pt(rate, dep, md, rt)      ( slider20 = rate; slider21 = dep; slider22 = md; setrt(20, rt); );
+function pv(rate, dep, md, rt)      ( slider30 = rate; slider31 = dep; slider32 = md; setrt(30, rt); );
+function pd(tm, fb, mix, md, rt)    ( slider40 = tm; slider41 = fb; slider42 = mix; slider43 = md; setrt(40, rt); );
+function pm(dr, outdb)              ( slider2 = dr; slider3 = outdb; );
+function apply_preset(n) (
+  // start from Init, then each preset changes only what it uses
+  pc(0.8, 50, 0, 0, 0); pt(4, 0, 0, 0); pv(1.5, 0, 0, 0); pd(350, 30, 0, 0, 0); pm(20, 0); slider5 = 100;
+  slider18 = 0; slider28 = 0; slider38 = 0; slider48 = 0;            // sync off
+  slider19 = 2; slider29 = 5; slider39 = 4; slider49 = 4;            // sync rates: 1 bar, 1/8, 1/4, 1/4
+  n == 1 ? ( pc(0.6, 60, 55, 0, 0); ) :                                     // Lush Chorus
+  n == 2 ? ( pc(0.35, 70, 60, 70, 4); pd(380, 35, 25, 30, 0); pm(40, 0); ) : // Seasick Tape
+  n == 3 ? ( pt(6, 70, 15, 0); pd(120, 20, 20, 0, 1); pm(15, 0); ) :         // Surf Trem
+  n == 4 ? ( pv(1.2, 80, 60, 1); pm(25, 0); ) :                              // Vibe Throb
+  n == 5 ? ( pd(450, 70, 45, 40, 4); pm(30, 0); ) :                          // Dub Echo
+  n == 6 ? ( pc(0.8, 30, 30, 0, 4); pt(5, 25, 0, 4); pv(5, 60, 30, 0); pm(25, 0); ) :  // Rotary Wash
+  n == 7 ? ( pd(300, 90, 50, 85, 1); pm(20, -3); );                          // Runaway
+);
+
+// Per-instance guards (variables survive @init re-runs; @serialize restores saved values)
+q_init == 0 ? (
+  lastPreset = slider1;
+  ui_sz = 2;             // new instances open in Large
+  ui_szinit = 1;
+  q_init = 1;
+);
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, ui_szinit);
+file_var(0, lastPreset);
+
+@slider
+// Preset picked from REAPER's parameter list (GUI prev/next applies directly)
+slider1 != lastPreset ? ( apply_preset(slider1); lastPreset = slider1; );
+
+@block
+// ---- Control-rate parameters ----
+dr = slider2/100;
+outG = db2g(slider3);
+mixM = slider5/100;
+
+// Tempo sync
+bar = ts_denom > 0 ? ts_num*4/ts_denom : 4;      // quarter notes per bar
+playing = play_state & 1;
+bpos = beat_position;                            // quarter notes at block start
+bpInc = tempo/(60*srate);                        // quarter notes per sample
+chSy = slider18 > 0.5; chQn = divqn(slider19, slider18);
+trSy = slider28 > 0.5; trQn = divqn(slider29, slider28);
+vbSy = slider38 > 0.5; vbQn = divqn(slider39, slider38);
+// delay time target (ms): synced note length, capped at 1.5 s
+dlTgt = (slider48 > 0.5 && tempo > 0) ? min(1500, divqn(slider49, slider48)*60000/tempo) : slider40;
+
+// L / C / R toggles per module; "sp" = spread (centre plus a side), "kc" = centre level
+chLo = slider15 > 0.5; chCo = slider16 > 0.5; chRo = slider17 > 0.5;
+trLo = slider25 > 0.5; trCo = slider26 > 0.5; trRo = slider27 > 0.5;
+vbLo = slider35 > 0.5; vbCo = slider36 > 0.5; vbRo = slider37 > 0.5;
+dlLo = slider45 > 0.5; dlCo = slider46 > 0.5; dlRo = slider47 > 0.5;
+
+// Chorus: clock stretch lengthens the BBD, lowers its clock (aliasing) and bandwidth
+st = slider13/100;
+chBase = 7 + 18*st;                          // ms
+chDep  = slider11/100*(3 + 4*st);            // ms
+fclk   = 40000*(1 - 0.88*st);                // virtual BBD clock (Hz)
+chClkOn  = fclk < srate*0.98;
+chClkInc = fclk/srate;
+chPc   = opc(min(14000, fclk*0.42));
+chMix  = slider12/100;
+
+// Tremolo: square chop sharpens the shape and the optical lag
+chop = slider22/100;
+trK  = 1 + 40*chop*chop;
+trTk = tanh(trK);
+trDep = slider21/100;
+trLag = 1 - exp(-1/((0.3 + 5.7*(1 - chop))*0.001*srate));
+
+// Vibe: asymmetrical lamp skews the sweep, slows the lamp's cooling, adds low thump
+asym  = slider32/100;
+vbSk  = 0.5 - 0.38*asym;
+vbRl  = 1 - exp(-1/((0.04 + 0.25*asym)*srate));
+vbTh  = 0.9*asym;
+vbOct = 3.0*slider31/100;
+vbWet = min(1, 2*slider31/100);
+
+// Delay: runaway clock pushes feedback past unity (tanh keeps it bounded) + wow & flutter
+run  = slider43/100;
+fbE  = 0.95*slider41/95 + 0.30*run;
+dlMix = slider42/100;
+
+@sample
+// ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+spl0 != spl0 ? spl0 = 0;
+spl1 != spl1 ? spl1 = 0;
+xL = spl0; xR = spl1;
+m  = 0.5*(xL + xR);
+dL = 0; dR = 0;
+
+// ---- Drift: slow independent wander of each module's rate ----
+w1 = rgen(rgD1, 2.5, cDrift); w2 = rgen(rgD2, 2.5, cDrift);
+w3 = rgen(rgD3, 2.5, cDrift); w4 = rgen(rgD4, 2.5, cDrift);
+
+// ---- LFO phases ----
+// synced: locked to the beat grid while playing, free-running at the synced rate when stopped
+bpos += bpInc;
+chSy ? ( chPh = playing ? bpos/chQn : chPh + bpInc/chQn ) : ( chPh += slider10*(1 + 0.2*dr*w1)/srate );
+trSy ? ( trPh = playing ? bpos/trQn : trPh + bpInc/trQn ) : ( trPh += slider20*(1 + 0.2*dr*w2)/srate );
+vbSy ? ( vbPh = playing ? bpos/vbQn : vbPh + bpInc/vbQn ) : ( vbPh += slider30*(1 + 0.2*dr*w3)/srate );
+chPh -= floor(chPh); trPh -= floor(trPh); vbPh -= floor(vbPh);
+
+// ===================== CHORUS =====================
+chWarb = st*(2.5*rgen(rgCw, 0.3, cWarb) + 4*rgen(rgCs, 4, cSea));   // warble + seasick drift (ms)
+chA[chW] = chpre(xL, chPre); chB[chW] = chpre(xR, chPre + 1); chC[chW] = chpre(m, chPre + 2);
+chMix > 0 ? (
+  sp = chCo && (chLo || chRo);
+  kc = (chLo || chRo) ? 0.707 : 1;
+  chLo ? dL += chMix*chvoice(chA, 0, vsC);
+  chRo ? dR += chMix*chvoice(chB, sp ? 2*THIRD : 0.25, vsC + 16);
+  chCo ? ( y = chMix*kc*chvoice(chC, sp ? THIRD : 0, vsC + 32); dL += y; dR += y; );
+);
+
+// ===================== TREMOLO =====================
+trDep > 0 ? (
+  sp = trCo && (trLo || trRo);
+  ws = trCo ? 0.5 : 1;                         // side share when the centre is also pulsing
+  wc = (trLo || trRo) ? 0.5 : 1;               // centre share when a side is also pulsing
+  trLo ? dL += ws*xL*(trgain(0, vsT) - 1);
+  trRo ? dR += ws*xR*(trgain(sp ? 2*THIRD : 0, vsT + 16) - 1);
+  trCo ? ( y = wc*m*(trgain(sp ? THIRD : 0, vsT + 32) - 1); dL += y; dR += y; );   // mid pulses
+);
+
+// ===================== VIBE =====================
+vbWet > 0 ? (
+  sp = vbCo && (vbLo || vbRo);
+  kc = (vbLo || vbRo) ? 0.707 : 1;
+  vbLo ? dL += vbvoice(xL, 0, vsV);
+  vbRo ? dR += vbvoice(xR, sp ? 2*THIRD : 0, vsV + 16);
+  vbCo ? ( y = kc*vbvoice(m, sp ? THIRD : 0, vsV + 32); dL += y; dR += y; );
+);
+
+// ===================== DELAY =====================
+dlT += dlTs*(dlTgt - dlT);                                      // glide = tape pitch bend
+wowPh += 0.45/srate; wowPh -= floor(wowPh);
+flPh  += 6.3/srate;  flPh  -= floor(flPh);
+dmod = run*(5*sin(TWO_PI*wowPh) + 0.5*sin(TWO_PI*flPh) + 2.5*rgen(rgDr, 1.2, cDrnd));
+dsm = max(2, min(DLN*0.55, (dlT + dmod)*srate*0.001));          // samples (LCR taps go to 1.25x)
+sp = dlCo && (dlLo || dlRo);
+kc = (dlLo || dlRo) ? 0.707 : 1;
+// each side has its own line + feedback; muted lines are cleared so they restart clean
+dlLo ? (
+  yA = hread(dlA, DLN, dlW - dsm*(sp ? 0.75 : 1));
+  dlA[dlW] = xL + dlloop(yA, dls);
+  dL += dlMix*yA;
+) : dlA[dlW] = 0;
+dlRo ? (
+  yB = hread(dlB, DLN, dlW - dsm*(sp ? 1.25 : 1));
+  dlB[dlW] = xR + dlloop(yB, dls + 2);
+  dR += dlMix*yB;
+) : dlB[dlW] = 0;
+dlCo ? (
+  yC = hread(dlC, DLN, dlW - dsm);
+  dlC[dlW] = m + dlloop(yC, dls + 4);
+  y = dlMix*kc*yC; dL += y; dR += y;
+) : dlC[dlW] = 0;
+
+// ---- advance write heads ----
+chW += 1; chW >= CHN ? chW = 0;
+dlW += 1; dlW >= DLN ? dlW = 0;
+
+// ===================== MASTER =====================
+oL = (xL + mixM*dL)*outG;
+oR = (xR + mixM*dR)*outG;
+pk = max(abs(oL), abs(oR));
+limEnv = pk > limEnv ? pk : limEnv*limRel;
+lg = limEnv > 0.966 ? 0.966/limEnv : 1;
+oL *= lg; oR *= lg;
+spl0 = max(-1, min(1, oL));
+spl1 = max(-1, min(1, oR));
+
+// meters
+mOut = max(mOut*0.9997, max(abs(spl0), abs(spl1)));
+mLim = lg < 0.98 ? 1 : mLim*0.9995;
+
+@gfx 1680 441
+
+// =====================================================================
+// GUI - 2U rack face drawn in a 1600 x 420 design space.
+// Size picker: S 75% / M 90% / L 105% (shrinks further if the window is smaller).
+// Knobs: drag vertically (Shift = fine), double-click or Ctrl-click = reset.
+// The LCD shows the preset, or the parameter you are touching.
+// =====================================================================
+
+szf = ui_sz == 1 ? 0.75 : ui_sz == 2 ? 1.05 : 0.9;
+S  = min(szf, min(gfx_w/1600, gfx_h/420));
+ox = floor((gfx_w - 1600*S)*0.5);
+oy = floor((gfx_h - 420*S)*0.5);
+mx = (mouse_x - ox)/S;
+my = (mouse_y - oy)/S;
+
+// the ? pop-up is modal: while it is open the panel underneath takes no clicks
+hlp ? ( (mouse_cap & 1) && !(pcap & 1) && !hlp_new ? hlp = 0; pcap = mouse_cap; );
+hlp_new = 0;
+
+S != lastS ? (
+  gfx_setfont(1, "Arial Bold", max(10, 40*S));            // MOD RACK
+  gfx_setfont(2, "Arial Bold", max(9, 24*S));             // module titles
+  gfx_setfont(3, "Arial Bold", max(9, 15*S));             // knob labels
+  gfx_setfont(4, "Arial Bold", max(9, 14*S));             // values / buttons
+  gfx_setfont(5, "Arial Bold", max(8, 13*S));             // small print
+  gfx_setfont(6, "Arial Bold", max(8, 16*S));             // GFX / MASTER
+  gfx_setfont(7, "Courier New", max(9, 24*S), 'b');       // LCD line 2
+  gfx_setfont(8, "Courier New", max(9, 15*S), 'b');       // LCD line 1
+  lastS = S;
+);
+
+// ---- helpers (design-space coordinates) ----
+function col(r, g, b) ( gfx_r = r; gfx_g = g; gfx_b = b; );
+function R(x, y, w, h) ( gfx_rect(ox + x*S, oy + y*S, max(1, w*S), max(1, h*S)); );
+function RO(x, y, w, h) local(t, k) (
+  t = max(1, floor(2*S + 0.5)); k = 0;
+  loop(t, gfx_rect(ox + x*S + k, oy + y*S + k, max(1, w*S - 2*k), max(1, h*S - 2*k), 0); k += 1; );
+);
+function TX(x, y, txt) ( gfx_x = ox + x*S; gfx_y = oy + y*S; gfx_drawstr(txt); );
+function TC(cx, y, txt) local(w, h) ( gfx_measurestr(txt, w, h); gfx_x = ox + cx*S - w*0.5; gfx_y = oy + y*S; gfx_drawstr(txt); );
+function TR(rx, y, txt) local(w, h) ( gfx_measurestr(txt, w, h); gfx_x = ox + rx*S - w; gfx_y = oy + y*S; gfx_drawstr(txt); );
+function CIRC(x, y, rr, fill) ( gfx_circle(ox + x*S, oy + y*S, rr*S, fill, 1); );
+function clicked(x, y, w, h) ( (mouse_cap & 1) && !(pcap & 1) && mx >= x && mx <= x+w && my >= y && my <= y+h; );
+// write a slider and tell REAPER (so GUI moves record as automation)
+function setk(idx, v) ( slider(idx) != v ? ( slider(idx) = v; slider_automate(2^(idx - 1)); ); );
+
+// Bevel: inset = 1 recessed, 0 raised (lo / hi are the edge shades)
+function bevel(x, y, w, h, inset, lo, hi) (
+  inset ? col(lo, lo, lo) : col(hi, hi, hi); R(x, y, w, 2); R(x, y, 2, h);
+  inset ? col(hi, hi, hi) : col(lo, lo, lo); R(x, y + h - 2, w, 2); R(x + w - 2, y, 2, h);
+);
+
+function screw(x, y, rr) (
+  col(0.62, 0.62, 0.64); CIRC(x, y, rr, 1);
+  col(0.30, 0.30, 0.32); CIRC(x, y, rr, 0);
+  gfx_line(ox + (x - rr*0.6)*S, oy + y*S, ox + (x + rr*0.6)*S, oy + y*S, 1);
+  gfx_line(ox + x*S, oy + (y - rr*0.6)*S, ox + x*S, oy + (y + rr*0.6)*S, 1);
+);
+
+// Panel colours for the module being drawn: p* = panel, i* = ink
+function setpanel(i) (
+  i == 0 ? ( pr = 0.55; pg = 0.80; pb = 0.70; ir = 0.07; ig = 0.17; ib = 0.13; ) :   // seafoam
+  i == 1 ? ( pr = 0.96; pg = 0.83; pb = 0.33; ir = 0.22; ig = 0.15; ib = 0.02; ) :   // yellow
+  i == 2 ? ( pr = 0.50; pg = 0.33; pb = 0.21; ir = 0.97; ig = 0.90; ib = 0.76; ) :   // brown (cream ink)
+           ( pr = 0.62; pg = 0.80; pb = 0.93; ir = 0.05; ig = 0.13; ib = 0.24; );    // light blue
+  // Complementary colour for the Mod pot: c' = max(r,g,b) + min(r,g,b) - c
+  // (a 180-degree hue rotation that keeps the panel's lightness and saturation)
+  qs = max(pr, max(pg, pb)) + min(pr, min(pg, pb));
+  qr = qs - pr; qg = qs - pg; qb = qs - pb;
+  ql = 0.299*qr + 0.587*qg + 0.114*qb;                   // luminance -> pointer contrast
+);
+function cpanel(f) ( col(pr*f, pg*f, pb*f); );
+function cink() ( col(ir, ig, ib); );
+
+// Buttons. sty 0 = black rack cap (lit = cream), sty 1 = panel route button (lit = ink)
+function btn(x, y, w, h, lbl, on, fnt, sty) local(sw, sh) (
+  sty == 0 ? (
+    on ? col(0.90, 0.88, 0.80) : col(0.22, 0.22, 0.24); R(x, y, w, h);
+    bevel(x, y, w, h, 0, 0.08, on ? 1.0 : 0.38);
+    on ? col(0.08, 0.08, 0.08) : col(0.88, 0.88, 0.90);
+  ) : (
+    on ? cink() : cpanel(0.84); R(x, y, w, h);
+    cpanel(0.6); RO(x, y, w, h);
+    on ? col(pr, pg, pb) : cink();
+  );
+  gfx_setfont(fnt);
+  sw = ui_symw(lbl); sh = ui_symh;
+  gfx_x = ox + (x + w*0.5)*S - sw*0.5;
+  gfx_y = oy + (y + h*0.5)*S - sh*0.5;
+  ui_symstr(lbl);
+  clicked(x, y, w, h);
+);
+
+// Knob. lgt = log taper, def = reset value, sty 0 = cream (on panel), 1 = red Mod pot, 2 = black master.
+// Drag vertically (Shift = fine); double-click or Ctrl-click resets to def.
+function knob(id, cx, cy, rad, v, vmin, vmax, lgt, def, sty) local(dx, dy, fr, nf, ang, sx, sy, sr, n, k, t, ca, sa, fa) (
+  fr = lgt ? log(v/vmin)/log(vmax/vmin) : (v - vmin)/(vmax - vmin);
+  dx = mx - cx; dy = my - cy;
+  kn_hot = drag_id == id || (dx*dx + dy*dy) < (rad*rad*1.6);   // house style: values show on hover / drag only
+  (mouse_cap & 1) && !(pcap & 1) && drag_id == -1 && (dx*dx + dy*dy) < (rad*rad*1.6) ? (
+    ((mouse_cap & 4) || (kc_id == id && time_precise() - kc_t < 0.35)) ? (
+      v = def; kc_t = 0; k_rst = id;
+    ) : (
+      drag_id = id; drag_sy = my; drag_sf = fr; kc_id = id; kc_t = time_precise();
+    );
+  );
+  drag_id == id ? (
+    (mouse_cap & 1) ? (
+      nf = max(0, min(1, drag_sf + (drag_sy - my)/((mouse_cap & 8) ? 720 : 180)));
+      v = lgt ? vmin*(vmax/vmin)^nf : vmin + nf*(vmax - vmin);
+    ) : drag_id = -1;
+  );
+  fr = lgt ? log(v/vmin)/log(vmax/vmin) : (v - vmin)/(vmax - vmin);
+  ang = (-0.75 + 1.5*fr)*$pi;
+
+  sx = ox + cx*S; sy = oy + cy*S; sr = rad*S;
+  n = max(2, floor(5*S + 0.5));
+
+  // house knob: printed ticks, fluted black skirt with a coloured cap (white on the top row, the panel's
+  // complementary colour on the Mod pots, grey on the master), black pointer
+  (sty == 2) ? col(0.80, 0.80, 0.82) : cink();
+  k = 0;
+  loop(11,
+    fa = (-0.75 + k*0.15)*$pi;
+    gfx_line(sx + sin(fa)*(sr + 4*S), sy - cos(fa)*(sr + 4*S), sx + sin(fa)*(sr + 9*S), sy - cos(fa)*(sr + 9*S), 1);
+    k += 1;
+  );
+  sc = S; pk_kstyle = 7; pk_ptr = -1;
+  pk_kcol = sty == 1 ? (floor(qr*255 + 0.5)*65536 + floor(qg*255 + 0.5)*256 + floor(qb*255 + 0.5)) : sty == 2 ? 0x9DA2A8 : 0xEDEDE6;
+  pk_bkcap(sx, sy, sr, ang);
+  v;
+);
+
+// LCD readout of the touched parameter
+function touch(id, name, val) (
+  (drag_id == id || k_rst == id) ? (
+    strcpy(#lcdn, name); strcpy(#lcdv, val); lcd_t = time_precise();
+    k_rst == id ? k_rst = -1;
+  );
+);
+
+// Label + value under a knob, in the current ink
+function klab(cx, y, lbl, val) (
+  gfx_setfont(3); TC(cx, y, lbl);
+  kn_hot ? ( gfx_setfont(4); TC(cx, y + 20, val); );   // value on hover / drag only
+);
+
+function fhz(v)  ( v < 1 ? sprintf(#vt, "%.2f Hz", v) : sprintf(#vt, "%.1f Hz", v); #vt; );
+function fpct(v) ( sprintf(#vt, "%d%%", floor(v + 0.5)); #vt; );
+function fms(v)  ( v < 1000 ? sprintf(#vt, "%d ms", floor(v + 0.5)) : sprintf(#vt, "%.2f s", v/1000); #vt; );
+function fdb(v) local(q) (
+  q = floor(v*10 + 0.5)/10;
+  q > 0 ? sprintf(#vt, "+%.1f dB", q) : q < 0 ? sprintf(#vt, "%.1f dB", q) : strcpy(#vt, "0.0 dB");
+  #vt;
+);
+function fdiv(i) (
+  i == 0 ? "4 BARS" : i == 1 ? "2 BARS" : i == 2 ? "1 BAR" : i == 3 ? "1/2" : i == 4 ? "1/4" : i == 5 ? "1/8" : i == 6 ? "1/16" : "1/32";
+);
+
+// Synced value text, e.g. "1/8", "1/8 D", "1/8 T"
+function fsync(i, md) (
+  md == 2 ? sprintf(#vs, "%s D", fdiv(i)) : md == 3 ? sprintf(#vs, "%s T", fdiv(i)) : strcpy(#vs, fdiv(i));
+  #vs;
+);
+
+// RATE / TIME knob with clickable label: click cycles Hz|ms -> Straight -> Dotted -> Triplet.
+// base = module slider base (value = base, sync mode = base+8, sync note = base+9)
+function synck(id, cx, base, vmin, vmax, vdef, ddef, nm, istime) local(md, v) (
+  md = floor(slider(base + 8) + 0.5);
+  md > 0 ? (
+    v = knob(id, cx, 112, 27, slider(base + 9), 0, 7, 0, ddef, 0);
+    setk(base + 9, floor(v + 0.5));
+  ) : (
+    setk(base, knob(id, cx, 112, 27, slider(base), vmin, vmax, 1, vdef, 0));
+  );
+  gfx_setfont(3);
+  md > 0 ? (
+    cink(); R(cx - 35, 144, 70, 20); col(pr, pg, pb);
+    TC(cx, 146, md == 1 ? "SYNC" : md == 2 ? "DOTTED" : "TRIPLET");
+  ) : ( cink(); TC(cx, 146, istime ? "TIME" : "RATE"); );
+  cink(); gfx_setfont(4);
+  kn_hot ? TC(cx, 166, md > 0 ? fsync(slider(base + 9), md) : istime ? fms(slider(base)) : fhz(slider(base)));   // value on hover / drag only
+  // SYNC key: a visible switch for the same cycle (free -> sync -> dotted -> triplet)
+  btn(cx + 20, 62, 50, 20, "SYNC", md > 0, 5, 1) ? 0;
+  clicked(cx - 35, 147, 70, 17) || clicked(cx + 20, 62, 50, 20) ? (
+    setk(base + 8, (md + 1) % 4);
+    strcpy(#lcdn, nm);
+    strcpy(#lcdv, md == 0 ? "SYNC STRAIGHT" : md == 1 ? "SYNC DOTTED" : md == 2 ? "SYNC TRIPLET" : istime ? "TIME IN MS" : "RATE IN HZ");
+    lcd_t = time_precise();
+  );
+  touch(id, nm, md > 0 ? fsync(slider(base + 9), md) : istime ? fms(slider(base)) : fhz(slider(base)));
+);
+
+function pname(n) (
+  n == 0 ? "INIT" : n == 1 ? "LUSH CHORUS" : n == 2 ? "SEASICK TAPE" : n == 3 ? "SURF TREM" :
+  n == 4 ? "VIBE THROB" : n == 5 ? "DUB ECHO" : n == 6 ? "ROTARY WASH" : "RUNAWAY";
+);
+
+// Preset step from the GUI
+function step_preset(dir) (
+  slider1 = (slider1 + dir + 8) % 8;
+  apply_preset(slider1); lastPreset = slider1;
+  lcd_t = 0;
+  slider_automate(562949953421311);             // sliders 1-49
+);
+
+// =====================================================================
+// Draw
+// =====================================================================
+
+// Rack face (black anodised) over the whole window
+col(0.10, 0.10, 0.11); gfx_rect(0, 0, gfx_w, gfx_h);
+col(0.17, 0.17, 0.18); R(44, 0, 1512, 2); col(0.05, 0.05, 0.05); R(44, 418, 1512, 2);
+
+// Rack ears with mounting slots
+ex = 0;
+loop(2,
+  ex_x = ex == 0 ? 0 : 1556;
+  col(0.15, 0.15, 0.16); R(ex_x, 0, 44, 420);
+  bevel(ex_x, 0, 44, 420, 0, 0.05, 0.26);
+  ey = 0;
+  loop(2,
+    ey_y = ey == 0 ? 64 : 356;
+    col(0.02, 0.02, 0.02);
+    CIRC(ex_x + 16, ey_y, 7, 1); CIRC(ex_x + 28, ey_y, 7, 1); R(ex_x + 16, ey_y - 7, 12, 14);
+    ey += 1;
+  );
+  ex += 1;
+);
+
+// ---- Left: badge, LCD, presets, size ----
+col(0.55, 0.55, 0.58); gfx_setfont(6); TX(72, 24, "GFX");
+col(0.95, 0.94, 0.90); gfx_setfont(1); TX(70, 44, "MOD RACK");
+col(0.55, 0.55, 0.58); gfx_setfont(5); TX(72, 92, "PARALLEL STEREO FX");
+
+col(0.03, 0.03, 0.03); R(66, 118, 258, 90);
+bevel(66, 118, 258, 90, 1, 0.02, 0.24);
+col(0.55, 0.68, 0.24); R(70, 122, 250, 82);                       // green LCD
+col(0.08, 0.13, 0.03);
+time_precise() - lcd_t < 1.5 ? (
+  gfx_setfont(8); TX(80, 130, #lcdn);
+  gfx_setfont(7); TX(80, 160, #lcdv);
+) : (
+  lcf_ = 50*S; gfx_setfont(10, "Courier New", lcf_, 'b'); gfx_measurestr(pname(slider1), lcw_, lch_);
+  lcw_ > 230*S ? ( gfx_setfont(10, "Courier New", lcf_*230*S/lcw_, 'b'); gfx_measurestr(pname(slider1), lcw_, lch_); );
+  gfx_x = ox + 80*S; gfx_y = oy + 163*S - lch_*0.5; gfx_drawstr(pname(slider1));
+);
+
+// PRESETS key or a click on the LCD: every preset in a drop-down (current one ticked)
+pm_ = btn(70, 218, 122, 34, "PRESETS", 0, 4, 0);
+clicked(66, 118, 258, 90) || pm_ ? (
+  strcpy(#pmenu, ""); k = 0;
+  loop(8, k == slider1 ? strcat(#pmenu, "!"); strcat(#pmenu, pname(k)); k < 7 ? strcat(#pmenu, "|"); k += 1; );
+  gfx_x = mouse_x; gfx_y = mouse_y;
+  psel = gfx_showmenu(#pmenu);
+  psel > 0 ? ( slider1 = psel - 1; apply_preset(slider1); lastPreset = slider1; lcd_t = 0; slider_automate(562949953421311); );
+);
+btn(200, 218, 56, 34, "◄", 0, 4, 0) ? step_preset(-1);
+btn(264, 218, 56, 34, "►", 0, 4, 0) ? step_preset(1);
+
+col(0.55, 0.55, 0.58); gfx_setfont(5); TX(70, 274, "SIZE");
+btn(70,  292, 46, 28, "S", ui_sz == 1, 4, 0) ? ui_sz = 1;
+btn(122, 292, 46, 28, "M", ui_sz == 0, 4, 0) ? ui_sz = 0;
+btn(174, 292, 46, 28, "L", ui_sz == 2, 4, 0) ? ui_sz = 2;
+btn(226, 292, 46, 28, "?", hlp, 4, 0) ? ( hlp = 1; hlp_new = 1; );
+col(0.40, 0.40, 0.42); gfx_setfont(5); TX(70, 372, "MODEL GFX-MR4   2U");
+
+// ---- Four module panels ----
+mi = 0;
+loop(4,
+  setpanel(mi);
+  px = 345 + (mi == 0 ? 1 : mi == 1 ? 0 : mi)*262;     // panel order: Tremolo, Chorus, Vibe, Delay
+  base = 10 + mi*10;
+
+  cpanel(1); R(px, 24, 250, 372);
+  cpanel(0.55); RO(px, 24, 250, 372);
+  cpanel(1.12); R(px + 2, 26, 246, 2);
+  screw(px + 12, 36, 5); screw(px + 238, 36, 5); screw(px + 12, 384, 5); screw(px + 238, 384, 5);
+
+  cink(); gfx_setfont(2);
+  TX(px + 26, 30, mi == 0 ? "CHORUS" : mi == 1 ? "TREMOLO" : mi == 2 ? "VIBE" : "DELAY");
+  gfx_setfont(5);
+  TR(px + 226, 40, mi == 0 ? "BBD" : mi == 1 ? "OPTICAL" : mi == 2 ? "PHOTOCELL" : "BBD / TAPE");
+
+  // Knob row
+  mi == 0 ? (
+    synck(1, px + 48, 10, 0.05, 8, 0.8, 2, "CHORUS RATE", 0);
+    setk(11, knob(2, px + 125, 112, 27, slider11, 0, 100, 0, 50, 0));   cink(); klab(px + 125, 146, "DEPTH", fpct(slider11)); touch(2, "CHORUS DEPTH", fpct(slider11));
+    setk(12, knob(3, px + 202, 112, 27, slider12, 0, 100, 0, 0, 0));    cink(); klab(px + 202, 146, "MIX",   fpct(slider12)); touch(3, "CHORUS MIX",   fpct(slider12));
+  ) : mi == 1 ? (
+    synck(11, px + 70, 20, 0.1, 15, 4, 5, "TREMOLO RATE", 0);
+    setk(21, knob(12, px + 180, 112, 27, slider21, 0, 100, 0, 0, 0));   cink(); klab(px + 180, 146, "DEPTH", fpct(slider21)); touch(12, "TREMOLO DEPTH", fpct(slider21));
+  ) : mi == 2 ? (
+    synck(21, px + 70, 30, 0.1, 12, 1.5, 4, "VIBE RATE", 0);
+    setk(31, knob(22, px + 180, 112, 27, slider31, 0, 100, 0, 0, 0));    cink(); klab(px + 180, 146, "DEPTH", fpct(slider31)); touch(22, "VIBE DEPTH", fpct(slider31));
+  ) : (
+    synck(31, px + 48, 40, 20, 1500, 350, 4, "DELAY TIME", 1);
+    setk(41, knob(32, px + 125, 112, 27, slider41, 0, 95, 0, 30, 0));     cink(); klab(px + 125, 146, "FEEDBACK", fpct(slider41)); touch(32, "DELAY FEEDBACK", fpct(slider41));
+    setk(42, knob(33, px + 202, 112, 27, slider42, 0, 100, 0, 0, 0));     cink(); klab(px + 202, 146, "MIX",      fpct(slider42)); touch(33, "DELAY MIX",      fpct(slider42));
+  );
+
+  // Divider
+  cpanel(0.7); R(px + 16, 192, 218, 2);
+
+  // Mod pot (red)
+  cink(); gfx_setfont(5); TC(px + 125, 204, "MOD");
+  mvi = base + ((mi == 0 || mi == 3) ? 3 : 2);     // Mod pot slider index
+  mv = knob(mi*10 + 9, px + 125, 262, 32, slider(mvi), 0, 100, 0, 0, 1);
+  setk(mvi, mv);
+  cink();
+  klab(px + 125, 304, mi == 0 ? "CLOCK STRETCH" : mi == 1 ? "SQUARE CHOP" : mi == 2 ? "ASYM LAMP" : "RUNAWAY CLOCK", fpct(mv));
+  touch(mi*10 + 9, mi == 0 ? "CLOCK STRETCH" : mi == 1 ? "SQUARE CHOP" : mi == 2 ? "ASYM LAMP" : "RUNAWAY CLOCK", fpct(mv));
+
+  // L / C / R output toggles: click to activate or mute
+  k = 0;
+  loop(3,
+    rv = slider(base + 5 + k) > 0.5;
+    btn(px + 18 + k*74, 344, 66, 34, k == 0 ? "L" : k == 1 ? "C" : "R", rv, 3, 1) ? (
+      setk(base + 5 + k, !rv);
+      // LCD readout of the new routing
+      strcpy(#lcdn, mi == 0 ? "CHORUS OUT" : mi == 1 ? "TREMOLO OUT" : mi == 2 ? "VIBE OUT" : "DELAY OUT");
+      sprintf(#lcdv, "%s %s %s", slider(base + 5) > 0.5 ? "L" : "-", slider(base + 6) > 0.5 ? "C" : "-", slider(base + 7) > 0.5 ? "R" : "-");
+      (slider(base + 5) + slider(base + 6) + slider(base + 7)) < 0.5 ? strcpy(#lcdv, "MUTED");
+      lcd_t = time_precise();
+    );
+    k += 1;
+  );
+
+  mi += 1;
+);
+
+// ---- Master ----
+col(0.14, 0.14, 0.15); R(1393, 24, 154, 372);
+bevel(1393, 24, 154, 372, 1, 0.05, 0.24);
+col(0.80, 0.80, 0.82); gfx_setfont(6); TX(1405, 34, "MASTER");
+
+setk(2, knob(91, 1450, 90, 24, slider2, 0, 100, 0, 20, 2));
+col(0.85, 0.85, 0.87); klab(1450, 122, "DRIFT", fpct(slider2)); touch(91, "DRIFT", fpct(slider2));
+setk(5, knob(93, 1450, 192, 24, slider5, 0, 100, 0, 100, 2));
+col(0.85, 0.85, 0.87); klab(1450, 224, "MIX", fpct(slider5)); touch(93, "MASTER MIX", fpct(slider5));
+setk(3, knob(92, 1450, 294, 24, slider3, -24, 12, 0, 0, 2));
+col(0.85, 0.85, 0.87); klab(1450, 326, "OUTPUT", fdb(slider3)); touch(92, "OUTPUT", fdb(slider3));
+
+// Output LED ladder (-48 .. +3 dB)
+mdb = mOut > 0.0000001 ? 20*log10(mOut) : -100;
+mp = max(0, min(1, (mdb + 48)/51));
+col(0.03, 0.03, 0.03); R(1512, 62, 22, 294);
+bevel(1512, 62, 22, 294, 1, 0.02, 0.22);
+k = 0;
+loop(20,
+  f = (k + 0.5)/20; d = -48 + 51*f;
+  d > 0 ? col(0.95, 0.18, 0.12) : d > -6 ? col(1.0, 0.68, 0.10) : col(0.30, 0.90, 0.30);
+  f > mp ? ( gfx_r *= 0.2; gfx_g *= 0.2; gfx_b *= 0.2; );
+  R(1516, 62 + 294 - 4 - (k + 1)*14.3, 14, 11);
+  k += 1;
+);
+col(0.60, 0.60, 0.62); gfx_setfont(5); TC(1523, 362, "OUT");
+
+// Limiter LED
+mLim > 0.5 ? col(0.98, 0.16, 0.10) : col(0.28, 0.06, 0.05); CIRC(1412, 382, 6, 1);
+col(0.60, 0.60, 0.62); gfx_setfont(5); TX(1424, 375, "LIMIT");
+
+// ? pop-up: design credit and the manual
+hlp ? (
+  gfx_r = gfx_g = gfx_b = 0; gfx_a = 0.62; gfx_rect(0, 0, gfx_w, gfx_h); gfx_a = 1;
+  col(0.11, 0.11, 0.13); R(560, 130, 480, 160);
+  col(0.88, 0.38, 0.23); R(580, 172, 440, 1);
+  gfx_setfont(3); col(0.95, 0.95, 0.93); TX(580, 146, "Design by JGWizrad.  © John Garden 2026");
+  gfx_setfont(5); col(0.91, 0.70, 0.23); TX(580, 186, "https://www.gardenfx.uk/");
+  col(0.85, 0.84, 0.82); TX(580, 210, "Manual - https://www.gardenfx.uk/manual/gfx-modrack.pdf");
+  col(0.52, 0.51, 0.49); TX(580, 254, "Click anywhere to close.");
+);
+pcap = mouse_cap;

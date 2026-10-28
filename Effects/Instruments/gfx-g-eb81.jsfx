@@ -1,0 +1,1090 @@
+desc:EB81 [FM synth] (GFX)
+//tags: instrument synth poly fm phase modulation feedback bitcrush lofi industrial idm effect ring
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel, gfx-instrument, gfx-voice, gfx-dyn and gfx-faceplate
+// (.jsfx-inc) in the same folder.
+//
+// EB81. A dual-unit FM synthesizer and processor dressed as one heavy Eastern Bloc rack: on the left an
+// East Berlin laboratory test console (analogue cross-modulation with an overdriven feedback loop), on the
+// right a Warsaw research terminal (a low-bit digital operator with sample-rate reduction and bit crush built
+// into its feedback path). The two decks are coupled by the ROUTING keys; the audio input can drive either deck.
+//
+// SEKTION A - BERLIN (runs at 2x oversampling, so it is raw but not accidentally digital)
+//   CARRIER A and MODULATOR A, waves SINE / SAW (built from its first four harmonics) / RECT (full-wave rectified sine) /
+//   CLIP (hard-driven, clipped sine). MOD RATIO 0.5 - 16 (+ FINE) sets the modulator against the note.
+//   DEPTH = phase-modulation index 0 - 10 (+ VELO: how much playing harder adds; the MOD ENV adds more).
+//   FEEDBACK: the deck's output goes through an overdriven op-amp stage (asymmetric soft clip, DRIVE) and a
+//   resonant 2-pole filter (CUTOFF / RESO, LP or BP) and is fed back into the modulator's or the carrier's phase
+//   (INTO switch, PHASE normal / inverted). The filter is in the audio path too, so CUTOFF / RESO sweep audibly,
+//   and with FEEDBACK they become wild resonant sweeps. Phase-domain feedback cannot run away in level.
+// SEKTION B - WARSZAWA (runs at the host rate, aliasing on purpose)
+//   OPERATOR B on a low-bit phase accumulator: PHASE BITS 4 - 16 quantise the phase (16 = smooth, 4 = a
+//   16-step staircase), RATIO / FINE against the note. SELF-FB: a fixed asymmetric loop (the positive half
+//   feeds back harder) from the crushed output back into B's own phase. The B path: operator -> SAMPLE RATE
+//   (hold) -> CRUSH (bits) -> [the self-feedback tap] -> TERMINAL LPF (2-pole) -> out.
+// ROUTING (the CROSS knob is the coupling between the decks, PM or RING):
+//   SERIAL     A modulates B (A's output into B's phase, or B x A)
+//   PARALLEL   both decks mixed; B crosses into A (B into the carrier's phase, or A x B)
+//   RECURSIVE  A -> B and B's output back into A's modulator, through a safety limiter (the loop stays bounded)
+// SOURCE: SYNTH (MIDI voices), AUDIO (the input, mono, IN gain, drives a single always-on voice: it is the
+//   modulator signal of Carrier A - heard carrier-suppressed, so a small DEPTH is a ring modulator and more DEPTH
+//   phase-bends the input - and it replaces Operator B's oscillator in the crush chain, where SELF-FB becomes an
+//   amplitude feedback loop; the carriers follow FREQ, or the last MIDI note held), BOTH (MIDI voices with the
+//   input added to both modulator inputs: the input is heard only through played notes).
+// AMP ADSR + VELO, MOD ENV ADSR with amounts to DEPTH and to the loop CUTOFF, one LFO (RATE, DEPTH; SINE /
+//   TRI / SQR / S&H; to PITCH, DEPTH, CUTOFF, CRUSH or CROSS), A|B balance, POLY (8 voices) / MONO / LEGATO,
+//   GLIDE, BEND range. MIDI: pitch bend, CC1 adds DEPTH, CC64 sustain, CC120 / CC123 all notes off.
+// DRIFT (GFX instrument standard, 0-100 %): the tuning wanders, the modulator and Operator B wander against the
+//   carrier (slow FM beating), the loop cutoff and the terminal LPF wander, the hold clock breathes, and every
+//   note lands slightly differently in tune.
+// DISPLAY: RATIO page (the operator ratios as numbers and bars) or TELEMETRY (the live waveform with clip markers
+//   and the aliasing / step indicator), drawn in the active skin.
+// SKIN: ENAMEL / VFD / MATRIX (the 81 family's three looks; each deck keeps its identity). Saved in a slider.
+// OUTPUT: VOLUME, DRIFT and SAT (the output soft clip is always on).
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-voice.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+// ---------- SEKTION A - BERLIN ----------
+slider1:0<0,3,1{Sine,Saw,Rect,Clip}>-A carrier wave
+slider2:2<0.5,16,0.5>-A mod ratio
+slider3:0<-0.5,0.5,0.001>-A mod fine (ratio)
+slider4:0<0,3,1{Sine,Saw,Rect,Clip}>-A mod wave
+slider5:30<0,100,0.1>-Mod depth (%)
+slider6:40<0,100,1>-Depth velocity (%)
+slider7:0<0,100,0.1>-A feedback (%)
+slider8:18000<40,18000,1>-Loop cutoff (Hz)
+slider9:0<0,100,0.1>-Loop resonance (%)
+slider10:10<0,100,0.1>-Drive (%)
+slider11:0<0,1,1{Modulator,Carrier}>-Feedback into
+slider12:0<0,1,1{LP,BP}>-Loop filter
+slider13:0<0,1,1{Normal,Inverted}>-Loop phase
+// ---------- SEKTION B - WARSZAWA ----------
+slider14:1<0.5,16,0.5>-B ratio
+slider15:0<-0.5,0.5,0.001>-B fine (ratio)
+slider16:16<4,16,1>-B phase bits
+slider17:0<0,100,0.1>-B self-feedback (%)
+slider18:0<0,100,0.1>-Cross (%)
+slider19:0<0,1,1{PM,Ring}>-Cross mode
+slider20:48000<200,48000,1>-Sample rate (Hz)
+slider21:16<2,16,0.1>-Crush (bits)
+slider22:20000<200,20000,1>-Terminal LPF (Hz)
+// ---------- ROUTING / SOURCE ----------
+slider23:1<0,2,1{Serial,Parallel,Recursive}>-Routing
+slider24:0<0,2,1{Synth,Audio,Both}>-Source
+slider25:0<-24,24,0.1>-Input gain (dB)
+slider26:110<20,2000,0.1>-Audio freq (Hz)
+slider27:35<0,100,1>-A|B balance (%)
+// ---------- ENVELOPES / LFO ----------
+slider28:2<0.5,5000,0.1>-Amp attack (ms)
+slider29:400<5,8000,1>-Amp decay (ms)
+slider30:80<0,100,1>-Amp sustain (%)
+slider31:300<5,8000,1>-Amp release (ms)
+slider32:50<0,100,1>-Amp velocity (%)
+slider33:1<0.5,5000,0.1>-Mod env attack (ms)
+slider34:500<5,8000,1>-Mod env decay (ms)
+slider35:30<0,100,1>-Mod env sustain (%)
+slider36:400<5,8000,1>-Mod env release (ms)
+slider37:30<-100,100,1>-Mod env > depth (%)
+slider38:0<-100,100,1>-Mod env > cutoff (%)
+slider39:4<0.05,30,0.01>-LFO rate (Hz)
+slider40:0<0,100,1>-LFO depth (%)
+slider41:0<0,3,1{Sine,Triangle,Square,S&H}>-LFO shape
+slider42:1<0,4,1{Pitch,Depth,Cutoff,Crush,Cross}>-LFO destination
+// ---------- VOICE / MASTER ----------
+slider43:0<0,2,1{Poly,Mono,Legato}>-Voice mode
+slider44:0<0,2000,1>-Glide (ms)
+slider45:2<0,24,1>-Pitch bend range (st)
+slider46:25<0,100,1>-Drift (%)
+slider47:0<-24,6,0.1>-Volume (dB)
+slider48:0<0,16,1>-MIDI channel (0 = omni)
+slider49:0<0,100,1>-Band sat (%)
+slider50:30<0,100,1>-Bias (%)
+slider51:120<40,400,1>-Sat low band (Hz)
+slider52:6000<2000,16000,10>-Sat high band (Hz)
+slider53:-0.3<-24,0,0.1>-Ceiling (dB)
+slider54:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider55:1<0,2,1{Enamel,VFD,Matrix}>-Skin
+slider56:0<0,1,1{Ratio,Telemetry}>-Display page
+slider57:prs_sel=0<0,24,1{No preset,Init,Steelworks Bass,Glass Bells,Data Centre,Tower Block Pad,Radio Interference,Thaw,Cassette Bit,Warsaw Arp,Audio Crusher (FX),Ring Station (FX),Cast Iron Lead,High Voltage Bass,Tubular Bell,Data Stream,Signal Tower Lead,Cooling Tower Drone,Punch Card,Eastern Bloc Brass,Groundworks Sub,Morse Code,Circuit Perc,Two-Way Radio (FX),Voltage Field}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-eb81";                                    // the ? pop-up links to this manual
+ext_noinit = 1;
+fl_ok = 0;
+
+// ---------- memory ----------
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();   // 20000 - 24095
+EBV  = 30000;                                              // 9 voices x 64 slots (voice 8 = the AUDIO voice)
+EBH  = 31000;                                              // held-note stack (128)
+EBQO = 31200; EBQT = 31500; EBQN = 31800; EBQV = 32100;    // note event queue (300 each)
+EBDEF = 32500;                                             // the Init values of sliders 1-47
+EBTMP = 32600;                                             // preset parser scratch (400)
+EBHB = 33100;                                              // half-band decimator ring (64)
+EBBD = 33200;                                              // Warszawa delay ring (32), lines B up with the decimated A
+EBCAP = 33300;                                             // scope capture (256)
+memset(EBV, 0, 9 * 64); memset(EBHB, 0, 64); memset(EBBD, 0, 32); memset(EBCAP, 0, 256);
+eb_i = 0; loop(9, EBV[eb_i * 64] = -1; eb_i += 1; );
+
+// voice slots (p = EBV + 64 * voice):
+//   0 note (-1 free)  1 key held  2 age  3 held by pedal  4 pitch now (st)  5 pitch target  6 velocity 0..1
+//   7 note detune (st)  10 carrier phase  11 modulator phase  12 B phase  13 amp stage (0 idle, 1 att, 2 dec / sus,
+//   3 rel)  14 amp level  15 mod env stage  16 mod env level  17 / 18 loop filter states  19 A feedback (cycles)
+//   20 B output (for the cross into A)  21 B held sample  22 hold clock  23 B crushed (self-feedback tap)
+//   24 / 25 terminal LPF states  26 A out (decimated estimate)  27 B to A (limited, RECURSIVE)  28 last A sample
+//   29 B envelope (limiter)  30 carrier inc (per 2x step)  31 modulator inc  32 B inc  33 depth (cycles)
+//   34 - 36 loop filter coefficients  37 voice gain  38 needs its control values now  39 depth (smoothed)
+
+eb_L12 = log(2) / 12; eb_LN2 = log(2); eb_TAU = 2 * $pi;
+
+// ---------- presets: the Init values, and each preset as "slider:value" changes from Init ----------
+#eb_def = "0 2 0 0 30 40 0 18000 0 10 0 0 0 1 0 16 0 0 0 48000 16 20000 1 0 0 110 35 2 400 80 300 50 1 500 30 400 30 0 4 0 0 1 0 0 2 25 0";
+
+function eb_nums(s, dst) local(i, n, c, len, acc, neg, fr, scl, inn) (
+  n = 0; i = 0; inn = 0; len = strlen(s);
+  loop(len + 1,
+    c = i < len ? str_getchar(s, i) : 32;
+    c >= 48 && c <= 57 ? (
+      !inn ? ( inn = 1; acc = 0; fr = 0; scl = 1; neg = 0; );
+      fr ? ( scl *= 0.1; acc += (c - 48) * scl; ) : acc = acc * 10 + c - 48;
+    ) : c == 46 ? (
+      !inn ? ( inn = 1; acc = 0; scl = 1; neg = 0; ); fr = 1;
+    ) : c == 45 ? (
+      inn = 1; acc = 0; fr = 0; scl = 1; neg = 1;
+    ) : (
+      inn ? ( dst[n] = neg ? -acc : acc; n += 1; inn = 0; );
+    );
+    i += 1;
+  );
+  n;
+);
+eb_nums(#eb_def, EBDEF);
+
+#eb_pm = "Init|Steelworks Bass|Glass Bells|Data Centre|Tower Block Pad|Radio Interference|Thaw|Cassette Bit|Warsaw Arp|Audio Crusher (FX)|Ring Station (FX)|Cast Iron Lead|High Voltage Bass|Tubular Bell|Data Stream|Signal Tower Lead|Cooling Tower Drone|Punch Card|Eastern Bloc Brass|Groundworks Sub|Morse Code|Circuit Perc|Two-Way Radio (FX)|Voltage Field";
+function eb_pstr(p) (
+  p == 2  ? "1:0 4:1 2:1 5:42 6:30 7:38 8:900 9:55 10:55 37:55 33:0.5 34:180 35:10 14:0.5 16:6 18:12 19:1 27:28 28:0.5 29:450 30:70 31:120 43:1 44:25 47:-1.8" :
+  p == 3  ? "1:0 4:0 2:3.5 3:0.012 5:40 6:50 37:60 33:0.5 34:1600 35:0 36:2000 14:7 16:12 27:38 22:12000 28:0.5 29:3200 30:0 31:2600 47:-1.9" :
+  p == 4  ? "1:3 2:4 5:35 14:2 16:5 17:40 18:30 19:0 20:6000 21:6 23:2 27:70 28:0.5 29:220 30:0 31:180 34:120 35:0 37:40 47:-3" :
+  p == 5  ? "1:1 4:0 2:1 3:0.004 5:22 6:20 7:22 8:2600 9:30 10:15 37:15 33:600 34:2000 35:50 14:2 15:0.003 16:10 27:40 22:4500 28:900 29:2000 30:85 31:2600 39:0.18 40:30 42:2 47:-2.1" :
+  p == 6  ? "1:0 2:3 5:30 14:5 15:0.07 16:4 17:60 18:55 19:0 20:3000 23:2 27:55 39:6 40:60 41:3 42:4 28:5 29:800 30:90 31:500 47:-3.6" :
+  p == 7  ? "1:0 4:0 2:0.5 5:35 7:30 8:1200 9:70 12:1 37:0 14:1 15:0.006 16:14 27:25 28:2000 29:3000 30:100 31:4000 39:0.1 40:45 41:1 42:1 47:-1.5" :
+  p == 8  ? "1:0 4:0 2:1 5:20 6:40 37:25 34:700 35:20 14:1 16:8 20:11025 21:8 22:6000 27:60 28:1 29:1200 30:40 31:500 46:70 47:-1.6" :
+  p == 9  ? "1:0 4:0 2:2 5:28 6:50 37:80 33:0.5 34:150 35:0 14:4 16:7 18:30 19:1 20:16000 27:50 28:0.5 29:220 30:0 31:150 47:-3.8" :
+  p == 10 ? "24:1 27:100 17:20 20:8000 21:7 22:9000 25:0 5:0 47:-2" :
+  p == 11 ? "24:1 26:440 27:0 1:0 5:4 6:0 37:0 10:20 47:-2" :
+  p == 12 ? "1:1 4:0 2:1 5:30 7:45 8:3000 9:40 10:60 37:20 14:2 16:12 27:20 28:3 29:600 30:85 31:250 39:5.5 40:12 42:0 43:2 44:60 47:-0.4" :
+  p == 13 ? "1:3 4:2 2:2 5:55 6:30 7:60 8:600 9:75 10:80 11:1 12:1 37:40 34:300 35:20 14:1 16:8 27:20 28:0.5 29:600 30:60 31:120 43:1 44:15 47:-2.4" :
+  p == 14 ? "1:0 4:0 2:1.5 3:-0.09 5:48 6:40 37:55 33:0.5 34:2500 35:0 36:3000 14:3.5 16:16 27:35 28:0.5 29:4500 30:0 31:3500 47:-1.7" :
+  p == 15 ? "1:0 2:2 5:25 14:3 16:4 17:70 18:40 19:0 20:2500 22:3000 23:2 27:65 39:8 40:50 41:3 42:3 28:400 29:1000 30:100 31:1500 47:-2.6" :
+  p == 16 ? "1:0 4:0 2:3 5:24 6:40 14:2 15:0.01 16:9 18:20 19:0 23:0 27:40 28:4 29:800 30:80 31:300 39:5 40:10 42:0 43:2 44:40 47:-2.4" :
+  p == 17 ? "1:0 4:2 2:0.5 5:60 7:70 8:400 9:85 37:0 14:0.5 16:10 27:15 28:3000 29:4000 30:100 31:5000 39:0.07 40:60 41:1 42:2 47:-0.9" :
+  p == 18 ? "1:0 2:1 5:10 14:2 16:4 17:30 21:5 20:9000 27:85 28:0.5 29:120 30:0 31:110 38:50 37:0 34:100 35:0 47:3.4" :
+  p == 19 ? "1:1 4:0 2:1 5:35 6:40 7:25 8:2500 9:25 10:30 37:40 33:60 34:400 35:40 14:1 16:16 27:25 28:30 29:600 30:80 31:250 47:-1.5" :
+  p == 20 ? "1:0 4:0 2:1 5:10 6:30 10:30 37:20 34:200 35:0 14:0.5 16:16 27:10 28:0.5 29:500 30:90 31:100 43:1 44:10 47:-1.6" :
+  p == 21 ? "1:0 4:0 2:7 5:30 6:40 37:50 34:120 35:0 14:4 16:6 18:20 19:1 27:55 28:0.5 29:160 30:0 31:180 47:-2.2" :
+  p == 22 ? "1:0 4:1 2:5.5 3:0.13 5:70 6:40 7:80 8:3000 9:80 12:1 37:60 33:0.5 34:60 35:0 14:3 16:6 27:30 28:0.5 29:140 30:0 31:120 47:2.1" :
+  p == 23 ? "24:2 25:6 5:40 6:20 1:0 4:0 2:1 37:20 16:10 21:8 27:50 28:5 29:800 30:90 31:300 47:-4" :
+  p == 24 ? "1:0 2:2.5 5:45 7:60 8:2000 9:60 14:1.5 16:6 17:60 18:100 19:0 23:2 27:50 28:800 29:2000 30:100 31:2500 47:-2.9" :
+  "";
+);
+function load_preset(p) local(n, i) (
+  eb_panic = 1;                                            // (first: the audio thread holds the old sound until it has faded)
+  i = 0; loop(47, slider(i + 1) = EBDEF[i]; i += 1; );
+  n = eb_nums(eb_pstr(p), EBTMP);
+  i = 0; loop(floor(n / 2), EBTMP[i * 2] >= 1 && EBTMP[i * 2] <= 47 ? slider(EBTMP[i * 2]) = EBTMP[i * 2 + 1]; i += 1; );
+  i = 1; loop(47, ui_auto(i); i += 1; );
+  pr_cur = p; eb_panic = 1;
+);
+
+// ---------- waves (phase in cycles) ----------
+function eb_wave(w, ph) local(sn, cs, s2, c2) (
+  w == 0 ? sin(6.283185307 * ph) :
+  w == 1 ? (                                                   // saw from its first four harmonics (no hard edge to alias)
+    sn = sin(6.283185307 * ph); cs = cos(6.283185307 * ph);
+    s2 = 2 * sn * cs; c2 = 1 - 2 * sn * sn;
+    (sn + 0.5 * s2 + 0.3333333 * sn * (3 - 4 * sn * sn) + 0.25 * 2 * s2 * c2) * 0.6547600;
+  ) :
+  w == 2 ? (abs(sin(3.141592654 * ph)) - 0.6366198) * 1.6 :  // full-wave rectified sine
+  vo_tanh(2.2 * sin(6.283185307 * ph)) * 1.0249;              // hard-driven, clipped sine
+);
+
+// ---------- voices ----------
+function eb_vrel(p) ( p[1] = 0; p[3] = 0; p[13] > 0 ? p[13] = 3; p[15] > 0 ? p[15] = 3; );
+function eb_vstart(p, n, v, retrig, from) (
+  p[13] == 0 ? (
+    // a fresh voice: free-running phases (chords never line up into one big peak), clean loop and crush states
+    p[10] = rand(1); p[11] = rand(1); p[12] = rand(1); p[14] = 0; p[16] = 0;
+    p[17] = p[18] = p[19] = p[20] = p[21] = p[23] = p[24] = p[25] = p[26] = p[27] = p[28] = p[29] = 0; p[22] = 1; p[39] = -1;
+    p[4] = from;
+  );
+  eb_gc >= 1 ? p[4] = n;
+  p[0] = n; p[1] = 1; p[3] = 0; p[5] = n; p[6] = v / 127;
+  retrig || p[13] == 0 || p[13] == 3 ? (
+    p[7] = log(ins_note_detune()) / eb_LN2 * 12;
+    p[13] = 1; p[15] = 1;
+  );
+  p[38] = 1;
+);
+function eb_alloc() local(i, p, best, ba) (
+  best = -1;
+  i = 0; loop(8, p = EBV + i * 64; p[13] == 0 && (best < 0 || p[2] < ba) ? ( best = i; ba = p[2]; ); i += 1; );
+  best < 0 ? ( i = 0; loop(8, p = EBV + i * 64; !p[1] && (best < 0 || p[2] < ba) ? ( best = i; ba = p[2]; ); i += 1; ); );
+  best < 0 ? ( i = 0; loop(8, p = EBV + i * 64; best < 0 || p[2] < ba ? ( best = i; ba = p[2]; ); i += 1; ); );
+  EBV + best * 64;
+);
+function eb_hpush(n) local(i, f) (
+  f = -1; i = 0; loop(eb_hc, EBH[i] == n ? f = i; i += 1; );
+  f >= 0 ? ( i = f; loop(eb_hc - f - 1, EBH[i] = EBH[i + 1]; i += 1; ); eb_hc -= 1; );
+  eb_hc < 127 ? ( EBH[eb_hc] = n; eb_hc += 1; );
+);
+function eb_hpop(n) local(i, f) (
+  f = -1; i = 0; loop(eb_hc, EBH[i] == n ? f = i; i += 1; );
+  f >= 0 ? ( i = f; loop(eb_hc - f - 1, EBH[i] = EBH[i + 1]; i += 1; ); eb_hc -= 1; );
+  f >= 0;
+);
+function eb_note_on(n, v) local(i, p, held, from) (
+  held = eb_hc > 0;
+  eb_hpush(n);
+  eb_src != 1 ? (
+    eb_mode == 0 ? (
+      i = 0; loop(8, p = EBV + i * 64; p[0] == n && p[1] ? eb_vrel(p); i += 1; );
+      from = eb_last >= 0 && eb_glide > 0 ? eb_last : n;
+      p = eb_alloc(); eb_age += 1; p[2] = eb_age;
+      eb_vstart(p, n, v, 1, from);
+    ) : (
+      p = EBV; eb_age += 1; p[2] = eb_age;
+      eb_vstart(p, n, v, !(held && eb_mode == 2), p[13] > 0 ? p[4] : (eb_last >= 0 && eb_glide > 0 ? eb_last : n));
+    );
+  );
+  eb_last = n; eb_lastf = 440 * 2 ^ ((n - 69) / 12);
+);
+function eb_note_off(n) local(i, p, had) (
+  had = eb_hpop(n);
+  eb_mode == 0 ? (
+    i = 0; loop(8, p = EBV + i * 64; p[0] == n && p[1] ? ( eb_pedal ? p[3] = 1 : eb_vrel(p); ); i += 1; );
+  ) : had ? (
+    p = EBV;
+    eb_hc > 0 ? ( p[0] = EBH[eb_hc - 1]; p[5] = p[0]; eb_gc >= 1 ? p[4] = p[0]; )      // back to the note still held
+              : ( eb_pedal ? p[3] = 1 : eb_vrel(p); );
+  );
+);
+function eb_all_off() local(i, p) (
+  i = 0; loop(8, p = EBV + i * 64; p[1] ? eb_vrel(p); p[0] = -1; i += 1; );
+  eb_hc = 0;
+);
+function eb_pedal_up() local(i, p) ( i = 0; loop(8, p = EBV + i * 64; p[3] ? eb_vrel(p); i += 1; ); );
+function eb_qpush(ofs, t, n, v) local(i) (
+  eb_qc < 300 ? (
+    i = eb_qc; while (i > 0 && EBQO[i - 1] > ofs) ( EBQO[i] = EBQO[i - 1]; EBQT[i] = EBQT[i - 1]; EBQN[i] = EBQN[i - 1]; EBQV[i] = EBQV[i - 1]; i -= 1; );
+    EBQO[i] = ofs; EBQT[i] = t; EBQN[i] = n; EBQV[i] = v; eb_qc += 1;
+  );
+);
+
+// half-band decimator (55 taps, Kaiser): x[n] is the newest 2x sample
+function eb_hb(j) ( EBHB[(eb_hw - j) & 63]; );
+function eb_decim() (
+  0.4999981 * eb_hb(27)
+  + 0.3164612056 * (eb_hb(26) + eb_hb(28)) - 0.1006737700 * (eb_hb(24) + eb_hb(30))
+  + 0.0549772033 * (eb_hb(22) + eb_hb(32)) - 0.0340332202 * (eb_hb(20) + eb_hb(34))
+  + 0.0217907704 * (eb_hb(18) + eb_hb(36)) - 0.0138908563 * (eb_hb(16) + eb_hb(38))
+  + 0.0086223983 * (eb_hb(14) + eb_hb(40)) - 0.0051233702 * (eb_hb(12) + eb_hb(42))
+  + 0.0028654696 * (eb_hb(10) + eb_hb(44)) - 0.0014778311 * (eb_hb(8)  + eb_hb(46))
+  + 0.0006820495 * (eb_hb(6)  + eb_hb(48)) - 0.0002672723 * (eb_hb(4)  + eb_hb(50))
+  + 0.0000789506 * (eb_hb(2)  + eb_hb(52)) - 0.0000107803 * (eb_hb(0)  + eb_hb(54));
+);
+
+// ---------- parameters ----------
+function eb_c8(c) ( 1 - (1 - c) ^ 8; );
+function update() local(d) (
+  eb_cw = slider1; eb_mw = slider4;
+  eb_ra0 = max(slider2 + slider3, 0.05);
+  d = slider5 / 100; eb_idx = 10 * d ^ 1.6; eb_dv = slider6 / 100;
+  eb_fba = 0.55 * (slider7 / 100) ^ 1.2;
+  eb_cut = slider8; eb_res = slider9 / 100; eb_k = 2 - 1.97 * fl_rs; eb_bpg = 1.4 * sqrt(eb_k);   // (RESO: its glide, fl_rs)
+  d = slider10 / 100; eb_dg = 0.5 + 9 * d * d; eb_db = 0.35 * d; eb_dbt = vo_tanh(eb_db); eb_dn = 1 / vo_tanh(eb_dg);
+  eb_into = slider11; eb_bp = slider12; eb_pol = slider13 ? -1 : 1;
+  eb_rb0 = max(slider14 + slider15, 0.05);
+  eb_bits = slider16;
+  eb_fbb = 0.5 * (slider17 / 100) ^ 1.2; eb_fbba = 0.85 * slider17 / 100;
+  eb_cr0 = slider18 / 100; eb_xm = slider19;
+  eb_rate0 = slider20; eb_crb0 = slider21; eb_lpf0 = slider22;
+  eb_rt = slider23; eb_src = slider24; eb_ing = 10 ^ (slider25 / 20); eb_ffix = slider26;
+  d = slider27 / 100; eb_ga = min(1, 2 * (1 - d)); eb_gb = min(1, 2 * d);
+  eb_aa = vo_coef(slider28); eb_ad = vo_coef(slider29); eb_as = slider30 / 100; eb_ar = vo_coef(slider31); eb_av = slider32 / 100;
+  eb_ma8 = eb_c8(vo_coef(slider33)); eb_md8 = eb_c8(vo_coef(slider34)); eb_ms = slider35 / 100; eb_mr8 = eb_c8(vo_coef(slider36));
+  eb_mea = slider37 / 100; eb_mec = slider38 / 100;
+  eb_lr = slider39; eb_ldp = slider40 / 100; eb_lsh = slider41; eb_lds = slider42;
+  eb_mode = slider43; eb_glide = slider44; eb_gc = slider44 > 0 ? eb_c8(vo_coef(slider44)) : 1;
+  eb_brng = slider45;
+  eb_drift = slider46 / 100; eb_volt = 10 ^ (slider47 / 20); eb_chan = slider48;
+  eb_sr2 = 2 * srate; eb_i2s = 1 / eb_sr2; eb_fmax2 = srate * 0.9;
+  ins_output_setup(49);   // output stage: CLIP, always on
+);
+
+ins_drift_init();
+eb_bend = 0; eb_mwh = 0; eb_pedal = 0; eb_hc = 0; eb_age = 0; eb_last = -1; eb_lastf = 220; eb_qc = 0;
+eb_ct = 0; eb_lph = 0; eb_lsv = 0; eb_lv = 0; eb_hw = 0; eb_bw = 0; eb_audg = 0; eb_lastsrc = -1; eb_lastmode = -1;
+eb_dcxl = eb_dcyl = eb_dcxr = eb_dcyr = 0; eb_dqxl = eb_dqyl = eb_dqxr = eb_dqyr = 0; eb_ain = eb_aprev = 0; eb_ci = 256; eb_cdc = 0; eb_cfree = 0; eb_cdec = 2;
+eb_sprev = 0; eb_hfa = eb_hfb = 0; eb_hfm = 0; eb_clipf = 0; eb_pk = 0; eb_tlast = 0;
+eb_pg = eb_pgt = 1;
+eb_pcf = 0; eb_pck = eb_pcg = 1;
+// a preset loaded while voices sound: the old sound fades out (12 ms), the new preset applies at the silent
+// point (where the released notes end) and the output fades back in (12 ms): no click
+// notes played during the fade wait for its silent point (they start with the new sound)
+EBPC = 33600; eb_pcn = 0;                                    // (32 pairs: note, velocity)
+function eb_pchold(n, v) ( eb_pcn < 32 ? ( EBPC[eb_pcn * 2] = n; EBPC[eb_pcn * 2 + 1] = v; eb_pcn += 1; ); );
+function eb_pcunhold(n) local(i, j) (
+  i = j = 0; loop(eb_pcn, EBPC[i * 2] != n ? ( EBPC[j * 2] = EBPC[i * 2]; EBPC[j * 2 + 1] = EBPC[i * 2 + 1]; j += 1; ); i += 1; ); eb_pcn = j;
+);
+function eb_pcapply() local(i, p) (
+  i = 0; loop(8, p = EBV + i * 64; p[13] == 3 ? ( p[13] = 0; p[15] = 0; p[14] = 0; p[0] = -1; ); i += 1; );   // the released notes end here
+  update(); eb_lastmode = eb_mode; eb_lastsrc = eb_src; eb_pcf = 0;
+  i = 0; loop(eb_pcn, eb_note_on(EBPC[i * 2], EBPC[i * 2 + 1]); i += 1; ); eb_pcn = 0;
+);
+// everything that depends on the sample rate (run again from @block if the rate changes: ext_noinit keeps @init
+// from running then)
+function eb_srinit() (
+  eb_sr = srate;
+  eb_sm = 1 - exp(-1 / (0.03 * srate)); eb_pgs = 1 - exp(-1 / (0.06 * srate));
+  eb_ags = 1 - exp(-1 / (0.02 * srate));
+  ost_init(20000);
+);
+eb_srinit();
+!ui_dflt ? ( ui_sz = 2; pr_cur = 1; );                     // a new instance opens Large, on Init
+update();
+eb_vol = eb_volt;
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 24 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(24, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+!eb_panic && !eb_pcf ? update();
+
+@block
+prs_chk();
+srate != eb_sr ? eb_srinit();
+eb_treq > 0 && eb_treq != eb_tql ? ( load_preset(eb_treq); eb_tql = eb_treq; );     // test hook: a preset asked for from outside the panel
+eb_pcr = 1 / (0.012 * srate);
+eb_panic && !eb_pcf ? ( eb_i = 0; loop(9, EBV[eb_i * 64 + 13] > 0 ? eb_pcf = 1; eb_i += 1; ); );   // sounding: fade first
+!eb_pcf ? update();
+
+eb_qc = 0;
+eb_mode != eb_lastmode ? ( eb_qpush(0, 3, 0, 0); eb_lastmode = eb_mode; );
+eb_src != eb_lastsrc ? ( eb_src == 1 ? eb_qpush(0, 3, 0, 0); eb_lastsrc = eb_src; );
+eb_tnote != eb_tlast ? ( eb_tnote > 0 ? eb_qpush(0, 1, eb_tnote, 100) : eb_qpush(0, 0, eb_tlast, 0); eb_tlast = eb_tnote; );   // test hook
+while (midirecv(mofs, m1, m2, m3)) (
+  ins_chan_ok(m1, eb_chan) ? (
+    eb_st = m1 & 0xF0;
+    eb_st == 0x90 || eb_st == 0x80 ? (
+      eb_qpush(mofs, eb_st == 0x90 && m3 > 0, m2, m3);
+      eb_st == 0x90 && m3 > 0 ? ins_midi_hit();
+    ) :
+    eb_st == 0xE0 ? eb_bend = (((m3 * 128 + m2) - 8192) / 8192) * eb_brng :
+    eb_st == 0xB0 ? (
+      m2 == 1 ? eb_mwh = m3 / 127 :
+      m2 == 64 ? ( eb_pedal = m3 >= 64; !eb_pedal ? eb_qpush(mofs, 2, 0, 0); ) :
+      m2 == 123 || m2 == 120 ? eb_qpush(mofs, 3, 0, 0);
+    );
+  );
+);
+// transport stop: release whatever is still held (as an all-notes-off would; a safety net if the stop's note-offs go missing)
+gfx_pst = play_state == 1 || play_state == 5;
+gfx_pst_prev && !gfx_pst ? ( eb_qpush(0, 3, 0, 0); );
+gfx_pst_prev = gfx_pst;
+eb_panic ? ( eb_all_off(); eb_panic = 0; );                // (with a fade running, the update waits for its silent point)
+// the AUDIO voice: always on in AUDIO
+eb_pa = EBV + 8 * 64;
+eb_src == 1 && eb_pa[13] == 0 ? (
+  memset(eb_pa, 0, 64); eb_pa[0] = 0; eb_pa[13] = 2; eb_pa[22] = 1; eb_pa[6] = 1; eb_pa[38] = 1; eb_pa[14] = 1;
+);
+eb_eqi = 0; eb_spos = 0;
+
+ins_drift_block(eb_drift, samplesblock);
+eb_dps = 12 * log(ins_pitch) / eb_LN2;
+
+// the scope's time base: about three cycles of the note in 256 points
+eb_cdec = max(1, min(48, floor(3 * srate / max(eb_src == 1 && eb_hc == 0 ? eb_ffix : eb_lastf, 20) / 256 + 0.5)));
+// telemetry: how much of the signal is in its steps (mean |difference| / mean |level|)
+eb_hfb > 0.0001 ? eb_hfm += (min(eb_hfa / eb_hfb, 2) - eb_hfm) * 0.25 : eb_hfm *= 0.8;
+eb_hfa = eb_hfb = 0;
+abs(eb_dcyl) + abs(eb_dcyr) + abs(eb_dqyl) + abs(eb_dqyr) < 0.0000000001 ? eb_dcyl = eb_dcyr = eb_dqyl = eb_dqyr = 0;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@sample
+while (eb_eqi < eb_qc && (EBQO[eb_eqi] <= eb_spos || eb_spos >= samplesblock - 1)) (   // (an event stamped at / past the block end: handled at its last sample)
+  eb_et = EBQT[eb_eqi];
+  eb_et == 1 ? ( eb_pcf ? eb_pchold(EBQN[eb_eqi], EBQV[eb_eqi]) : eb_note_on(EBQN[eb_eqi], EBQV[eb_eqi]); ) : eb_et == 0 ? ( eb_pcunhold(EBQN[eb_eqi]); eb_note_off(EBQN[eb_eqi]); ) : eb_et == 2 ? eb_pedal_up() : ( eb_pcn = 0; eb_all_off(); );
+  eb_eqi += 1;
+);
+eb_spos += 1;
+eb_pcf ? ( eb_pck -= eb_pcr; eb_pck <= 0 ? ( eb_pck = 0; eb_pcapply(); ); eb_pcg = 0.5 - 0.5 * cos($pi * eb_pck); ) :
+eb_pck < 1 ? ( eb_pck = min(eb_pck + eb_pcr, 1); eb_pcg = 0.5 - 0.5 * cos($pi * eb_pck); );
+
+// ---------- input ----------
+eb_aprev = eb_ain;
+eb_ain = eb_src ? (spl0 + spl1) * 0.5 * eb_ing : 0;
+eb_aim = 0.5 * (eb_ain + eb_aprev);                       // the 2x step in between
+eb_audg += ((eb_src == 1) - eb_audg) * eb_ags;
+
+// ---------- control rate (every 8 samples): LFO, crush clock, filter ----------
+eb_ct += 1;
+eb_tick = eb_ct >= 8;
+eb_tick ? (
+  eb_ct = 0;
+  // the loop filter's CUTOFF (two 15 ms stages), RESO and the mod env's depth to it glide, so a turned knob never steps
+  fl_k = 1 - exp(-8 / (0.015 * srate));
+  !fl_ok ? ( fl_c1 = fl_c2 = log(eb_cut); fl_rs = eb_res; fl_ev = eb_mec; fl_ok = 1; );
+  fl_c1 += (log(eb_cut) - fl_c1) * fl_k; fl_c2 += (fl_c1 - fl_c2) * fl_k; fl_rs += (eb_res - fl_rs) * fl_k; fl_ev += (eb_mec - fl_ev) * fl_k;
+  eb_k = 2 - 1.97 * fl_rs; eb_bpg = 1.4 * sqrt(eb_k);
+  eb_lph += eb_lr * 8 / srate; eb_lph >= 1 ? ( eb_lph -= floor(eb_lph); eb_lsv = rand(2) - 1; );
+  eb_lv = eb_lsh == 0 ? sin(eb_TAU * eb_lph) : eb_lsh == 1 ? 1 - 4 * abs(eb_lph - 0.5) : eb_lsh == 2 ? (eb_lph < 0.5 ? 1 : -1) : eb_lsv;
+  eb_lu = 0.5 + 0.5 * eb_lv;
+  eb_pmod = eb_bend + eb_dps + (eb_lds == 0 ? eb_lv * 2 * eb_ldp * eb_ldp : 0);
+  eb_lidx = eb_lds == 1 ? eb_lv * 6 * eb_ldp : 0;
+  eb_lcut = eb_lds == 2 ? eb_lv * 4 * eb_ldp : 0;
+  eb_cr = min(max(eb_cr0 + (eb_lds == 4 ? eb_lu * eb_ldp : 0), 0), 1);
+  eb_xc = 0.5 * eb_cr ^ 1.3;                              // cross as phase (cycles)
+  eb_xr = eb_cr;                                          // cross as ring
+  // B crush chain
+  eb_cb = eb_crb0 - (eb_lds == 3 ? eb_lu * eb_ldp * 8 : 0);
+  eb_crush = eb_cb < 15.95; eb_cst = 2 ^ (max(eb_cb, 1.5) - 1); eb_icst = 1 / eb_cst;
+  eb_rr = eb_rate0 * (eb_lds == 3 ? 2 ^ (-eb_lu * eb_ldp * 3) : 1) * (1 + 0.04 * ins_fx);
+  eb_shr = eb_rate0 >= 47999 && !(eb_lds == 3 && eb_ldp > 0) ? 1 : min(eb_rr / srate, 1);
+  eb_N = 2 ^ eb_bits; eb_iN = 1 / eb_N;
+  eb_lg = tan($pi * min(max(eb_lpf0 * 2 ^ (ins_tone * 0.5), 30), srate * 0.45) / srate); eb_lG = eb_lg / (1 + eb_lg);
+  eb_lpon = eb_lpf0 < 19999;
+  eb_ra = eb_ra0 * 2 ^ (ins_aux * 0.3 / 12);
+  eb_rb = eb_rb0 * 2 ^ (-ins_aux * 0.3 / 12);
+  eb_nact = 0; eb_i = 0; loop(8, eb_nact += min(EBV[eb_i * 64 + 14] * 4, 1); eb_i += 1; );
+  eb_pgt = 1 / sqrt(1 + 0.3 * max(eb_nact - 1, 0));
+);
+
+// ---------- the voices ----------
+eb_A0 = eb_A1 = eb_B = 0;
+eb_p = EBV;
+eb_v = 0;
+loop(9,
+  eb_p[13] > 0 && (eb_v < 8 ? eb_src != 1 : 1) ? (
+    eb_isa = eb_v == 8;
+    (eb_tick || eb_p[38]) ? (
+      eb_p[38] = 0;
+      eb_p[4] += (eb_p[5] - eb_p[4]) * eb_gc;
+      // mod env (control rate)
+      eb_m = eb_p[16];
+      eb_p[15] == 1 ? ( eb_m += (1.3 - eb_m) * eb_ma8; eb_m >= 1 ? ( eb_m = 1; eb_p[15] = 2; ); ) :
+      eb_p[15] == 2 ? eb_m += (eb_ms - eb_m) * eb_md8 :
+      eb_p[15] == 3 ? eb_m -= eb_m * eb_mr8;
+      eb_p[16] = eb_m;
+      eb_isa ? ( eb_m = 0; eb_vel = 1;
+                 eb_f = (eb_hc > 0 ? 440 * exp((EBH[eb_hc - 1] - 69) * eb_L12) : eb_ffix) * exp(eb_pmod * eb_L12); )
+             : ( eb_vel = eb_p[6]; eb_f = 440 * exp((eb_p[4] + eb_p[7] + eb_pmod - 69) * eb_L12); );
+      eb_p[30] = min(eb_f * eb_i2s, 0.45);
+      eb_p[31] = min(eb_f * eb_ra * eb_i2s, 0.49);
+      eb_p[32] = min(eb_f * eb_rb / srate, 0.49);
+      eb_d = eb_idx * (1 - eb_dv + eb_dv * eb_vel) + eb_m * eb_mea * 10 + eb_lidx + eb_mwh * 4;
+      eb_p[33] = min(max(eb_d, 0), 14) / eb_TAU; eb_p[39] < 0 ? eb_p[39] = eb_p[33];
+      eb_o = eb_m * fl_ev * 6 + eb_lcut + ins_cut;
+      eb_g = tan($pi * min(max(exp(fl_c2 + eb_o * eb_LN2), 25), eb_fmax2) * eb_i2s);
+      eb_p[34] = 1 / (1 + eb_g * (eb_g + eb_k)); eb_p[35] = eb_g * eb_p[34]; eb_p[36] = eb_g * eb_p[35];
+      eb_p[37] = eb_isa ? 1 : 0.38 * (1 - eb_av + eb_av * eb_vel);
+    );
+
+    // ----- SEKTION A: two steps at 2x (the voice's state held in registers for the sample) -----
+    eb_bh = eb_p[20]; eb_fv = eb_p[19]; eb_yl = eb_p[28]; eb_s1 = eb_p[17]; eb_s2 = eb_p[18];
+    eb_c1 = eb_p[34]; eb_c2 = eb_p[35]; eb_c3 = eb_p[36];
+    eb_pc = eb_p[10]; eb_pm = eb_p[11]; eb_ic = eb_p[30]; eb_im = eb_p[31];
+    eb_xpm = eb_rt > 0 && !eb_xm ? eb_xc * eb_bh : 0;                       // B into the carrier's phase
+    eb_rf  = eb_rt > 0 && eb_xm ? 1 - 0.9 * eb_xr + 0.9 * eb_xr * eb_bh * 1.3 : 1;   // A x B (a 10 % leak: never locks at zero)
+    eb_rec = eb_rt == 2 ? eb_xc * eb_p[27] : 0;                             // B back into the modulator
+    eb_dc = eb_p[39] += (eb_p[33] - eb_p[39]) * 0.2;                       // the depth, de-zippered
+    eb_j = 0;
+    loop(2,
+      eb_x = eb_j ? eb_ain : eb_aim;
+      eb_pc += eb_ic; eb_pc >= 1 ? eb_pc -= 1;
+      eb_isa ? (
+        // the input is the modulator; the bare carrier is taken away (small DEPTH = ring modulation)
+        eb_ph = eb_pc + eb_fv + eb_xpm;
+        eb_c = (eb_wave(eb_cw, eb_ph + (eb_dc + 0.03) * eb_x) - eb_wave(eb_cw, eb_ph)) / min(eb_dc * eb_TAU + 0.19, 1.5);
+      ) : (
+        eb_pm += eb_im; eb_pm >= 1 ? eb_pm -= 1;
+        eb_mv = eb_wave(eb_mw, eb_pm + (eb_into ? 0 : eb_fv) + eb_rec);
+        eb_src == 2 ? eb_mv += eb_x;
+        eb_c = eb_wave(eb_cw, eb_pc + eb_dc * eb_mv + (eb_into ? eb_fv : 0) + eb_xpm);
+      );
+      eb_c *= eb_rf;
+      // the over-driven op-amp (asymmetric) and the resonant 2-pole loop filter
+      eb_c = (vo_tanh(eb_dg * eb_c + eb_db) - eb_dbt) * eb_dn;
+      eb_v3 = eb_c - eb_s2; eb_v1 = eb_c1 * eb_s1 + eb_c2 * eb_v3; eb_v2 = eb_s2 + eb_c2 * eb_s1 + eb_c3 * eb_v3;
+      eb_s1 = 2 * eb_v1 - eb_s1; eb_s2 = 2 * eb_v2 - eb_s2;
+      eb_y = eb_bp ? eb_v1 * eb_bpg : eb_v2;
+      eb_e = abs(eb_y); eb_e > 1 ? eb_y = sign(eb_y) * (1 + 0.5 * vo_tanh((eb_e - 1) * 2));   // linear to full scale, then a soft ceiling at 1.5
+      eb_fv = (eb_y + eb_yl) * 0.5 * eb_fba * eb_pol;                         // into the phase next step
+      eb_yl = eb_y;
+      eb_j ? eb_y1 = eb_y : eb_y0 = eb_y;
+      eb_j += 1;
+    );
+    abs(eb_s1) > 6 ? eb_s1 = vo_tanh(eb_s1 / 6) * 6;
+    eb_p[10] = eb_pc; eb_p[11] = eb_pm; eb_p[17] = eb_s1; eb_p[18] = eb_s2; eb_p[19] = eb_fv; eb_p[28] = eb_yl;
+    eb_ad2 = 0.5 * (eb_y0 + eb_y1);
+
+    // ----- amp -----
+    eb_isa ? ( eb_a = eb_audg; eb_audg < 0.00002 && eb_src != 1 ? ( eb_p[13] = 0; eb_a = 0; ); ) : (
+      eb_a = eb_p[14];
+      eb_p[13] == 1 ? ( eb_a += (1.3 - eb_a) * eb_aa; eb_a >= 1 ? ( eb_a = 1; eb_p[13] = 2; ); ) :
+      eb_p[13] == 2 ? eb_a += (eb_as - eb_a) * eb_ad :
+      ( eb_a -= eb_a * eb_ar; eb_a < 0.00002 ? ( eb_a = 0; eb_p[13] = 0; eb_p[15] = 0; eb_p[0] = -1; ); );
+      eb_p[14] = eb_a;
+    );
+    eb_a *= eb_p[37];
+
+    // ----- SEKTION B: the low-bit operator and its crush chain -----
+    eb_pb = eb_p[12] + eb_p[32]; eb_pb >= 1 ? eb_pb -= 1; eb_p[12] = eb_pb;
+    eb_s = eb_p[23]; eb_s < 0 ? eb_s *= 0.4;                                  // the fixed asymmetric loop
+    eb_isa ? (
+      eb_br = vo_tanh(eb_ain + eb_fbba * eb_s * 1.6);
+      eb_rt != 1 && !eb_xm ? eb_br += eb_xc * 2 * eb_ad2;
+    ) : (
+      eb_q = eb_pb + eb_fbb * eb_s + (eb_rt != 1 && !eb_xm ? eb_xc * eb_ad2 : 0);
+      eb_q -= floor(eb_q); eb_q = floor(eb_q * eb_N) * eb_iN;
+      eb_br = sin(eb_TAU * eb_q);
+      eb_src == 2 ? eb_br += eb_ain;
+    );
+    eb_rt != 1 && eb_xm ? eb_br *= 1 - 0.9 * eb_xr + 0.9 * eb_xr * eb_ad2 * 1.3;
+    eb_hc2 = eb_p[22] + eb_shr;
+    eb_hc2 >= 1 ? (
+      eb_hc2 -= floor(eb_hc2);
+      eb_bc = eb_crush ? floor(eb_br * eb_cst + 0.5) * eb_icst : eb_br;
+      eb_p[21] = eb_bc;
+    ) : eb_bc = eb_p[21];
+    eb_p[22] = eb_hc2; eb_p[23] = eb_bc;
+    eb_lpon ? (
+      eb_s1 = eb_p[24]; eb_s2 = eb_p[25];
+      eb_u = (eb_bc - eb_s1) * eb_lG; eb_bo = eb_u + eb_s1; eb_s1 = eb_bo + eb_u;
+      eb_u = (eb_bo - eb_s2) * eb_lG; eb_bo = eb_u + eb_s2; eb_s2 = eb_bo + eb_u;
+      eb_p[24] = eb_s1; eb_p[25] = eb_s2;
+    ) : eb_bo = eb_bc;
+    eb_p[20] = eb_bo;
+    // RECURSIVE: B back into A, through a limiter that keeps the loop gain in hand
+    eb_rt == 2 ? (
+      eb_e = max(abs(eb_bo), eb_p[29] * 0.9995); eb_p[29] = eb_e;
+      eb_p[27] = eb_bo / (1 + max(eb_e - 0.7, 0) * 3);
+    );
+
+    eb_A0 += eb_y0 * eb_a; eb_A1 += eb_y1 * eb_a; eb_B += eb_bo * eb_a;
+  );
+  eb_p += 64; eb_v += 1;
+);
+
+// ---------- mix: A decimated, B lined up with it ----------
+EBHB[eb_hw] = eb_A0; eb_hw = (eb_hw + 1) & 63;
+EBHB[eb_hw] = eb_A1;
+eb_Ao = eb_decim();
+eb_hw = (eb_hw + 1) & 63;
+EBBD[eb_bw] = eb_B; eb_Bo = EBBD[(eb_bw - 13) & 31]; eb_bw = (eb_bw + 1) & 31;
+eb_pg += (eb_pgt - eb_pg) * eb_pgs;                       // polyphony compensation (glides)
+eb_Ao *= eb_ga * eb_pg; eb_Bo *= eb_gb * eb_pg;
+eb_L = eb_Ao + eb_Bo * 0.94; eb_R = eb_Ao * 0.94 + eb_Bo;   // Berlin a touch left, Warszawa a touch right
+
+// ---------- MASTER ----------
+eb_vol += (eb_volt - eb_vol) * eb_sm;
+eb_L *= eb_vol * eb_pcg; eb_R *= eb_vol * eb_pcg;
+// DC block (rectified waves, asymmetric drive and the asymmetric loops can leave an offset)
+eb_dqyl = eb_L - eb_dqxl + 0.999 * eb_dqyl; eb_dqxl = eb_L; eb_L = eb_dqyl;
+eb_dqyr = eb_R - eb_dqxr + 0.999 * eb_dqyr; eb_dqxr = eb_R; eb_R = eb_dqyr;
+abs(eb_L) > 1 || abs(eb_R) > 1 ? eb_clipf = 1;               // telemetry: the knee is holding the peaks down
+// the bus: a soft knee above -6 dBFS that never passes -1 dBFS (chords stay clear of the output stage)
+eb_e = abs(eb_L); eb_e > 0.5 ? eb_L = sign(eb_L) * (0.5 + 0.34 * vo_tanh((eb_e - 0.5) * 2.9412));
+eb_e = abs(eb_R); eb_e > 0.5 ? eb_R = sign(eb_R) * (0.5 + 0.34 * vo_tanh((eb_e - 0.5) * 2.9412));
+// and again after it (a hard-squashed asymmetric wave picks up a little offset in the knee)
+eb_dcyl = eb_L - eb_dcxl + 0.999 * eb_dcyl; eb_dcxl = eb_L; eb_L = eb_dcyl;
+eb_dcyr = eb_R - eb_dcxr + 0.999 * eb_dcyr; eb_dcxr = eb_R; eb_R = eb_dcyr;
+// telemetry: scope capture (rising zero crossing, free-runs when nothing triggers), clip flag, step energy
+eb_s = 0.5 * (eb_L + eb_R);
+eb_hfa += abs(eb_s - eb_sprev); eb_hfb += abs(eb_s);
+eb_ci >= 256 ? (
+  eb_cfree += 1;
+  (eb_sprev <= 0 && eb_s > 0) || eb_cfree > srate * 0.15 ? ( eb_ci = 0; eb_cdc = 0; eb_cfree = 0; );
+);
+eb_ci < 256 ? ( eb_cdc -= 1; eb_cdc <= 0 ? ( EBCAP[eb_ci] = eb_s; eb_ci += 1; eb_cdc = eb_cdec; ); );
+eb_sprev = eb_s;
+eb_L = ostL.ost_band(eb_L); eb_R = ostR.ost_band(eb_R);
+ost_out(eb_L, eb_R);
+spl0 = ost_l; spl1 = ost_r;
+eb_pk = max(eb_pk, max(abs(spl0), abs(spl1)));
+
+
+@gfx 1240 460
+ui_thm = 5; ui_hw = 0;
+ui_begin(1240, 460);
+
+// =====================================================================
+// Skin colours (the 81 family's palette). Each deck keeps its identity in every skin:
+// A = analogue test console, B = digital research terminal.
+// =====================================================================
+eg_th = slider55 | 0;
+eg_th == 0 ? (                                          // ENAMEL: light industrial laboratory
+  eg_p = 0xC4BFAF; eg_h = 0xB4AF9F; eg_ink = 0x1C1C1C; eg_i2 = 0x4A4842; eg_a = 0xFF7900; eg_lit = 0xFFA126;
+  eg_g = 0x141414; eg_d = 0xFF8C00; eg_gh = 0x2B2016; eg_red = 0xE0281A;
+  eg_af = 0xD6D2C4; eg_af2 = 0xCAC5B5; eg_ai = 0x1C1C1C; eg_ai2 = 0x4A4842; eg_al = 0x1C1C1C;
+  eg_bf = 0x2A2E31; eg_bf2 = 0x222629; eg_bi = 0x4EE1DC; eg_bacc = 0xFF8C00; eg_bg = 0x070808; eg_bgh = 0x0F1617;
+) : eg_th == 1 ? (                                      // VFD: cold gas-discharge
+  eg_p = 0x181A1B; eg_h = 0x101112; eg_ink = 0x4EE1DC; eg_i2 = ui_mix(0x4EE1DC, 0x181A1B, 0.45); eg_a = 0xFF8C00; eg_lit = 0x4EE1DC;
+  eg_g = 0x070808; eg_d = 0x4EE1DC; eg_gh = 0x0D0E0F; eg_red = 0xFF3A2A;
+  eg_af = 0x25292C; eg_af2 = 0x1F2225; eg_ai = 0xA8DCD8; eg_ai2 = ui_mix(0xA8DCD8, 0x25292C, 0.42); eg_al = 0x060707;
+  eg_bf = 0x0F1112; eg_bf2 = 0x0B0C0D; eg_bi = 0x4EE1DC; eg_bacc = 0xFF8C00; eg_bg = 0x050606; eg_bgh = 0x0D0E0F;
+) : (                                                   // MATRIX: military LED matrix
+  eg_p = 0x222528; eg_h = 0x18191B; eg_ink = 0xC7BEB3; eg_i2 = ui_mix(0xC7BEB3, 0x222528, 0.4); eg_a = 0xD4A373; eg_lit = 0xD4A373;
+  eg_g = 0x0E0F10; eg_d = 0xD4A373; eg_gh = 0x2C302E; eg_red = 0xBC3908;
+  eg_af = 0x31363B; eg_af2 = 0x2A2F33; eg_ai = 0xC7BEB3; eg_ai2 = ui_mix(0xC7BEB3, 0x31363B, 0.4); eg_al = 0x0B0C0D;
+  eg_bf = 0x1A1C1E; eg_bf2 = 0x151718; eg_bi = 0xD4A373; eg_bacc = 0xBC3908; eg_bg = 0x0E0F10; eg_bgh = 0x2C302E;
+);
+eg_bi2 = ui_mix(eg_bi, eg_bf, 0.45); eg_bl = ui_mix(eg_bi, eg_bf, 0.8);
+eg_grn = ui_mix(0x1E5631, 0xFFFFFF, 0.18); eg_amb = 0xD4A373; eg_rd = 0xBC3908;
+
+gfx_setfont(6,  "Trebuchet MS", 27 * sc, 'b');          // title
+gfx_setfont(10, "Trebuchet MS", 11.5 * sc, 'b');        // small print
+gfx_setfont(11, "Trebuchet MS", 13 * sc, 'b');          // section labels
+gfx_setfont(12, "Trebuchet MS", 12.5 * sc, 'b');        // key captions
+gfx_setfont(13, "Courier New", 14 * sc, 'b');           // terminal print
+gfx_setfont(14, "Trebuchet MS", 16 * sc, 'b');          // deck titles
+
+function eg_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+function eg_fr(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc, 0); );
+function eg_t(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function eg_ct(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function eg_rt(rx, cy, s) local(tw, th) ( tw = ui_symw(s); th = ui_symh; gfx_x = rx * sc - tw; gfx_y = cy * sc - th * 0.5; ui_symstr(s); );
+function eg_hov(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function eg_set(idx, v) ( slider(idx) = v; ui_auto(idx); );
+function eg_ln(x1, y1, x2, y2) ( gfx_line(x1 * sc, y1 * sc, x2 * sc, y2 * sc, 1); );
+
+// ---------- keys: st 0 chassis (the family key), 1 Berlin pushbutton (heavy), 2 Warszawa terminal key ----------
+function eg_key(x, y, w, h, lbl, on, st) local(hov, hit, dn) (
+  hov = eg_hov(x, y, w, h);
+  hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  st == 2 ? (
+    // terminal key: dark, a thin glowing outline, lit = filled with the deck's glow
+    ui_col(on ? eg_bi : eg_bl); eg_r(x, y, w, h);
+    ui_col(on ? ui_mix(eg_bi, eg_bf2, 0.12) : (hov ? ui_mix(eg_bf2, eg_bi, 0.08) : eg_bf2)); eg_r(x + 1, y + 1, w - 2, h - 2);
+    on ? ( ui_cola(eg_bi, 0.18); eg_r(x - 3, y - 3, w + 6, h + 6); ui_cola(0xFFFFFF, 0.25); eg_r(x + 1, y + 1, w - 2, 1); );
+    on ? ui_col(eg_bf2) : ui_col(eg_bi2);
+  ) : eg_th == 0 ? (
+    dn = st == 1 ? (on ? 1 : 3) : 0;
+    st == 1 ? ( ui_cola(0x000000, 0.3); eg_r(x + 1, y + 2, w, h); );
+    ui_col(eg_ink); eg_r(x, y, w, h);
+    st == 1 ? ( ui_col(on ? 0xB45300 : 0x8F8A7C); eg_r(x + 2, y + h - 2 - dn, w - 4, dn); );
+    on ? ui_col(eg_a) : ui_col(hov ? 0xF3F0E6 : ui_mix(eg_af, 0xFFFFFF, 0.35)); eg_r(x + (st == 1 ? 2 : 1), y + (st == 1 ? 2 : 1), w - (st == 1 ? 4 : 2), h - (st == 1 ? 4 + dn : 2));
+    on ? ( ui_cola(0xFFFFFF, 0.3); eg_r(x + 2, y + 2, w - 4, 1); ui_cola(eg_lit, 0.25); eg_r(x - 2, y - 2, w + 4, 2); eg_r(x - 2, y + h, w + 4, 2); );
+    ui_col(eg_ink);
+  ) : eg_th == 1 ? (
+    ui_col(on ? eg_ink : ui_mix(eg_ink, eg_p, 0.7)); eg_r(x, y, w, h);
+    st == 1 ? ( ui_col(on ? eg_ink : ui_mix(eg_ink, eg_p, 0.7)); eg_r(x - 1, y - 1, w + 2, h + 2); );
+    ui_col(0x0A0B0C); eg_r(x + 1, y + 1, w - 2, h - 2);
+    on ? ( ui_cola(eg_ink, 0.22); eg_r(x + 1, y + 1, w - 2, h - 2); ui_cola(eg_ink, 0.12); eg_r(x - 3, y - 3, w + 6, h + 6); )
+       : hov ? ( ui_cola(eg_ink, 0.08); eg_r(x + 1, y + 1, w - 2, h - 2); );
+    on ? ui_col(ui_mix(eg_ink, 0xFFFFFF, 0.35)) : ui_cola(eg_ink, 0.6);
+  ) : (
+    dn = st == 1 ? (on ? 2 : 4) : 0;
+    ui_col(0x0B0C0D); eg_r(x, y, w, h);
+    st == 1 ? ( ui_col(on ? ui_mix(eg_lit, 0x000000, 0.45) : 0x151617); eg_r(x + 1, y + h - 1 - dn, w - 2, dn); );
+    on ? ui_col(eg_lit) : ui_col(hov ? ui_mix(eg_gh, 0xFFFFFF, 0.07) : eg_gh); eg_r(x + 1, y + 1, w - 2, h - 2 - dn);
+    on ? ( ui_cola(eg_lit, 0.25); eg_r(x - 2, y - 2, w + 4, h + 4); ui_cola(0xFFFFFF, 0.3); eg_r(x + 1, y + 1, w - 2, 1); );
+    on ? ui_col(0x17191B) : ui_cola(eg_ink, 0.85);
+  );
+  gfx_setfont(12); eg_ct(x + w * 0.5, y + (h - (st == 1 && eg_th != 1 ? (on ? 1 : 3) : 0)) * 0.5 + 0.5, lbl);
+  hit;
+);
+// a row of keys for a stepped slider ("A|B|C")
+function eg_keys(x, y, w, h, gap, idx, n, labels, st) local(i) (
+  i = 0;
+  loop(n,
+    eg_key(x + i * (w + gap), y, w, h, pk_pitem(labels, i + 1, #egk), floor(slider(idx) + 0.5) == i, st) ? eg_set(idx, i);
+    i += 1;
+  );
+);
+
+// ---------- the Berlin routing pair: two lit push-buttons, one lit = its setting (0 = top, 1 = bottom) ----------
+function eg_tog(cx, y, idx, title, up, dn) local(on) (
+  on = slider(idx) >= 0.5;
+  gfx_setfont(10); ui_col(eg_ai2); eg_ct(cx, y + 4, title);
+  eg_key(cx - 31, y + 14, 62, 25, up, !on, 1) ? eg_set(idx, 0);
+  eg_key(cx - 31, y + 44, 62, 25, dn, on, 1) ? eg_set(idx, 1);
+);
+
+// ---------- knobs ----------
+// Berlin: chunky industrial knob with precise ticks.  Warszawa: the laboratory knob with its glowing ring.
+function eg_kn(cx, cy, r, idx, lo, hi, def, lg, label, fmt, kind) (
+  sprintf(#egv, fmt, slider(idx));
+  kind == 0 ? ( dy_kst = 0; dy_ink = eg_ai; dy_ntick = 11; dy_knob(cx, cy, r, idx, lo, hi, def, lg, 0xEEEFEA, label, #egv); ) :
+  kind == 1 ? ( dy_kst = 31; dy_ink = eg_bi; dy_knob(cx, cy, r, idx, lo, hi, def, lg, eg_bi, label, #egv); ) :
+  kind == 2 ? ( dy_kst = 3; dy_ink = eg_ink; dy_ntick = 11; dy_knob(cx, cy, r, idx, lo, hi, def, lg, 0xEEEFEA, label, #egv); ) :
+              ( dy_kst = 20; dy_ink = eg_ink; dy_ntick = 11; dy_knob(cx, cy, r, idx, lo, hi, def, lg, kind == 4 ? 0xD8B040 : 0x9DA2A8, label, #egv); );
+  dy_kst = 7;
+);
+function eg_round(idx, st) local(v) ( v = floor(slider(idx) / st + 0.5) * st; v != slider(idx) ? slider(idx) = v; );
+
+// ---------- a deck: heavy frame, title band, its name ----------
+function eg_deck(x, y, w, h, deck, t1, t2) (
+  deck == 0 ? (
+    ui_col(eg_al); eg_r(x, y, w, h);
+    ui_col(eg_af); eg_r(x + 3, y + 3, w - 6, h - 6);
+    ui_col(eg_af2); eg_r(x + 3, y + 3, w - 6, 24);
+    ui_col(eg_al); eg_r(x + 3, y + 27, w - 6, 3);
+    gfx_setfont(14); ui_col(eg_ai); eg_t(x + 12, y + 7, t1);
+    gfx_setfont(10); ui_col(eg_ai2); eg_rt(x + w - 12, y + 15, t2);
+  ) : (
+    ui_col(eg_bl); eg_r(x, y, w, h);
+    ui_col(eg_bf); eg_r(x + 1, y + 1, w - 2, h - 2);
+    ui_col(eg_bf2); eg_r(x + 1, y + 1, w - 2, 26);
+    ui_col(eg_bi); eg_r(x + 1, y + 27, w - 2, 1);
+    ui_cola(eg_bi, 0.25); eg_r(x + 1, y + 28, w - 2, 2);
+    gfx_setfont(14); ui_col(eg_bi); eg_t(x + 12, y + 7, t1);
+    gfx_setfont(13); ui_col(eg_bi2); eg_rt(x + w - 12, y + 15, t2);
+  );
+);
+
+// ---------- the seven-segment / LED readouts ----------
+function eg_seg(x, y, w, h, n, s, con, coff) ( rd_seg(x, y, w, h, n, s, con, coff); );
+// a horizontal bar in the active skin: n 0..1
+function eg_bar(x, y, w, h, n, col) local(i, k, cw, lit, c) (
+  n = min(max(n, 0), 1);
+  eg_th == 0 ? (
+    ui_col(eg_gh); eg_r(x, y, w, h);
+    ui_col(col); eg_r(x, y, w * n, h);
+    ui_cola(0xFFFFFF, 0.25); eg_r(x, y, w * n, 1);
+    i = 0; loop(7, ui_cola(col, 0.5); eg_r(x + i * w / 6 - 0.5, y + h + 1, 1, 3); i += 1; );
+  ) : eg_th == 1 ? (
+    k = floor(w / 4); cw = w / k; i = 0;
+    loop(k, lit = (i + 0.5) / k <= n;
+      lit ? ( ui_cola(col, 0.22); eg_r(x + i * cw - 0.5, y - 1, cw, h + 2); ui_col(col); ) : ui_col(eg_gh);
+      eg_r(x + i * cw, y, cw - 1.5, h); i += 1; );
+  ) : (
+    k = floor(w / 7); cw = w / k; i = 0;
+    loop(k, lit = (i + 0.5) / k <= n; c = (i + 0.5) / k > 0.85 ? eg_rd : (i + 0.5) / k > 0.6 ? eg_amb : eg_grn;
+      lit ? ( ui_cola(c, 0.2); eg_r(x + i * cw - 0.5, y - 1, cw, h + 2); ui_col(c); ) : ui_col(eg_gh);
+      eg_r(x + i * cw + 0.5, y, cw - 2, h);
+      lit ? ( ui_cola(0xFFFFFF, 0.25); eg_r(x + i * cw + 0.5, y, cw - 2, 1); );
+      i += 1; );
+  );
+);
+
+// a small envelope sketch in a glass strip
+function eg_env(x, y, w, h, a, d, s, r) local(ta, td, tr, tt, sx, x1, x2, sy) (
+  ui_col(eg_th == 0 ? 0x0B0C0D : eg_th == 1 ? 0x2E3235 : 0x0B0C0D); eg_r(x, y, w, h);
+  ui_col(eg_g); eg_r(x + 1, y + 1, w - 2, h - 2);
+  ta = log(1 + a); td = log(1 + d); tr = log(1 + r); tt = ta + td + tr + 2.2; sx = (w - 8) / tt;
+  sy = y + 3 + (h - 6) * (1 - s);
+  ui_col(eg_d);
+  x1 = x + 4; x2 = x1 + ta * sx; eg_ln(x1, y + h - 3, x2, y + 3);
+  x1 = x2; x2 = x1 + td * sx; eg_ln(x1, y + 3, x2, sy);
+  x1 = x2; x2 = x1 + 2.2 * sx; eg_ln(x1, sy, x2, sy);
+  x1 = x2; x2 = x + w - 4; eg_ln(x1, sy, x2, y + h - 3);
+);
+
+// a module in the bottom row (chassis): a sunken face, its name
+function eg_mod(x, y, w, h, name) (
+  eg_th == 0 ? ( ui_col(eg_ink); eg_r(x, y, w, h); ui_col(ui_mix(eg_p, 0xFFFFFF, 0.22)); eg_r(x + 1.5, y + 1.5, w - 3, h - 3); )
+             : ( ui_col(eg_th == 1 ? ui_mix(eg_ink, eg_p, 0.78) : 0x0B0C0D); eg_r(x, y, w, h);
+                 ui_col(eg_th == 1 ? 0x1D2022 : 0x2A2E32); eg_r(x + 1, y + 1, w - 2, h - 2); );
+  gfx_setfont(11); ui_col(eg_i2); eg_t(x + 9, y + 5, name);
+);
+
+// arrow for the routing diagrams
+function eg_arrow(x1, y1, x2, y2) local(dx, dy, l, ux, uy) (
+  eg_ln(x1, y1, x2, y2); eg_ln(x1, y1 + 0.6, x2, y2 + 0.6);
+  dx = x2 - x1; dy = y2 - y1; l = sqrt(dx * dx + dy * dy); ux = dx / l; uy = dy / l;
+  gfx_triangle(x2 * sc, y2 * sc, (x2 - ux * 6 - uy * 3.5) * sc, (y2 - uy * 6 + ux * 3.5) * sc, (x2 - ux * 6 + uy * 3.5) * sc, (y2 - uy * 6 - ux * 3.5) * sc);
+);
+function eg_box(x, y, s) ( eg_fr(x, y, 18, 15); eg_fr(x + 0.6, y + 0.6, 17, 14); gfx_setfont(10); eg_ct(x + 9, y + 7.5, s); );
+
+// =====================================================================
+// Chassis and header
+// =====================================================================
+ui_col(eg_p); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(eg_h); eg_r(0, 0, 1240, 54);
+ui_col(eg_th == 0 ? eg_ink : eg_a); eg_r(0, 54, 1240, 2);
+ui_col(eg_th == 2 ? eg_a : eg_ink); gfx_circle(31 * sc, 27 * sc, 16 * sc, 1, 1);
+gfx_setfont(4); ui_col(eg_th == 0 ? eg_af : 0x111213); ui_text(31 * sc, 21.5 * sc, "GFX");
+gfx_setfont(6); ui_col(eg_ink); eg_t(58, 12, "EB81"); gfx_measurestr("EB81", eb_tw, eb_th); eb_sx = 58 + eb_tw / sc + 14;
+gfx_setfont(10); ui_col(eg_i2); eg_t(eb_sx, 13, "FM-SYNTHESIZER"); eg_t(eb_sx, 28, "AND PROCESSOR");
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+eg_k = pk_preset(300 * sc, 10 * sc, 400 * sc, 34 * sc, pr_cur, #eb_pm);
+eg_k > 0 ? prs_dirty = eg_k;
+gfx_setfont(10); ui_col(eg_i2); eg_rt(782, 27, "SKIN");
+eg_key(790, 15, 70, 24, "ENAMEL", eg_th == 0, 0) ? eg_set(55, 0);
+eg_key(864, 15, 52, 24, "VFD",    eg_th == 1, 0) ? eg_set(55, 1);
+eg_key(920, 15, 68, 24, "MATRIX", eg_th == 2, 0) ? eg_set(55, 2);
+rd_led(1010, 22, 3.6, ins_midi_lit(), eg_th == 2 ? eg_grn : 0x3ADF6A);
+gfx_setfont(10); ui_col(eg_i2); eg_ct(1010, 37, "MIDI");
+sprintf(#egl, slider48 < 0.5 ? "OMNI" : "CH %.0f", slider48);
+eg_key(1028, 15, 62, 24, #egl, 0, 0) ? (
+  strcpy(#egm, ""); eg_n = 0;
+  loop(17, eg_n == floor(slider48 + 0.5) ? strcat(#egm, "!"); eg_n == 0 ? strcat(#egm, "Omni") : ( sprintf(#egk, "Channel %d", eg_n); strcat(#egm, #egk); ); eg_n < 16 ? strcat(#egm, "|"); eg_n += 1; );
+  gfx_x = 1028 * sc; gfx_y = 39 * sc; eg_n = gfx_showmenu(#egm); eg_n > 0 ? eg_set(48, eg_n - 1);
+);
+ui_size_picker(1160 * sc, 18 * sc);
+dy_nov = 1;
+
+// =====================================================================
+// SEKTION A - BERLIN
+// =====================================================================
+eg_deck(10, 62, 470, 238, 0, "SECTION A  –  BERLIN", "ANALOGUE TEST DESK");
+ui_col(eg_al); eg_r(248, 92, 3, 205);
+gfx_setfont(11); ui_col(eg_ai);
+eg_t(22, 98, "CARRIER A");
+eg_keys(22, 116, 52, 24, 5, 1, 4, "SINE|SAW|RECT|CLIP", 1);
+gfx_setfont(11); ui_col(eg_ai); eg_t(22, 148, "MODULATOR A");
+eg_keys(22, 166, 52, 24, 5, 4, 4, "SINE|SAW|RECT|CLIP", 1);
+eg_kn(48,  228, 19, 2, 0.5, 16, 2, 0, "RATIO", "%.1f", 0); eg_round(2, 0.5);
+eg_kn(104, 228, 19, 3, -0.5, 0.5, 0, 0, "FINE", "%+.3f", 0);
+eg_kn(160, 228, 19, 5, 0, 100, 30, 0, "DEPTH", "%.0f%%", 0);
+eg_kn(216, 228, 19, 6, 0, 100, 40, 0, "VELO", "%.0f%%", 0);
+gfx_setfont(11); ui_col(eg_ai); eg_t(264, 98, "FEEDBACK");
+eg_tog(298, 116, 11, "TARGET", "MOD", "CARRIER");
+eg_tog(366, 116, 12, "FILTER", "LP", "BP");
+eg_tog(434, 116, 13, "PHASE", "0°", "180°");
+eg_kn(280, 228, 21, 7, 0, 100, 0, 0, "FEEDBACK", "%.0f%%", 0);
+dy_kf = 2; eg_kn(338, 228, 19, 8, 40, 18000, 18000, 1, "CUTOFF", "%.0f Hz", 0);
+eg_kn(394, 228, 19, 9, 0, 100, 0, 0, "RESO", "%.0f%%", 0);
+eg_kn(450, 228, 19, 10, 0, 100, 10, 0, "DRIVE", "%.0f%%", 0);
+
+// =====================================================================
+// SEKTION B - WARSZAWA
+// =====================================================================
+eg_deck(760, 62, 470, 238, 1, "SECTION B  –  WARSAW", "RESEARCH TERMINAL");
+ui_col(eg_bl); eg_r(999, 94, 1, 202);
+// the data grid
+eg_cx = 772; eg_cy = 96;
+eg_i = 0;
+loop(4,
+  eg_gx = eg_cx + (eg_i % 2) * 112; eg_gy = eg_cy + floor(eg_i / 2) * 44;
+  ui_col(eg_bl); eg_r(eg_gx, eg_gy, 108, 40);
+  ui_col(eg_bg); eg_r(eg_gx + 1, eg_gy + 1, 106, 38);
+  gfx_setfont(10); ui_col(eg_bi2);
+  eg_t(eg_gx + 6, eg_gy + 4, eg_i == 0 ? "RATIO" : eg_i == 1 ? "PHASE" : eg_i == 2 ? "CLOCK" : "CRUSH");
+  eg_i == 0 ? sprintf(#egs, "%.2f", slider14 + slider15) :
+  eg_i == 1 ? sprintf(#egs, "%d", slider16) :
+  eg_i == 2 ? ( slider20 >= 47999 ? strcpy(#egs, "FULL") : sprintf(#egs, slider20 >= 10000 ? "%.0f" : "%.1f", slider20 / 1000); ) :
+              ( slider21 >= 15.95 ? strcpy(#egs, "OFF") : sprintf(#egs, "%.0f", slider21); );
+  eg_seg(eg_gx + 44, eg_gy + 9, 11, 22, 4, #egs, eg_bi, eg_bgh);
+  eg_i == 1 ? ( gfx_setfont(10); ui_col(eg_bi2); eg_t(eg_gx + 6, eg_gy + 21, "BIT"); );
+  eg_i == 2 && slider20 < 47999 ? ( gfx_setfont(10); ui_col(eg_bi2); eg_t(eg_gx + 6, eg_gy + 21, "kHz"); );
+  eg_i == 3 && slider21 < 15.95 ? ( gfx_setfont(10); ui_col(eg_bi2); eg_t(eg_gx + 6, eg_gy + 21, "BIT"); );
+  eg_i += 1;
+);
+eg_i = 0;   // (eg_i is only a loop counter here)
+eg_kn(796, 228, 19, 14, 0.5, 16, 1, 0, "RATIO", "%.1f", 1); eg_round(14, 0.5);
+eg_kn(852, 228, 19, 15, -0.5, 0.5, 0, 0, "FINE", "%+.3f", 1);
+eg_kn(908, 228, 19, 16, 4, 16, 16, 0, "BITS", "%.0f bit", 1); eg_round(16, 1);
+eg_kn(964, 228, 19, 17, 0, 100, 0, 0, "SELF-FB", "%.0f%%", 1);
+// DATENPFAD: cross mode and the step plot
+gfx_setfont(11); ui_col(eg_bi); eg_t(1012, 98, "DATA PATH");
+eg_key(1012, 116, 52, 24, "PM",   slider19 < 0.5, 2) ? eg_set(19, 0);
+eg_key(1068, 116, 52, 24, "RING", slider19 >= 0.5, 2) ? eg_set(19, 1);
+gfx_setfont(10); ui_col(eg_bi2); eg_t(1128, 116, "CROSS"); eg_t(1128, 129, "MODE");
+// the quantised wave: phase bits across, crush bits up, the hold clock as steps
+eg_px = 1012; eg_py = 148; eg_pw = 206; eg_ph = 36;
+ui_col(eg_bl); eg_r(eg_px, eg_py, eg_pw, eg_ph);
+ui_col(eg_bg); eg_r(eg_px + 1, eg_py + 1, eg_pw - 2, eg_ph - 2);
+ui_cola(eg_bi, 0.12); eg_i = 1; loop(7, eg_r(eg_px + eg_i * eg_pw / 8, eg_py + 1, 1, eg_ph - 2); eg_i += 1; ); eg_r(eg_px + 1, eg_py + eg_ph * 0.5, eg_pw - 2, 1);
+eg_N = 2 ^ slider16; eg_cs = slider21 >= 15.95 ? 0 : 2 ^ (slider21 - 1);
+eg_hs = slider20 >= 47999 ? 1 : max(1, floor(48000 / slider20 * 0.5));
+eg_i = 0; eg_lx = 0; eg_ly = 0;
+loop(eg_pw - 6,
+  eg_t0 = floor(eg_i / eg_hs) * eg_hs / (eg_pw - 6) * 2;                  // two cycles across
+  eg_q = floor((eg_t0 - floor(eg_t0)) * eg_N) / eg_N;
+  eg_v = sin(2 * $pi * eg_q); eg_cs > 0 ? eg_v = floor(eg_v * eg_cs + 0.5) / eg_cs;
+  eg_yy = eg_py + eg_ph * 0.5 - eg_v * (eg_ph * 0.5 - 4);
+  eg_xx = eg_px + 3 + eg_i;
+  ui_col(eg_bi); eg_i > 0 ? ( eg_ln(eg_lx, eg_ly, eg_xx, eg_ly); eg_ln(eg_xx, eg_ly, eg_xx, eg_yy); );
+  eg_lx = eg_xx; eg_ly = eg_yy; eg_i += 1;
+);
+gfx_setfont(10); ui_cola(eg_bi2, 0.9); eg_rt(eg_px + eg_pw - 5, eg_py + 8, "STEPS");
+eg_kn(1036, 228, 19, 18, 0, 100, 0, 0, "CROSS", "%.0f%%", 1);
+eg_kn(1092, 228, 19, 20, 200, 48000, 48000, 1, "RATE", slider20 >= 47999 ? "FULL" : "%.0f Hz", 1);
+eg_kn(1148, 228, 19, 21, 2, 16, 16, 0, "CRUSH", slider21 >= 15.95 ? "OFF" : "%.1f bit", 1);
+eg_kn(1204, 228, 19, 22, 200, 20000, 20000, 1, "LPF", slider22 >= 19999 ? "OPEN" : "%.0f Hz", 1);
+
+// =====================================================================
+// Centre: the display and the ROUTING keys
+// =====================================================================
+eg_th == 0 ? ( ui_col(eg_ink); eg_r(486, 62, 268, 238); ui_col(ui_mix(eg_p, 0x000000, 0.06)); eg_r(487.5, 63.5, 265, 235); )
+           : ( ui_col(eg_th == 1 ? ui_mix(eg_ink, eg_p, 0.78) : 0x0B0C0D); eg_r(486, 62, 268, 238); ui_col(eg_th == 1 ? 0x141617 : 0x26292C); eg_r(487, 63, 266, 236); );
+eg_key(494, 68, 124, 22, "RATIO",      slider56 < 0.5, 0) ? eg_set(56, 0);
+eg_key(622, 68, 124, 22, "TELEMETRY", slider56 >= 0.5, 0) ? eg_set(56, 1);
+eg_sx = 494; eg_sy = 96; eg_sw = 252; eg_sh = 108;
+ui_col(eg_th == 1 ? 0x2E3235 : 0x0B0C0D); eg_r(eg_sx - 2, eg_sy - 2, eg_sw + 4, eg_sh + 4);
+ui_col(eg_g); eg_r(eg_sx, eg_sy, eg_sw, eg_sh);
+
+slider56 < 0.5 ? (
+  // ---------- RATIO page: the three operators against the note ----------
+  eg_i = 0;
+  loop(3,
+    eg_ry = eg_sy + 6 + eg_i * 34;
+    eg_rv = eg_i == 0 ? 1 : eg_i == 1 ? max(slider2 + slider3, 0.05) : max(slider14 + slider15, 0.05);
+    gfx_setfont(10); ui_cola(eg_d, 0.75);
+    eg_t(eg_sx + 8, eg_ry, eg_i == 0 ? "CARRIER A" : eg_i == 1 ? "MOD A" : "OPERATOR B");
+    sprintf(#egs, eg_rv >= 10 ? "%.1f" : "%.2f", eg_rv);
+    eg_seg(eg_sx + 8, eg_ry + 15, 10, 16, 4, #egs, eg_d, eg_gh);
+    eg_f = (slider24 == 1 && eb_hc == 0 ? slider26 : eb_lastf) * eg_rv;
+    sprintf(#egs, eg_f >= 1000 ? "%.2f kHz" : "%.0f Hz", eg_f >= 1000 ? eg_f / 1000 : eg_f);
+    gfx_setfont(10); ui_cola(eg_d, 0.6); eg_rt(eg_sx + eg_sw - 8, eg_ry + 6, #egs);
+    eg_bar(eg_sx + 90, eg_ry + 17, eg_sw - 98, 10, (log(eg_rv) / log(2) + 1) / 5, eg_d);
+    eg_i += 1;
+  );
+) : (
+  // ---------- TELEMETRY page: the live waveform, clip markers, the step indicator ----------
+  eb_clipf ? ( eg_clt = time_precise(); eb_clipf = 0; );
+  eg_clip = time_precise() - eg_clt < 0.4;
+  eg_wx = eg_sx + 4; eg_ww = eg_sw - 8; eg_wy = eg_sy + 4; eg_wh = eg_sh - 30; eg_mid = eg_wy + eg_wh * 0.5;
+  eg_th == 0 ? (
+    ui_cola(eg_d, 0.13); eg_i = 1; loop(7, eg_r(eg_wx + eg_i * eg_ww / 8, eg_wy, 1, eg_wh); eg_i += 1; );
+    eg_r(eg_wx, eg_mid, eg_ww, 1); eg_r(eg_wx, eg_wy + eg_wh * 0.25, eg_ww, 1); eg_r(eg_wx, eg_wy + eg_wh * 0.75, eg_ww, 1);
+    ui_col(eg_clip ? eg_red : ui_mix(eg_red, eg_g, 0.6));
+    eg_i = 0; loop(26, eg_r(eg_wx + eg_i * eg_ww / 26, eg_wy, eg_ww / 52, 1.5); eg_r(eg_wx + eg_i * eg_ww / 26, eg_wy + eg_wh - 1.5, eg_ww / 52, 1.5); eg_i += 1; );
+    ui_col(eg_d); eg_i = 0;
+    loop(255,
+      eg_x1 = eg_wx + eg_i / 255 * eg_ww; eg_x2 = eg_wx + (eg_i + 1) / 255 * eg_ww;
+      eg_y1 = eg_mid - min(max(EBCAP[eg_i], -1.05), 1.05) * eg_wh * 0.5;
+      eg_y2 = eg_mid - min(max(EBCAP[eg_i + 1], -1.05), 1.05) * eg_wh * 0.5;
+      eg_ln(eg_x1, eg_y1, eg_x2, eg_y2); eg_ln(eg_x1, eg_y1 + 0.7, eg_x2, eg_y2 + 0.7);
+      eg_i += 1;
+    );
+  ) : (
+    // VFD: a dot matrix (ghost dots everywhere); MATRIX: chunky LED cells
+    eg_cw = eg_th == 1 ? 3 : 6; eg_nc = floor(eg_ww / eg_cw); eg_nr = floor(eg_wh / eg_cw);
+    eg_wy = eg_mid - eg_nr * eg_cw * 0.5;
+    eg_j = 0;
+    loop(eg_nr, eg_i = 0; ui_col(eg_th == 1 ? 0x101314 : eg_gh);
+      loop(eg_nc, eg_r(eg_wx + eg_i * eg_cw, eg_wy + eg_j * eg_cw, eg_cw - 1, eg_cw - 1); eg_i += 1; ); eg_j += 1; );
+    // clip rows
+    eg_clip ? ( ui_col(eg_th == 1 ? eg_a : eg_rd); eg_i = 0;
+      loop(eg_nc, eg_r(eg_wx + eg_i * eg_cw, eg_wy, eg_cw - 1, eg_cw - 1); eg_r(eg_wx + eg_i * eg_cw, eg_wy + (eg_nr - 1) * eg_cw, eg_cw - 1, eg_cw - 1); eg_i += 1; ); );
+    eg_i = 0; eg_lr = -1;
+    loop(eg_nc,
+      eg_v = EBCAP[floor(eg_i / eg_nc * 255)];
+      eg_rr = floor((0.5 - min(max(eg_v, -1), 1) * 0.5) * (eg_nr - 1) + 0.5);
+      eg_r0 = eg_lr < 0 ? eg_rr : min(eg_lr, eg_rr); eg_r1 = eg_lr < 0 ? eg_rr : max(eg_lr, eg_rr);
+      eg_lr >= 0 && eg_r1 - eg_r0 > 0 ? ( eg_lr < eg_rr ? eg_r0 += 1 : eg_r1 -= 1; );
+      eg_j = eg_r0;
+      loop(eg_r1 - eg_r0 + 1,
+        eg_a2 = abs((eg_j / (eg_nr - 1)) * 2 - 1);
+        eg_c = eg_th == 1 ? (eg_a2 > 0.92 ? eg_a : eg_d) : (eg_a2 > 0.85 ? eg_rd : eg_a2 > 0.55 ? eg_amb : eg_grn);
+        ui_cola(eg_c, 0.25); eg_r(eg_wx + eg_i * eg_cw - 1, eg_wy + eg_j * eg_cw - 1, eg_cw + 1, eg_cw + 1);
+        ui_col(eg_c); eg_r(eg_wx + eg_i * eg_cw, eg_wy + eg_j * eg_cw, eg_cw - 1, eg_cw - 1);
+        eg_j += 1;
+      );
+      eg_lr = eg_rr; eg_i += 1;
+    );
+  );
+  // the step / aliasing indicator
+  eg_ay = eg_sy + eg_sh - 20;
+  ui_cola(eg_d, 0.25); eg_r(eg_sx + 4, eg_ay - 3, eg_sw - 8, 1);
+  gfx_setfont(10); ui_cola(eg_d, 0.75); eg_t(eg_sx + 8, eg_ay + 1, "STEPS");
+  eg_bar(eg_sx + 62, eg_ay + 3, 88, 9, eb_hfm / 1.2, eg_th == 2 ? eg_amb : eg_d);
+  sprintf(#egr, "%.1fk", slider20 / 1000); sprintf(#egb, "%.0fB", slider21);
+  sprintf(#egs, "2^%d %s %s", slider16, slider20 >= 47999 ? "FULL" : #egr, slider21 >= 15.95 ? "" : #egb);
+  gfx_setfont(10); ui_cola(eg_d, 0.75); eg_rt(eg_sx + eg_sw - 8, eg_ay + 7, #egs);
+  eg_clip ? ( gfx_setfont(10); ui_col(eg_th == 0 ? eg_red : eg_th == 1 ? eg_a : eg_rd); eg_rt(eg_sx + eg_sw - 8, eg_sy + 10, "CLIP"); );
+);
+
+// ROUTING keys and their diagrams
+gfx_setfont(11); ui_col(eg_i2); eg_t(496, 212, "CIRCUIT");
+gfx_setfont(10); ui_col(eg_i2); eg_rt(746, 218, "A ↔ B");
+eg_keys(494, 230, 80, 26, 6, 23, 3, "SERIAL|PARALLEL|RECURSIVE", 0);
+eg_i = 0;
+loop(3,
+  eg_dx = 494 + eg_i * 86; eg_dy = 266;
+  ui_col(floor(slider23 + 0.5) == eg_i ? (eg_th == 0 ? eg_ink : eg_a) : eg_i2);
+  eg_box(eg_dx + 8, eg_dy, "A"); eg_box(eg_dx + 54, eg_dy, "B");
+  eg_i == 0 ? ( eg_arrow(eg_dx + 27, eg_dy + 7.5, eg_dx + 53, eg_dy + 7.5); eg_arrow(eg_dx + 73, eg_dy + 7.5, eg_dx + 79, eg_dy + 7.5); ) :
+  eg_i == 1 ? ( eg_arrow(eg_dx + 53, eg_dy + 7.5, eg_dx + 27, eg_dy + 7.5); eg_ln(eg_dx + 17, eg_dy + 16, eg_dx + 17, eg_dy + 24); eg_ln(eg_dx + 63, eg_dy + 16, eg_dx + 63, eg_dy + 24); eg_ln(eg_dx + 17, eg_dy + 24, eg_dx + 63, eg_dy + 24); gfx_setfont(10); eg_ct(eg_dx + 40, eg_dy + 19, "+"); ) :
+  ( eg_arrow(eg_dx + 27, eg_dy + 4, eg_dx + 53, eg_dy + 4); eg_arrow(eg_dx + 53, eg_dy + 11, eg_dx + 27, eg_dy + 11); gfx_setfont(10); eg_ct(eg_dx + 40, eg_dy + 22, "LIMIT"); );
+  eg_i += 1;
+);
+eg_i = 0;
+
+// =====================================================================
+// Bottom row: AMP, MOD ENV, LFO, VOICE, QUELLE, MASTER
+// =====================================================================
+eg_by = 306; eg_bh = 146; eg_ky = eg_by + 100;
+// AMP
+eg_x = 10; eg_mod(eg_x, eg_by, 196, eg_bh, "AMP");
+eg_env(eg_x + 10, eg_by + 28, 176, 32, slider28, slider29, slider30 / 100, slider31);
+eg_kn(eg_x + 31,  eg_ky, 16, 28, 0.5, 5000, 2, 1, "ATT", "%.1f ms", 2);
+eg_kn(eg_x + 75,  eg_ky, 16, 29, 5, 8000, 400, 1, "DEC", "%.0f ms", 2);
+eg_kn(eg_x + 119, eg_ky, 16, 30, 0, 100, 80, 0, "SUS", "%.0f%%", 2);
+eg_kn(eg_x + 163, eg_ky, 16, 31, 5, 8000, 300, 1, "REL", "%.0f ms", 2);
+// MOD ENV
+eg_x = 211; eg_mod(eg_x, eg_by, 280, eg_bh, "MOD ENV");
+eg_env(eg_x + 10, eg_by + 28, 166, 32, slider33, slider34, slider35 / 100, slider36);
+gfx_setfont(10); ui_col(eg_i2); eg_ct(eg_x + 229, eg_by + 36, "AMOUNT TO"); ui_cola(eg_i2, 0.6); eg_r(eg_x + 190, eg_by + 46, 78, 1);
+eg_kn(eg_x + 31,  eg_ky, 16, 33, 0.5, 5000, 1, 1, "ATT", "%.1f ms", 2);
+eg_kn(eg_x + 75,  eg_ky, 16, 34, 5, 8000, 500, 1, "DEC", "%.0f ms", 2);
+eg_kn(eg_x + 119, eg_ky, 16, 35, 0, 100, 30, 0, "SUS", "%.0f%%", 2);
+eg_kn(eg_x + 163, eg_ky, 16, 36, 5, 8000, 400, 1, "REL", "%.0f ms", 2);
+eg_kn(eg_x + 207, eg_ky, 16, 37, -100, 100, 30, 0, "DEPTH", "%+.0f%%", 2);
+eg_kn(eg_x + 251, eg_ky, 16, 38, -100, 100, 0, 0, "CUTOFF", "%+.0f%%", 2);
+// LFO
+eg_x = 496; eg_mod(eg_x, eg_by, 214, eg_bh, "LFO");
+eg_keys(eg_x + 10, eg_by + 30, 32, 26, 3, 41, 4, "SIN|TRI|SQR|S&H", 0);
+eg_kn(eg_x + 36,  eg_ky, 16, 39, 0.05, 30, 4, 1, "RATE", "%.2f Hz", 2);
+eg_kn(eg_x + 106, eg_ky, 16, 40, 0, 100, 0, 0, "DEPTH", "%.0f%%", 2);
+eg_i = 0;
+loop(5,
+  eg_key(eg_x + 150, eg_by + 8 + eg_i * 27, 56, 23, eg_i == 0 ? "PITCH" : eg_i == 1 ? "DEPTH" : eg_i == 2 ? "CUTOFF" : eg_i == 3 ? "CRUSH" : "CROSS",
+         floor(slider42 + 0.5) == eg_i, 0) ? eg_set(42, eg_i);
+  eg_i += 1;
+);
+eg_i = 0;
+// VOICE
+eg_x = 715; eg_mod(eg_x, eg_by, 176, eg_bh, "VOICE");
+eg_keys(eg_x + 8, eg_by + 30, 51, 26, 4, 43, 3, "POLY|MONO|LEGATO", 0);
+eg_kn(eg_x + 33,  eg_ky, 16, 44, 0, 2000, 0, 0, "GLIDE", "%.0f ms", 2);
+eg_kn(eg_x + 88,  eg_ky, 16, 45, 0, 24, 2, 0, "BEND", "%.0f st", 2); eg_round(45, 1);
+eg_kn(eg_x + 143, eg_ky, 16, 32, 0, 100, 50, 0, "VELO", "%.0f%%", 2);
+// QUELLE (source) and the deck balance
+eg_x = 896; eg_mod(eg_x, eg_by, 176, eg_bh, "SOURCE");
+eg_keys(eg_x + 8, eg_by + 30, 51, 26, 4, 24, 3, "SYNTH|AUDIO|BOTH", 0);
+eg_kn(eg_x + 33,  eg_ky, 13, 25, -24, 24, 0, 0, "IN", "%+.1f dB", 3);
+eg_kn(eg_x + 88,  eg_ky, 16, 26, 20, 2000, 110, 1, "FREQ", "%.1f Hz", 2);
+eg_kn(eg_x + 143, eg_ky, 16, 27, 0, 100, 35, 0, "A | B", "%.0f%%", 2);
+// MASTER
+eg_x = 1077; eg_mod(eg_x, eg_by, 153, eg_bh, "MASTER");
+eg_kn(eg_x + 76, eg_by + 46, 18, 47, -24, 6, 0, 0, "VOLUME", "%+.1f dB", 2);
+eg_kn(eg_x + 50, eg_ky + 6, 11, 46, 0, 100, 25, 0, "DRIFT", "%.0f%%", 3);
+eg_kn(eg_x + 102, eg_ky + 6, 11, 49, 0, 100, 0, 0, "SAT", "%.0f%%", 4);
+
+dy_kst = 7; dy_nov = 0;
+pk_end();
+ui_end();

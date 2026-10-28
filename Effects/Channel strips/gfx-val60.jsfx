@@ -1,0 +1,787 @@
+desc:VAL60 [channel strip] (GFX)
+//tags: channel strip valve tube compressor saturation warmth
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-thick, gfx-glow (.jsfx-inc) in the same folder.
+//
+// VAL60 - a valve channel: in the spirit of the 1990s British dual-channel valve dynamics processors that put a
+// tube gain stage in front of a soft-knee, optical-style compressor. Warmth, thickness and gentle saturation for DI
+// bass, synths and sub-mixes, and glue on the way to the converters.
+//
+// SIGNAL FLOW
+//   input transformer > INPUT GAIN > the VALVE stage (2x oversampled: a biased triode, TUBE DRIVE sets how hard it
+//   works; it keeps its level, so DRIVE adds harmonics, not volume) > soft-knee compressor (THRESHOLD, RATIO,
+//   ATTACK, RELEASE; an optical-style memory: after heavy, long compression the release slows, up to 2x) > output
+//   transformer > LEVEL > the house output stage (CLIP, -0.3 dBFS: analogue-style soft limiting).
+//   VALVE: switches the valve stage in or out (a 12 ms crossfade); IN: the compressor in or out.
+//   MAKE-UP (0 - 20 dB) on the compressed path; MIX: parallel compression - the valve's sound against its
+//   compressed, made-up copy (in the compressor section, so IN takes it out too).
+// THRESHOLD is in dBu (0 dBu = -18 dBFS, the house calibration).
+//
+// THICK: the house THICK circuit (gfx-thick): dense low-mid weight (a dynamic 280 Hz bell that lifts
+//   decaying notes), iron saturation below 500 Hz (2nd and 3rd harmonics, alias-free, no latency) and a rounded
+//   transient front; level-matched, a 15 ms fade in and out. Here: between the valve and the compressor; the valve is also pushed harder and more lop-sided (grid conduction),
+//   the input transformer loaded more, and the compressor's detector window lengthened to 25 ms.
+// DRIFT (a key: 33 % lit, 5 % dark; 50 % = the standard amount below): the valves and their supply.
+//   warm-up     from load the valve starts a little quieter and more lop-sided and settles over about a minute
+//               (the HEATERS lamp brightens as it does)
+//   heaters     slow wander of the valve's bias (the saturation's symmetry, +/- 0.04) and gain (+/- 0.15 dB)
+//   HT sag      loud programme pulls the high-tension supply down: the valve saturates a little earlier (up to 15 %
+//               more drive) and the level dips (to -0.25 dB), recovering over about half a second
+//   capacitors  the compressor's timing parts sit off nominal (+/- 8 %) and wander (+/- 6 %)
+//   0 % = none (and no warm-up), 100 % = twice the standard amount, a little faster.
+//
+// GUI: house dark grey rack faceplate, elephant's breath outlines and title; S / M / L / ? size picker; drag knobs
+//   (Shift = fine), mouse wheel, double-click or Ctrl-click = default.
+// PRESETS: Init, Valve Warmth DI, Rich Bass Guitar, Vocal Tube Fatten, Drum Bus Crunch, Synth Thickening, Acoustic Warmth, Master Bus Glue, Heavy Saturation, Subtle Colour.
+//   Level-matched to the input on programme (LEVEL), except Init (no make-up gain: some sit a little lower).
+// Latency: 31 samples (the 2x oversampling filters), reported.
+//
+// TWEAK points are marked TWEAK.
+// STATUS: Stable v2.0 (from the Lab, Oct 2026). v0.3 (complete: engine, faceplate, THICK, 10 factory presets).
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-thick.jsfx-inc
+import gfx-glow.jsfx-inc
+
+slider1:c_in=1<0,1,1{Out,In}>-Compressor in
+slider2:in_gain=0<-10,20,0.1>-Input gain (dB)
+slider3:drive=20<0,100,1>-Tube drive (%)
+slider4:v_on=1<0,1,1{Off,On}>-Valve stage
+slider5:thr=-10<-30,10,0.1>-Threshold (dBu)
+slider6:ratio=3<1.5,10,0.01>-Ratio
+slider7:atk=10<1,50,0.1>-Attack (ms)
+slider8:rel=500<100,4000,1>-Release (ms)
+slider9:out_lvl=0<-18,6,0.1>-Level (dB)
+slider10:drift=33<0,100,1>-Drift (%)
+slider11:vu_mode=0<0,1,1{Output,Gain reduction}>-VU meter
+slider12:thick=0<0,1,1{Off,On}>-Thick
+slider13:mkup=0<0,20,0.1>-Make-up gain (dB)
+slider14:mix=100<0,100,1>-Mix (%)
+slider15:prs_sel=0<0,10,1{No preset,Init,Valve Warmth DI,Rich Bass Guitar,Vocal Tube Fatten,Drum Bus Crunch,Synth Thickening,Acoustic Warmth,Master Bus Glue,Saturated Parallel,Subtle Colour}>-Preset
+
+@init
+XCH = 7400000;                               // channels 3 - 64 (8192 each): delayed by the latency too
+#ui_man = "gfx-val60";
+ext_noinit = 1;
+!ui_dflt ? ( ui_sz = 0;  pr_cur = 1; );
+ui_dflt = 1;
+gfx_ext_retina = 1;
+CR = 16;
+
+ost_init(0);  ostL.ost_ch_init();  ostR.ost_ch_init();
+
+// ---------- tuning (TWEAK) ----------
+K_LO = 0.08;  K_HI = 3.2;     // valve drive at TUBE DRIVE 0 % and 100 % (k = K_LO x (K_HI / K_LO) ^ drive)
+V_B = 0.20;                   // the valve's bias: its even harmonics
+KNEE = 10;                    // dB: soft knee
+XI_K = 0.45;  XO_K = 0.35;    // the transformers' cores
+
+// ---------- memory: the half-band filter and the oversampling rings ----------
+H = 100;      // 63 taps
+H2 = 200;     // 2 x the even taps (the upsampler's polyphase branch)
+UL = 300;  UR = 400;          // upsampler rings, 64
+DL = 500;  DR = 700;          // downsampler rings, 128
+// a 63-tap half-band low-pass, Kaiser window (beta 8): every other tap is zero, the centre is 0.5
+function bessi0(x) local(s, t, k) ( s = 1;  t = 1;  k = 1;  loop(30, t *= sqr(x / (2 * k));  s += t;  k += 1; );  s; );
+i = 0;  hs = 0;
+loop(63,
+  m = i - 31;
+  H[i] = m == 0 ? 0.5 : (m % 2 == 0 ? 0 : sin($pi * m / 2) / ($pi * m)) ;
+  H[i] *= bessi0(8 * sqrt(max(0, 1 - sqr(m / 31)))) / bessi0(8);
+  hs += H[i];  i += 1;
+);
+i = 0;  loop(63, H[i] /= hs;  i += 1; );
+i = 0;  loop(32, H2[i] = 2 * H[2 * i];  i += 1; );
+memset(UL, 0, 64);  memset(UR, 0, 64);  memset(DL, 0, 128);  memset(DR, 0, 128);
+pdc_bot_ch = 0;  pdc_top_ch = 2;  pdc_delay = 31;
+
+// ---------- drift sources ----------
+HB.drift_init(0.8 + rand(0.4));   HG.drift_init(0.7 + rand(0.4));
+CPA.drift_init(0.5 + rand(0.4));  CPB.drift_init(0.5 + rand(0.4));
+tol_a = rand(2) - 1;  tol_r = rand(2) - 1;
+warm_t = 0;
+
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function g2db(g) ( 8.685889638065035 * log(max(g, 0.0000000001)); );
+function ts(x) ( x = max(-3, min(3, x));  x * (27 + x * x) / (27 + 9 * x * x); );
+function dts(b) local(u, v) ( u = 27 + 9 * b * b;  v = 27 + b * b;  ((27 + 3 * b * b) * u - b * v * 18 * b) / (u * u); );
+// the 2x upsampler: e = the even sample, o = the odd one (o is a plain delay: the half-band's centre tap)
+function up2(x, b) instance(p, e, o) local(j, s) (
+  b[p] = x;  s = 0;  j = 0;
+  loop(16, s += H2[j] * (b[(p - j + 64) & 63] + b[(p - 31 + j + 64) & 63]);  j += 1; );   // symmetric: half the work
+  e = s;  o = b[(p - 15 + 64) & 63];
+  p = (p + 1) & 63;
+);
+// the 2x downsampler: takes the pair (a, then c), returns one sample
+function dn2(a, c, b) instance(p) local(j, s, q) (
+  b[p] = a;  q = p;  p = (p + 1) & 127;  b[p] = c;  p = (p + 1) & 127;   // centred on a: a whole-sample delay
+  s = 0.5 * b[(q - 31 + 128) & 127];  j = 0;
+  loop(16, s += H[2 * j] * (b[(q - 2 * j + 128) & 127] + b[(q - 62 + 2 * j + 128) & 127]);  j += 1; );
+  s;
+);
+// a biased valve stage: unity small-signal gain, soft and asymmetric when driven, DC removed (5 Hz at 2x)
+function valve(x, k, b, sl) instance(dx, dy) local(y) (
+  y = (ts(x * k + b) - ts(b)) / (k * sl);
+  dy = y - dx + dc_r2 * dy;  dx = y;
+  dy;
+);
+function xfmr(x, k) instance(lp) (
+  lp += (x - lp) * xf_c;
+  x - lp + ts(lp * k) / k;
+);
+
+function update_params() (
+  drift_macro(drift);
+  t_in = c_in >= 0.5;  t_v = v_on >= 0.5;
+  t_ig = in_gain;  t_k = log(K_LO * (K_HI / K_LO) ^ (drive / 100));
+  t_thr = thr;  t_rat = ratio;  t_out = out_lvl;  t_mk = mkup;
+);
+
+xf_c = 1 - exp(-2 * $pi * 120 / srate);
+dc_r2 = 1 - 2 * $pi * 5 / (2 * srate);
+sm_c = 1 - exp(-CR / (0.03 * srate));
+sw_c = 1 - exp(-1 / (0.012 * srate));
+rms_c = 1 - exp(-1 / (0.01 * srate));        // detector: 10 ms mean square ...
+rms_c2 = 1 - exp(-1 / (0.025 * srate));      // ... THICK: 25 ms
+thk_init();  thk_lift = 4;  thk_drv = 2.0;  thk_asym = 0.22;  thk_tr = 1.0;  thk_trim = 0;   // TWEAK: VAL60's THICK
+xik = XI_K;  vbt = V_B;
+sag_c = 1 - exp(-1 / (0.5 * srate));
+update_params();
+s_ig = t_ig;  s_k = t_k;  s_thr = t_thr;  s_rat = t_rat;  s_out = t_out;
+ig_g = db2g(s_ig);  out_g = db2g(s_out);  ig_i = og_i = 0;
+s_mk = t_mk;  mk_g = db2g(s_mk);  mk_i = 0;
+mix_c = 1 - exp(-1 / (0.03 * srate));  mix_s = mix / 100;
+m_in = t_in;  m_v = t_v;
+ms = 0;  gr = 0;  cg = 1;  cgi = 0;  mem = 0;  sag = 0;  vk = exp(s_k);
+cr_n = 0;
+
+// (moved here from @gfx: the PRESET parameter loads presets on the audio side)
+function param_touched(idx) ( slider_automate(2 ^ (idx - 1));  gui_dirty = 1; );
+function param_touched_au(idx) ( slider_automate(2 ^ (idx - 1));  gui_dirty = 1; );
+function pv(i, v) ( slider(i) = v; );
+function p_init() (
+  pv(1, 1); pv(2, 0); pv(3, 20); pv(4, 1); pv(5, -10); pv(6, 3); pv(7, 10); pv(8, 500); pv(9, 0); pv(10, 33); pv(11, 0); pv(12, 0); pv(13, 0); pv(14, 100);
+);
+function load_preset(p) local(i) (
+  p_init();
+  p == 2 ? ( pv(2, 3); pv(3, 40); pv(5, -8); pv(6, 2); pv(7, 15); pv(8, 400); pv(13, 5.0); );   // Valve Warmth DI
+  p == 3 ? ( pv(2, 4); pv(3, 55); pv(6, 4); pv(7, 20); pv(8, 300); pv(12, 1); pv(13, 9.0); );   // Rich Bass Guitar
+  p == 4 ? ( pv(2, 2); pv(3, 35); pv(5, -12); pv(7, 8); pv(13, 10.0); );   // Vocal Tube Fatten
+  p == 5 ? ( pv(2, 6); pv(3, 70); pv(6, 4); pv(8, 200); pv(12, 1); pv(13, 9.0); );   // Drum Bus Crunch
+  p == 6 ? ( pv(2, 4); pv(3, 60); pv(5, -8); pv(6, 2.5); pv(7, 20); pv(8, 600); pv(12, 1); pv(13, 6.0); );   // Synth Thickening
+  p == 7 ? ( pv(3, 30); pv(6, 2); pv(7, 15); pv(13, 7.0); );   // Acoustic Warmth
+  p == 8 ? ( pv(3, 15); pv(5, -6); pv(6, 1.5); pv(7, 30); pv(8, 800); pv(13, 3.5); );   // Master Bus Glue
+  p == 9 ? ( pv(2, 8); pv(3, 90); pv(5, -12); pv(6, 4); pv(7, 20); pv(8, 400); pv(12, 1); pv(13, 7.5); pv(14, 50); );   // Saturated Parallel
+  p == 10 ? ( pv(1, 0); pv(3, 25); pv(13, 0.5); );   // Subtle Colour
+  i = 1;  loop(14, param_touched_au(i);  i += 1; );
+);
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 10 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(10, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+update_params();
+
+@block
+prs_chk();
+gui_dirty ? ( gui_dirty = 0;  update_params(); );
+bdt = samplesblock / srate;
+warm_t += bdt;
+wu = exp(-warm_t / 22) * min(dm_a, 1);
+hsp = 0.035 * dm_s * bdt;
+vb = V_B + 0.04 * dm_a * HB.drift_tick(hsp) + 0.10 * wu;                     // bias: the symmetry
+vg = db2g(0.15 * dm_a * HG.drift_tick(hsp) - 1.0 * wu);
+sag_amt = min(1, sag / 0.3);
+age_a = 1 + dm_a * (0.05 * tol_a + 0.04 * CPA.drift_tick(0.02 * dm_s * bdt));
+age_r = 1 + dm_a * (0.05 * tol_r + 0.04 * CPB.drift_tick(0.02 * dm_s * bdt));
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);                                       // house output stage: CLIP
+pdc_bot_ch = 0;  pdc_top_ch = 2;  pdc_delay = 31;
+// display hand-offs
+gr_disp = min(gr_disp, grmin);  grmin = 0;
+vul_disp = vu_n > 0 ? vul_acc / vu_n : 0;  vur_disp = vu_n > 0 ? vur_acc / vu_n : 0;  vul_acc = vur_acc = 0;  vu_n = 0;
+ost_clipped ? ( clip_disp = 1;  ost_clipped = 0; );
+wu_disp = wu;
+// the track's other channels (3 and up, e.g. stems on a multichannel bus) pass through untouched but delayed by
+// the latency, so everything on the track stays in time
+xch_n = min(num_ch, 64) - 2;
+pdc_bot_ch = 0; pdc_top_ch = 2 + max(xch_n, 0);
+
+@serialize
+file_var(0, pr_cur);
+file_var(0, ui_sz);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@sample
+cr_n <= 0 ? (
+  cr_n = CR;
+  s_ig += (t_ig - s_ig) * sm_c;  s_k += (t_k - s_k) * sm_c;  s_thr += (t_thr - s_thr) * sm_c;
+  s_rat += (t_rat - s_rat) * sm_c;  s_out += (t_out - s_out) * sm_c;
+  ig_i = (db2g(s_ig) - ig_g) / CR;
+  s_mk += (t_mk - s_mk) * sm_c;  mk_i = (db2g(s_mk) - mk_g) / CR;
+  og_i = (db2g(s_out - 0.25 * dm_a * sag_amt) * vg - out_g) / CR;
+  // THICK pushes the valve harder and more lop-sided (grid conduction) and loads the input iron more
+  vk = exp(s_k) * (1 + 0.15 * dm_a * sag_amt) * (1 + 0.6 * thk_m);
+  vbt = vb + 0.10 * thk_m;  vsl = dts(vbt);
+  xik = XI_K * (1 + 0.8 * thk_m);
+  // the compressor: feed-forward RMS, soft knee; an optical-style memory slows the release after long, heavy GR
+  lv = g2db(sqrt(ms)) + 18;
+  ov = lv - s_thr;
+  sl_ = 1 - 1 / s_rat;
+  tgr = ov <= -KNEE * 0.5 ? 0 : ov < KNEE * 0.5 ? -sl_ * sqr(ov + KNEE * 0.5) / (2 * KNEE) : -sl_ * ov;
+  mem += (min(1, -gr / 8) - mem) * (1 - exp(-CR / (1.5 * srate)));          // TWEAK: builds over ~1.5 s
+  ac = 1 - exp(-CR / (atk * 0.001 * age_a * srate));
+  rc = 1 - exp(-CR / (rel * 0.001 * age_r * (1 + mem) * srate));
+  gr += (tgr - gr) * (tgr < gr ? ac : rc);
+  grmin = min(grmin, gr);
+  cgi = (db2g(gr) - cg) / CR;
+);
+cr_n -= 1;
+ig_g += ig_i;  out_g += og_i;  cg += cgi;
+m_in += (t_in - m_in) * sw_c;  m_v += (t_v - m_v) * sw_c;  mk_g += mk_i;  mix_s += (mix / 100 - mix_s) * mix_c;
+
+// ---------- input transformer, INPUT GAIN ----------
+xl = XIL.xfmr(spl0, xik) * ig_g;  xr = XIR.xfmr(spl1, xik) * ig_g;
+
+// ---------- the valve, 2x oversampled (the dry path runs through the same filters, so VALVE swaps cleanly) ----------
+UPL.up2(xl, UL);  UPR.up2(xr, UR);
+el = UPL.e;  ol = UPL.o;  er = UPR.e;  orr = UPR.o;
+m_v > 0.00001 ? (
+  el += (VL.valve(el, vk, vbt, vsl) - el) * m_v;  ol += (VL.valve(ol, vk, vbt, vsl) - ol) * m_v;
+  er += (VR.valve(er, vk, vbt, vsl) - er) * m_v;  orr += (VR.valve(orr, vk, vbt, vsl) - orr) * m_v;
+);
+xl = DNL.dn2(el, ol, DL);  xr = DNR.dn2(er, orr, DR);
+thk_proc(xl, xr, thick >= 0.5);  xl = thk_l;  xr = thk_r;    // THICK, between the valve and the compressor
+
+// ---------- the compressor (detector on its input, linked stereo) ----------
+ms += (max(xl * xl, xr * xr) - ms) * (rms_c + (rms_c2 - rms_c) * thk_m);
+// MAKE-UP on the compressed path, MIX = parallel compression (the valve's sound against its compressed copy), IN
+yl = xl * cg * mk_g;  yr = xr * cg * mk_g;
+yl = xl + (yl - xl) * mix_s;  yr = xr + (yr - xr) * mix_s;
+yl = xl + (yl - xl) * m_in;  yr = xr + (yr - xr) * m_in;
+
+// ---------- output transformer, LEVEL, the house output stage ----------
+// MAKE-UP (after the compressor), the output transformer, MIX (parallel: the dry input against all of it), LEVEL
+yl = XOL.xfmr(yl, XO_K) * out_g;  yr = XOR.xfmr(yr, XO_K) * out_g;
+sag += (max(abs(yl), abs(yr)) - sag) * sag_c;
+vul_acc += yl * yl;  vur_acc += yr * yr;  vu_n += 1;
+yl = ostL.ost_band(yl);  yr = ostR.ost_band(yr);
+ost_out(yl, yr);
+spl0 = ost_l;  spl1 = ost_r;
+// channels 3 and up: delayed by the latency (see @block)
+xch_n > 0 ? (
+  xch_k = 0;
+  loop(xch_n,
+    XCH[xch_k * 8192 + xch_w] = spl(xch_k + 2);
+    spl(xch_k + 2) = XCH[xch_k * 8192 + ((xch_w - pdc_delay) & 8191)];
+    xch_k += 1;
+  );
+  xch_w = (xch_w + 1) & 8191;
+);
+
+@gfx 960 388
+// =====================================================================
+// GUI - checkpoint 1: a working first panel in the house dark grey with elephant's breath accents (the finished
+// faceplate and the meter ballistics are checkpoint 2).
+// Layout (design units, 960 x 388): header 0 - 58; outlined sections, top line y 84, bottom y 372:
+//   VALVE 16 - 280   COMPRESSOR 296 - 664   OUTPUT 680 - 944
+// Knob row centres y 176, labels on one line (y 226); keys y 300.
+// =====================================================================
+C_FACE = 0x2B2D2F;  C_HEAD = 0x1D1E20;  C_INK = 0xF1F0EB;  C_INK2 = 0xB9B8B2;  C_LINE = 0xC7BEB3;
+C_YEL = 0xF2C230;  C_LCDBG = 0x0B0D0E;  C_LCDTX = 0xF2C26A;  C_CREAM = 0xF1E6C4;
+LK_AMB = 0xF2A41E;  LK_YEL = 0xF2C230;  lk_well = 0x050505;
+VUS = 20000;                              // GUI memory: the faceplate grain, the VU needles
+
+function col(h, a) (
+  gfx_r = floor(h / 65536) / 255;  gfx_g = (floor(h / 256) % 256) / 255;  gfx_b = (h % 256) / 255;  gfx_a = a;
+);
+function shade(h, f) local(r, g, b) (
+  r = min(255, floor(floor(h / 65536) * f));  g = min(255, floor((floor(h / 256) % 256) * f));
+  b = min(255, floor((h % 256) * f));  r * 65536 + g * 256 + b;
+);
+function ui_mix(c1, c2, t) (
+  floor(floor(c1 / 65536) * (1 - t) + floor(c2 / 65536) * t) * 65536 +
+  floor((floor(c1 / 256) % 256) * (1 - t) + (floor(c2 / 256) % 256) * t) * 256 +
+  floor((c1 % 256) * (1 - t) + (c2 % 256) * t);
+);
+function px(v) ( ox + v * sc; );
+function py(v) ( oy + v * sc; );
+function ps(v) ( v * sc; );
+function u_rect(x, y, w, h) ( gfx_rect(px(x), py(y), ps(w), ps(h), 1); );
+function text_c(x, y, str) local(w, h) ( gfx_measurestr(str, w, h);  gfx_x = x - w * 0.5;  gfx_y = y - h * 0.5;  gfx_drawstr(str); );
+function text_l(x, y, str) local(w, h) ( gfx_measurestr(str, w, h);  gfx_x = x;  gfx_y = y - h * 0.5;  gfx_drawstr(str); );
+function rivet(x, y) (
+  col(0x55585C, 1);  gfx_circle(px(x), py(y), ps(3.5), 1, 1);
+  col(0xFFFFFF, 0.35);  gfx_circle(px(x) - ps(1), py(y) - ps(1), ps(1.2), 1, 1);
+  col(0x000000, 0.6);  gfx_line(px(x) - ps(2), py(y), px(x) + ps(2), py(y), 1);
+);
+// an outlined section: the title (and lamps) sit in gaps in the top line
+// one rounded corner of an outline, anti-aliased, in device pixels: (cx, cy) the arc's centre, ra the outer radius,
+// th the line width, sx / sy which way the corner faces (-1 = left / top, 1 = right / bottom)
+function ocorner(cx, cy, ra, th, sx, sy) local(i, j, d, c) (
+  j = 0;
+  loop(ra,
+    i = 0;
+    loop(ra,
+      d = sqrt(sqr(i + 0.5) + sqr(j + 0.5));
+      c = max(0, min(1, min(ra - d + 0.5, d - (ra - th) + 0.5)));
+      c > 0 ? ( gfx_a = 0.85 * c;  gfx_rect(sx < 0 ? cx - i - 1 : cx + i, sy < 0 ? cy - j - 1 : cy + j, 1, 1, 1); );
+      i += 1;
+    );
+    j += 1;
+  );
+);
+// an outlined section: whole device pixels throughout so the lines and the corners meet exactly; the title
+// (and lamps, gx0 - gx1) sit in gaps in the top line
+function box(x, y, w, h, title, gx0, gx1) local(tw, th, L, R, T, B, ra, lw, g0, g1) (
+  gfx_setfont(4);  gfx_measurestr(title, tw, th);
+  L = floor(px(x) + 0.5);  R = floor(px(x + w) + 0.5);  T = floor(py(y) + 0.5);  B = floor(py(y + h) + 0.5);
+  ra = floor(ps(7) + 0.5);  lw = max(1, floor(ps(1.5) + 0.5));
+  g0 = floor(px(x + w * 0.5) - tw * 0.5 - ps(8) + 0.5);  g1 = floor(px(x + w * 0.5) + tw * 0.5 + ps(8) + 0.5);
+  col(C_LINE, 0.85);
+  gfx_rect(L + ra, T, g0 - (L + ra), lw, 1);
+  gx0 > 0 ? ( gfx_rect(g1, T, floor(px(gx0) + 0.5) - g1, lw, 1);  gfx_rect(floor(px(gx1) + 0.5), T, R - ra - floor(px(gx1) + 0.5), lw, 1); )
+          : gfx_rect(g1, T, R - ra - g1, lw, 1);
+  gfx_rect(L + ra, B - lw, R - L - 2 * ra, lw, 1);
+  gfx_rect(L, T + ra, lw, B - T - 2 * ra, 1);  gfx_rect(R - lw, T + ra, lw, B - T - 2 * ra, 1);
+  ocorner(L + ra, T + ra, ra, lw, -1, -1);  ocorner(R - ra, T + ra, ra, lw, 1, -1);
+  ocorner(L + ra, B - ra, ra, lw, -1, 1);   ocorner(R - ra, B - ra, ra, lw, 1, 1);
+  col(C_INK, 1);  text_c(px(x + w * 0.5), T + lw * 0.5, title);
+);
+function fmtv(v, fmt) (
+  fmt == 1 ? sprintf(#kv, "%+.1f dBu", v) :
+  fmt == 2 ? sprintf(#kv, "%+.1f dB", v) :
+  fmt == 3 ? sprintf(#kv, "%.1f : 1", v) :
+  fmt == 4 ? sprintf(#kv, v < 10 ? "%.1f ms" : "%d ms", v) :
+  fmt == 5 ? ( v < 1000 ? sprintf(#kv, "%d ms", v) : sprintf(#kv, "%.2f s", v / 1000); ) :
+  fmt == 7 ? sprintf(#kv, "%d %%", v) :
+             sprintf(#kv, "%.2f", v);
+  #kv;
+);
+function hover_tag(x, y, str) local(w, h) (
+  gfx_setfont(3);  gfx_measurestr(str, w, h);
+  col(0x000000, 0.92);  gfx_rect(x - w * 0.5 - ps(6), y - h * 0.5 - ps(3), w + ps(12), h + ps(6), 1);
+  col(C_LCDTX, 1);  text_c(x, y, str);
+);
+// a filled quad with soft edges (the pointer stripe)
+function quad(ax, ay, bx, by, hw) local(dx, dy, l) (
+  l = sqrt(sqr(bx - ax) + sqr(by - ay));  dx = -(by - ay) / l * hw;  dy = (bx - ax) / l * hw;
+  gfx_triangle(ax + dx, ay + dy, bx + dx, by + dy, bx - dx, by - dy, ax - dx, ay - dy);
+);
+// a scale mark: a short white tick at t (0 - 1) and, if str is set, its number
+function smark(cx, cy, r, t, str) local(a, sa, ca) (
+  a = -0.75 * $pi + t * 1.5 * $pi;  sa = sin(a);  ca = cos(a);
+  col(C_INK, 0.9);  gfx_line(px(cx + sa * (r + 4)), py(cy - ca * (r + 4)), px(cx + sa * (r + 8)), py(cy - ca * (r + 8)), 1);
+  strlen(str) ? ( gfx_setfont(5);  col(C_INK, 1);  text_c(px(cx + sa * (r + 17)), py(cy - ca * (r + 16)), str); );
+);
+function lt(v, vmin, vmax) ( log(v / vmin) / log(vmax / vmin); );       // where v sits on a log knob
+// Pointer knob: a black knurled skirt, a black cap, a yellow stripe the full radius. klog = 1 before a call: the
+// travel is logarithmic. The label sits on the row's common line (klab_y), coloured kcol (white, or yellow for the
+// key filters).
+function kn(cx, cy, r, idx, vmin, vmax, def, lbl, fmt) local(x, y, rr, v, t, hov, now, a, j, lg, b)
+(
+  lg = klog;  klog = 0;
+  x = px(cx);  y = py(cy);  rr = ps(r);
+  hov = sqr(mouse_x - x) + sqr(mouse_y - y) <= sqr(rr * 1.25);
+  v = max(vmin, min(vmax, slider(idx)));
+  t = lg ? lt(v, vmin, vmax) : (v - vmin) / (vmax - vmin);
+  click && hov && !drag_idx ? (
+    now = time_precise();
+    (mouse_cap & 4) || (last_click_idx == idx && now - last_click_t < 0.35) ? (
+      slider(idx) = def;  param_touched(idx);  drag_idx = 0;
+    ) : ( drag_idx = idx;  drag_y = mouse_y;  drag_t = t; );
+    last_click_idx = idx;  last_click_t = now;
+  );
+  hov && mouse_wheel != 0 && !drag_idx ? (
+    t = max(0, min(1, t + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.03)));
+    v = lg ? vmin * (vmax / vmin) ^ t : vmin + t * (vmax - vmin);
+    v = v >= 100 ? floor(v + 0.5) : floor(v * 100 + 0.5) / 100;
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+    mouse_wheel = 0;
+  );
+  drag_idx == idx ? (
+    t = max(0, min(1, drag_t + (drag_y - mouse_y) / ps((mouse_cap & 8) ? 1100 : 220)));
+    v = lg ? vmin * (vmax / vmin) ^ t : vmin + t * (vmax - vmin);
+    v = v >= 100 ? floor(v + 0.5) : lg ? floor(v * 100 + 0.5) / 100 : floor(v * 10 + 0.5) / 10;
+    v = max(vmin, min(vmax, v));
+    v != slider(idx) ? ( slider(idx) = v;  param_touched(idx); );
+  );
+  v = max(vmin, min(vmax, slider(idx)));
+  t = lg ? lt(v, vmin, vmax) : (v - vmin) / (vmax - vmin);
+  a = -0.75 * $pi + t * 1.5 * $pi;
+  col(0x000000, 0.5);  gfx_circle(x + ps(1.5), y + ps(2.5), rr, 1, 1);                     // shadow
+  col(0x0A0A0A, 1);  gfx_circle(x, y, rr, 1, 1);                                          // skirt
+  col(0x2A2A2A, 1);  j = 0;                                                               // knurl
+  loop(36, b = j / 36 * 2 * $pi;  gfx_line(x + sin(b) * rr * 0.84, y - cos(b) * rr * 0.84, x + sin(b) * (rr - 1), y - cos(b) * (rr - 1), 1);  j += 1; );
+  col(0x1D1D1E, 1);  gfx_circle(x, y, rr * 0.78, 1, 1);                                   // cap
+  col(0xFFFFFF, 0.10);  gfx_arc(x, y, rr * 0.72, -1.6, -0.3, 1);                          // one soft highlight
+  col(0x3A3A3C, 1);  gfx_circle(x, y, rr, 0, 1);
+  col(C_YEL, 1);  quad(x + sin(a) * rr * 0.18, y - cos(a) * rr * 0.18, x + sin(a) * rr * 0.97, y - cos(a) * rr * 0.97, ps(r >= 24 ? 1.7 : 1.4));
+  gfx_setfont(6);  col(kcol ? kcol : C_INK, 1);  kcol = 0;
+  text_c(x, py(klab_y), lbl);
+  hov || drag_idx == idx ? hover_tag(x, y - rr - ps(18), fmtv(v, fmt));
+);
+// ---------- keys ----------
+function ui_rrs(x, y, w, h, r) local(i, d, ins) (
+  x = floor(x + 0.5); y = floor(y + 0.5); w = floor(w + 0.5); h = floor(h + 0.5);
+  r = min(floor(r + 0.5), floor(min(w, h) * 0.5));
+  i = 0;
+  loop(r,
+    d = r - i - 0.5; ins = floor(r - sqrt(max(r * r - d * d, 0)) + 0.5);
+    gfx_rect(x + ins, y + i, w - 2 * ins, 1);  gfx_rect(x + ins, y + h - 1 - i, w - 2 * ins, 1);
+    i += 1;
+  );
+  gfx_rect(x, y + r, w, h - 2 * r);
+);
+function lk_rr(x, y, w, h, r) ( ui_rrs(px(x), py(y), ps(w), ps(h), ps(r)); );
+function ui_keytext(cx, cy, str) local(w, h) (
+  gfx_measurestr(str, w, h); gfx_x = floor(cx - w * 0.5 + 0.5); gfx_y = floor(cy - h * 0.58 + 0.5); gfx_drawstr(str);
+);
+// house lamp key (IN, and the preset bar)
+function lk_key(x, y, w, h, on, c, str) local(hov, hit, k, lens, dn, i, t, dx, dy) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov && !drag_idx;
+  dn = hov && lmb ? 1 : 0;
+  k = min(w / 54, h / 40);
+  lens = shade(ui_mix(c, 0xCFC9BC, 0.5), 0.76);
+  on ? lens = c;
+  on ? (
+    col(c, 0.10); lk_rr(x - 9 * k, y - 9 * k, w + 18 * k, h + 18 * k, 10 * k);
+    col(c, 0.18); lk_rr(x - 6 * k, y - 6 * k, w + 12 * k, h + 12 * k, 8 * k);
+  );
+  col(lk_well, 1);           lk_rr(x - 4 * k, y - 4 * k, w + 8 * k, h + 8 * k, 5 * k);
+  col(shade(lens, 0.55), 1); lk_rr(x, y + 1 / sc, w, h, 4 * k);
+  y += (dn - 1) / sc;
+  on ? (
+    col(lens, 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    i = 1;
+    loop(4,
+      t = 0.07 * i * (1 + 0.6 * max(1 - k, 0));
+      dx = (i == 1 ? 3 : i == 2 ? 6 : i == 3 ? 10 : 14) * k;
+      dy = (i == 1 ? 2 : i == 2 ? 4 : i == 3 ? 7 : 9) * k;
+      col(ui_mix(c, 0xFFFFFF, t), 1); lk_rr(x + dx, y + dy, w - 2 * dx, h - 1 / sc - 2 * dy, 4 * k);
+      i += 1;
+    );
+  ) : (
+    col(shade(lens, 0.62), 1); lk_rr(x, y, w, h - 1 / sc, 4 * k);
+    col(shade(lens, 0.78), 1); lk_rr(x + 2 * k, y + 2 * k, w - 4 * k, h - 5 * k, 4 * k);
+    col(shade(lens, 0.92), 1); lk_rr(x + 5 * k, y + 4 * k, w - 10 * k, h - 10 * k, 4 * k);
+    col(lens, 1);              lk_rr(x + 9 * k, y + 7 * k, w - 18 * k, h - 17 * k, 4 * k);
+  );
+  col(0xFFFFFF, on ? 0.45 : 0.22);  gfx_rect(px(x + 4 * k), py(y), ps(w - 8 * k), max(1, ps(1.5)));
+  hov && !dn ? ( col(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1 / sc, 4 * k); );
+  gfx_setfont(2);  col(shade(c, on ? 0.30 : 0.17), 1);
+  ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
+  hit;
+);
+// square white push-button with an amber LED (the selector keys): pressed in and lit when on
+function wk_key(x, y, w, h, on, str) local(hov, hit, b, dn) (
+  hov = mouse_x >= px(x) && mouse_x < px(x + w) && mouse_y >= py(y) && mouse_y < py(y + h);
+  hit = click && hov && !drag_idx;
+  b = 1.6;  dn = on ? 0 : 1.6;
+  col(0x000000, 0.5);  u_rect(x + 1, y + 2, w, h);
+  col(0x050505, 1);  u_rect(x, y, w, h);
+  col(on ? 0xEDEAE0 : 0xBDBAB0, 1);  u_rect(x + b, y + b + dn, w - 2 * b, h - 2 * b - dn);
+  on ? ( col(0xFFFFFF, 0.6);  u_rect(x + b, y + b, w - 2 * b, 1);  col(0x000000, 0.15);  u_rect(x + b, y + h - b - 2, w - 2 * b, 2); )
+     : ( col(0x000000, 0.3);  u_rect(x + b, y + b + dn, w - 2 * b, 1.5); );
+  hov ? ( col(0xFFFFFF, 0.1);  u_rect(x + b, y + b + dn, w - 2 * b, h - 2 * b - dn); );
+  on ? ( col(0xFFB030, 0.35);  gfx_circle(px(x + 10), py(y + h * 0.5 + dn * 0.5), ps(5), 1, 1); );
+  col(on ? 0xFFB030 : 0x6B5A3C, 1);  gfx_circle(px(x + 10), py(y + h * 0.5 + dn * 0.5), ps(2.8), 1, 1);
+  gfx_setfont(2);  col(on ? 0x22201C : 0x4E4A44, 1);
+  ui_keytext(px(x + w * 0.5 + 6), py(y + h * 0.5 + dn * 0.5), str);
+  hit;
+);
+// a small plain square grey push-button (THICK, DRIFT); its red LED sits to its right and its name is printed on
+// the faceplate under the pair. (x, y) = the button's top left; returns 1 when the button is clicked
+function sq_key(x, y, on, lbl) local(hov, hit, s, b, dn) (
+  s = 22;  b = 2;  dn = on ? 1.5 : 0;
+  hov = mouse_x >= px(x) && mouse_x < px(x + s) && mouse_y >= py(y) && mouse_y < py(y + s);
+  hit = click && hov && !drag_idx;
+  col(0x000000, 0.5);  u_rect(x + 1, y + 2, s, s);
+  col(0x050505, 1);  u_rect(x, y, s, s);                                       // the well
+  col(on ? 0x8A8C90 : 0x9C9EA2, 1);  u_rect(x + b, y + b + dn, s - 2 * b, s - 2 * b - dn);   // the grey cap
+  !on ? ( col(0xFFFFFF, 0.28);  u_rect(x + b, y + b, s - 2 * b, 1);
+          col(0x000000, 0.28);  u_rect(x + b, y + s - b - 2, s - 2 * b, 2); )
+      : ( col(0x000000, 0.35);  u_rect(x + b, y + b + dn, s - 2 * b, 1.5); );
+  hov ? ( col(0xFFFFFF, 0.08);  u_rect(x + b, y + b + dn, s - 2 * b, s - 2 * b - dn); );
+  // the LED, to the right
+  col(0x000000, 1);  gfx_circle(px(x + s + 12), py(y + s * 0.5), ps(5.2), 1, 1);
+  col(on ? 0xFF2A1A : 0x4A1410, 1);  gfx_circle(px(x + s + 12), py(y + s * 0.5), ps(3.8), 1, 1);
+  on ? ( col(0xFF3A2A, 0.3);  gfx_circle(px(x + s + 12), py(y + s * 0.5), ps(8), 1, 1);
+         col(0xFFFFFF, 0.55);  gfx_circle(px(x + s + 11), py(y + s * 0.5 - 1), ps(1.2), 1, 1); );
+  // the label, printed on the faceplate
+  gfx_setfont(7);  col(C_INK, 1);  text_c(px(x + (s + 17) * 0.5), py(y + s + 12), lbl);
+  hit;
+);
+// a round LED lamp
+function lamp(x, y, c, on) local(k) (
+  k = lamp_k > 0 ? lamp_k : 1;  lamp_k = 0;                 // lamp_k before a call: size (1 = standard)
+  col(0x000000, 1);  gfx_circle(px(x), py(y), ps(6 * k), 1, 1);
+  col(on ? c : shade(c, 0.28), 1);  gfx_circle(px(x), py(y), ps(4.6 * k), 1, 1);
+  on ? ( col(c, 0.28);  gfx_circle(px(x), py(y), ps(9 * k), 1, 1);  col(0xFFFFFF, 0.55);  gfx_circle(px(x - 1.5 * k), py(y - 1.5 * k), ps(1.4 * k), 1, 1); );
+);
+// ---------- LED ladders ----------
+// one LED: a small rounded block, lit or dim
+function led(x, y, w, h, c, on) (
+  col(0x000000, 1);  u_rect(x - 1, y - 1, w + 2, h + 2);
+  col(on ? c : shade(c, 0.22), 1);  u_rect(x, y, w, h);
+  on ? ( col(0xFFFFFF, 0.3);  u_rect(x + 1, y + 1, w - 2, 1); );
+);
+// level ladder, house: -42 .. +3 dBFS in 3 dB steps (16 LEDs), green / yellow from -6 / red from 0;
+// a held peak LED (1.2 s, then 0.6 dB a frame); slot = which hold (in GUI memory)
+function ladder(x, y, v, slot) local(j, d, c, pk) (
+  now_t = time_precise();
+  v > VUS[slot] ? ( VUS[slot] = v;  VUS[slot + 1] = now_t; ) :
+    now_t - VUS[slot + 1] > 1.2 ? VUS[slot] = max(v, VUS[slot] - 0.6);
+  pk = VUS[slot];
+  j = 0;
+  loop(16,
+    d = -42 + j * 3;  c = d >= 0 ? 0xFF3A2A : d >= -6 ? 0xFFC81E : 0x3CE05A;
+    led(x + j * 11, y, 8, 12, c, v >= d || (pk >= d && pk < d + 3));
+    j += 1;
+  );
+);
+
+function vu(x, y, w, h, val, val2, grm, lbl, slot) local(nn, vv, cx, cyp, R, j, d, t, a, xx, yy, n, lin, sp, ti, to, tl, nl)
+(
+  vg_spill(px(x - 3), py(y - 3), ps(w + 6), ps(h + 6), 1);              // backlit (gfx-glow)
+  col(0x2A2F2B, 1);  u_rect(x - 3, y - 3, w + 6, h + 6);
+  vg_glow(px(x), py(y), ps(w), ps(h), 1);
+  cx = x + w * 0.5;
+  h < 80 ? ( cyp = y + h + 90;  R = h + 78;  sp = 0.42;  ti = R - 17;  to = R - 9;  tl = R + 1;  nl = R - 11; )   // short face: flat arc, numbers above the ticks
+         : ( cyp = y + h + 34;  R = h + 14;  sp = 0.78;  ti = R - 10;  to = R;  tl = R - 20;  nl = R - 2; );
+  // scale: angle from -sp to +sp rad
+  j = 0;
+  loop(grm ? 5 : 10,
+    grm ? ( d = j == 0 ? 0 : j == 1 ? 3 : j == 2 ? 6 : j == 3 ? 10 : 20;  t = 1 - sqrt(d / 20); ) :
+          ( d = j == 0 ? -20 : j == 1 ? -10 : j == 2 ? -7 : j == 3 ? -5 : j == 4 ? -3 : j == 5 ? -1 : j == 6 ? 0 : j == 7 ? 1 : j == 8 ? 2 : 3;
+            lin = 10 ^ (d / 20);  t = (lin - 0.1) / (1.4125 - 0.1); );
+    a = -sp + t * 2 * sp;
+    col(!grm && d > 0 ? 0xC0302A : 0x1E1E1A, 1);
+    gfx_line(px(cx + sin(a) * ti), py(cyp - cos(a) * ti), px(cx + sin(a) * to), py(cyp - cos(a) * to), 1);
+    gfx_setfont(5);
+    grm ? sprintf(#vl, "%d", d) : sprintf(#vl, d > 0 ? "+%d" : "%d", d);
+    (grm || j == 0 || j == 1 || (j == 3 && h >= 80) || j == 6 || j == 9) ? text_c(px(cx + sin(a) * tl), py(cyp - cos(a) * tl), #vl);
+    j += 1;
+  );
+  !grm ? ( col(0xC0302A, 1);  n = 0;                                   // the red arc above 0 VU
+    loop(20, t = (1 + n / 20 * 0.4125 - 0.1) / 1.3125;  a = -sp + t * 2 * sp;  gfx_rect(px(cx + sin(a) * R) - 1, py(cyp - cos(a) * R) - 1, ps(2), ps(2), 1);  n += 1; ); );
+  gfx_setfont(6);  col(0x1E1E1A, 1);  text_c(px(cx), py(y + h - 14), lbl);
+  nn = 0;                                   // GR: one needle; OUTPUT: left (black) and right (red)
+  loop(grm ? 1 : 2,
+  // the needle (spring ballistics, ~300 ms)
+  vv = nn ? val2 : val;
+  grm ? t = 1 - sqrt(min(20, max(0, -vv)) / 20) :
+        ( lin = 10 ^ (max(-30, min(4, vv)) / 20);  t = max(-0.04, min(1.04, (lin - 0.1) / 1.3125)); );
+  VUS[(slot + nn) * 2 + 1] += ((t - VUS[(slot + nn) * 2]) * 0.24 - VUS[(slot + nn) * 2 + 1] * 0.5);
+  VUS[(slot + nn) * 2] += VUS[(slot + nn) * 2 + 1];
+  a = -sp + max(-0.06, min(1.06, VUS[(slot + nn) * 2])) * 2 * sp;
+  gfx_x = 0;  col(nn ? 0xB0281E : 0x111111, 1);
+  xx = cx + sin(a) * nl;  yy = cyp - cos(a) * nl;
+  n = (cyp - (y + h - 4)) / cos(a);                                   // the needle starts where it leaves the face's foot
+  gfx_line(px(cx + sin(a) * n), py(cyp - cos(a) * n), px(xx), py(yy), 1);
+  nn += 1;
+  );
+  col(0x2A2F2B, 1);  u_rect(x, y + h - 4, w, 4);
+);
+
+
+PRESET_MENU = "Init|Valve Warmth DI|Rich Bass Guitar|Vocal Tube Fatten|Drum Bus Crunch|Synth Thickening|Acoustic Warmth|Master Bus Glue|Saturated Parallel|Subtle Colour";
+// ---------- house preset bar: [PRESETS][<][>][LCD] ----------
+function pb_count(menu) local(k, n) ( n = 1;  k = 0;  loop(strlen(menu), str_getchar(menu, k) == 124 ? n += 1;  k += 1; );  n; );
+function pb_item(menu, i, dst) local(k, k0, n, c, len) (
+  strcpy(dst, "");  len = strlen(menu);  k = 0;  k0 = 0;  n = 1;
+  loop(len + 1,
+    c = k < len ? str_getchar(menu, k) : 124;
+    c == 124 ? ( n == i ? strcpy_substr(dst, menu, k0, k - k0);  n += 1;  k0 = k + 1; );
+    k += 1;
+  );
+  dst;
+);
+function lcd(x, y, w, h, str) local(tw, th, gy) (
+  col(0x2A2B2D, 1);  u_rect(x - 2, y - 2, w + 4, h + 4);
+  col(0x000000, 1);  u_rect(x, y, w, h);
+  col(C_LCDBG, 1);   u_rect(x + 3, y + 3, w - 6, h - 6);
+  gfx_setfont(8);  gfx_measurestr(str, tw, th);  gy = py(y + h * 0.5) - th * 0.5;
+  col(C_LCDTX, 0.22);  gfx_x = px(x + 10) - 1;  gfx_y = gy;  gfx_drawstr(str);  gfx_x = px(x + 10) + 1;  gfx_y = gy;  gfx_drawstr(str);
+  col(C_LCDTX, 1);  gfx_x = px(x + 10);  gfx_y = gy;  gfx_drawstr(str);
+);
+function pb_tri(cx, cy, s, dir) ( gfx_triangle(px(cx + dir * s), py(cy), px(cx - dir * s), py(cy - s), px(cx - dir * s), py(cy + s)); );
+function preset_bar(x, y, h, lw, cur, menu) local(n, sel, open, lx, i) (
+  n = pb_count(menu);  sel = 0;  open = 0;
+  lk_key(x, y + 3, 92, h - 6, 0, 0xD8DCD2, "PRESETS") ? open = 1;
+  lk_key(x + 102, y + 3, 38, h - 6, 0, 0xD8DCD2, "") ? ( sel = cur <= 1 || cur > n ? n : cur - 1; );
+  lk_key(x + 150, y + 3, 38, h - 6, 0, 0xD8DCD2, "") ? ( sel = cur >= n || cur < 1 ? 1 : cur + 1; );
+  col(0x1A1A1A, 1);  pb_tri(x + 121, y + h * 0.5, 5, -1);  pb_tri(x + 169, y + h * 0.5, 5, 1);
+  lx = x + 202;
+  cur >= 1 && cur <= n ? pb_item(menu, cur, #pb_nm) : strcpy(#pb_nm, "--");
+  lcd(lx, y, lw, h, #pb_nm);
+  click && mouse_x >= px(lx) && mouse_x < px(lx + lw) && mouse_y >= py(y) && mouse_y < py(y + h) ? open = 1;
+  open ? (
+    strcpy(#pb_m, "");  i = 1;
+    loop(n, i == cur ? strcat(#pb_m, "!");  strcat(#pb_m, pb_item(menu, i, #pb_t));  strcat(#pb_m, "|");  i += 1; );
+    strcat(#pb_m, "Reset all to defaults");
+    gfx_x = px(x);  gfx_y = py(y + h);  i = gfx_showmenu(#pb_m);  i > 0 ? sel = i;
+  );
+  sel;
+);
+
+// ---------- frame setup ----------
+g_ret = gfx_ext_retina > 1 ? gfx_ext_retina : 1;
+g_want = ui_sz == 1 ? 0.85 : ui_sz == 2 ? 1.3 : 1;
+sc = g_ret * max(min(g_want, min(gfx_w / (960 * g_ret), gfx_h / (388 * g_ret))), 0.5);
+ox = (gfx_w - 960 * sc) * 0.5;
+oy = (gfx_h - 388 * sc) * 0.5;
+lmb = mouse_cap & 1;
+click = lmb && !last_lmb;
+kcol = 0;  klog = 0;
+
+gfx_setfont(1, "Trebuchet MS", ps(30), 'b');
+gfx_setfont(10, "Trebuchet MS", ps(12), 'b');
+gfx_setfont(2, "Trebuchet MS", ps(12), 'b');
+gfx_setfont(3, "Verdana", ps(13), 'b');
+gfx_setfont(4, "Trebuchet MS", ps(15), 'b');
+gfx_setfont(5, "Trebuchet MS", ps(11), 'b');
+gfx_setfont(6, "Trebuchet MS", ps(13), 'b');
+gfx_setfont(7, "Trebuchet MS", ps(10), 'b');
+gfx_setfont(8, "Courier New", ps(19.7), 'b');
+
+// ---------- the faceplate ----------
+col(0x050505, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+col(C_FACE, 1);  u_rect(0, 0, 960, 388);
+!grain_ok ? (
+  g_j = 0;  loop(1400, VUS[100 + g_j * 3] = rand(960);  VUS[101 + g_j * 3] = 58 + rand(328);  VUS[102 + g_j * 3] = rand(1) < 0.5;  g_j += 1; );
+  grain_ok = 1;
+);
+g_j = 0;
+loop(1400,
+  col(VUS[102 + g_j * 3] ? 0xFFFFFF : 0x000000, VUS[102 + g_j * 3] ? 0.035 : 0.25);
+  gfx_rect(px(VUS[100 + g_j * 3]), py(VUS[101 + g_j * 3]), max(1, ps(1)), max(1, ps(1)), 1);
+  g_j += 1;
+);
+col(C_HEAD, 1);  u_rect(0, 0, 960, 58);
+col(0x34353A, 1);  u_rect(0, 58, 960, 1.5);
+col(0x000000, 0.55);  u_rect(0, 385, 960, 3);  u_rect(957, 0, 3, 388);
+rivet(9, 9);  rivet(951, 9);  rivet(9, 379);  rivet(951, 379);
+gfx_setfont(1);  col(C_LINE, 1);  text_l(px(26), py(25), "VAL60");
+gfx_setfont(10);  col(C_INK2, 1);  text_l(px(28), py(47), "VALVE CHANNEL / COMPRESSOR");
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+pb_k = preset_bar(300, 12, 34, 250, pr_cur, PRESET_MENU);
+pb_k > 0 ? ( prs_dirty = pb_k;  pr_cur = pb_k > 10 ? 1 : pb_k; );
+
+// ---------- VALVE ----------
+box(16, 84, 264, 288, "VALVE", 0, 0);
+klab_y = 226;
+smark(82, 176, 24, 0, "-10");  smark(82, 176, 24, 1 / 3, "0");  smark(82, 176, 24, 2 / 3, "+10");  smark(82, 176, 24, 1, "+20");
+smark(82, 176, 24, 1 / 6, "");  smark(82, 176, 24, 0.5, "");  smark(82, 176, 24, 5 / 6, "");
+kn(82, 176, 24, 2, -10, 20, 0, "INPUT GAIN", 2);
+smark(206, 176, 28, 0, "0");  smark(206, 176, 28, 0.25, "25");  smark(206, 176, 28, 0.5, "50");  smark(206, 176, 28, 0.75, "75");
+smark(206, 176, 28, 1, "100");
+kn(206, 176, 28, 3, 0, 100, 20, "TUBE DRIVE", 7);
+gfx_setfont(7);  col(C_INK2, 1);  text_c(px(82), py(242), "dB");  text_c(px(206), py(242), "%");
+v_on < 0.5 ? ( col(C_FACE, 0.55);  gfx_circle(px(206), py(176), ps(29), 1, 1); );
+lk_key(36, 300, 92, 30, v_on >= 0.5, LK_YEL, "VALVE") ? ( slider(4) = v_on >= 0.5 ? 0 : 1;  param_touched(4); );
+sq_key(151, 299, thick >= 0.5, "THICK") ? ( slider(12) = thick >= 0.5 ? 0 : 1;  param_touched(12); );
+// the HEATERS pilot lamp: dim while the valve warms, full once settled
+g_w = 1 - wu_disp;
+col(0x000000, 1);  gfx_circle(px(234), py(315), ps(10), 1, 1);
+col(0x3A2410, 1);  gfx_circle(px(234), py(315), ps(8), 1, 1);
+col(0xFFB040, 0.3 + 0.7 * g_w);  gfx_circle(px(234), py(315), ps(8), 1, 1);
+col(0xFFE6B0, 0.6 * g_w);  gfx_circle(px(232), py(313), ps(3), 1, 1);
+col(0xFFB040, 0.22 * g_w);  gfx_circle(px(234), py(315), ps(15), 1, 1);
+gfx_setfont(7);  col(C_INK, 1);  text_c(px(234), py(333), "HEATERS");
+
+// ---------- COMPRESSOR ----------
+box(296, 84, 368, 288, "COMPRESSOR", 0, 0);
+smark(350, 176, 24, 0, "-30");  smark(350, 176, 24, 0.25, "-20");  smark(350, 176, 24, 0.5, "-10");  smark(350, 176, 24, 0.75, "0");
+smark(350, 176, 24, 1, "+10");
+kn(350, 176, 24, 5, -30, 10, -10, "THRESHOLD", 1);
+smark(440, 176, 20, 0, "1.5");  smark(440, 176, 20, lt(3, 1.5, 10), "3");  smark(440, 176, 20, lt(5, 1.5, 10), "5");
+smark(440, 176, 20, 1, "10");  smark(440, 176, 20, lt(2, 1.5, 10), "");  smark(440, 176, 20, lt(7, 1.5, 10), "");
+klog = 1;  kn(440, 176, 20, 6, 1.5, 10, 3, "RATIO", 3);
+smark(524, 176, 20, 0, "1");  smark(524, 176, 20, lt(5, 1, 50), "5");  smark(524, 176, 20, lt(20, 1, 50), "20");  smark(524, 176, 20, 1, "50");
+klog = 1;  kn(524, 176, 20, 7, 1, 50, 10, "ATTACK", 4);
+smark(608, 176, 20, 0, ".1");  smark(608, 176, 20, lt(500, 100, 4000), ".5");  smark(608, 176, 20, lt(1500, 100, 4000), "1.5");
+smark(608, 176, 20, 1, "4");
+klog = 1;  kn(608, 176, 20, 8, 100, 4000, 500, "RELEASE", 5);
+klab_y = 340;
+smark(376, 298, 20, 0, "0");  smark(376, 298, 20, 0.25, "5");  smark(376, 298, 20, 0.5, "10");  smark(376, 298, 20, 0.75, "15");
+smark(376, 298, 20, 1, "20");
+kn(376, 298, 20, 13, 0, 20, 0, "MAKE-UP", 2);
+gfx_setfont(7);  col(C_INK2, 1);  text_c(px(376), py(356), "dB");
+smark(494, 298, 20, 0, "DRY");  smark(494, 298, 20, 0.5, "50");  smark(494, 298, 20, 1, "WET");
+kn(494, 298, 20, 14, 0, 100, 100, "MIX", 7);
+klab_y = 226;
+gfx_setfont(7);  col(C_INK2, 1);
+text_c(px(350), py(242), "dBu");  text_c(px(524), py(242), "ms");  text_c(px(608), py(242), "s");
+c_in < 0.5 ? ( col(C_FACE, 0.55);  u_rect(304, 96, 352, 268); );
+lk_key(574, 300, 70, 30, c_in >= 0.5, LK_AMB, "IN") ? ( slider(1) = c_in >= 0.5 ? 0 : 1;  param_touched(1); );
+
+// ---------- OUTPUT ----------
+box(680, 84, 264, 288, "OUTPUT", 0, 0);
+g_gr = gr_disp;  gr_disp = 0;
+g_l = vul_disp > 0 ? 10 * log10(vul_disp) + 18 : -60;
+g_r = vur_disp > 0 ? 10 * log10(vur_disp) + 18 : -60;
+vu(722, 102, 180, 92, vu_mode >= 0.5 ? (c_in >= 0.5 ? g_gr : 0) : g_l, g_r, vu_mode >= 0.5, vu_mode >= 0.5 ? "GR" : "VU", 3);
+clip_disp ? ( clip_t = time_precise();  clip_disp = 0; );
+lamp(890, 112, 0xFF3A2A, time_precise() - clip_t < 0.4);
+wk_key(722, 210, 86, 26, vu_mode < 0.5, "OUT") ? ( slider(11) = 0;  param_touched(11); );
+wk_key(816, 210, 86, 26, vu_mode >= 0.5, "GR") ? ( slider(11) = 1;  param_touched(11); );
+klab_y = 340;
+smark(780, 298, 22, 0, "-18");  smark(780, 298, 22, 0.375, "-9");  smark(780, 298, 22, 0.75, "0");  smark(780, 298, 22, 1, "+6");
+kn(780, 298, 22, 9, -18, 6, 0, "LEVEL", 2);
+// DRIFT: a two-position key - lit = 33 %, dark = 5 % (a whisper of it)
+sq_key(862, 287, drift >= 19, "DRIFT") ? ( slider(10) = drift >= 19 ? 5 : 33;  param_touched(10); );
+
+// ---------- S / M / L / ? (size picker and credits) ----------
+g_j = 0;
+loop(4,
+  g_x = 878 + g_j * 14;  g_on = g_j == 0 ? ui_sz == 1 : g_j == 1 ? ui_sz == 0 : g_j == 2 ? ui_sz == 2 : sz_help;
+  col(0x000000, 1);  u_rect(g_x, 20, 13, 18);
+  col(g_on ? C_LCDTX : 0x2E2F32, 1);  u_rect(g_x + 1, 21, 11, 16);
+  gfx_setfont(7);  col(g_on ? C_LCDBG : 0xC9C1A6, 1);  text_c(px(g_x + 6.5), py(29), g_j == 0 ? "S" : g_j == 1 ? "M" : g_j == 2 ? "L" : "?");
+  click && !sz_help && mouse_x >= px(g_x) && mouse_x < px(g_x + 13) && mouse_y >= py(20) && mouse_y < py(38) ? (
+    g_j == 0 ? ui_sz = 1 : g_j == 1 ? ui_sz = 0 : g_j == 2 ? ui_sz = 2 : ( sz_help = 1;  sz_new = 1; );
+  );
+  g_j += 1;
+);
+sz_help && click && !sz_new ? sz_help = 0;
+sz_new = 0;
+sz_help ? (
+  col(0x000000, 0.62);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
+  strcpy(#hl3, "Manual - https://www.gardenfx.uk/manual/");  strcat(#hl3, #ui_man);  strcat(#hl3, ".pdf");
+  gfx_setfont(5);  gfx_measurestr(#hl3, g_tw, g_th);
+  g_cw = max(g_tw + ps(40), ps(380));  g_ch = ps(130);
+  g_cx = (gfx_w - g_cw) * 0.5;  g_cy = (gfx_h - g_ch) * 0.5;
+  col(0x000000, 0.5);  ui_rrs(g_cx + ps(3), g_cy + ps(5), g_cw, g_ch, ps(8));
+  col(0x1C1D20, 1);    ui_rrs(g_cx, g_cy, g_cw, g_ch, ps(8));
+  col(0xE0603A, 1);    gfx_rect(g_cx + ps(20), g_cy + ps(36), g_cw - ps(40), max(1, ps(1)), 1);
+  gfx_setfont(6);  col(0xF2F2EE, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(14);  gfx_drawstr("Design by JGWizrad.  © John Garden 2026");
+  gfx_setfont(5);  col(0xE8B23A, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(50);  gfx_drawstr("https://www.gardenfx.uk/");
+  col(0xD8D6D0, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(72);  gfx_drawstr(#hl3);
+  col(0x85837E, 1);  gfx_x = g_cx + ps(20);  gfx_y = g_cy + ps(102);  gfx_drawstr("Click anywhere to close.");
+);
+
+!lmb ? drag_idx = 0;
+mouse_wheel = 0;
+last_lmb = lmb;

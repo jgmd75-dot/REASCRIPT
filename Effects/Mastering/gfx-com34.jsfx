@@ -1,0 +1,472 @@
+desc:COM34 [diode bridge mastering compressor] (GFX)
+//tags: mastering compressor diode bridge vintage auto ratio transformer stepped colour
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn and gfx-clip (.jsfx-inc) in the same folder.
+//
+// COM34. A stepped, mastering diode-bridge compressor in the spirit of the 60s bridge compressors and their modern
+// boutique descendants (the sound is designed from scratch): tight, colourful and rich with harmonics. Every control is
+// switched, for repeatable settings.
+//
+//   COMPRESSION  24 positions: the threshold, from 0 (no compression on most material) down to -29 dBFS.
+//   AUTO RATIO   as on the 60s units, the ratio rises as the gain reduction deepens: about 1.5:1 at the knee, 4:1 at 6 dB
+//                of gain reduction, 8:1 and more at 15 dB. A 4 dB knee.
+//   ATTACK       FAST (0.3 ms), 5, 10, 15, 25, 50 ms.   RELEASE 50, 100, 200, 400, 600 ms and AUTO (two-stage: peaks let go
+//                quickly, sustained material slowly).
+//   SOFT         lighter compression that lets the peaks partly through (a wider knee, a gentler slope).
+//   BASS         the low end counts less in the detector (a 120 Hz high-pass in the side chain): more bass punch.
+//   GAIN         25 positions, -2 .. +10 dB in 0.5 dB steps (the output, after the bridge).
+//   LINK         on: one detector for both sides (the louder wins: no image shift). Off: each side its own.
+//   IN           engage / bypass (10 ms fade; GAIN and the colour go with it).
+//   The colour: the input transformer (a little warmth, about 0.25 % THD at a hot level), and the bridge itself, whose
+//   2nd harmonic grows with the gain reduction and is strongest in the lows (about 1.5 % at 100 Hz, 0.5 % at 1 kHz with
+//   10 dB of gain reduction). The house output stage passes straight through (a mastering tool: no clip).
+//   DRIFT        (0 - 100 %, 50 % = standard, 0 = none): the bridge's balance wanders (its 2nd harmonic breathes), and the
+//                input transformer warms with what it is fed (rising over a couple of seconds, cooling over about six).
+//   VFD / MATRIX the panel's look (VFD dark with beige and cream; MATRIX a silver panel, dark knobs, cream). The look only.
+//   PRESETS      12 (Init + 11) plus Reset all to defaults. A preset sets every control but LINK, DRIFT and the look.
+
+slider1:1<0,1,1{Bypass,Engage}>-In
+slider2:8<0,23,1>-Compression (step)
+slider3:4<0,24,1>-Gain (step: -2 .. +10 dB)
+slider4:2<0,5,1{Fast,5 ms,10 ms,15 ms,25 ms,50 ms}>-Attack
+slider5:3<0,5,1{50 ms,100 ms,200 ms,400 ms,600 ms,Auto}>-Release
+slider6:0<0,1,1{Hard,Soft}>-Hard / soft
+slider7:0<0,1,1{Flat,Bass}>-Flat / bass
+slider8:1<0,1,1{Separate,Link}>-Link
+slider9:50<0,100,1>-Drift (%)
+slider10:0<0,1,1{VFD,Matrix}>-Look
+slider11:prs_sel=0<0,12,1{No preset,Init,Gentle Master,Dense Master,Punchy Master,Soft Touch,Bass Punch,Auto Release Master,Drum Bus Vibe,Fast Catch,Acoustic Master,Vintage Squash,Loud and Rich}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-drift.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-clip.jsfx-inc
+
+@init
+#ui_man = "gfx-com34";                                // the ? pop-up links to this manual
+ext_noinit = 1;
+clp_aa = 1; clp_pf_on = 0; clp_kt_on = 0;             // gfx-clip: ADAA clippers only (the transformer)
+
+function cm_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function cm_op(f) ( 1 - exp(-2 * $pi * min(f, 0.49 * srate) / srate); );
+function cm_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
+function cm_sm(g) ( g * g * (3 - 2 * g); );
+function cm_att(i) ( i == 0 ? 0.3 : i == 1 ? 5 : i == 2 ? 10 : i == 3 ? 15 : i == 4 ? 25 : 50; );
+function cm_rel(i) ( i == 0 ? 50 : i == 1 ? 100 : i == 2 ? 200 : i == 3 ? 400 : 600; );
+
+// one side's gain computer: the auto ratio (it rises with the gain reduction), a 4 dB knee (SOFT: 10 dB, gentler)
+function cm_curve(ov) local(o, k) (
+  k = cm_soft ? 5 : 2;
+  o = ov <= -k ? 0 : ov >= k ? ov : sqr(ov + k) / (4 * k);              // the knee: the overshoot, eased in
+  -o * (1 - 1 / (1.5 + 0.35 * o)) * (cm_soft ? 0.7 : 1);
+);
+// one side's gain smoothing (attack / release, or AUTO: two stages); returns the gain in dB
+function cm_smooth(t) instance(g, gf, gs) (
+  cm_auto ? (
+    gf += (t < gf ? cm_ka : cm_krf) * (t - gf); gs += (t < gs ? cm_kas : cm_krs) * (t - gs); g = min(gf, gs);
+  ) : ( g += (t < g ? cm_ka : cm_kr) * (t - g); gf = gs = g; );
+  g;
+);
+// one side's colour: the bridge's 2nd harmonic, growing with the gain reduction, strongest in the lows; DC blocked
+function cm_bridge(y, gdb) instance(lo, dc) local(e, h) (
+  lo += cm_klo * (y - lo);
+  h = -gdb * cm_hb;
+  e = y + h * (0.079 * y * y + 0.16 * lo * lo);
+  dc += cm_kdc * (e - dc);
+  e - dc;
+);
+
+// ---------- presets ----------
+#cm_pm = "Init|Gentle Master|Dense Master|Punchy Master|Soft Touch|Bass Punch|Auto Release Master|Drum Bus Vibe|Fast Catch|Acoustic Master|Vintage Squash|Loud and Rich";
+function cm_set(cp, gn, at, re, so, ba) ( slider1 = 1; slider2 = cp; slider3 = gn; slider4 = at; slider5 = re; slider6 = so; slider7 = ba; );
+function load_preset(p) local(i) (
+  //                cmp gain att rel soft bass
+  p == 1  ? cm_set(8, 4, 2, 3, 0, 0) :     // Init
+  p == 2  ? cm_set(7, 8, 4, 5, 1, 1) :     // Gentle Master
+  p == 3  ? cm_set(12, 10, 2, 3, 0, 1) :     // Dense Master
+  p == 4  ? cm_set(10, 8, 4, 2, 0, 1) :     // Punchy Master
+  p == 5  ? cm_set(9, 11, 3, 4, 1, 0) :     // Soft Touch
+  p == 6  ? cm_set(11, 9, 3, 3, 0, 1) :     // Bass Punch
+  p == 7  ? cm_set(10, 8, 3, 5, 0, 1) :     // Auto Release Master
+  p == 8  ? cm_set(16, 24, 1, 1, 0, 0) :     // Drum Bus Vibe
+  p == 9  ? cm_set(10, 13, 0, 0, 0, 0) :     // Fast Catch
+  p == 10 ? cm_set(8, 9, 5, 4, 1, 0) :     // Acoustic Master
+  p == 11 ? cm_set(17, 24, 2, 2, 0, 0) :     // Vintage Squash
+  p == 12 ? cm_set(14, 12, 3, 5, 0, 1) :     // Loud and Rich
+  p == 13 ? ( cm_set(8, 4, 2, 3, 0, 0); slider8 = 1; slider9 = 50; slider10 = 0; );   // Reset all to defaults
+  i = 1; loop(10, ui_auto(i); i += 1; );
+  pr_cur = p == 13 ? 1 : p;
+);
+
+// ---------- state ----------
+function cm_srinit() (
+  cm_sr = srate;
+  cm_kd = cm_tc(2);                                   // the detector average
+  cm_krf = cm_tc(80); cm_krs = cm_tc(1500);           // AUTO: fast and slow releases
+  cm_klo = cm_op(250); cm_kdc = cm_op(8); cm_ksc = cm_op(120);
+  cm_kh = cm_tc(2000); cm_kc = cm_tc(6000);           // the transformer's heat: rise / cool
+  cm_fst = 1 / (0.01 * srate);
+  cm_gsm = 1 - exp(-1 / (0.015 * srate));
+  ost_init(0);
+);
+cm_srinit();
+in_init();
+dB.drift_init(0.8 + rand(0.4)); dT.drift_init(0.8 + rand(0.4));
+drift_macro(50);
+cm_snap = 1;
+
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@block
+prs_chk();
+srate != cm_sr ? cm_srinit();
+in_setup(0, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through (a mastering tool)
+drift_macro(slider9);
+cm_n = samplesblock / srate;
+cm_vb = dB.drift_tick(0.05 * dm_s * cm_n); cm_vt = dT.drift_tick(0.04 * dm_s * cm_n);
+cm_tI = slider1 >= 0.5;
+cm_th = -1.25 * floor(min(max(slider2, 0), 23) + 0.5);
+cm_gt = 10 ^ ((-2 + 0.5 * floor(min(max(slider3, 0), 24) + 0.5)) / 20);
+cm_ka = cm_tc(cm_att(floor(min(max(slider4, 0), 5) + 0.5)));
+cm_ri = floor(min(max(slider5, 0), 5) + 0.5); cm_auto = cm_ri == 5; cm_kr = cm_tc(cm_rel(cm_ri));
+cm_kas = cm_tc(10 * cm_att(floor(min(max(slider4, 0), 5) + 0.5)) + 20);
+cm_soft = slider6 >= 0.5; cm_bass = slider7 >= 0.5; cm_link = slider8 >= 0.5;
+cm_hb = 0.125 * (1 + 0.35 * dm_a * cm_vb);              // the bridge's balance (its 2nd harmonic), wandering
+// the input transformer: its drive rises with its heat, and leans (more 2nd)
+cm_tk = 0.65 * (1 + 0.25 * dm_a * cm_heat); cm_tb = 0.03 + 0.06 * dm_a * cm_heat + 0.01 * dm_a * cm_vt;
+tA.clp_set(1, 1, 0.9, 0); tB.clp_set(1, 1, 0.9, 0); cm_rest = tA.clp_crv(cm_tb);
+cm_snap ? ( cm_gI = cm_tI; cm_gs = cm_gt; tA.x1 = tB.x1 = cm_tb; tA.ad1 = tB.ad1 = tA.clp_ad(cm_tb); );
+cm_snap = 0;
+cm_heat = cm_tn(cm_heat);
+tA.clp_tidy(); tB.clp_tidy(); cm_ma = cm_tn(cm_ma); cm_mb = cm_tn(cm_mb); cm_sa = cm_tn(cm_sa); cm_sb = cm_tn(cm_sb);
+bA.lo = cm_tn(bA.lo); bB.lo = cm_tn(bB.lo); bA.dc = cm_tn(bA.dc); bB.dc = cm_tn(bB.dc);
+// the panel's mailboxes
+cma_ga = min(cma_ga, cm_gra); cma_gb = min(cma_gb, cm_grb); cm_gra = cm_grb = 0;
+cma_ol = max(cma_ol, cm_ol); cma_or = max(cma_or, cm_or); cm_ol = cm_or = 0;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+in_process(spl0, spl1);
+cm_xl = in_l; cm_xr = in_r;
+abs(cm_xl) < 0.000000000000001 ? cm_xl = 0; abs(cm_xr) < 0.000000000000001 ? cm_xr = 0;
+cm_gI != cm_tI ? ( cm_gI = cm_tI ? min(cm_gI + cm_fst, 1) : max(cm_gI - cm_fst, 0); );
+cm_eI = cm_sm(cm_gI);
+cm_gs += (cm_gt - cm_gs) * cm_gsm;
+// the input transformer (always in the engaged path)
+cm_ta = (tA.clp_run(cm_xl * cm_tk + cm_tb) - cm_rest) / cm_tk; cm_tb2 = (tB.clp_run(cm_xr * cm_tk + cm_tb) - cm_rest) / cm_tk;
+cm_d = max(abs(cm_xl), abs(cm_xr)) * cm_eI; cm_heat += (cm_d > cm_heat ? cm_kh : cm_kc) * (min(cm_d, 1) - cm_heat);
+// the detector: BASS takes the lows out of it (a 120 Hz high-pass, 6 dB/oct)
+cm_sa += cm_ksc * (cm_ta - cm_sa); cm_sb += cm_ksc * (cm_tb2 - cm_sb);
+cm_da = cm_bass ? cm_ta - cm_sa : cm_ta; cm_db = cm_bass ? cm_tb2 - cm_sb : cm_tb2;
+cm_ma += cm_kd * (cm_da * cm_da - cm_ma); cm_mb += cm_kd * (cm_db * cm_db - cm_mb);
+cm_la = 10 * log10(max(cm_ma, 0.00000000001)) + 3.0103; cm_lb = 10 * log10(max(cm_mb, 0.00000000001)) + 3.0103;
+cm_link ? ( cm_la = cm_lb = max(cm_la, cm_lb); );
+cm_ga = gA.cm_smooth(cm_curve(cm_la - cm_th)); cm_gb = gB.cm_smooth(cm_curve(cm_lb - cm_th));
+cm_gra = min(cm_gra, cm_ga * cm_eI); cm_grb = min(cm_grb, cm_gb * cm_eI);
+// the bridge: the gain, its colour; then GAIN
+cm_ya = bA.cm_bridge(cm_ta * exp(0.115129255 * cm_ga), cm_ga) * cm_gs;
+cm_yb = bB.cm_bridge(cm_tb2 * exp(0.115129255 * cm_gb), cm_gb) * cm_gs;
+cm_yl = cm_xl + cm_eI * (cm_ya - cm_xl); cm_yr = cm_xr + cm_eI * (cm_yb - cm_xr);
+cm_yl != cm_yl ? cm_yl = 0; cm_yr != cm_yr ? cm_yr = 0;
+ost_out(cm_yl, cm_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+cm_ol = max(cm_ol, abs(spl0)); cm_or = max(cm_or, abs(spl1));
+
+@gfx 1080 430
+ui_begin(1080, 430);
+// =====================================================================
+// GUI - in the 34 series manner (KRT81): sharp-cornered sections, big black stepped knobs with printed scales, a red
+// "point source" LED gain-reduction meter per side. Two looks: VFD (a dark panel, beige and cream) and MATRIX (a silver
+// panel, dark knobs, cream). Design space 1080 x 430. Knobs: drag (SHIFT = fine), wheel, double-click = default; the
+// name shows the value while the knob is touched.
+// =====================================================================
+cv_mx = 0;                                  // one look (VFD); slider10 kept so old projects load
+!cv_mx ? (                                                // VFD: dark, beige and cream
+  KRP = 0x2C2A27; KRF = 0x1E1C1A; KRI = 0xF3E9D2; KRA = 0xD9C3A0; KRW = 0x0F0E0D; KRM = 0x55524D;
+  KRC = 0xD9C3A0; KRPT = 0x241C10; KRCN = 0xD9C3A0; KRGH = 0x2E2A24; KRAMB = 0xFFD24A; KRRED = 0xFF3B1F; KRKT = 0x241C10;
+  KRH = ui_mix(KRP, 0x000000, 0.35); KRI2 = ui_mix(KRI, KRF, 0.35); CVOFF = ui_mix(KRP, 0xFFFFFF, 0.07);
+) : (                                                     // MATRIX: a silver panel, dark knobs, cream accents
+  KRP = 0xC3C6C9; KRF = 0xB4B7BA; KRI = 0x1C1D1F; KRA = 0xF1E2C2; KRW = 0x141516; KRM = 0x8E9194;
+  KRC = 0x2A2B2D; KRPT = 0x17191B; KRCN = 0xF1E2C2; KRGH = 0x2C2E30; KRAMB = 0xD4A373; KRRED = 0xBC3908; KRKT = 0x1C1D1F;
+  KRH = 0xA9ACAF; KRI2 = 0x45474A; CVOFF = 0xD3D6D9;
+);
+
+gfx_setfont(6,  "Trebuchet MS", 27 * sc, 'b');
+gfx_setfont(10, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(11, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(12, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(14, "Trebuchet MS", 15 * sc, 'b');
+gfx_setfont(15, "Trebuchet MS", 12 * sc, 'b');     // lamp key legends
+
+function kr_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+function kr_txt(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function kr_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function kr_rtxt(rx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = rx * sc - tw; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function kr_lbl(x, y, s) ( gfx_setfont(11); ui_col(KRI2); kr_txt(x, y, s); );
+function kr_hov(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function kr_thick(x1, y1, x2, y2, w) local(dx, dy, l, nx, ny, k) (       // (drawn here: works with any system files)
+  dx = x2 - x1; dy = y2 - y1; l = max(sqrt(dx * dx + dy * dy), 0.001); nx = -dy / l; ny = dx / l;
+  k = -0.5 * w; loop(floor(w * 2.5) + 1, gfx_line(x1 + nx * k, y1 + ny * k, x2 + nx * k, y2 + ny * k, 1); k += 0.4; );
+);
+function kr_key(x, y, w, h, lbl, on) local(hov, hit) (
+  hov = kr_hov(x, y, w, h); hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  ui_col(0x050505); kr_r(x, y, w, h);
+  on ? ui_col(KRA) : ui_col(hov ? ui_mix(KRP, 0xFFFFFF, 0.14) : ui_mix(KRP, 0xFFFFFF, 0.07)); kr_r(x + 1, y + 1, w - 2, h - 2);
+  on ? ( ui_cola(KRA, 0.25); kr_r(x - 2, y - 2, w + 4, h + 4); ui_cola(0xFFFFFF, 0.3); kr_r(x + 1, y + 1, w - 2, 1); );
+  on ? ui_col(KRKT) : ui_col(KRI);
+  gfx_setfont(12); kr_ctxt(x + w * 0.5, y + h * 0.5 + 0.5, lbl);
+  hit;
+);
+function kr_dim(x, y, w, h, lbl) ( ui_col(0x050505); kr_r(x, y, w, h); ui_col(ui_mix(KRF, KRP, 0.3)); kr_r(x + 1, y + 1, w - 2, h - 2);
+  ui_col(ui_mix(KRI, KRF, 0.75)); gfx_setfont(12); kr_ctxt(x + w * 0.5, y + h * 0.5 + 0.5, lbl); 0; );
+function kr_sect(x, y, w, h, name) (
+  ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRF); kr_r(x + 1, y + 1, w - 2, h - 2);
+  strlen(name) ? kr_lbl(x + 9, y + 6, name);
+);
+function kr_scale(cx, cy, r, n, nr, labels, minor) local(i, k, k0, len, c, a, ca, sa, m) (
+  len = strlen(labels); k0 = 0; i = 0; k = 0;
+  minor > 0 ? (
+    m = 0; ui_col(KRI2);
+    loop((n - 1) * minor + 1,
+      a = -0.75 * $pi + m / ((n - 1) * minor) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      gfx_line((cx + ca * (r + 4)) * sc, (cy + sa * (r + 4)) * sc, (cx + ca * (r + 6)) * sc, (cy + sa * (r + 6)) * sc, 1);
+      m += 1;
+    );
+  );
+  gfx_setfont(10);
+  loop(len + 1,
+    c = k < len ? str_getchar(labels, k) : 124;
+    c == 124 ? (
+      strcpy_substr(#krv_sl, labels, k0, k - k0);
+      a = -0.75 * $pi + i / max(n - 1, 1) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      ui_col(KRI);
+      gfx_line((cx + ca * (r + 3)) * sc, (cy + sa * (r + 3)) * sc, (cx + ca * (r + 7)) * sc, (cy + sa * (r + 7)) * sc, 1);
+      strlen(#krv_sl) ? kr_ctxt(cx + ca * (r + nr), cy + sa * (r + nr), #krv_sl);
+      i += 1; k0 = k + 1;
+    );
+    k += 1;
+  );
+);
+function kr_bake(cx, cy, r, a) local(i, t, ca, sa, k) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.55); gfx_circle(cx + 2.5 * sc, cy + 4.5 * sc, r * 1.02, 1, 1);
+  ui_col(0x0A0A0A); gfx_circle(cx, cy, r + 1 * sc, 1, 1);
+  ui_col(0x191817); gfx_circle(cx, cy, r, 1, 1);
+  i = 0;
+  loop(16,
+    t = i / 16 * 2 * $pi; k = 0.5 + 0.5 * cos(t + 0.8);
+    ui_col(ui_mix(0x0D0C0B, 0x48443F, k * 0.8)); gfx_circle(cx + sin(t) * r * 0.86, cy - cos(t) * r * 0.86, r * 0.15, 1, 1);
+    ui_col(0x0D0C0B); gfx_circle(cx + sin(t + 0.196) * r * 0.9, cy - cos(t + 0.196) * r * 0.9, r * 0.075, 1, 1);
+    i += 1;
+  );
+  ui_col(0x090808); gfx_circle(cx, cy, r * 0.70 + 1 * sc, 1, 1);
+  ui_col(0x22201E); gfx_circle(cx, cy, r * 0.70, 1, 1);
+  ui_cola(0xFFFFFF, 0.08); gfx_circle(cx, cy, r * 0.70, 0, 1);
+  ui_col(0x060606); kr_thick(cx + ca * r * 0.18, cy + sa * r * 0.18, cx + ca * r * 0.98, cy + sa * r * 0.98, 4.2 * sc);
+  ui_col(KRA); kr_thick(cx + ca * r * 0.22, cy + sa * r * 0.22, cx + ca * r * 0.95, cy + sa * r * 0.95, 2.5 * sc);
+);
+function kr_scap(cx, cy, r, a, cap) local(ca, sa, k, pc) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.5); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+  ui_col(0x121212); gfx_circle(cx, cy, r, 1, 1);
+  ui_cola(0xFFFFFF, 0.12); gfx_circle(cx, cy, r, 0, 1);
+  k = r * 0.74;
+  ui_col(cap); gfx_circle(cx, cy, k, 1, 1);
+  ui_col(ui_mix(cap, 0x000000, 0.35)); gfx_circle(cx, cy, k, 0, 1);
+  pc = (cap & 255) + ((cap >> 8) & 255) + ((cap >> 16) & 255) > 380 ? KRPT : 0xF4F0E6;
+  ui_col(pc); kr_thick(cx + ca * k * 0.2, cy + sa * k * 0.2, cx + ca * r * 0.94, cy + sa * r * 0.94, 2.6 * sc);
+);
+krv_small = 0; krv_lg = 0; krv_step = 0; krv_cap = 0;
+function kr_kn(v, lo, hi) ( krv_lg ? log(max(v, lo) / lo) / log(hi / lo) : (v - lo) / (hi - lo); );
+function kr_kv(n, lo, hi) ( krv_lg ? lo * exp(n * log(hi / lo)) : lo + n * (hi - lo); );
+function kr_knob(cx, cy, r, idx, lo, hi, def) local(v, n, dx, dy, hov, did) (
+  did = 1700 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 5) * sc);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - krv_lt < 0.35 && krv_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; krv_lt = 0; ) : (
+      drag_id = did; krv_y = mouse_y; krv_lt = time_precise(); krv_lid = idx; krv_n = kr_kn(v, lo, hi);
+    );
+  );
+  drag_id == did ? (
+    krv_n = min(max(krv_n + (krv_y - mouse_y) / (((mouse_cap & 8) ? 1200 : (krv_step ? 160 : 240)) * sc), 0), 1); krv_y = mouse_y;
+    v = kr_kv(krv_n, lo, hi); krv_step ? v = floor(v + 0.5);
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    krv_step ? slider(idx) = min(max(floor(v + 0.5) + sign(mouse_wheel), lo), hi) : (
+      n = min(max(kr_kn(v, lo, hi) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.025), 0), 1);
+      slider(idx) = kr_kv(n, lo, hi);
+    );
+    ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(kr_kn(v, lo, hi), 0), 1);
+  krv_small ? kr_scap(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi, krv_cap ? krv_cap : KRC) : kr_bake(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi);
+  hov || drag_id == did ? ( ui_cola(0xFFFFFF, 0.07); gfx_circle(cx * sc, cy * sc, (r + 2) * sc, 1, 1); );
+  hov || drag_id == did;
+);
+function kr_name(cx, cy, act, name, val) ( gfx_setfont(14); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy, act ? val : name); );
+// a small knob with a tick ring (or n step ticks) and its name; the value while touched
+function kr_small(cx, cy, r, idx, lo, hi, def, nt, name, val) local(i, t, act) (
+  ui_cola(KRI, 0.85); i = 0;
+  loop(nt, t = -0.75 * $pi + i / (nt - 1) * 1.5 * $pi;
+    gfx_line((cx + sin(t) * (r + 4)) * sc, (cy - cos(t) * (r + 4)) * sc, (cx + sin(t) * (r + 8)) * sc, (cy - cos(t) * (r + 8)) * sc, 1); i += 1; );
+  krv_small = 1; act = kr_knob(cx, cy, r, idx, lo, hi, def); krv_small = 0;
+  strlen(name) ? ( gfx_setfont(11); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy + r + 15, act ? val : name); );
+  act;
+);
+function kr_cell(x, y, w, h, lit, zone) local(c) (
+  c = zone == 2 ? KRRED : zone == 1 ? KRAMB : KRCN;
+  lit ? ( ui_cola(c, 0.16); kr_r(x - 0.5, y - 1, w + 1, h + 2); ui_col(c); kr_r(x, y, w, h); ui_cola(0xFFFFFF, 0.22); kr_r(x, y, w, 1.5); )
+      : ( ui_col(KRGH); kr_r(x, y, w, h); ui_cola(0x000000, 0.25); kr_r(x, y + h - 1, w, 1); );
+);
+function kr_hbar(x, y, w, h, v) local(n, i, sw, d) (
+  n = 32; sw = w / n; i = 0;
+  loop(n, d = -48 + (i + 0.5) / n * 48; kr_cell(x + i * sw + 0.5, y, sw - 2, h, v >= d, d > -3 ? 2 : d > -12 ? 1 : 0); i += 1; );
+);
+function kr_grbar(x, y, w, h, gr) local(n, i, sw, d) (                     // gain reduction: 0 .. -24 dB, from the left
+  n = 24; sw = w / n; i = 0;
+  loop(n, d = -(i + 0.5); kr_cell(x + i * sw + 0.5, y, sw - 2, h, gr <= d, 1); i += 1; );
+);
+function kr_window(x, y, w, h) ( ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRW); kr_r(x + 1, y + 1, w - 2, h - 2); );
+function kr_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+// a red point-source LED
+function cv_led(cx, cy, on) (
+  on ? ( ui_cola(0xFF2A10, 0.28); gfx_circle(cx * sc, cy * sc, 7 * sc, 1, 1); ui_col(0xFF3B1F); ) : ui_col(0x3A1410);
+  gfx_circle(cx * sc, cy * sc, 4.2 * sc, 1, 1);
+  ui_cola(0xFFFFFF, on ? 0.55 : 0.12); gfx_circle((cx - 1.2) * sc, (cy - 1.3) * sc, 1.3 * sc, 1, 1);
+);
+// panel keys: house lamp keys (gfx-ui). kr_kc = the key's lamp colour (set before the call; cleared after;
+// none = amber). MATRIX is a light face: a warm-dark collar.
+function cv_key(x, y, w, h, lbl, on) local(c) (
+  c = kr_kc ? kr_kc : LK_AMB; kr_kc = 0;
+  lk_well = cv_mx ? 0x2A2722 : 0x0A0A0B; lk_font = 15; lk_font2 = 15;
+  lk_fit(x, y, w, h, on, c, lbl);
+);
+// a section that's switched off: greyed slightly (its IN key is redrawn on top)
+function cv_off(x, y, w, h) ( ui_cola(KRF, 0.5); kr_r(x + 1, y + 1, w - 2, h - 2); );
+// a two-way switch shown as its two names, the live one lit
+function cv_sw(x, y, idx, a, b) local(on) (
+  on = slider(idx) >= 0.5;
+  gfx_setfont(10); ui_col(KRI2); sprintf(#cvw, "%s / %s", a, b); kr_ctxt(x + 36, y - 10, #cvw);
+  cv_key(x, y, 72, 26, on ? b : a, on) ? kr_tog(idx);
+);
+
+// =====================================================================
+// Faceplate and header
+// =====================================================================
+ui_col(ui_mix(KRP, 0x000000, 0.35)); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0xFFFFFF, 0.08); kr_r(0, 0, 1080, 1.5); kr_r(0, 0, 1.5, 430);
+ui_cola(0x000000, 0.35); kr_r(0, 428.5, 1080, 1.5); kr_r(1078.5, 0, 1.5, 430);
+ui_col(KRP); kr_r(12, 12, 1056, 406);
+cv_mx ? ( cv_i = 0; loop(203, ui_cola(cv_i & 1 ? 0xFFFFFF : 0x000000, 0.025); kr_r(12, 12 + cv_i * 2, 1056, 1); cv_i += 1; ); );   // (brushed)
+ui_cola(0x000000, 0.30); kr_r(12, 12, 1056, 1.5); kr_r(12, 12, 1.5, 406);
+ui_cola(0xFFFFFF, 0.07); kr_r(12, 416.5, 1056, 1.5); kr_r(1066.5, 12, 1.5, 406);
+ui_col(KRH); kr_r(13.5, 13.5, 1053, 50.5);
+ui_col(cv_mx ? KRI : KRA); kr_r(13.5, 64, 1053, 2);
+ui_col(cv_mx ? KRI : KRA); gfx_circle(45 * sc, 39 * sc, 16 * sc, 1, 1);
+gfx_setfont(4); ui_col(cv_mx ? KRA : KRKT); ui_text(45 * sc, 33.5 * sc, "GFX");
+gfx_setfont(6); ui_col(KRI); kr_txt(72, 24, "COM34"); gfx_measurestr("COM34", cv_tw, cv_th);
+cv_tx = 72 + cv_tw / sc + 14;
+gfx_setfont(11); ui_col(KRI2); kr_txt(cv_tx, 25, "DIODE BRIDGE"); kr_txt(cv_tx, 40, "MASTERING");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+k_ = pk_preset(340 * sc, 22 * sc, 280 * sc, 34 * sc, pr_cur, #cm_pm);
+k_ > 0 ? prs_dirty = k_;
+ui_size_picker(1000 * sc, 30 * sc);
+
+cv_k = 72 + 150;
+// ---------- COMPRESSOR ----------
+kr_sect(22, 72, 412, 338, "COMPRESSOR");
+krv_step = 1;
+kr_scale(112, cv_k, 46, 11, 20, "0|1|2|3|4|5|6|7|8|9|10", 0);
+cv_i = 0; ui_col(KRI2);                                    // the 24 detents
+loop(24, cv_t = -0.75 * $pi + cv_i / 23 * 1.5 * $pi;
+  gfx_line((112 + sin(cv_t) * 50) * sc, (cv_k - cos(cv_t) * 50) * sc, (112 + sin(cv_t) * 53) * sc, (cv_k - cos(cv_t) * 53) * sc, 1); cv_i += 1; );
+cv_a = kr_knob(112, cv_k, 46, 2, 0, 23, 8); sprintf(#cvv, "%d  (%.1f dBFS)", floor(slider2 + 0.5), -1.25 * floor(slider2 + 0.5));
+kr_name(112, cv_k + 84, cv_a, "COMPRESSION", #cvv);
+kr_scale(256, cv_k - 40, 26, 6, 15, "F|5|10|15|25|50", 0);
+cv_a = kr_knob(256, cv_k - 40, 26, 4, 0, 5, 2); slider4 < 0.5 ? strcpy(#cvv, "FAST") : sprintf(#cvv, "%d ms", cm_att(floor(slider4 + 0.5)));
+kr_name(256, cv_k + 6, cv_a, "ATTACK", #cvv);
+kr_scale(366, cv_k - 40, 26, 6, 15, "50|100|200|400|600|A", 0);
+cv_a = kr_knob(366, cv_k - 40, 26, 5, 0, 5, 3); slider5 >= 4.5 ? strcpy(#cvv, "AUTO") : sprintf(#cvv, "%d ms", cm_rel(floor(slider5 + 0.5)));
+kr_name(366, cv_k + 6, cv_a, "RELEASE", #cvv);
+krv_step = 0;
+kr_kc = LK_YEL; cv_sw(220, cv_k + 72, 6, "HARD", "SOFT");
+kr_kc = LK_RED; cv_sw(330, cv_k + 72, 7, "FLAT", "BASS");
+slider1 < 0.5 ? cv_off(22, 72, 412, 338);
+kr_kc = LK_AMB; cv_key(330, 80, 96, 26, slider1 >= 0.5 ? "ENGAGED" : "BYPASS", slider1 >= 0.5) ? kr_tog(1);
+
+// ---------- GAIN REDUCTION: two rows of red LEDs (A / B) ----------
+kr_sect(440, 72, 440, 338, "GAIN REDUCTION");
+kr_kc = LK_RED; cv_key(774, 80, 98, 26, slider8 >= 0.5 ? "LINK A-B" : "SEPARATE", slider8 >= 0.5) ? kr_tog(8);
+kr_window(452, 124, 416, 170);
+cv_ga = cma_ga; cv_gb = cma_gb; cma_ga = cma_gb = 0;
+cv_ha = cv_ga < cv_ha ? cv_ga : min(cv_ha + 0.4, 0); cv_hb = cv_gb < cv_hb ? cv_gb : min(cv_hb + 0.4, 0);
+cv_i = 0;
+loop(15,
+  cv_d = cv_i < 10 ? cv_i + 1 : 10 + (cv_i - 9) * 2;           // 1 .. 10, then 12, 14, 16, 18, 20
+  cv_x = 840 - cv_i * 26;
+  gfx_setfont(10); ui_col(0xE8D9C0); sprintf(#cvd, "%d", cv_d); kr_ctxt(cv_x, 142, #cvd);
+  cv_led(cv_x, 176, -cv_ha >= cv_d - 0.5); cv_led(cv_x, 226, -cv_hb >= cv_d - 0.5);
+  cv_i += 1;
+);
+gfx_setfont(10); ui_col(0xE8D9C0); kr_txt(462, 170, "A"); kr_txt(462, 220, "B");
+kr_ctxt(660, 258, "dB GAIN REDUCTION");
+sprintf(#cvv, "A %.1f   B %.1f dB", cv_ha, cv_hb); gfx_setfont(14); ui_col(KRI); kr_ctxt(660, 316, #cvv);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(660, 340, "AUTO RATIO: THE DEEPER IT WORKS, THE HARDER IT HOLDS");
+sprintf(#cvv, "%d%%", floor(slider9 + 0.5)); kr_small(486, 374, 14, 9, 0, 100, 50, 11, "", #cvv);
+gfx_setfont(11); ui_col(KRI2); kr_txt(510, 368, "DRIFT");
+
+// ---------- OUTPUT: GAIN ----------
+kr_sect(886, 72, 172, 338, "OUTPUT");
+krv_step = 1;
+kr_scale(972, cv_k, 40, 7, 18, "-2|0|2|4|6|8|10", 0);
+cv_a = kr_knob(972, cv_k, 40, 3, 0, 24, 4); sprintf(#cvv, "%+.1f dB", -2 + 0.5 * floor(slider3 + 0.5));
+kr_name(972, cv_k + 76, cv_a, "GAIN", #cvv);
+krv_step = 0;
+function kr_fall(v, pk) ( pk = pk > 0.0000001 ? 20 * log10(pk) : -90; pk > v ? pk : max(v - 0.6, -90); );
+cv_ml = kr_fall(cv_ml, cma_ol); cv_mr = kr_fall(cv_mr, cma_or); cma_ol = cma_or = 0;
+kr_window(898, 330, 148, 34);
+kr_hbar(904, 336, 136, 9, cv_ml); kr_hbar(904, 349, 136, 9, cv_mr);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(972, 376, "OUT  -48 .. 0 dBFS");
+
+pk_end();
+ui_end();

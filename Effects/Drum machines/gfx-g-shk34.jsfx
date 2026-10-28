@@ -1,0 +1,710 @@
+desc:SHK34 [shakers + tambourine] (GFX)
+//tags: percussion shaker egg maracas tambourine step sequencer procedural synthesis drum machine
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn and gfx-clip (.jsfx-inc) in the same folder.
+//
+// SHK34. Procedural (sample-free) shakers and tambourine with a step sequencer synced to REAPER's transport.
+//
+//   SHAKER     each hit is a shake stroke: a cloud of tiny grains (the beads hitting each other and the shell) firing
+//              at random, swelling and dying with the stroke, through two resonant band-passes (the shell). Strokes
+//              alternate push and pull (PUSH/PULL: how much weaker and darker the pull is). TONE 1.5 .. 9 kHz (egg
+//              shakers high, wooden maracas low), BEADS (small and dense .. big and sparse), STROKE 30 .. 400 ms,
+//              RESONANCE (the shell's ring).
+//   TAMBOURINE the jingles as a stochastic cloud too: the hit sets them moving (its energy dies away over RING,
+//              40 .. 800 ms), and at random moments they collide - each collision a burst that rings the jingles' metal
+//              resonances (about 5.6 and 8.1 kHz, and the shell's 2.3 kHz; BRIGHT moves them), retuned a little at every
+//              collision as the jingles tilt: the shimmer. RATTLE: how many jingles; HIT: the frame's click.
+//   SEQUENCER  a lane per instrument, each with its own LENGTH (1 - 32 steps: polymeters), RATE 1/4 .. 1/32 with
+//              triplets, SWING 0 - 75 % (the off-steps late; 33 % is a triplet feel), HUMANIZE (timing late by up to
+//              20 ms and strength by up to 30 %, at random), ACCENT (accented steps louder and brighter). It follows
+//              REAPER's transport; FREE runs it at the project tempo while stopped. MIDI notes play the lanes too:
+//              70 (maracas) and 82 (shaker) the shaker, 54 the tambourine; velocity over 108 is an accent.
+//   LEVEL / PAN per lane, MASTER. The house output stage: CLIP (ceiling -0.3 dBFS).
+//   DRIFT      (0 - 100 %, 50 % = standard, 0 = none): tuning (a hair) and the player - the timing drifts a few ms
+//              behind the beat and back, and the strength breathes.
+//   VFD / MATRIX  the panel's look (VFD charcoal and sand; MATRIX battleship grey and cream). The look only.
+//   REVERB     on the whole mix: ROOM, SPRING (two tanks with the chirp) or PLATE; DECAY, TONE and AMOUNT (added
+//              to the dry). Switching type fades across without a click. Presets leave it alone; Reset all clears it.
+//   PRESETS    12 (Init + 11) plus Reset all to defaults. A preset sets the sounds, the patterns and the groove; MASTER,
+//              DRIFT and the look are left alone (Reset all restores them too).
+
+slider1:3<0,5,1{1/4,1/8,1/8T,1/16,1/16T,1/32}>-Rate
+slider2:0<0,75,1>-Swing (%)
+slider3:15<0,100,1>-Humanize (%)
+slider4:5<0,10,0.1>-Accent
+slider5:0<0,1,1{Off,On}>-Free run (plays when stopped)
+slider6:0<-24,6,0.1>-Master (dB)
+slider7:50<0,100,1>-Drift (%)
+slider8:0<0,1,1{VFD,Matrix}>-Look
+slider9:16<1,32,1>-Shaker length (steps)
+slider10:0<-24,6,0.1>-Shaker level (dB)
+slider11:-20<-100,100,1>-Shaker pan
+slider12:16<1,32,1>-Tambourine length (steps)
+slider13:0<-24,6,0.1>-Tambourine level (dB)
+slider14:25<-100,100,1>-Tambourine pan
+slider15:5500<1500,9000,1>-Shaker tone (Hz)
+slider16:4<0,10,0.1>-Shaker beads
+slider17:110<30,400,1>-Shaker stroke (ms)
+slider18:4<0,10,0.1>-Shaker resonance
+slider19:4<0,10,0.1>-Shaker push / pull
+slider20:250<40,800,1>-Tambourine ring (ms)
+slider21:5<0,10,0.1>-Tambourine bright
+slider22:5<0,10,0.1>-Tambourine hit
+slider23:5<0,10,0.1>-Tambourine rattle
+slider40:0<0,3,1{Off,Room,Spring,Plate}>-Reverb
+slider41:5<0,10,0.1>-Reverb decay
+slider42:5<0,10,0.1>-Reverb tone
+slider43:25<0,100,1>-Reverb amount (%)
+slider44:prs_sel=0<0,12,1{No preset,Init,Egg Shaker 16ths,Samba Ganza,Pop Tambourine,Motown Fours,Soul Sixteenths,Swing Shuffle,Maracas,Three Over Four,Bossa Shaker,Halftime,Busy Groove}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-drift.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-clip.jsfx-inc
+
+@init
+ext_noinit = 1;
+clp_aa = 1; clp_pf_on = 0; clp_kt_on = 0;
+function pc_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function pc_tc(ms) ( 1 - exp(-1 / (max(ms, 0.002) * 0.001 * srate)); );
+function pc_kd(ms) ( exp(-1 / (max(ms, 0.002) * 0.001 * srate)); );          // a per-sample decay factor (time constant, ms)
+
+// ---------- memory ----------
+STP = 5000;                                           // the steps: lane x 32 + step (0 off, 1 hit, 2 accent)
+EX = 4000; OUT = 4010; LTR = 4020; CUR = 4030;        // per lane: excitation, output, trigger flash, playing step
+MQ = 4100;                                            // the MIDI queue: offset, lane, velocity, mute
+MD = 1000;                                            // the modal resonators: 8 values each
+pc_nm = 0;
+
+// ---------- the modal resonators: two-pole, an impulse of 1 rings at amplitude 1 ----------
+function md_set(m, ln, f, tau, w) local(o, ww, r) (
+  o = MD + m * 8; ww = 2 * $pi * min(max(f, 20), 0.45 * srate) / srate; r = exp(-1 / (max(tau, 0.0005) * srate));
+  o[0] = 2 * r * cos(ww); o[1] = -r * r; o[2] = sin(ww); o[5] = w; o[6] = ln;
+);
+// the same, normalised for noise excitation (unity power gain, whatever the ring time)
+function md_setn(m, ln, f, tau, w) local(o, ww, r) (
+  o = MD + m * 8; ww = 2 * $pi * min(max(f, 20), 0.45 * srate) / srate; r = exp(-1 / (max(tau, 0.0005) * srate));
+  o[0] = 2 * r * cos(ww); o[1] = -r * r; o[2] = sin(ww) * 2 * sqrt(1 - r); o[5] = w; o[6] = ln;
+);
+function md_run() local(o, y) (
+  o = MD;
+  loop(pc_nm, y = o[0] * o[3] + o[1] * o[4] + o[2] * EX[o[6]]; o[4] = o[3]; o[3] = y; OUT[o[6]] += y * o[5]; o += 8; );
+);
+function md_tidy() local(o) ( o = MD; loop(pc_nm, o[3] = pc_tn(o[3]); o[4] = pc_tn(o[4]); o += 8; ); );
+// ---------- a state-variable band-pass (TPT) ----------
+function pc_svf(f, q) instance(a1, a2, a3) local(g, k) (
+  g = tan($pi * min(max(f, 20), 0.45 * srate) / srate); k = 1 / max(q, 0.3);
+  a1 = 1 / (1 + g * (g + k)); a2 = g * a1; a3 = g * a2;
+);
+function pc_bp(x) instance(a1, a2, a3, c1, c2) local(v1, v2, v3) (
+  v3 = x - c2; v1 = a1 * c1 + a2 * v3; v2 = c2 + a2 * c1 + a3 * v3; c1 = 2 * v1 - c1; c2 = 2 * v2 - c2; v1;
+);
+function pc_svt() instance(c1, c2) ( c1 = pc_tn(c1); c2 = pc_tn(c2); );
+
+
+NL = 2;
+SHG = 0.45; TBG = 0.24;                                     // (the instruments' output trims)
+#ui_man = "gfx-g-shk34";
+// =====================================================================
+// THE INSTRUMENTS
+// =====================================================================
+pc_nm = 8;                                            // the tambourine: the shell and a fixed bank of detuned jingle pairs
+function ins_note(n) ( pc_mute = 0; n == 70 || n == 82 ? 0 : n == 54 ? 1 : -1; );
+function ins_srinit() ( tb_ks = pc_kd(1.4); tb_kc = pc_kd(0.25); tb_pc = 22050 / srate / 1024; );
+function ins_trig(k, v, a) local(b, r) (
+  k == 0 ? (
+    sh_dir = 1 - sh_dir;                              // push, pull, push ...
+    sh_tg = v * (sh_dir ? 1 : 1 - 0.05 * sh_pp); sh_at = 1;
+    sh_f = sh_tone * (sh_dir ? 1 : 1 - 0.008 * sh_pp) * (a ? 1 + 0.012 * pc_acc : 1) * TUN[0];
+    s1.pc_svf(sh_f, sh_q); s2.pc_svf(sh_f * 1.6, sh_q * 0.8);
+  ) : (
+    tb_E += v * (a ? 1 + 0.05 * pc_acc : 1);           // the shake's energy
+    tb_c = v * tb_hit;                                 // the frame's click
+  );
+);
+function ins_block() (
+  sh_tone = min(max(slider15, 1500), 9000); sh_bd = min(max(slider16, 0), 10); sh_len = min(max(slider17, 30), 400);
+  sh_q = 1 + 0.9 * min(max(slider18, 0), 10); sh_pp = min(max(slider19, 0), 10);
+  sh_ka = pc_tc(6); sh_kd = pc_kd(sh_len * 0.45);
+  sh_den = (7000 - 550 * sh_bd) / srate; sh_kg = pc_kd(0.15 + 0.25 * sh_bd);
+  sh_mk = 0.9 / sqrt(sh_q);
+  tb_ring = min(max(slider20, 40), 800); tb_br = min(max(slider21, 0), 10); tb_hit = min(max(slider22, 0), 10) / 5;
+  tb_rt = min(max(slider23, 0), 10) / 10; tb_kE = pc_kd(tb_ring * 0.5);
+  tb_nob = 8 + 40 * tb_rt;                           // the jingles in play
+  tb_gn = sqrt(250 / max(tb_ring, 120)) * (28 / tb_nob) ^ 0.25; // (the level kept as RING and RATTLE change)
+  // the jingles: a fixed bank of slightly detuned pairs that ring cleanly (retuning a ringing mode crackles)
+  tb_bs = (0.8 + 0.04 * tb_br) * TUN[1]; tb_jt = 0.010 + 0.012 * tb_rt;
+  md_setn(0, 1, 2300 * tb_bs, 0.0016, 0.10 * TBG);
+  md_setn(1, 1, 5470 * tb_bs, tb_jt, 0.55 * TBG);
+  md_setn(2, 1, 5730 * tb_bs, tb_jt * 0.9, 0.55 * TBG);
+  md_setn(3, 1, 7860 * tb_bs, tb_jt * 0.8, 0.6 * TBG);
+  md_setn(4, 1, 8120 * tb_bs, tb_jt * 0.85, 0.6 * TBG);
+  md_setn(5, 1, 8410 * tb_bs, tb_jt * 0.75, 0.45 * TBG);
+  md_setn(6, 1, 10950 * tb_bs, tb_jt * 0.6, (0.08 + 0.03 * tb_br) * TBG);
+  md_setn(7, 1, 11650 * tb_bs, tb_jt * 0.55, (0.08 + 0.03 * tb_br) * TBG);
+  s1.pc_svt(); s2.pc_svt(); sh_e = pc_tn(sh_e); sh_g = pc_tn(sh_g); tb_E = pc_tn(tb_E); tb_L = pc_tn(tb_L); tb_hp = pc_tn(tb_hp);
+);
+function ins_sample() local(n, x) (
+  // SHAKER: the stroke, its grain cloud, the shell
+  sh_at ? ( sh_e += (sh_tg - sh_e) * sh_ka; sh_e >= sh_tg * 0.95 ? sh_at = 0; ) : sh_e *= sh_kd;
+  sh_e > 0.0001 ? (
+    rand(1) < sh_den * min(sh_e * 1.6, 1) ? sh_g = max(sh_g, (0.35 + rand(0.65)) * sh_e);
+    sh_g *= sh_kg;
+    n = (rand(2) - 1) * sh_g;
+    OUT[0] = (s1.pc_bp(n) + 0.55 * s2.pc_bp(n) + 0.12 * n) * sh_mk * SHG;
+  );
+  // TAMBOURINE (PhISEM): collisions at random while the shake's energy lasts, thinning out as it dies away;
+  // each collision's strength follows the energy on a gentle curve, so the jingles fade out rather than stop
+  tb_E > 0.00005 ? (
+    rand(1) < tb_nob * tb_pc * (0.3 + 0.7 * min(tb_E, 1)) ? tb_L = max(tb_L, (0.55 + rand(0.45)) * tb_E ^ 0.7 * tb_gn);
+    tb_E *= tb_kE;
+  );
+  x = (rand(2) - 1) * tb_L; tb_L *= tb_ks;
+  EX[1] = x;
+  x = (rand(2) - 1) * tb_c; tb_hp += 0.45 * (x - tb_hp); OUT[1] += (x - tb_hp) * 0.6 * TBG; tb_c *= tb_kc;   // the frame's click
+);
+
+
+// ---------- REVERB on the mix: ROOM (early reflections and a 4-line feedback network), SPRING (two dispersive
+// loops, the chirp of a real tank), PLATE (a figure-8 allpass tank). DECAY, TONE, AMOUNT (added to the dry).
+// Switching type fades the wet out, clears the tank and fades the new one in - no clicks.
+RV_W = 6000; RV_S = 6200; RV_B = 20000;
+function rv_alloc() ( rv_n = ceil(0.25 * srate) + 8; memset(RV_B, 0, 16 * rv_n); memset(RV_W, 0, 16); memset(RV_S, 0, 160); );
+function rv_rd(k, d) local(i) ( i = RV_W[k] - d; i < 0 ? i += rv_n; RV_B[k * rv_n + i]; );
+function rv_wr(k, x) local(i) ( i = RV_W[k]; RV_B[k * rv_n + i] = x; i += 1; i >= rv_n ? i = 0; RV_W[k] = i; );
+function rv_ap(k, x, d, g) local(v, u) ( v = rv_rd(k, d); u = x - g * v; rv_wr(k, u); v + g * u; );
+function rv_p(n) ( max(floor(n * srate / 29761 + 0.5), 1); );                   // plate lengths (the tank's own rate)
+function rv_ms(m) ( max(floor(m * 0.001 * srate + 0.5), 1); );
+function rv_setup() local(t60, k) (
+  rv_tt = floor(min(max(slider40, 0), 3) + 0.5);
+  rv_dk = min(max(slider41, 0), 10) / 10; rv_tn = min(max(slider42, 0), 10) / 10;
+  rv_amt = min(max(slider43, 0), 100) / 100;
+  rv_t != rv_tt && rv_g < 0.0003 ? ( memset(RV_B, 0, 16 * rv_n); memset(RV_W, 0, 16); memset(RV_S, 0, 160);
+    rv_bw = rv_zl = rv_zr = rv_l0 = rv_l1 = rv_h0 = rv_h1 = 0; rv_t = rv_tt; );
+  rv_gt = rv_t == rv_tt && rv_t > 0 ? rv_amt : 0;
+  rv_t == 1 ? (                                                                  // ROOM
+    t60 = 0.3 * 6 ^ rv_dk;
+    RV_S[20] = rv_ms(29.7); RV_S[21] = rv_ms(37.1); RV_S[22] = rv_ms(41.3); RV_S[23] = rv_ms(47.9);
+    k = 0; loop(4, RV_S[24 + k] = 10 ^ (-3 * RV_S[20 + k] / srate / t60); k += 1; );
+    rv_dc = 1 - exp(-2 * $pi * 1500 * 8 ^ rv_tn / srate); rv_kn = 3.2;
+  ) : rv_t == 2 ? (                                                              // SPRING
+    t60 = 0.8 * 4 ^ rv_dk;
+    RV_S[20] = rv_ms(37.3); RV_S[21] = rv_ms(43.9);
+    RV_S[24] = min(10 ^ (-3 * (RV_S[20] / srate + 0.004) / t60), 0.97); RV_S[25] = min(10 ^ (-3 * (RV_S[21] / srate + 0.004) / t60), 0.97);
+    rv_dc = 1 - exp(-2 * $pi * 2000 * 3 ^ rv_tn / srate); rv_hc = 1 - exp(-2 * $pi * 140 / srate); rv_a = -0.62; rv_kn = 0.9;
+  ) : rv_t == 3 ? (                                                              // PLATE
+    t60 = 0.6 * 8 ^ rv_dk;
+    rv_dec = 10 ^ (-1.5 * ((672 + 4453 + 1800 + 3720) / 29761) / t60);
+    rv_dc = 1 - exp(-2 * $pi * 1500 * 8 ^ rv_tn / srate); rv_bc = 1 - exp(-2 * $pi * (3000 + 9000 * rv_tn) / srate); rv_kn = 0.75;
+  );
+  rv_kg = 1 - exp(-1 / (0.01 * srate));
+  rv_bw = pc_tn(rv_bw); rv_zl = pc_tn(rv_zl); rv_zr = pc_tn(rv_zr); rv_l0 = pc_tn(rv_l0); rv_l1 = pc_tn(rv_l1); rv_h0 = pc_tn(rv_h0); rv_h1 = pc_tn(rv_h1);
+  k = 0; loop(4, RV_S[k] = pc_tn(RV_S[k]); k += 1; );
+);
+function rv_run(l, r) local(x, a1, a2, a3, a4, h, dl, dr, u, v, w, fl, fr, y, o, i, s) (
+  rv_wl = rv_wr_ = 0;
+  rv_t == 1 ? (                                                                  // ROOM
+    x = (l + r) * 0.5; rv_wr(0, x);
+    rv_wl = 0.42 * rv_rd(0, rv_ms(3.1)) + 0.33 * rv_rd(0, rv_ms(7.9)) + 0.26 * rv_rd(0, rv_ms(13.7)) + 0.2 * rv_rd(0, rv_ms(19.9));
+    rv_wr_ = 0.42 * rv_rd(0, rv_ms(5.3)) + 0.33 * rv_rd(0, rv_ms(11.2)) + 0.26 * rv_rd(0, rv_ms(17.3)) + 0.2 * rv_rd(0, rv_ms(23.6));
+    a1 = rv_rd(1, RV_S[20]); a2 = rv_rd(2, RV_S[21]); a3 = rv_rd(3, RV_S[22]); a4 = rv_rd(4, RV_S[23]);
+    RV_S[0] += rv_dc * (a1 - RV_S[0]); a1 = RV_S[0] * RV_S[24];
+    RV_S[1] += rv_dc * (a2 - RV_S[1]); a2 = RV_S[1] * RV_S[25];
+    RV_S[2] += rv_dc * (a3 - RV_S[2]); a3 = RV_S[2] * RV_S[26];
+    RV_S[3] += rv_dc * (a4 - RV_S[3]); a4 = RV_S[3] * RV_S[27];
+    h = 0.5 * (a1 + a2 + a3 + a4);
+    dl = rv_ap(5, l, rv_ms(4.7), 0.6); dr = rv_ap(6, r, rv_ms(6.1), 0.6);
+    rv_wr(1, a1 - h + 0.5 * dl); rv_wr(2, a2 - h + 0.5 * dr); rv_wr(3, a3 - h + 0.5 * dl); rv_wr(4, a4 - h + 0.5 * dr);
+    rv_wl = 0.6 * rv_wl + 0.7 * (a1 - a3); rv_wr_ = 0.6 * rv_wr_ + 0.7 * (a2 - a4);
+  ) : rv_t == 2 ? (                                                              // SPRING: two tanks
+    s = 0;
+    loop(2,
+      y = rv_rd(s, RV_S[20 + s]);
+      o = RV_S + 32 + s * 64; i = 0;
+      loop(48, v = rv_a * y + o[i]; o[i] = y - rv_a * v; y = v; i += 1; );     // the dispersion: the chirp
+      s == 0 ? ( rv_l0 += rv_dc * (y - rv_l0); rv_h0 += rv_hc * (rv_l0 - rv_h0); y = rv_l0 - rv_h0; rv_wl = y;
+                 rv_wr(0, 0.75 * l + 0.25 * r + y * RV_S[24]); )
+             : ( rv_l1 += rv_dc * (y - rv_l1); rv_h1 += rv_hc * (rv_l1 - rv_h1); y = rv_l1 - rv_h1; rv_wr_ = y;
+                 rv_wr(1, 0.75 * r + 0.25 * l + y * RV_S[25]); );
+      s += 1;
+    );
+  ) : rv_t == 3 ? (                                                              // PLATE
+    x = (l + r) * 0.5; rv_bw += rv_bc * (x - rv_bw);
+    x = rv_ap(1, rv_bw, rv_p(142), 0.75); x = rv_ap(2, x, rv_p(107), 0.75); x = rv_ap(3, x, rv_p(379), 0.625); x = rv_ap(4, x, rv_p(277), 0.625);
+    fl = rv_rd(12, rv_p(3163)) * rv_dec; fr = rv_rd(8, rv_p(3720)) * rv_dec;
+    u = rv_ap(5, x + fl, rv_p(672), -0.7); v = rv_rd(6, rv_p(4453)); rv_wr(6, u);
+    rv_zl += rv_dc * (v - rv_zl); w = rv_ap(7, rv_zl * rv_dec, rv_p(1800), 0.5); rv_wr(8, w);
+    u = rv_ap(9, x + fr, rv_p(908), -0.7); v = rv_rd(10, rv_p(4217)); rv_wr(10, u);
+    rv_zr += rv_dc * (v - rv_zr); w = rv_ap(11, rv_zr * rv_dec, rv_p(2656), 0.5); rv_wr(12, w);
+    rv_wl = 0.6 * (rv_rd(10, rv_p(266)) + rv_rd(10, rv_p(2974)) - rv_rd(11, rv_p(1913)) + rv_rd(12, rv_p(1996)) - rv_rd(6, rv_p(1990)) - rv_rd(7, rv_p(187)) - rv_rd(8, rv_p(1066)));
+    rv_wr_ = 0.6 * (rv_rd(6, rv_p(353)) + rv_rd(6, rv_p(3627)) - rv_rd(7, rv_p(1228)) + rv_rd(8, rv_p(2673)) - rv_rd(10, rv_p(2111)) - rv_rd(11, rv_p(335)) - rv_rd(12, rv_p(121)));
+  );
+);
+
+function rv_reset() local(i) ( slider40 = 0; slider41 = 5; slider42 = 5; slider43 = 25; i = 40; loop(4, ui_auto(i); i += 1; ); );
+
+// ---------- the sequencer ----------
+function pc_div(i) ( i == 0 ? 1 : i == 1 ? 0.5 : i == 2 ? 1 / 3 : i == 3 ? 0.25 : i == 4 ? 1 / 6 : 0.125; );
+function pc_len(k) ( floor(min(max(slider(9 + k * 3), 1), 32) + 0.5); );
+function pc_t(n) ( n * pc_sl + ((n & 1) ? pc_sw * pc_sl : 0); );                // swing: the odd steps late
+function pc_hoff() ( (rand(1) * pc_hu * 0.02 + pc_poff) * tempo / 60; );         // humanize (late only) + the player's drift
+function pc_hit(k, v, a) (
+  v *= (1 - pc_hu * 0.3 * rand(1)) * pc_pstr;                                     // humanize and the player's strength
+  a ? v *= 1 + 0.12 * pc_acc;                                                     // ACCENT: louder (and brighter, per instrument)
+  LTR[k] = 1;
+  ins_trig(k, min(v, 2), a);
+);
+function pc_fire(n) local(k, st, v) (
+  k = 0;
+  loop(NL,
+    st = n % pc_len(k); CUR[k] = st; v = STP[k * 32 + st];
+    v > 0 ? pc_hit(k, v == 2 ? 1 : 0.72, v == 2);
+    k += 1;
+  );
+);
+function pc_resync() local(n) (
+  n = floor(pc_pos / pc_sl + 0.000001); pc_t(n) < pc_pos - 0.0005 ? n += 1;
+  pc_nx = n; pc_tn = pc_t(n) + pc_hoff();
+);
+// a pattern from a string: '.' off, 'x' hit, 'X' accent; its length sets the lane's LENGTH
+function pc_pat(k, s) local(i, c, n) (
+  n = min(strlen(s), 32); i = 0;
+  loop(32, c = i < n ? str_getchar(s, i) : 46; STP[k * 32 + i] = c == 88 ? 2 : c == 120 ? 1 : 0; i += 1; );
+  !pc_po ? slider(9 + k * 3) = n;
+);
+function pc_seq(rate, sw, hu, ac) ( !pc_po ? ( slider1 = rate; slider2 = sw; slider3 = hu; slider4 = ac; ); );
+
+// ---------- presets ----------
+#pc_pm = "Init|Egg Shaker 16ths|Samba Ganza|Pop Tambourine|Motown Fours|Soul Sixteenths|Swing Shuffle|Maracas|Three Over Four|Bossa Shaker|Halftime|Busy Groove";
+function shk_set(tn, bd, st, rs, pp, rg, br, ht, rt) ( !pc_po ? (
+  slider15 = tn; slider16 = bd; slider17 = st; slider18 = rs; slider19 = pp; slider20 = rg; slider21 = br; slider22 = ht; slider23 = rt;
+  slider10 = 0; slider11 = -20; slider13 = 0; slider14 = 25; ); );
+function load_preset(p) local(i) (
+  p == 1 || p == 13 ? ( pc_seq(3, 0, 15, 5); shk_set(5500, 4, 110, 4, 4, 250, 5, 5, 5); pc_pat(0, "XxxxXxxxXxxxXxxx"); pc_pat(1, "....X.......X..."); ) :
+  p == 2  ? ( pc_seq(3, 8, 20, 6); shk_set(7200, 2, 80, 3, 3, 250, 5, 5, 5); pc_pat(0, "XxxxXxxxXxxxXxxx"); pc_pat(1, "................"); ) :
+  p == 3  ? ( pc_seq(3, 12, 20, 7); shk_set(4300, 6, 120, 5, 6, 250, 5, 5, 5); pc_pat(0, "XxxXXxxXXxxXXxxX"); pc_pat(1, ".......x.......X"); ) :
+  p == 4  ? ( pc_seq(3, 0, 15, 6); shk_set(5500, 4, 110, 4, 4, 300, 6, 6, 6); pc_pat(0, "................"); pc_pat(1, "x.x.X.x.x.x.X.x."); ) :
+  p == 5  ? ( pc_seq(3, 0, 10, 5); shk_set(5500, 4, 110, 4, 4, 500, 5, 7, 6); pc_pat(0, "................"); pc_pat(1, "X...X...X...X..."); ) :
+  p == 6  ? ( pc_seq(3, 10, 20, 6); shk_set(6000, 3, 90, 4, 4, 220, 6, 4, 6); pc_pat(0, "x.x.x.x.x.x.x.x."); pc_pat(1, "x.xxX.xxx.xxX.xx"); ) :
+  p == 7  ? ( pc_seq(3, 33, 20, 6); shk_set(5200, 4, 120, 4, 5, 250, 5, 5, 5); pc_pat(0, "XxXxXxXxXxXxXxXx"); pc_pat(1, "....X.......X..."); ) :
+  p == 8  ? ( pc_seq(3, 5, 20, 6); shk_set(3000, 7, 140, 5, 5, 250, 5, 5, 5); pc_pat(0, "X.xxX.xxX.xxX.xx"); pc_pat(1, "................"); ) :
+  p == 9  ? ( pc_seq(3, 0, 15, 6); shk_set(5800, 3, 100, 4, 4, 300, 5, 5, 5); pc_pat(0, "XxxXxxXxxXxx"); pc_pat(1, "X...X...X...X..."); ) :
+  p == 10 ? ( pc_seq(3, 10, 15, 4); shk_set(5000, 4, 130, 4, 3, 250, 5, 5, 5); pc_pat(0, "XxxxXxxxXxxxXxxx"); pc_pat(1, "................"); ) :
+  p == 11 ? ( pc_seq(3, 15, 20, 6); shk_set(5600, 4, 110, 4, 5, 450, 5, 6, 6); pc_pat(0, "x.x.x.x.x.x.x.x."); pc_pat(1, "........X......."); ) :
+  p == 12 ? ( pc_seq(3, 18, 25, 7); shk_set(6200, 3, 100, 4, 5, 260, 6, 5, 7); pc_pat(0, "XxxXxxXxXxxXxxXxXxxXxxXxXxxXxXxx"); pc_pat(1, "x...X..x.x..X...x...X..x"); );
+  p == 13 && !pc_po ? ( slider5 = 0; slider6 = 0; slider7 = 50; slider8 = 0; rv_reset(); );
+  !pc_po ? ( i = 1; loop(23, ui_auto(i); i += 1; ); pr_cur = p == 13 ? 1 : p; );
+);
+
+// ---------- state ----------
+TUN = 4040; GL = 4050; GR = 4060; GLT = 4070; GRT = 4080; LTF = 4090;
+pc_sr = srate; ost_init(0); ins_srinit(); rv_alloc();
+in_init();
+dT.drift_init(0.8 + rand(0.4)); dP.drift_init(0.8 + rand(0.4)); dS.drift_init(0.8 + rand(0.4));
+drift_macro(50);
+pc_k = 0; loop(NL, TUN[pc_k] = 1; pc_k += 1; );
+pc_pstr = 1;
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; pc_po = 1; load_preset(1); pc_po = 0; );   // new instances: Medium, Init's patterns
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+// the @slider work, also run after a preset swap in @block (PRESET parameter)
+function prs_sl() (
+  0
+);
+function prs_chk() local(k) (
+  prs_dirty > 0 ? ( prs_pk = prs_dirty; prs_dirty = 0; prs_q = 1; ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( prs_pk = prs_sel; prs_q = 0; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+  // PRESET parameter: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+  prs_pk > 0 ? (
+    prs_g <= 0 ? (
+      k = prs_pk; prs_pk = 0; load_preset(k); prs_sl();
+      prs_q ? ( k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
+      prs_gs = 1 / (0.030 * srate);
+    ) : prs_gs = -1 / (0.005 * srate);
+  );
+);
+prs_ok = 0; prs_dirty = 0; prs_pk = 0; prs_g = 1; prs_gs = 0;
+
+@slider
+prs_chk();
+prs_sl();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_mem(0, STP, 160);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@block
+prs_chk();
+srate != pc_sr ? ( pc_sr = srate; ost_init(0); ins_srinit(); rv_alloc(); );
+in_setup(0, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);                // the house output stage: CLIP
+drift_macro(slider7);
+pc_n = samplesblock / srate;
+pc_vt = dT.drift_tick(0.05 * dm_s * pc_n); pc_vp = dP.drift_tick(0.06 * dm_s * pc_n); pc_vs = dS.drift_tick(0.06 * dm_s * pc_n);
+pc_poff = 0.006 * dm_a * (0.5 + 0.5 * pc_vp);          // the player: a few ms behind or on the beat, wandering
+pc_pstr = 1 + 0.08 * dm_a * pc_vs;                     // and a little harder or softer
+pc_k = 0; loop(NL, TUN[pc_k] = 2 ^ (0.0045 * dm_a * pc_vt * (pc_k & 1 ? -1 : 1) * (1 + 0.3 * pc_k) / 12); pc_k += 1; );   // tuning, a hair
+// the sequencer: the transport (or FREE RUN), the division, swing, humanize
+pc_sl = pc_div(floor(min(max(slider1, 0), 5) + 0.5));
+pc_sw = min(max(slider2, 0), 75) / 100; pc_hu = min(max(slider3, 0), 100) / 100; pc_acc = min(max(slider4, 0), 10);
+pc_free = slider5 >= 0.5;
+pc_play = play_state & 1;
+pc_run = pc_play || pc_free;
+pc_inc = tempo / (60 * srate);
+pc_play ? (
+  (!pc_was || !pc_wpl || abs(beat_position - pc_pos) > 0.05 || pc_sl != pc_slw || pc_sw != pc_sww) ? ( pc_pos = beat_position; pc_resync(); ) : pc_pos = beat_position;
+) : pc_free ? (
+  (!pc_was || pc_wpl || pc_sl != pc_slw || pc_sw != pc_sww) ? ( pc_wpl ? pc_pos = 0; pc_resync(); );
+);
+pc_was = pc_run; pc_wpl = pc_play; pc_slw = pc_sl; pc_sww = pc_sw;
+// MIDI: notes play the lanes (General MIDI numbers); everything passes through
+pc_mq = 0; pc_mi = 0; pc_si = 0;
+while(
+  midirecv(pc_ofs, pc_m1, pc_m2, pc_m3) ? (
+    (pc_m1 & 0xF0) == 0x90 && pc_m3 > 0 && pc_mq < 60 ? (
+      pc_ln = ins_note(pc_m2);
+      pc_ln >= 0 ? ( MQ[pc_mq * 4] = pc_ofs; MQ[pc_mq * 4 + 1] = pc_ln; MQ[pc_mq * 4 + 2] = pc_m3 / 127; MQ[pc_mq * 4 + 3] = pc_mute; pc_mq += 1; );
+    );
+    midisend(pc_ofs, pc_m1, pc_m2, pc_m3);
+    1;
+  );
+);
+pc_k = 0; loop(NL, pc_lt = 10 ^ (min(max(slider(10 + pc_k * 3), -24), 6) / 20); pc_p = (min(max(slider(11 + pc_k * 3), -100), 100) / 100 + 1) * $pi / 4;
+  GLT[pc_k] = pc_lt * cos(pc_p); GRT[pc_k] = pc_lt * sin(pc_p); pc_k += 1; );
+pc_mst = 10 ^ (min(max(slider6, -24), 6) / 20);
+ins_block();
+md_tidy();
+rv_setup();
+pca_ol = max(pca_ol, pc_ol); pca_or = max(pca_or, pc_or); pc_ol = pc_or = 0;
+
+@sample
+spl0 = spl1 = 0;
+// the sequencer's clock
+pc_run ? (
+  pc_pos >= pc_tn ? ( pc_fire(pc_nx); pc_nx += 1; pc_tn = pc_t(pc_nx) + pc_hoff(); );
+  pc_pos += pc_inc;
+);
+// MIDI notes due now; a lane auditioned from the panel
+pc_mi < pc_mq && MQ[pc_mi * 4] <= pc_si ? ( pc_mute = MQ[pc_mi * 4 + 3]; pc_hit(MQ[pc_mi * 4 + 1], MQ[pc_mi * 4 + 2], MQ[pc_mi * 4 + 2] > 0.85); pc_mute = 0; pc_mi += 1; );
+pc_mi < pc_mq && MQ[pc_mi * 4] <= pc_si ? ( pc_mute = MQ[pc_mi * 4 + 3]; pc_hit(MQ[pc_mi * 4 + 1], MQ[pc_mi * 4 + 2], MQ[pc_mi * 4 + 2] > 0.85); pc_mute = 0; pc_mi += 1; );
+pc_aud > 0 ? ( pc_hit(pc_aud - 1, 0.85, 0); pc_aud = 0; );
+pc_si += 1;
+// the instruments
+pc_k = 0; loop(NL, OUT[pc_k] = 0; pc_k += 1; );
+ins_sample();
+md_run();
+pc_k = 0; pc_yl = pc_yr = 0;
+loop(NL,
+  GL[pc_k] += (GLT[pc_k] - GL[pc_k]) * 0.002; GR[pc_k] += (GRT[pc_k] - GR[pc_k]) * 0.002;
+  pc_yl += OUT[pc_k] * GL[pc_k]; pc_yr += OUT[pc_k] * GR[pc_k]; pc_k += 1;
+);
+pc_ms += (pc_mst - pc_ms) * 0.002;
+pc_yl *= pc_ms; pc_yr *= pc_ms;
+rv_g += (rv_gt - rv_g) * rv_kg;
+rv_t > 0 ? ( rv_run(pc_yl, pc_yr); pc_yl += rv_wl * rv_g * rv_kn; pc_yr += rv_wr_ * rv_g * rv_kn; );
+pc_yl != pc_yl ? pc_yl = 0; pc_yr != pc_yr ? pc_yr = 0;
+ost_out(pc_yl, pc_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+pc_ol = max(pc_ol, abs(spl0)); pc_or = max(pc_or, abs(spl1));
+prs_gs != 0 ? ( prs_g += prs_gs; prs_g <= 0 ? ( prs_g = 0; prs_gs = 0; ) : prs_g >= 1 ? ( prs_g = 1; prs_gs = 0; ); );
+prs_g < 1 ? ( prs_w = prs_g * prs_g * (3 - 2 * prs_g); spl0 *= prs_w; spl1 *= prs_w; );   // PRESET parameter duck: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+
+@gfx 1080 560
+ui_begin(1080, 560);
+// =====================================================================
+// GUI - in the 34 series manner (KRT81): the instruments' panels above, the step sequencer below (a lane per
+// instrument, each with its own LENGTH: click a step for a hit, again for an accent, again to clear; click a lane's
+// name to hear it). Two looks: VFD (charcoal and the instrument's colour) and MATRIX (battleship grey and cream).
+// Design space 1080 x 560. Knobs: drag (SHIFT = fine), wheel, double-click = default; the value shows while touched.
+// =====================================================================
+pv_mx = 0;                                  // one look (VFD); slider8 kept so old projects load
+!pv_mx ? (
+  KRP = 0x2E2F31; KRF = 0x202123; KRI = 0xF2E8D2; KRA = 0xD8C08A; KRW = 0x121314; KRM = 0x55575A;
+  KRC = 0xD8C08A; KRPT = 0x1E1408; KRCN = 0xD8C08A; KRGH = 0x2E2B27; KRAMB = 0xFFD24A; KRRED = 0xFF3B1F; KRKT = 0x1E1408;
+) : (
+  KRP = 0x222528; KRF = ui_mix(0x222528, 0x000000, 0.25); KRI = 0xC7BEB3; KRA = 0xF3E5C0; KRW = ui_mix(0x222528, 0x000000, 0.45);
+  KRM = 0x4A4E4A; KRC = 0xF3E5C0; KRPT = 0x17191B; KRCN = 0x1E5631; KRGH = 0x2C302E; KRAMB = 0xD4A373; KRRED = 0xBC3908; KRKT = 0x17191B;
+);
+KRH = ui_mix(KRP, 0x000000, 0.35); KRI2 = ui_mix(KRI, KRF, 0.35);
+gfx_setfont(6,  "Trebuchet MS", 27 * sc, 'b');
+gfx_setfont(10, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(11, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(12, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(14, "Trebuchet MS", 15 * sc, 'b');
+
+function kr_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+function kr_txt(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function kr_ctxt(cx, cy, s) local(tw, th) ( tw = ui_symw(s); th = ui_symh; gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; ui_symstr(s); );
+function kr_rtxt(rx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = rx * sc - tw; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function kr_lbl(x, y, s) ( gfx_setfont(11); ui_col(KRI2); kr_txt(x, y, s); );
+function kr_hov(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function kr_thick(x1, y1, x2, y2, w) local(dx, dy, l, nx, ny, k) (       // (drawn here: works with any system files)
+  dx = x2 - x1; dy = y2 - y1; l = max(sqrt(dx * dx + dy * dy), 0.001); nx = -dy / l; ny = dx / l;
+  k = -0.5 * w; loop(floor(w * 2.5) + 1, gfx_line(x1 + nx * k, y1 + ny * k, x2 + nx * k, y2 + ny * k, 1); k += 0.4; );
+);
+function kr_key(x, y, w, h, lbl, on) local(hov, hit) (
+  hov = kr_hov(x, y, w, h); hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  ui_col(0x050505); kr_r(x, y, w, h);
+  on ? ui_col(KRA) : ui_col(hov ? ui_mix(KRP, 0xFFFFFF, 0.14) : ui_mix(KRP, 0xFFFFFF, 0.07)); kr_r(x + 1, y + 1, w - 2, h - 2);
+  on ? ( ui_cola(KRA, 0.25); kr_r(x - 2, y - 2, w + 4, h + 4); ui_cola(0xFFFFFF, 0.3); kr_r(x + 1, y + 1, w - 2, 1); );
+  on ? ui_col(KRKT) : ui_col(KRI);
+  gfx_setfont(12); kr_ctxt(x + w * 0.5, y + h * 0.5 + 0.5, lbl);
+  hit;
+);
+function kr_dim(x, y, w, h, lbl) ( ui_col(0x050505); kr_r(x, y, w, h); ui_col(ui_mix(KRF, KRP, 0.3)); kr_r(x + 1, y + 1, w - 2, h - 2);
+  ui_col(ui_mix(KRI, KRF, 0.75)); gfx_setfont(12); kr_ctxt(x + w * 0.5, y + h * 0.5 + 0.5, lbl); 0; );
+function kr_sect(x, y, w, h, name) (
+  ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRF); kr_r(x + 1, y + 1, w - 2, h - 2);
+  strlen(name) ? kr_lbl(x + 9, y + 6, name);
+);
+function kr_scale(cx, cy, r, n, nr, labels, minor) local(i, k, k0, len, c, a, ca, sa, m) (
+  len = strlen(labels); k0 = 0; i = 0; k = 0;
+  minor > 0 ? (
+    m = 0; ui_col(KRI2);
+    loop((n - 1) * minor + 1,
+      a = -0.75 * $pi + m / ((n - 1) * minor) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      gfx_line((cx + ca * (r + 4)) * sc, (cy + sa * (r + 4)) * sc, (cx + ca * (r + 6)) * sc, (cy + sa * (r + 6)) * sc, 1);
+      m += 1;
+    );
+  );
+  gfx_setfont(10);
+  loop(len + 1,
+    c = k < len ? str_getchar(labels, k) : 124;
+    c == 124 ? (
+      strcpy_substr(#krv_sl, labels, k0, k - k0);
+      a = -0.75 * $pi + i / max(n - 1, 1) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      ui_col(KRI);
+      gfx_line((cx + ca * (r + 3)) * sc, (cy + sa * (r + 3)) * sc, (cx + ca * (r + 7)) * sc, (cy + sa * (r + 7)) * sc, 1);
+      strlen(#krv_sl) ? kr_ctxt(cx + ca * (r + nr), cy + sa * (r + nr), #krv_sl);
+      i += 1; k0 = k + 1;
+    );
+    k += 1;
+  );
+);
+function kr_bake(cx, cy, r, a) local(i, t, ca, sa, k) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.55); gfx_circle(cx + 2.5 * sc, cy + 4.5 * sc, r * 1.02, 1, 1);
+  ui_col(0x0A0A0A); gfx_circle(cx, cy, r + 1 * sc, 1, 1);
+  ui_col(0x191817); gfx_circle(cx, cy, r, 1, 1);
+  i = 0;
+  loop(16,
+    t = i / 16 * 2 * $pi; k = 0.5 + 0.5 * cos(t + 0.8);
+    ui_col(ui_mix(0x0D0C0B, 0x48443F, k * 0.8)); gfx_circle(cx + sin(t) * r * 0.86, cy - cos(t) * r * 0.86, r * 0.15, 1, 1);
+    ui_col(0x0D0C0B); gfx_circle(cx + sin(t + 0.196) * r * 0.9, cy - cos(t + 0.196) * r * 0.9, r * 0.075, 1, 1);
+    i += 1;
+  );
+  ui_col(0x090808); gfx_circle(cx, cy, r * 0.70 + 1 * sc, 1, 1);
+  ui_col(0x22201E); gfx_circle(cx, cy, r * 0.70, 1, 1);
+  ui_cola(0xFFFFFF, 0.08); gfx_circle(cx, cy, r * 0.70, 0, 1);
+  ui_col(0x060606); kr_thick(cx + ca * r * 0.18, cy + sa * r * 0.18, cx + ca * r * 0.98, cy + sa * r * 0.98, 4.2 * sc);
+  ui_col(KRA); kr_thick(cx + ca * r * 0.22, cy + sa * r * 0.22, cx + ca * r * 0.95, cy + sa * r * 0.95, 2.5 * sc);
+);
+function kr_scap(cx, cy, r, a, cap) local(ca, sa, k, pc) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.5); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+  ui_col(0x121212); gfx_circle(cx, cy, r, 1, 1);
+  ui_cola(0xFFFFFF, 0.12); gfx_circle(cx, cy, r, 0, 1);
+  k = r * 0.74;
+  ui_col(cap); gfx_circle(cx, cy, k, 1, 1);
+  ui_col(ui_mix(cap, 0x000000, 0.35)); gfx_circle(cx, cy, k, 0, 1);
+  pc = (cap & 255) + ((cap >> 8) & 255) + ((cap >> 16) & 255) > 380 ? KRPT : 0xF4F0E6;
+  ui_col(pc); kr_thick(cx + ca * k * 0.2, cy + sa * k * 0.2, cx + ca * r * 0.94, cy + sa * r * 0.94, 2.6 * sc);
+);
+krv_small = 0; krv_lg = 0; krv_step = 0; krv_cap = 0;
+function kr_kn(v, lo, hi) ( krv_lg ? log(max(v, lo) / lo) / log(hi / lo) : (v - lo) / (hi - lo); );
+function kr_kv(n, lo, hi) ( krv_lg ? lo * exp(n * log(hi / lo)) : lo + n * (hi - lo); );
+function kr_knob(cx, cy, r, idx, lo, hi, def) local(v, n, dx, dy, hov, did) (
+  did = 1700 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 5) * sc);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - krv_lt < 0.35 && krv_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; krv_lt = 0; ) : (
+      drag_id = did; krv_y = mouse_y; krv_lt = time_precise(); krv_lid = idx; krv_n = kr_kn(v, lo, hi);
+    );
+  );
+  drag_id == did ? (
+    krv_n = min(max(krv_n + (krv_y - mouse_y) / (((mouse_cap & 8) ? 1200 : (krv_step ? 160 : 240)) * sc), 0), 1); krv_y = mouse_y;
+    v = kr_kv(krv_n, lo, hi); krv_step ? v = floor(v + 0.5);
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    krv_step ? slider(idx) = min(max(floor(v + 0.5) + sign(mouse_wheel), lo), hi) : (
+      n = min(max(kr_kn(v, lo, hi) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.025), 0), 1);
+      slider(idx) = kr_kv(n, lo, hi);
+    );
+    ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(kr_kn(v, lo, hi), 0), 1);
+  krv_small ? kr_scap(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi, krv_cap ? krv_cap : KRC) : kr_bake(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi);
+  hov || drag_id == did ? ( ui_cola(0xFFFFFF, 0.07); gfx_circle(cx * sc, cy * sc, (r + 2) * sc, 1, 1); );
+  hov || drag_id == did;
+);
+function kr_name(cx, cy, act, name, val) ( gfx_setfont(14); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy, act ? val : name); );
+// a small knob with a tick ring (or n step ticks) and its name; the value while touched
+function kr_small(cx, cy, r, idx, lo, hi, def, nt, name, val) local(i, t, act) (
+  ui_cola(KRI, 0.85); i = 0;
+  loop(nt, t = -0.75 * $pi + i / (nt - 1) * 1.5 * $pi;
+    gfx_line((cx + sin(t) * (r + 4)) * sc, (cy - cos(t) * (r + 4)) * sc, (cx + sin(t) * (r + 8)) * sc, (cy - cos(t) * (r + 8)) * sc, 1); i += 1; );
+  krv_small = 1; act = kr_knob(cx, cy, r, idx, lo, hi, def); krv_small = 0;
+  strlen(name) ? ( gfx_setfont(11); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy + r + 15, act ? val : name); );
+  act;
+);
+function kr_cell(x, y, w, h, lit, zone) local(c) (
+  c = zone == 2 ? KRRED : zone == 1 ? KRAMB : KRCN;
+  lit ? ( ui_cola(c, 0.16); kr_r(x - 0.5, y - 1, w + 1, h + 2); ui_col(c); kr_r(x, y, w, h); ui_cola(0xFFFFFF, 0.22); kr_r(x, y, w, 1.5); )
+      : ( ui_col(KRGH); kr_r(x, y, w, h); ui_cola(0x000000, 0.25); kr_r(x, y + h - 1, w, 1); );
+);
+function kr_hbar(x, y, w, h, v) local(n, i, sw, d) (
+  n = 32; sw = w / n; i = 0;
+  loop(n, d = -48 + (i + 0.5) / n * 48; kr_cell(x + i * sw + 0.5, y, sw - 2, h, v >= d, d > -3 ? 2 : d > -12 ? 1 : 0); i += 1; );
+);
+function kr_grbar(x, y, w, h, gr) local(n, i, sw, d) (                     // gain reduction: 0 .. -24 dB, from the left
+  n = 24; sw = w / n; i = 0;
+  loop(n, d = -(i + 0.5); kr_cell(x + i * sw + 0.5, y, sw - 2, h, gr <= d, 1); i += 1; );
+);
+function kr_window(x, y, w, h) ( ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRW); kr_r(x + 1, y + 1, w - 2, h - 2); );
+
+function kr_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+function pv_lname(k) ( k == 0 ? "SHAKER" : "TAMBOURINE"; );
+// a knob of the instruments' panels: the name above, the value below
+function pv_k(cx, cy, idx, lo, hi, def, lg, name, val) local(a) (
+  krv_lg = lg; a = kr_small(cx, cy, 16, idx, lo, hi, def, 11, "", val); krv_lg = 0;
+  gfx_setfont(11); ui_col(a ? KRA : KRI); kr_ctxt(cx, cy - 30, name);
+  gfx_setfont(10); ui_col(a ? KRA : KRI2); kr_ctxt(cx, cy + 29, val);
+);
+
+// =====================================================================
+// Faceplate and header
+// =====================================================================
+ui_col(ui_mix(KRP, 0x000000, 0.35)); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0xFFFFFF, 0.08); kr_r(0, 0, 1080, 1.5); kr_r(0, 0, 1.5, 560);
+ui_cola(0x000000, 0.35); kr_r(0, 558.5, 1080, 1.5); kr_r(1078.5, 0, 1.5, 560);
+ui_col(KRP); kr_r(12, 12, 1056, 536);
+ui_cola(0x000000, 0.30); kr_r(12, 12, 1056, 1.5); kr_r(12, 12, 1.5, 536);
+ui_cola(0xFFFFFF, 0.07); kr_r(12, 546.5, 1056, 1.5); kr_r(1066.5, 12, 1.5, 536);
+ui_col(KRH); kr_r(13.5, 13.5, 1053, 50.5);
+ui_col(KRA); kr_r(13.5, 64, 1053, 2);
+ui_col(KRA); gfx_circle(45 * sc, 39 * sc, 16 * sc, 1, 1);
+gfx_setfont(4); ui_col(KRKT); ui_text(45 * sc, 33.5 * sc, "GFX");
+gfx_setfont(6); ui_col(KRI); kr_txt(72, 24, "SHK34"); gfx_measurestr("SHK34", pv_tw, pv_th);
+pv_tx = 72 + pv_tw / sc + 14;
+gfx_setfont(11); ui_col(KRI2); kr_txt(pv_tx, 25, "SHAKERS AND"); kr_txt(pv_tx, 40, "TAMBOURINE");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+k_ = pk_preset(340 * sc, 22 * sc, 290 * sc, 34 * sc, pr_cur, #pc_pm);
+k_ > 0 ? prs_dirty = k_;
+ui_size_picker(1000 * sc, 30 * sc);
+
+// =====================================================================
+// The instruments
+// =====================================================================
+pv_y = 72; pv_ky = pv_y + 104;
+
+kr_sect(22, pv_y, 610, 190, "SHAKER");
+sprintf(#pa, "%.1f kHz", slider15 / 1000); pv_k(72, pv_ky, 15, 1500, 9000, 5500, 1, "TONE", #pa);
+sprintf(#pb, "%.1f", slider16); pv_k(152, pv_ky, 16, 0, 10, 4, 0, "BEADS", #pb);
+sprintf(#pc, "%d ms", floor(slider17 + 0.5)); pv_k(232, pv_ky, 17, 30, 400, 110, 1, "STROKE", #pc);
+sprintf(#pd, "%.1f", slider18); pv_k(312, pv_ky, 18, 0, 10, 4, 0, "RESO", #pd);
+sprintf(#pe, "%.1f", slider19); pv_k(392, pv_ky, 19, 0, 10, 4, 0, "PUSH/PULL", #pe);
+sprintf(#pf, "%+.1f dB", slider10); pv_k(482, pv_ky, 10, -24, 6, 0, 0, "LEVEL", #pf);
+sprintf(#pg, "%+d", floor(slider11 + 0.5)); pv_k(562, pv_ky, 11, -100, 100, -20, 0, "PAN", #pg);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(232, pv_y + 172, "GRAINS OF BEADS IN A RESONANT SHELL - PUSH AND PULL STROKES");
+kr_sect(638, pv_y, 420, 190, "TAMBOURINE");
+sprintf(#ph, "%d ms", floor(slider20 + 0.5)); pv_k(686, pv_ky, 20, 40, 800, 250, 1, "RING", #ph);
+sprintf(#pi, "%.1f", slider21); pv_k(756, pv_ky, 21, 0, 10, 5, 0, "BRIGHT", #pi);
+sprintf(#pj, "%.1f", slider22); pv_k(826, pv_ky, 22, 0, 10, 5, 0, "HIT", #pj);
+sprintf(#pk, "%.1f", slider23); pv_k(896, pv_ky, 23, 0, 10, 5, 0, "RATTLE", #pk);
+sprintf(#pl, "%+.1f dB", slider13); pv_k(966, pv_ky, 13, -24, 6, 0, 0, "LEVEL", #pl);
+sprintf(#pm, "%+d", floor(slider14 + 0.5)); pv_k(1028, pv_ky, 14, -100, 100, 25, 0, "PAN", #pm);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(848, pv_y + 172, "A FRAME HIT RINGS FIVE METAL JINGLES");
+
+
+// =====================================================================
+// The sequencer
+// =====================================================================
+kr_sect(22, 268, 1036, 192, "SEQUENCER");
+gfx_setfont(10); ui_col(play_state & 1 || slider5 >= 0.5 ? KRA : KRI2); kr_txt(31, 292, play_state & 1 ? "PLAYING" : slider5 >= 0.5 ? "FREE RUN" : "STOPPED");
+pv_i = 0;
+loop(6,
+  kr_key(132 + pv_i * 42, 274, 40, 22, pv_i == 0 ? "1/4" : pv_i == 1 ? "1/8" : pv_i == 2 ? "1/8T" : pv_i == 3 ? "1/16" : pv_i == 4 ? "1/16T" : "1/32",
+    floor(slider1 + 0.5) == pv_i) ? ( slider1 = pv_i; ui_auto(1); );
+  pv_i += 1;
+);
+function pv_sk(x, idx, lo, hi, def, name, val) local(a) (
+  a = kr_small(x, 285, 11, idx, lo, hi, def, 11, "", val);
+  gfx_setfont(11); ui_col(a ? KRA : KRI2); kr_rtxt(x - 22, 286, a ? val : name);   // (the name turns into its value while touched)
+);
+sprintf(#pvs1, "%d%%", floor(slider2 + 0.5)); pv_sk(458, 2, 0, 75, 0, "SWING", #pvs1);
+sprintf(#pvs2, "%d%%", floor(slider3 + 0.5)); pv_sk(570, 3, 0, 100, 15, "HUMAN", #pvs2);
+sprintf(#pvs3, "%.1f", slider4); pv_sk(684, 4, 0, 10, 5, "ACCENT", #pvs3);
+kr_key(712, 274, 56, 22, "FREE", slider5 >= 0.5) ? kr_tog(5);
+sprintf(#pvs4, "%+.1f", slider6); pv_sk(870, 6, -24, 6, 0, "MASTER", #pvs4);
+sprintf(#pvs5, "%d%%", floor(slider7 + 0.5)); pv_sk(1000, 7, 0, 100, 50, "DRIFT", #pvs5);
+// the lanes
+pv_rh = 52; pv_y0 = 306;
+pv_k = 0;
+loop(NL,
+  pv_yy = pv_y0 + pv_k * pv_rh; pv_h = pv_rh - 6;
+  LTF[pv_k] = max(LTF[pv_k] * 0.82, LTR[pv_k]); LTR[pv_k] = 0;
+  kr_key(28, pv_yy, 96, pv_h, pv_lname(pv_k), LTF[pv_k] > 0.25) ? pc_aud = pv_k + 1;
+  pv_len = pc_len(pv_k);
+  pv_len > 1 ? ( kr_key(128, pv_yy + (pv_h - 20) * 0.5, 18, 20, "◄", 0) ? ( slider(9 + pv_k * 3) = pv_len - 1; ui_auto(9 + pv_k * 3); ); ) : kr_dim(128, pv_yy + (pv_h - 20) * 0.5, 18, 20, "◄");
+  sprintf(#pvl, "%d", pv_len); gfx_setfont(11); ui_col(KRA); kr_ctxt(162, pv_yy + pv_h * 0.5, #pvl);
+  pv_len < 32 ? ( kr_key(178, pv_yy + (pv_h - 20) * 0.5, 18, 20, "►", 0) ? ( slider(9 + pv_k * 3) = pv_len + 1; ui_auto(9 + pv_k * 3); ); ) : kr_dim(178, pv_yy + (pv_h - 20) * 0.5, 18, 20, "►");
+  pv_s = 0;
+  loop(32,
+    pv_x = 202 + pv_s * 26 + floor(pv_s / 4) * 0;
+    pv_v = STP[pv_k * 32 + pv_s]; pv_in = pv_s < pv_len;
+    pv_hov = kr_hov(pv_x, pv_yy, 23, pv_h);
+    pv_hov && pressed && drag_id == 0 ? ( drag_id = -1; STP[pv_k * 32 + pv_s] = (pv_v + 1) % 3; pv_v = STP[pv_k * 32 + pv_s]; );
+    ui_col(0x050505); kr_r(pv_x, pv_yy, 23, pv_h);
+    pv_v == 0 ? ui_col(pv_in ? ((pv_s & 3) == 0 ? ui_mix(KRGH, 0xFFFFFF, 0.06) : KRGH) : ui_mix(KRF, 0x000000, 0.3)) :
+                ui_col(pv_v == 2 ? KRA : ui_mix(KRA, KRF, pv_in ? 0.45 : 0.75));
+    kr_r(pv_x + 1, pv_yy + 1, 21, pv_h - 2);
+    pv_v == 2 ? ( ui_cola(0xFFFFFF, 0.35); kr_r(pv_x + 1, pv_yy + 1, 21, 2); );
+    pv_in && pv_s == CUR[pv_k] && (play_state & 1 || slider5 >= 0.5) ? ( ui_cola(0xFFFFFF, 0.5); kr_r(pv_x, pv_yy + pv_h - 3, 23, 3); );
+    pv_s += 1;
+  );
+  pv_k += 1;
+);
+gfx_setfont(10); ui_col(KRI2); kr_txt(202, 448, "CLICK: HIT  -  AGAIN: ACCENT  -  AGAIN: OFF.   EACH LANE ITS OWN LENGTH.   MIDI NOTES PLAY THE LANES TOO.");
+
+// the reverb
+kr_sect(22, 468, 1036, 70, "REVERB");
+pv_i = 0;
+loop(4,
+  kr_key(132 + pv_i * 64, 492, 60, 24, pv_i == 0 ? "OFF" : pv_i == 1 ? "ROOM" : pv_i == 2 ? "SPRING" : "PLATE",
+    floor(slider40 + 0.5) == pv_i) ? ( slider40 = pv_i; ui_auto(40); );
+  pv_i += 1;
+);
+function pv_rk(x, idx, lo, hi, def, name, val) local(a) (
+  a = kr_small(x, 504, 11, idx, lo, hi, def, 11, "", val);
+  gfx_setfont(11); ui_col(a ? KRA : KRI2); kr_rtxt(x - 22, 505, a ? val : name);
+);
+pv_rt = floor(slider40 + 0.5);
+sprintf(#pvr1, "%.1f s", pv_rt == 2 ? 0.8 * 4 ^ (slider41 / 10) : pv_rt == 3 ? 0.6 * 8 ^ (slider41 / 10) : 0.3 * 6 ^ (slider41 / 10));
+pv_rk(560, 41, 0, 10, 5, "DECAY", #pvr1);
+sprintf(#pvr2, "%.1f", slider42); pv_rk(720, 42, 0, 10, 5, "TONE", #pvr2);
+sprintf(#pvr3, "%d%%", floor(slider43 + 0.5)); pv_rk(900, 43, 0, 100, 25, "AMOUNT", #pvr3);
+
+pk_end();
+ui_end();

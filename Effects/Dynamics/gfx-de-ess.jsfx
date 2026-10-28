@@ -1,0 +1,252 @@
+desc:De-Ess [de-esser] (GFX)
+// gfx-de-ess - split-band / wideband de-esser
+//tags: dynamics de-esser sibilance vocal
+//author: JGWizrad / Garden FX (GFX)
+//
+// The detector listens to the esses only: a band around FREQ (BAND) or everything above it (HIGH).
+// When that band crosses THRESHOLD the de-esser turns it down, by no more than RANGE.
+// SPLIT       only the esses band is turned down - the rest of the voice is untouched (transparent).
+// WIDE        the whole signal ducks on each ess, like the classic hardware boxes.
+// LISTEN      hear what the detector hears, to tune FREQ onto the esses.
+// RELEASE     how quickly the esses band comes back after each ess.
+// Stereo: one detector for both channels, so the image never shifts.
+//
+// GUI: drag knobs (Shift = fine), double-click / Ctrl-click = reset. Click the LCD for the preset list.
+// S / M / L / ? = size and help.
+//
+// Requires gfx-output, gfx-ui, gfx-panel, gfx-dyn and gfx-faceplate (.jsfx-inc) in the same folder.
+
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:0<0,7,1{Init,Female Vocal,Male Vocal,Gentle Air,Hard Esses,Acoustic Guitar,Hats and Cymbals,Podcast Voice}>-Preset
+slider2:0<0,1,1{Split,Wide}>-Mode
+slider3:0<0,1,1{Band,High}>-Shape
+slider4:6500<2000,12000,1>-Frequency (Hz)
+slider5:-26<-50,0,0.1>-Threshold (dB)
+slider6:10<0,24,0.1>-Range (dB)
+slider7:60<20,300,1>-Release (ms)
+slider8:0<0,1,1{Off,On}>-Listen
+slider9:0<-12,12,0.1>-Output (dB)
+slider10:1<0,1,1{Off,Clip}>-(unused, was output stage)
+
+@init
+ext_noinit = 1;                                       // keep the state across transport start / stop (no reset mid-signal)
+gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+#ui_man = "gfx-de-ess";
+nextmem = 0;
+function alloc(n) local(p) ( p = nextmem; nextmem += n; memset(p, 0, n); p; );
+function db2g(d) ( exp(d*0.11512925465); );
+function g2db(g) ( 8.68588963807*log(max(g, 0.0000000001)); );
+function tc(s) ( 1 - exp(-1/(max(s, 0.000001)*srate)); );
+ost_init(alloc(4096));
+
+// ZDF state-variable filter (Cytomic): hp, bp (unity peak) and lp from one structure
+function svf_set(f, q) instance(g, k, a1, a2, a3) (
+  g = tan($pi*min(f, srate*0.45)/srate); k = 1/q;
+  a1 = 1/(1 + g*(g + k)); a2 = g*a1; a3 = g*a2;
+);
+function svf(x) instance(g, k, a1, a2, a3, ic1, ic2, v1, v2, v3, hp, bp) (
+  v3 = x - ic2; v1 = a1*ic1 + a2*v3; v2 = ic2 + a2*ic1 + a3*v3;
+  ic1 = 2*v1 - ic1; ic2 = 2*v2 - ic2;
+  hp = x - k*v1 - v2; bp = k*v1;
+);
+// dynamic high shelf (Cytomic SVF shelf) - gain lin is set per sample, corner and Q from hsT / hsK
+function hshelf(x, lin) instance(ic1, ic2) local(A, g, a1, a2, a3, v1, v2, v3) (
+  A = sqrt(max(lin, 0.0001)); g = hsT*sqrt(A);
+  a1 = 1/(1 + g*(g + hsK)); a2 = g*a1; a3 = g*a2;
+  v3 = x - ic2; v1 = a1*ic1 + a2*v3; v2 = ic2 + a2*ic1 + a3*v3;
+  ic1 = 2*v1 - ic1; ic2 = 2*v2 - ic2;
+  A*A*x + hsK*(1 - A)*A*v1 + (1 - A*A)*v2;
+);
+
+function setup() (
+  mode = floor(slider2 + 0.5); shape = floor(slider3 + 0.5);
+  fL.svf_set(slider4, shape ? 0.7071 : 1.2); fR.svf_set(slider4, shape ? 0.7071 : 1.2);
+  hsT = tan($pi*min(slider4, srate*0.45)/srate); hsK = 1.4142;
+  thr = slider5; rng = slider6; rel = tc(slider7*0.001); lis = slider8 > 0.5;
+  outg = db2g(slider9);
+  ost_setup(0, 0, 120, 6000, -0.3, 0);   // output stage: straight through
+);
+att = tc(0.0003);
+env = 0; gr = 0; mGr = 0; mDet = 0; mOut = 0;
+
+// ---------- presets: mode, shape, freq, threshold, range, release ----------
+function pr(m, s, f, t, r, l) ( slider2 = m; slider3 = s; slider4 = f; slider5 = t; slider6 = r; slider7 = l; slider8 = 0; );
+function apply_preset(n) (
+  n == 0 ? pr(0, 0, 6500, -26, 10, 60) :      // Init
+  n == 1 ? pr(0, 0, 7500, -26, 10, 50) :      // Female Vocal
+  n == 2 ? pr(0, 0, 5500, -24, 9, 70) :       // Male Vocal
+  n == 3 ? pr(0, 1, 9000, -22, 6, 80) :       // Gentle Air
+  n == 4 ? pr(1, 0, 6500, -32, 16, 40) :      // Hard Esses
+  n == 5 ? pr(0, 0, 4500, -24, 6, 90) :       // Acoustic Guitar
+  n == 6 ? pr(0, 1, 10000, -22, 8, 60) :      // Hats and Cymbals
+           pr(0, 0, 6000, -28, 12, 60);       // Podcast Voice
+);
+!ui_dflt ? ( ui_sz = 2; lastPreset = slider1; );
+ui_dflt = 1;
+setup();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, lastPreset);
+
+@slider
+slider1 != lastPreset ? ( apply_preset(slider1); lastPreset = slider1; );
+setup();
+
+@block
+setup();
+
+@sample
+// ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+fL.svf(spl0); fR.svf(spl1);
+dL = shape ? fL.hp : fL.bp; dR = shape ? fR.hp : fR.bp;
+// one detector for both channels: peak of the esses band
+d_ = max(abs(dL), abs(dR));
+env += (d_ - env)*(d_ > env ? att : rel);
+lv = g2db(env);
+tg = min(rng, dy_curve(lv - thr, 6)*0.8);      // 5:1 above the knee, never more than RANGE
+gr += (tg - gr)*(tg > gr ? 0.5 : 1);           // envelope already sets the timing
+g_ = db2g(-gr);
+lis ? (
+  yL = dL; yR = dR;
+) : mode == 0 ? (
+  shape ? ( yL = hsL.hshelf(spl0, g_); yR = hsR.hshelf(spl1, g_); )          // HIGH: a shelf that dips above FREQ
+        : ( yL = spl0 + dL*(g_ - 1); yR = spl1 + dR*(g_ - 1); );        // BAND: a bell that dips around FREQ
+) : (
+  yL = spl0*g_; yR = spl1*g_;
+);
+ost_out(yL*outg, yR*outg);
+spl0 = ost_l; spl1 = ost_r;
+mGr = max(mGr, gr); mDet = max(mDet, env);
+a_ = max(abs(spl0), abs(spl1)); mOut = a_ > mOut ? a_ : mOut*0.9997;
+
+@gfx 720 300
+// =====================================================================
+// GUI - a top strip over one half-rack unit in elephant's breath, dark print, a teal ess lamp.
+// Design space 960 x 400 at qs = 0.75 * sc (720 x 300 at size M).
+// =====================================================================
+ui_begin(720, 300);
+qs = sc*0.75;
+
+gfx_setfont(8, "Trebuchet MS", 13.5*qs, 'b');
+gfx_setfont(9, "Courier New", 24*qs, 'b');
+gfx_setfont(10, "Courier New", 15*qs, 'b');
+gfx_setfont(12, "Trebuchet MS", 34*qs, 'b');
+gfx_setfont(13, "Trebuchet MS", 20*qs, 'b');
+GRN = 0x46D86A; AMB = 0xFFB030; RED = 0xFF3A2A; TEAL = 0x2FB3A8;
+PNL = 0xC7BEB3; INK = 0x2A2622; INK2 = 0x5A524A;
+
+function R(x, y, w, h) ( gfx_rect(x*qs, y*qs, max(1, w*qs), max(1, h*qs)); );
+function CIRC(x, y, rr, f) ( gfx_circle(x*qs, y*qs, rr*qs, f, 1); );
+function TX(x, y, t) ( gfx_x = x*qs; gfx_y = y*qs; gfx_drawstr(t); );
+function TC(cx, y, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = cx*qs - w*0.5; gfx_y = y*qs; gfx_drawstr(t); );
+function inbox(x, y, w, h) ( mouse_x >= x*qs && mouse_x < (x + w)*qs && mouse_y >= y*qs && mouse_y < (y + h)*qs; );
+function hitbox(x, y, w, h) local(h_) ( h_ = pressed && drag_id == 0 && inbox(x, y, w, h); h_ ? drag_id = -1; h_; );
+function setmsg(n, v) ( strcpy(#lcdn, n); strcpy(#lcdv, v); lcd_t = time_precise(); );
+function setv(idx, v) ( slider(idx) = v; ui_auto(idx); );
+function tog(idx) ( slider(idx) = slider(idx) < 0.5; ui_auto(idx); );
+function touch(idx, name, val) ( drag_id == 1600 + idx ? setmsg(name, val); );
+function knob(idx, cx, cy, r, lo, hi, def, lg, cap, label, val) (
+  dy_kst = 7; dy_ink = INK; dy_ntick = 11;
+  dy_knob(cx*0.75, cy*0.75, r*0.75, idx, lo, hi, def, lg, cap, label, val);   // value shows on hover / drag only
+  touch(idx, label, val);
+);
+// panel key: the house lamp key (gfx-ui), legend printed on the cap
+sc != de_lsc ? ( de_lsc = sc; gfx_setfont(15, "Trebuchet MS", 9.5*sc, 'b'); );   // lamp key legends
+function key(x, y, w, h, on, c, cap) (
+  lk_well = 0x2A2722; lk_font = 15; lk_font2 = 15;
+  lk_fit(x*0.75, y*0.75, w*0.75, h*0.75, on, c, cap);
+);
+function rscrew(x, y) ( rd_screw(x*0.75, y*0.75); );
+// vertical ladder: n segments lit from the top (gr) or bottom (level)
+function ladder(x, y, h, f, top, c1, c2, label) local(k, n, sh, lit, c) (
+  n = 16; sh = h/n;
+  ui_col(0x0A0A0B); R(x - 3, y - 3, 22, h + 6);
+  k = 0;
+  loop(n,
+    lit = top ? f >= (k + 0.5)/n : f >= (n - k - 0.5)/n;
+    c = top ? (k >= 12 ? c2 : c1) : (k < 3 ? c2 : c1);
+    ui_col(lit ? c : ui_mix(c, 0x000000, 0.82)); R(x, y + k*sh + 1, 16, sh - 2);
+    k += 1;
+  );
+  gfx_setfont(8); ui_col(INK); TC(x + 8, y + h + 8, label);
+);
+function pname(n) (
+  n == 0 ? "INIT" : n == 1 ? "FEMALE VOCAL" : n == 2 ? "MALE VOCAL" : n == 3 ? "GENTLE AIR" :
+  n == 4 ? "HARD ESSES" : n == 5 ? "ACOUSTIC GUITAR" : n == 6 ? "HATS & CYMBALS" : "PODCAST VOICE";
+);
+function go_preset(n) ( slider1 = n; apply_preset(n); lastPreset = n; lcd_t = 0; slider_automate(1023); );
+function fhz(v) ( v >= 1000 ? sprintf(#vt, "%.2f kHz", v/1000) : sprintf(#vt, "%d Hz", floor(v + 0.5)); #vt; );
+
+// ---------------------------------------------------------------------
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+
+// ---- top strip: name, presets, size ----
+ui_col(0x1E2023); R(0, 0, 960, 76);
+gfx_gradrect(0, 0, 960*qs, 30*qs, 1, 1, 1, 0.05, 0, 0, 0, 0, 0, 0, 0, -0.05/(30*qs));
+ui_col(TEAL); CIRC(40, 38, 22, 1);
+gfx_setfont(2); ui_col(0xF2EEE4); ui_text(40*qs, 31*qs, "GFX");
+gfx_setfont(12); ui_col(0xEDEBE4); TX(74, 14, "DE-ESS");
+gfx_setfont(8); ui_col(0xA8ABB0); TX(76, 52, "SIBILANCE CONTROL");
+
+ui_col(0x050505); R(270, 10, 290, 56);
+ui_col(0x061412); R(274, 14, 282, 48);
+ui_col(0x5FE0D2);
+time_precise() - lcd_t < 1.5 ? ( gfx_setfont(10); TX(286, 18, #lcdn); gfx_setfont(9); TX(286, 34, #lcdv); )
+  : ( pk_lcdfont(9, 29*qs); gfx_measurestr(pname(slider1), ltw_, lth_); pk_fitstr(pname(slider1), 286*qs, 38*qs - lth_*0.5, 29*qs, 262*qs); );
+hitbox(270, 10, 290, 56) ? (
+  #pm = ""; k = 0; loop(8, slider1 == k ? strcat(#pm, "!"); strcat(#pm, pname(k)); k < 7 ? strcat(#pm, "|"); k += 1; );
+  gfx_x = mouse_x; gfx_y = mouse_y; k = gfx_showmenu(#pm); k > 0 ? go_preset(k - 1);
+);
+ui_button(570*qs, 14*qs, 38*qs, 48*qs, "<", 0, 1) ? go_preset((slider1 + 7) % 8);
+ui_button(612*qs, 14*qs, 38*qs, 48*qs, ">", 0, 1) ? go_preset((slider1 + 1) % 8);
+ui_okfs = 0.8; ui_outkeys(744*0.75, 8*0.75, 52*0.75, 12, 2, 10);
+gfx_setfont(8, "Trebuchet MS", 13.5*qs, 'b');
+ui_size_picker(824*qs, 26*qs);
+
+// ---- the unit: elephant's breath ----
+ui_col(PNL); R(10, 86, 940, 304);
+gfx_gradrect(10*qs, 86*qs, 940*qs, 140*qs, 1, 1, 1, 0.10, 0, 0, 0, 0, 0, 0, 0, -0.10/(140*qs));
+ui_cola(0x000000, 0.3); R(10, 388, 940, 2); ui_cola(0xFFFFFF, 0.45); R(10, 86, 940, 1);
+ui_col(TEAL); R(10, 86, 940, 5);
+rscrew(24, 104); rscrew(24, 372); rscrew(936, 104); rscrew(936, 372);
+gfx_setfont(8); ui_col(INK2); TX(44, 104, "SPLIT-BAND  /  WIDEBAND  DE-ESSER");
+
+// mode and shape keys, listen
+key(44, 140, 62, 30, mode == 0, LK_YEL, "SPLIT") ? ( setv(2, 0); setmsg("MODE", "SPLIT - ESSES ONLY"); );
+key(114, 140, 62, 30, mode == 1, LK_YEL, "WIDE") ? ( setv(2, 1); setmsg("MODE", "WIDE - WHOLE SIGNAL"); );
+key(44, 214, 62, 30, shape == 0, LK_YEL, "BAND") ? ( setv(3, 0); setmsg("SHAPE", "BAND AROUND FREQ"); );
+key(114, 214, 62, 30, shape == 1, LK_YEL, "HIGH") ? ( setv(3, 1); setmsg("SHAPE", "EVERYTHING ABOVE"); );
+key(44, 290, 132, 30, lis, LK_RED, "LISTEN") ? ( tog(8); setmsg("LISTEN", slider8 > 0.5 ? "DETECTOR" : "OFF"); );
+ui_cola(INK, 0.25); R(206, 130, 1, 220);
+
+// knobs
+knob(4, 290, 222, 42, 2000, 12000, 6500, 1, TEAL, "FREQ", fhz(slider4));
+sprintf(#v5, "%.1f dB", slider5); knob(5, 428, 222, 42, -50, 0, -26, 0, 0x3A3A3E, "THRESHOLD", #v5);
+sprintf(#v6, "%.1f dB", slider6); knob(6, 556, 230, 32, 0, 24, 10, 0, 0x9DA2A8, "RANGE", #v6);
+sprintf(#v7, "%d ms", floor(slider7 + 0.5)); knob(7, 664, 230, 32, 20, 300, 60, 1, 0x9DA2A8, "RELEASE", #v7);
+sprintf(#v9, "%+.1f dB", slider9); knob(9, 772, 230, 32, -12, 12, 0, 0, 0x9DA2A8, "OUTPUT", #v9);
+
+// ess lamp: lit while the de-esser is working
+vGr = max(mGr, vGr*0.88); mGr = 0;
+rd_led(428*0.75, 130*0.75, 6*0.75, vGr > 0.5, TEAL);
+gfx_setfont(8); ui_col(INK2); TX(442, 124, "ESS");
+
+// meters: detector level against the threshold, and gain reduction
+vDet = max(mDet, vDet*0.9); mDet = 0;
+dd_ = g2db(vDet);
+ladder(842, 132, 216, min(max((dd_ + 60)/60, 0), 1), 0, GRN, AMB, "ESS LV");
+ty_ = 132 + 216*(1 - min(max((thr + 60)/60, 0), 1));
+ui_col(RED); R(836, ty_ - 1, 30, 2);
+ladder(892, 132, 216, min(vGr/24, 1), 1, TEAL, RED, "GR");
+
+pk_end();
+ui_end();

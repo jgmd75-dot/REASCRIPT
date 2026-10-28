@@ -1,0 +1,883 @@
+desc:Optimiser II [broadcast processor] (GFX)
+//tags: broadcast processor multiband limiter agc clipper loudness am fm long wave streaming
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-os and gfx-bypass (.jsfx-inc) in the
+// same folder.
+//
+// Optimiser II. The broadcast loudness processor again, in the spirit of the classic transmitter processors, with a
+// simpler panel and three models - one for each kind of broadcast sound:
+//   LW (beige)  - long wave: a narrow band (LOW CUT 100 Hz, HIGH CUT 4.5 kHz), dense and forward.
+//   AM (silver) - medium wave: LOW CUT 50 Hz, HIGH CUT 9.5 kHz, punchy.
+//   FM (blue)   - FM, modern and streaming: LOW CUT 30 Hz, HIGH CUT 15 kHz (turn HIGH CUT fully up = OFF for
+//                 full-bandwidth streaming).
+//   Choosing a model on the panel changes the faceplate and sets LOW CUT / HIGH CUT to its standard band.
+//   Each model has its own voicing (a model change glides over 30 ms):
+//   LW - the bands move almost as one (coupling 85 %), slower attack and recovery: dense, riding sound; a valve
+//        bend before the clipper (even harmonics) and lopsided peaks (the negative half clips 2 dB sooner);
+//        a voice lift: +2 dB round 300 Hz (body), +2.5 dB round 2.2 kHz (speech).
+//   AM - coupling 55 %, a slightly slower attack so the beat punches through; mildly lopsided (1 dB) with a
+//        little valve bend; +1.5 dB round 120 Hz (punch), +3 dB round 3.5 kHz (the bright AM presence).
+//   FM - coupling 45 %, quicker recovery: open, modern; symmetrical; +1 dB round 60 Hz, +1.5 dB round 10 kHz (air);
+//        HF LIMIT holds the treble 2 dB lower (the pinned FM top). AM / LW HF LIMIT sits 0 / 2 dB higher.
+//
+// SIGNAL FLOW
+//   input -> TRIM (+ GUARD) -> LOW CUT -> AGC (+ GATE) -> phase rotator -> 4 bands (150 Hz / 1.2 kHz / 6 kHz), each
+//   with its own compressor (DRIVE pushes them, SLOW / MED / FAST = how fast they recover), BASS / MID / PRESENCE /
+//   AIR = each band's level, HF LIMIT on the top band -> FIZZ -> [oversampled: CLIP] -> MIX (with the unprocessed,
+//   phase-matched signal) -> HIGH CUT -> OUTPUT -> final limiter (3 ms look-ahead, -0.3 dBFS).
+// AGC: a slow wideband gain riding towards a steady level (+/-12 dB); GATE freezes it in quiet passages.
+// HF LIMIT: a fast limiter on the top band - the pinned, steady broadcast treble.
+// FIZZ: the broadcast exciter - only the new harmonics above 3 kHz, round 8 kHz, about 26 dB under the programme.
+// CLIP: a soft clipper ahead of the final limiter: loudness and bite.
+// HPF (LOW CUT: OFF / 20 - 200 Hz, 12 dB/oct) and LPF (HIGH CUT: 2 - 20 kHz / OFF, 24 dB/oct) are the transmitter's band;
+//   both glide, and OFF crossfades (10 ms).
+// LINK (top bar): lit (default) - every detector hears both sides and moves them together; dark - dual mono.
+//   A change crossfades over 10 ms.
+// OS (top bar): the CLIP stage at 1x / 2x / 4x (default 2x); a change dips the sound for 5 ms.
+// BYPASS (top bar): crossfades (15 ms) to the dry input, kept in time with the latency. After REAPER's own bypass
+//   (a gap in processing) the stale buffers are cleared and the sound fades back in from the dry input.
+//
+// DRIFT (0 - 100 %, 50 % = standard): the transmitter's supply sag - the drive dips a little under loud programme
+//   (about 0.5 dB on AM / FM, 1.5 dB on LW, where it is a valve supply) and comes back over a quarter of a second,
+//   and the drive and band timing wander slowly (twice as much on LW).
+// GUI: drag a knob (SHIFT = fine), wheel, double-click = default; values show while a knob is touched. Keys light
+//   when on. S / M / L / ? = size and help.
+// METERS: IN L / R (after TRIM) and OUT L / R LED ladders (-42 .. +3 dBFS, 1.2 s floating peak hold, click to clear),
+//   the OUT peak figure; AGC (+/-12 dB, centre zero); gain reduction of the four bands, HF LIMIT and the final
+//   limiter (0 - 25 dB); GATE and CLIP lamps.
+// PRESETS: Init, then by model (the LCD drops the "FM: " prefix - the faceplate shows the model):
+//   FM: Gentle, Rock, Pop Loud, Dance Smash, Classical, Podcast Stream, Streaming Master;
+//   AM: Talk, Music Radio, Sports, Vintage, Night Skywave; LW: Speech, Weather Bulletin, Music, Dance Band,
+//   Wartime Wireless (they leave TRIM, GUARD, OS, LINK and DRIFT as they are).
+// Latency: the limiter's 3 ms look-ahead (144 samples at 48 kHz) + 31 / 37 samples at OS 2x / 4x; reported.
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-os.jsfx-inc
+import gfx-bypass.jsfx-inc
+
+slider1:o_model=2<0,2,1{LW,AM,FM}>-Model
+slider2:o_rel=1<0,2,1{Slow,Medium,Fast}>-Release
+slider3:o_agc=1<0,1,1{Off,On}>-AGC
+slider4:o_gate=1<0,1,1{Off,On}>-AGC gate
+slider5:o_drv=6<-12,6,0.1>-Drive (dB)
+slider6:o_bass=0<-6,6,0.1>-Bass (dB)
+slider7:o_mid=0<-6,6,0.1>-Mid (dB)
+slider8:o_pres=0<-6,6,0.1>-Presence (dB)
+slider9:o_air=0<-6,6,0.1>-Air (dB)
+slider10:o_clip=30<0,66,1>-Clip (%)
+slider11:o_hf=40<0,100,1>-HF limit (%)
+slider12:o_mix=100<0,100,1>-Mix (%)
+slider13:o_out=0<-24,12,0.1>-Output (dB)
+slider14:o_trim=0<-24,12,0.1>-Input trim (dB)
+slider15:o_guard=0<0,1,1{Off,On}>-Input guard
+slider16:o_drift=50<0,100,1>-Drift (%)
+slider17:o_rot=1<0,1,1{Off,On}>-Phase rotator
+slider18:o_fizz=0<0,1,1{Off,On}>-Fizz
+slider19:o_os=1<0,2,1{1x,2x,4x}>-Oversampling
+slider20:o_link=1<0,1,1{Off,On}>-Link
+slider21:o_byp=0<0,1,1{Off,On}>-Bypass
+slider22:o_lc=30<20,200,1>-Low cut (Hz)
+slider23:o_hc=15<2,20,0.01>-High cut (kHz)
+slider24:prs_sel=0<0,18,1{No preset,Init,FM: Gentle,FM: Rock,FM: Pop Loud,FM: Dance Smash,FM: Classical,FM: Podcast Stream,FM: Streaming Master,AM: Talk,AM: Music Radio,AM: Sports,AM: Vintage,AM: Night Skywave,LW: Speech,LW: Weather Bulletin,LW: Music,LW: Dance Band,LW: Wartime Wireless}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-optimiser-ii";
+ext_noinit = 1;
+
+OPB = 20000;                                   // the final limiter's look-ahead buffer, L / R (2048 each)
+OSD = 30000;                                   // MIX's dry path, delayed by the oversampling (64 each)
+DRY = 31000;                                   // the dry input delayed by the latency, L / R (1024 each): BYPASS + resume
+RMASK = 1023;
+
+// ---------- the final brickwall limiter (3 ms look-ahead, -0.3 dBFS) ----------
+function op_init() (
+  op_bsz = 2048; op_bmask = op_bsz - 1;
+  memset(OPB, 0, op_bsz * 2);
+  op_wp = 0; op_g = 1; op_hg = 1; op_hc = 0; op_gr = 1;
+  op_n = min(floor(0.003 * srate), op_bsz - 1);
+  op_att = 1 - exp(-5 / op_n);
+  op_rel = 1 - exp(-1 / (0.08 * srate));
+  op_c = 10 ^ (-0.3 / 20);
+  op_ga = op_gb = 1; op_hga = op_hgb = 1; op_hca = op_hcb = 0;
+);
+// stereo-linked; results in op_l, op_r
+function op_lim(l, r) local(pk, gt, rp, dl, dr) (
+  OPB[op_wp] = l; OPB[op_bsz + op_wp] = r;
+  rp = (op_wp - op_n + op_bsz) & op_bmask;
+  dl = OPB[rp]; dr = OPB[op_bsz + rp];
+  op_wp = (op_wp + 1) & op_bmask;
+  pk = max(abs(l), abs(r));
+  gt = pk > op_c ? op_c / pk : 1;
+  gt < op_hg ? ( op_hg = gt; op_hc = op_n; ) : ( op_hc > 0 ? op_hc -= 1 : op_hg = gt; );
+  op_g += (op_hg - op_g) * (op_hg < op_g ? op_att : op_rel);
+  op_gr = min(op_gr, op_g);
+  op_l = min(max(dl * op_g, -op_c), op_c);
+  op_r = min(max(dr * op_g, -op_c), op_c);
+);
+// LINK off: the same limiter, each side holding its own gain (the linked one carries on, for the crossfade)
+function op_lim2(l, r) local(pk, gt, rp, dl, dr, ga, gb) (
+  OPB[op_wp] = l; OPB[op_bsz + op_wp] = r;
+  rp = (op_wp - op_n + op_bsz) & op_bmask;
+  dl = OPB[rp]; dr = OPB[op_bsz + rp];
+  op_wp = (op_wp + 1) & op_bmask;
+  pk = max(abs(l), abs(r));
+  gt = pk > op_c ? op_c / pk : 1;
+  gt < op_hg ? ( op_hg = gt; op_hc = op_n; ) : ( op_hc > 0 ? op_hc -= 1 : op_hg = gt; );
+  op_g += (op_hg - op_g) * (op_hg < op_g ? op_att : op_rel);
+  pk = abs(l); gt = pk > op_c ? op_c / pk : 1;
+  gt < op_hga ? ( op_hga = gt; op_hca = op_n; ) : ( op_hca > 0 ? op_hca -= 1 : op_hga = gt; );
+  op_ga += (op_hga - op_ga) * (op_hga < op_ga ? op_att : op_rel);
+  pk = abs(r); gt = pk > op_c ? op_c / pk : 1;
+  gt < op_hgb ? ( op_hgb = gt; op_hcb = op_n; ) : ( op_hcb > 0 ? op_hcb -= 1 : op_hgb = gt; );
+  op_gb += (op_hgb - op_gb) * (op_hgb < op_gb ? op_att : op_rel);
+  ga = op_g + (op_ga - op_g) * lk_u; gb = op_g + (op_gb - op_g) * lk_u;
+  op_gr = min(op_gr, min(ga, gb));
+  op_l = min(max(dl * ga, -op_c), op_c);
+  op_r = min(max(dr * gb, -op_c), op_c);
+);
+
+// ---------- biquads ----------
+function bq_lp(f, q) instance(b0, b1, b2, a1, a2) local(w0, cw, al, n) (
+  w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); al = sin(w0) / (2 * q); n = 1 + al;
+  b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+);
+function bq_hp(f, q) instance(b0, b1, b2, a1, a2) local(w0, cw, al, n) (
+  w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); al = sin(w0) / (2 * q); n = 1 + al;
+  b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+);
+function bq_ap(f) instance(b0, b1, b2, a1, a2) local(w0, cw, al, n) (
+  w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); al = sin(w0) / (2 * 0.70710678); n = 1 + al;
+  b0 = (1 - al) / n; b1 = -2 * cw / n; b2 = 1; a1 = b1; a2 = b0;
+);
+function bq_pk(f, g, q) instance(b0, b1, b2, a1, a2) local(pa, w0, cw, al, n) (
+  pa = 10 ^ (g / 40); w0 = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w0); al = sin(w0) / (2 * q); n = 1 + al / pa;
+  b0 = (1 + al * pa) / n; b1 = -2 * cw / n; b2 = (1 - al * pa) / n; a1 = b1; a2 = (1 - al / pa) / n;
+);
+function bq(x, c0, c1, c2, d1, d2) instance(z1, z2) local(y) (
+  y = c0 * x + z1;
+  z1 = c1 * x - d1 * y + z2;
+  z2 = c2 * x - d2 * y;
+  y;
+);
+function bqz() instance(z1, z2) ( z1 = z2 = 0; );
+
+// ---------- band compressor: soft knee, returns gain reduction (dB) ----------
+function band_gr(pw, att, rel) instance(e, gr) local(ldb, ov, tg) (
+  e += (pw - e) * cdet;
+  ldb = 10 * log10(max(e, 0.000000000001)) + drv_s;
+  ov = ldb - b_thr;
+  tg = 2 * ov < -b_kn ? 0 : 2 * abs(ov) <= b_kn ? b_sl * sqr(ov + b_kn * 0.5) / (2 * b_kn) : b_sl * ov;
+  gr += (tg - gr) * (tg > gr ? att : rel);
+  gr;
+);
+// LINK off: one side's AGC and HF LIMIT, the same laws as the linked ones
+function agc_side(p) instance(ms, db) local(l, t) (
+  ms += (p - ms) * agc_c;
+  agc_on ? (
+    l = 10 * log10(max(ms, 0.000000000001));
+    !(gate_on && l < -50) ? (
+      t = min(max(-18 - l, -12), 12);
+      db += max(min(t - db, agc_up), -agc_dn);
+    );
+  ) : (
+    db += max(min(-db, agc_up * 4), -agc_dn * 4);
+  );
+);
+function hf_side(e_) instance(e, g) local(t) (
+  e += (e_ - e) * (e_ > e ? hf_at : hf_rl);
+  t = e > hft ? hft / e : 1;
+  g += (t - g) * (t < g ? hf_at : hf_rl);
+);
+// band coupling within one side
+function cpl_lim(g) ( gav + min(max(g - gav, -glim), glim); );
+// soft clipper: clean below 70% of the threshold, rounds smoothly up to it
+function opt_clip(x, t) local(a, k) (
+  a = abs(x); k = 0.7 * t;
+  a < k ? x : sign(x) * (k + (t - k) * ost_tanh((a - k) / (t - k)));
+);
+// the model's clipper: a touch of even-order (valve) bend (m_vw), then the positive half clipped at t and the
+// negative half at t x m_asy (the lopsided modulation of AM transmitters)
+function mdl_clip(x, t) (
+  x += m_vw * 0.18 * x * x / t;
+  x > 0 ? opt_clip(x, t) : opt_clip(x, t * m_asy);
+);
+function tc(ms) ( 1 - exp(-1 / (0.001 * ms * srate)); );
+
+function update() (
+  agc_on = o_agc; gate_on = o_gate;
+  bg1 = 10 ^ (o_bass / 20); bg2 = 10 ^ (o_mid / 20); bg3 = 10 ^ (o_pres / 20); bg4 = 10 ^ (o_air / 20);
+  clp_g = 10 ^ (9 * o_clip / 100 / 20);
+  drift_macro(o_drift);
+  ddr = (o_model < 0.5 ? 0.1 : 0.05) * dm_a; dspd = 0.25 * dm_s;
+  sag_k = (o_model < 0.5 ? 1.5 : 0.5) * dm_a;          // supply sag: dB of drive lost at full programme
+  mix_t = o_mix / 100;
+  rot_on = o_rot > 0.5; hf_amt = o_hf / 100; fz_on = o_fizz > 0.5;
+  lk_t = o_link >= 0.5;
+  by_t = o_byp >= 0.5;
+  out_t = 10 ^ (o_out / 20);
+  in_setup(o_trim, o_guard);
+  lc_on = o_lc > 20.5; hc_on = o_hc < 19.95;
+  lc_t = log(max(o_lc, 20)); hc_t = log(min(o_hc, 20) * 1000);
+  os_tf = os_f2n(o_os);
+  // the model's voicing (targets; @sample glides them, so a model change never steps)
+  o_model < 0.5 ? (        // LW: dense and wideband, a valve transmitter's body and lopsided peaks
+    mt_cpl = 0.85; m_ta = 1.5; m_tr = 1.6; mt_asy = 0.80; mt_vw = 1;    mt_hfo = 2;
+    mt_fa = log(300); mt_ga = 2;   mt_fb = log(2200);  mt_gb = 2.5;
+  ) : o_model < 1.5 ? (    // AM: punchy and bright, mildly lopsided
+    mt_cpl = 0.55; m_ta = 1.3; m_tr = 1.0; mt_asy = 0.88; mt_vw = 0.35; mt_hfo = 0;
+    mt_fa = log(120); mt_ga = 1.5; mt_fb = log(3500);  mt_gb = 3;
+  ) : (                    // FM / streaming: open and modern, symmetrical, the treble pinned by HF LIMIT
+    mt_cpl = 0.45; m_ta = 1;   m_tr = 0.8; mt_asy = 1;    mt_vw = 0;    mt_hfo = -2;
+    mt_fa = log(60);  mt_ga = 1;   mt_fb = log(10000); mt_gb = 1.5;
+  );
+  o_model != m_last ? ( m_last = o_model; m_gl = ceil(srate) + 16; );   // glide for a second, then rest
+);
+
+// band timing (with timing drift), called per block
+function timing(m) local(r1, r2, r3, r4) (
+  o_rel < 0.5 ? ( r1 = 800; r2 = 500; r3 = 400; r4 = 300; ) :
+  o_rel < 1.5 ? ( r1 = 350; r2 = 220; r3 = 180; r4 = 140; ) :
+                ( r1 = 150; r2 = 90;  r3 = 70;  r4 = 60;  );
+  at1 = tc(30 * m * m_ta); at2 = tc(12 * m * m_ta); at3 = tc(6 * m * m_ta); at4 = tc(3 * m * m_ta);
+  rl1 = tc(r1 * m * m_tr); rl2 = tc(r2 * m * m_tr); rl3 = tc(r3 * m * m_tr); rl4 = tc(r4 * m * m_tr);
+);
+
+// the model's standard band (the panel's model keys set it)
+function model_band(m) (
+  o_lc = m == 0 ? 100 : m == 1 ? 50 : 30;
+  o_hc = m == 0 ? 4.5 : m == 1 ? 9.5 : 15;
+);
+function model_band_au(m) (
+  o_lc = m == 0 ? 100 : m == 1 ? 50 : 30;
+  o_hc = m == 0 ? 4.5 : m == 1 ? 9.5 : 15;
+);
+
+// ---------- presets (TRIM, GUARD, OS, LINK and DRIFT stay as they are) ----------
+#o2_pmn = "Init|FM: Gentle|FM: Rock|FM: Pop Loud|FM: Dance Smash|FM: Classical|FM: Podcast Stream|FM: Streaming Master|AM: Talk|AM: Music Radio|AM: Sports|AM: Vintage|AM: Night Skywave|LW: Speech|LW: Weather Bulletin|LW: Music|LW: Dance Band|LW: Wartime Wireless";
+function setp(m, rl, ag, gt, dr, bs, md, pr, ai, cl, hf, fz) (
+  o_model = m; o_rel = rl; o_agc = ag; o_gate = gt; o_drv = dr; o_bass = bs; o_mid = md; o_pres = pr; o_air = ai;
+  o_clip = cl; o_hf = hf; o_fizz = fz; model_band_au(m);
+);
+function load_preset(p) local(i) (
+  o_mix = 100; o_out = 0; o_rot = 1;
+  //               model rel agc gate drv bass  mid   pres air  clip hf fizz
+  p == 1  ? setp(2, 1, 1, 1, 6, 0, 0, 0, 0, 30, 40, 0) :
+  p == 2  ? setp(2, 0, 1, 1, 4, 1, 0, 0.5, 1, 10, 30, 0) :
+  p == 3  ? setp(2, 1, 1, 1, 4.7, 2, -0.5, 1.5, 2, 30, 45, 1) :
+  p == 4  ? setp(2, 2, 1, 1, 5.5, 2.5, 0, 2, 3, 55, 55, 1) :
+  p == 5  ? setp(2, 2, 1, 0, 6, 3, -1, 1.5, 2.5, 64, 60, 1) :
+  p == 6  ? setp(2, 0, 1, 1, 2, 0, 0, 0, 0.5, 0, 20, 0) :
+  p == 7  ? ( setp(2, 1, 1, 1, 4.5, -3, 0.5, 2, 1, 15, 35, 0); o_hc = 20; ) :
+  p == 8  ? ( setp(2, 0, 0, 0, 3, 0.5, 0, 0.5, 1, 10, 25, 0); o_lc = 20; o_hc = 20; ) :
+  p == 9  ? setp(1, 1, 1, 1, 4.9, -2, 1, 2.5, 0, 20, 50, 0) :
+  p == 10 ? setp(1, 1, 1, 1, 5.1, 1.5, 0.5, 1.5, 1, 40, 45, 0) :
+  p == 11 ? setp(1, 2, 1, 1, 5.5, -1, 1.5, 3, 0, 50, 55, 0) :
+  p == 12 ? setp(1, 1, 1, 1, 5.8, 3, 2, 3, -2, 66, 50, 0) :
+  p == 13 ? ( setp(1, 0, 1, 1, 5.3, 2, 1, 2, -1.5, 35, 40, 0); o_hc = 6; ) :
+  p == 14 ? setp(0, 1, 1, 1, 5.1, -3, 2, 3, 0, 40, 40, 0) :
+  p == 15 ? setp(0, 0, 1, 1, 4.5, -2, 1.5, 2, 0, 25, 30, 0) :
+  p == 16 ? setp(0, 0, 1, 1, 4.7, 2, 1, 2, 0, 35, 35, 0) :
+  p == 17 ? setp(0, 1, 1, 1, 4.9, 2.5, 1, 1.5, 0, 45, 35, 0) :
+  p == 18 ? ( setp(0, 1, 1, 1, 5.6, 1, 2.5, 2, -3, 62, 40, 0); o_hc = 3.5; );
+  i = 1; loop(23, i != 14 && i != 15 && i != 16 && i != 19 && i != 20 && i != 21 ? ui_auto(i); i += 1; );
+  pr_cur = p;
+);
+
+// ---------- memory / state ----------
+klp1.bq_lp(150, 0.70710678);  khp1.bq_hp(150, 0.70710678);
+klp2.bq_lp(1200, 0.70710678); khp2.bq_hp(1200, 0.70710678);
+klp3.bq_lp(6000, 0.70710678); khp3.bq_hp(6000, 0.70710678);
+kap2.bq_ap(1200); kap3.bq_ap(6000);
+kpr.bq_ap(200);                                    // phase rotator
+kfz1.bq_hp(3000, 0.70710678); kfz2.bq_hp(5000, 0.70710678); kfz3.bq_pk(8000, 6, 0.9);
+hf_at = 1 - exp(-1 / (0.0003 * srate)); hf_rl = 1 - exp(-1 / (0.05 * srate)); hf_e = 0; hf_gn = 1;
+fz_a = 1 - exp(-1 / (0.001 * srate)); fz_r = 1 - exp(-1 / (0.04 * srate)); fz_w = 1 - exp(-1 / (0.03 * srate));
+fz_h = 0; fz_e = 0; fz_p = 0;
+b_thr = -12; b_sl = 0.8; b_kn = 8;                 // band threshold (dBFS after drive), slope (5:1), knee
+cpl = 0.5;                                         // band coupling (the model sets it)
+cdet = 1 - exp(-1 / (0.005 * srate));
+agc_c  = 1 - exp(-1 / (0.4 * srate));              // AGC level detector
+agc_up = 2 / srate; agc_dn = 6 / srate;            // AGC slew (dB per sample): 2 dB/s up, 6 dB/s down
+sm  = 1 - exp(-1 / (0.03 * srate));                // knob glides
+dc_k = 1 - 2 * $pi * 5 / srate; dcx_l = dcy_l = dcx_r = dcy_r = 0;
+sag_c = 1 - exp(-1 / (0.25 * srate)); sag_e = 0;   // supply sag follows the load over ~250 ms
+c_sw = 1 - exp(-1 / (0.015 * srate));              // BYPASS crossfade
+lk_c = 1 - exp(-1 / (0.01 * srate));               // LINK / filter OFF crossfades
+fl_c = 1 - exp(-1 / (0.03 * srate * 16 / 16));    // filter cutoff glide (per sample, applied every 16)
+drd.drift_init(0.8 + rand(1) * 0.5);
+drt.drift_init(0.8 + rand(1) * 0.5);
+op_init();
+os_design(); os_base = op_n; os_f = os_tf = os_f2n(o_os); os_gsetup();
+memset(OSD, 0, 128); osd_w = 0;
+memset(DRY, 0, 2048); dw = 0;
+in_init();
+agc_ms = 0.0159; agc_db = 0;
+rs_f = 1; rs_c = 1 / (0.015 * srate);
+
+m_last = -1; update();
+timing(1);
+rot_m = rot_on; fz_m = fz_on;
+cpl = mt_cpl; m_asy = mt_asy; m_vw = mt_vw; m_hfo = mt_hfo; m_fa = mt_fa; m_ga = mt_ga; m_fb = mt_fb; m_gb = mt_gb; mq_n = 0;
+mix_s = mix_t; out_s = out_t; drv_e = o_drv; lk_s = lk_t; lk_u = 1 - lk_s; by_s = by_t;
+drv_s = drv_e; clp_s = clp_g; bg1s = bg1; bg2s = bg2; bg3s = bg3; bg4s = bg4;
+lc_s = lc_t; hc_s = hc_t; lc_m = lc_on; hc_m = hc_on; fl_n = 0;
+
+ui_thm = 5; ui_hw = 1;                             // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );             // new instances open in Medium, on Init
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 18 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(18, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@slider
+prs_chk();
+update();
+
+@block
+prs_chk();
+update();
+dinc = dspd * samplesblock / srate;
+vd = drd.drift_tick(dinc); vt = drt.drift_tick(dinc);
+drv_e = o_drv + ddr * 3 * vd - sag_k * min(sag_e * 8, 1);
+timing(1 + 0.4 * ddr * vt);
+// resume after REAPER's bypass (or any gap in processing): the buffers hold stale audio, so @sample clears them
+// and fades in from the dry signal
+rs_now = time_precise();
+rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) ? rs_req = 1;
+rs_last = rs_now;
+
+@sample
+rs_req ? (
+  rs_req = 0; rs_f = 0; rs_x = 0; rs_wait = pdc_delay;
+  memset(OPB, 0, 4096); memset(OSD, 0, 128); memset(DRY, 0, 2048);
+  oul.os_clr(); our.os_clr(); odl.os_clr(); odr.os_clr();
+);
+rw_l = spl0; rw_r = spl1;
+// input stage: DC block, trim, guard
+in_process(spl0, spl1);
+inl = in_l; inr = in_r;
+in_l_d = max(in_l_d, abs(inl)); in_r_d = max(in_r_d, abs(inr));
+mix_s += (mix_t - mix_s) * sm;
+out_s += (out_t - out_s) * sm;
+drv_s += (drv_e - drv_s) * sm; clp_s += (clp_g - clp_s) * sm;
+bg1s += (bg1 - bg1s) * sm; bg2s += (bg2 - bg2s) * sm; bg3s += (bg3 - bg3s) * sm; bg4s += (bg4 - bg4s) * sm;
+
+// LOW CUT / HIGH CUT: the cutoffs glide (log), the coefficients follow (every sample while gliding); OFF crossfades
+lc_s += (lc_t - lc_s) * fl_c; hc_s += (hc_t - hc_s) * fl_c;
+lc_m += (lc_on - lc_m) * lk_c; hc_m += (hc_on - hc_m) * lk_c;
+fl_n -= 1;
+abs(lc_s - lc_t) > 0.0002 || abs(hc_s - hc_t) > 0.0002 ? fl_n = 0;   // while a cutoff glides: every sample
+fl_n <= 0 ? (
+  fl_n = 16;
+  klc.bq_hp(exp(lc_s), 0.70710678);
+  khc1.bq_lp(exp(hc_s), 0.54119610); khc2.bq_lp(exp(hc_s), 1.30656296);
+);
+lc_m > 0.0001 ? (
+  xl = Llc.bq(inl, klc.b0, klc.b1, klc.b2, klc.a1, klc.a2); xr = Rlc.bq(inr, klc.b0, klc.b1, klc.b2, klc.a1, klc.a2);
+  inl += (xl - inl) * lc_m; inr += (xr - inr) * lc_m;
+) : ( Llc.bqz(); Rlc.bqz(); );
+
+// 1. AGC: slow wideband gain riding towards -18 dBFS average
+agc_ms += (0.5 * (inl * inl + inr * inr) - agc_ms) * agc_c;
+sag_e += (abs(op_l) + abs(op_r) - 2 * sag_e) * sag_c;   // the supply's load: the output's average level
+gate_d = 0;
+agc_on ? (
+  a_ldb = 10 * log10(max(agc_ms, 0.000000000001));
+  gate_on && a_ldb < -50 ? gate_d = 1 : (
+    a_t = min(max(-18 - a_ldb, -12), 12);
+    agc_db += max(min(a_t - agc_db, agc_up), -agc_dn);
+  );
+) : (
+  agc_db += max(min(-agc_db, agc_up * 4), -agc_dn * 4);
+);
+lk_s += (lk_t - lk_s) * lk_c; lk_s > 0.9999 && lk_t ? lk_s = 1; lk_s < 0.0001 && !lk_t ? lk_s = 0;
+lk_u = 1 - lk_s;                                   // the dual-mono share (0 = linked)
+lk_u > 0 ? (
+  aga.agc_side(inl * inl); agb.agc_side(inr * inr);
+  xl = inl * 10 ^ ((agc_db + (aga.db - agc_db) * lk_u) / 20);
+  xr = inr * 10 ^ ((agc_db + (agb.db - agc_db) * lk_u) / 20);
+) : (
+  aga.ms = agb.ms = agc_ms; aga.db = agb.db = agc_db;
+  ag = 10 ^ (agc_db / 20);
+  xl = inl * ag; xr = inr * ag;
+);
+
+// 1b. phase rotator: four all-passes at 200 Hz even out lopsided (speech) peaks
+rot_m += (rot_on - rot_m) * c_sw; fz_m += (fz_on - fz_m) * c_sw;   // PHASE / FIZZ crossfade (15 ms)
+rot_on || rot_m > 0.0001 ? (
+  rx = xl; ry = xr;
+  xl = Lpr4.bq(Lpr3.bq(Lpr2.bq(Lpr1.bq(xl, kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2), kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2), kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2), kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2);
+  xr = Rpr4.bq(Rpr3.bq(Rpr2.bq(Rpr1.bq(xr, kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2), kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2), kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2), kpr.b0, kpr.b1, kpr.b2, kpr.a1, kpr.a2);
+  rot_m < 0.9999 ? ( xl = rx + (xl - rx) * rot_m; xr = ry + (xr - ry) * rot_m; );
+);
+
+// 1c. the model's voice: two broad peaks (glided; coefficients every 16 samples while gliding)
+m_gl > 0 ? (                                       // only while a model change glides (then it rests)
+  m_gl -= 1;
+  cpl += (mt_cpl - cpl) * sm; m_asy += (mt_asy - m_asy) * sm; m_vw += (mt_vw - m_vw) * sm; m_hfo += (mt_hfo - m_hfo) * sm;
+  m_fa += (mt_fa - m_fa) * sm; m_ga += (mt_ga - m_ga) * sm; m_fb += (mt_fb - m_fb) * sm; m_gb += (mt_gb - m_gb) * sm;
+  m_gl == 0 ? ( cpl = mt_cpl; m_asy = mt_asy; m_vw = mt_vw; m_hfo = mt_hfo; m_fa = mt_fa; m_ga = mt_ga; m_fb = mt_fb;
+                m_gb = mt_gb; mq_n = 0; );
+  mq_n -= 1;
+  mq_n <= 0 ? ( mq_n = 16; kva.bq_pk(exp(m_fa), m_ga, 0.75); kvb.bq_pk(exp(m_fb), m_gb, 0.85); );
+);
+xl = Lvb.bq(Lva.bq(xl, kva.b0, kva.b1, kva.b2, kva.a1, kva.a2), kvb.b0, kvb.b1, kvb.b2, kvb.a1, kvb.a2);
+xr = Rvb.bq(Rva.bq(xr, kva.b0, kva.b1, kva.b2, kva.a1, kva.a2), kvb.b0, kvb.b1, kvb.b2, kvb.a1, kvb.a2);
+
+// 2. phase-coherent 4-band split (LR4 crossovers + allpass alignment, sums flat)
+lo1 = Llp1b.bq(Llp1a.bq(xl, klp1.b0, klp1.b1, klp1.b2, klp1.a1, klp1.a2), klp1.b0, klp1.b1, klp1.b2, klp1.a1, klp1.a2);
+hi1 = Lhp1b.bq(Lhp1a.bq(xl, khp1.b0, khp1.b1, khp1.b2, khp1.a1, khp1.a2), khp1.b0, khp1.b1, khp1.b2, khp1.a1, khp1.a2);
+lo2 = Llp2b.bq(Llp2a.bq(hi1, klp2.b0, klp2.b1, klp2.b2, klp2.a1, klp2.a2), klp2.b0, klp2.b1, klp2.b2, klp2.a1, klp2.a2);
+hi2 = Lhp2b.bq(Lhp2a.bq(hi1, khp2.b0, khp2.b1, khp2.b2, khp2.a1, khp2.a2), khp2.b0, khp2.b1, khp2.b2, khp2.a1, khp2.a2);
+bl3 = Llp3b.bq(Llp3a.bq(hi2, klp3.b0, klp3.b1, klp3.b2, klp3.a1, klp3.a2), klp3.b0, klp3.b1, klp3.b2, klp3.a1, klp3.a2);
+bl4 = Lhp3b.bq(Lhp3a.bq(hi2, khp3.b0, khp3.b1, khp3.b2, khp3.a1, khp3.a2), khp3.b0, khp3.b1, khp3.b2, khp3.a1, khp3.a2);
+bl1 = Lap1b.bq(Lap1a.bq(lo1, kap2.b0, kap2.b1, kap2.b2, kap2.a1, kap2.a2), kap3.b0, kap3.b1, kap3.b2, kap3.a1, kap3.a2);
+bl2 = Lap2a.bq(lo2, kap3.b0, kap3.b1, kap3.b2, kap3.a1, kap3.a2);
+lo1 = Rlp1b.bq(Rlp1a.bq(xr, klp1.b0, klp1.b1, klp1.b2, klp1.a1, klp1.a2), klp1.b0, klp1.b1, klp1.b2, klp1.a1, klp1.a2);
+hi1 = Rhp1b.bq(Rhp1a.bq(xr, khp1.b0, khp1.b1, khp1.b2, khp1.a1, khp1.a2), khp1.b0, khp1.b1, khp1.b2, khp1.a1, khp1.a2);
+lo2 = Rlp2b.bq(Rlp2a.bq(hi1, klp2.b0, klp2.b1, klp2.b2, klp2.a1, klp2.a2), klp2.b0, klp2.b1, klp2.b2, klp2.a1, klp2.a2);
+hi2 = Rhp2b.bq(Rhp2a.bq(hi1, khp2.b0, khp2.b1, khp2.b2, khp2.a1, khp2.a2), khp2.b0, khp2.b1, khp2.b2, khp2.a1, khp2.a2);
+br3 = Rlp3b.bq(Rlp3a.bq(hi2, klp3.b0, klp3.b1, klp3.b2, klp3.a1, klp3.a2), klp3.b0, klp3.b1, klp3.b2, klp3.a1, klp3.a2);
+br4 = Rhp3b.bq(Rhp3a.bq(hi2, khp3.b0, khp3.b1, khp3.b2, khp3.a1, khp3.a2), khp3.b0, khp3.b1, khp3.b2, khp3.a1, khp3.a2);
+br1 = Rap1b.bq(Rap1a.bq(lo1, kap2.b0, kap2.b1, kap2.b2, kap2.a1, kap2.a2), kap3.b0, kap3.b1, kap3.b2, kap3.a1, kap3.a2);
+br2 = Rap2a.bq(lo2, kap3.b0, kap3.b1, kap3.b2, kap3.a1, kap3.a2);
+
+// unprocessed sum (same phase as the bands) for MIX
+dryl = bl1 + bl2 + bl3 + bl4; dryr = br1 + br2 + br3 + br4;
+
+g1 = c1.band_gr(max(bl1 * bl1, br1 * br1), at1, rl1);
+g2 = c2.band_gr(max(bl2 * bl2, br2 * br2), at2, rl2);
+g3 = c3.band_gr(max(bl3 * bl3, br3 * br3), at3, rl3);
+g4 = c4.band_gr(max(bl4 * bl4, br4 * br4), at4, rl4);
+// band coupling: each band's gain reduction may only stray (1 - coupling) x 12 dB from the average
+gav = (g1 + g2 + g3 + g4) * 0.25; glim = 12 * (1 - cpl);
+g1 = cpl_lim(g1); g2 = cpl_lim(g2); g3 = cpl_lim(g3); g4 = cpl_lim(g4);
+k1 = bg1s * 10 ^ ((drv_s - g1) / 20);
+k2 = bg2s * 10 ^ ((drv_s - g2) / 20);
+k3 = bg3s * 10 ^ ((drv_s - g3) / 20);
+k4 = bg4s * 10 ^ ((drv_s - g4) / 20);
+lk_u > 0 ? (
+  // dual mono: each side's own band compressors (and their coupling), crossfaded from the linked gains
+  gl1 = ca1.band_gr(bl1 * bl1, at1, rl1); gl2 = ca2.band_gr(bl2 * bl2, at2, rl2);
+  gl3 = ca3.band_gr(bl3 * bl3, at3, rl3); gl4 = ca4.band_gr(bl4 * bl4, at4, rl4);
+  gr1 = cb1.band_gr(br1 * br1, at1, rl1); gr2 = cb2.band_gr(br2 * br2, at2, rl2);
+  gr3 = cb3.band_gr(br3 * br3, at3, rl3); gr4 = cb4.band_gr(br4 * br4, at4, rl4);
+  gav = (gl1 + gl2 + gl3 + gl4) * 0.25;
+  gl1 = cpl_lim(gl1); gl2 = cpl_lim(gl2); gl3 = cpl_lim(gl3); gl4 = cpl_lim(gl4);
+  gav = (gr1 + gr2 + gr3 + gr4) * 0.25;
+  gr1 = cpl_lim(gr1); gr2 = cpl_lim(gr2); gr3 = cpl_lim(gr3); gr4 = cpl_lim(gr4);
+  gl1 = g1 + (gl1 - g1) * lk_u; gl2 = g2 + (gl2 - g2) * lk_u; gl3 = g3 + (gl3 - g3) * lk_u; gl4 = g4 + (gl4 - g4) * lk_u;
+  gr1 = g1 + (gr1 - g1) * lk_u; gr2 = g2 + (gr2 - g2) * lk_u; gr3 = g3 + (gr3 - g3) * lk_u; gr4 = g4 + (gr4 - g4) * lk_u;
+  kl1 = bg1s * 10 ^ ((drv_s - gl1) / 20); kl2 = bg2s * 10 ^ ((drv_s - gl2) / 20);
+  kl3 = bg3s * 10 ^ ((drv_s - gl3) / 20); kl4 = bg4s * 10 ^ ((drv_s - gl4) / 20);
+  kr1 = bg1s * 10 ^ ((drv_s - gr1) / 20); kr2 = bg2s * 10 ^ ((drv_s - gr2) / 20);
+  kr3 = bg3s * 10 ^ ((drv_s - gr3) / 20); kr4 = bg4s * 10 ^ ((drv_s - gr4) / 20);
+  g1 = max(gl1, gr1); g2 = max(gl2, gr2); g3 = max(gl3, gr3); g4 = max(gl4, gr4);   // (for the meters)
+) : (
+  ca1.e = cb1.e = c1.e; ca1.gr = cb1.gr = c1.gr; ca2.e = cb2.e = c2.e; ca2.gr = cb2.gr = c2.gr;
+  ca3.e = cb3.e = c3.e; ca3.gr = cb3.gr = c3.gr; ca4.e = cb4.e = c4.e; ca4.gr = cb4.gr = c4.gr;
+);
+// 3. the clip point: just under the limiter's, so the clipper and the limiter start at the same point
+cth = 0.98;
+// HF LIMIT: a fast limiter on the top band, holding the treble at a steady level under the clip point
+hf_amt > 0.005 ? (
+  hf_x = max(abs(bl4), abs(br4)) * k4;
+  hf_e += (hf_x - hf_e) * (hf_x > hf_e ? hf_at : hf_rl);
+  hft = cth * 10 ^ (-(3 + 15 * hf_amt - m_hfo) / 20);
+  hfg_t = hf_e > hft ? hft / hf_e : 1;
+  hf_gn += (hfg_t - hf_gn) * (hfg_t < hf_gn ? hf_at : hf_rl);
+  lk_u > 0 ? (
+    hfl.hf_side(abs(bl4) * kl4); hfr.hf_side(abs(br4) * kr4);
+    kl4 *= hf_gn + (hfl.g - hf_gn) * lk_u; kr4 *= hf_gn + (hfr.g - hf_gn) * lk_u;
+    hf_d = max(hf_d, -20 * log10(max(min(hfl.g, hfr.g), 0.0001)));
+  ) : ( hfl.e = hfr.e = hf_e; hfl.g = hfr.g = hf_gn; );
+  k4 *= hf_gn;
+  hf_d = max(hf_d, -20 * log10(max(hf_gn, 0.0001)));
+) : ( hf_gn = 1; hfl.g = hfr.g = 1; );
+lk_u > 0 ? (
+  wl = bl1 * kl1 + bl2 * kl2 + bl3 * kl3 + bl4 * kl4;
+  wr = br1 * kr1 + br2 * kr2 + br3 * kr3 + br4 * kr4;
+) : (
+  wl = bl1 * k1 + bl2 * k2 + bl3 * k3 + bl4 * k4;
+  wr = br1 * k1 + br2 * k2 + br3 * k3 + br4 * k4;
+);
+// FIZZ: harmonics only (the clean top is subtracted), shaped round 8 kHz, pinned ~26 dB under the programme
+// (its detectors run all the time, so switching it on starts from the programme's level - no burst)
+fh0 = Lfz1.bq(wl, kfz1.b0, kfz1.b1, kfz1.b2, kfz1.a1, kfz1.a2); fh1 = Rfz1.bq(wr, kfz1.b0, kfz1.b1, kfz1.b2, kfz1.a1, kfz1.a2);
+fa_ = max(abs(fh0), abs(fh1)); fz_h += (fa_ - fz_h) * (fa_ > fz_h ? fz_a : fz_r);
+fa_ = max(abs(wl), abs(wr)); fz_p += (fa_ - fz_p) * fz_w;
+fz_on || fz_m > 0.0001 ? (
+  fn_ = 1 / (fz_h + 0.00001); fu0 = fh0 * fn_; fu1 = fh1 * fn_;
+  fe0 = (ost_tanh(3 * fu0) / 3 - fu0 + 0.25 * fu0 * fu0) * fz_h; fe1 = (ost_tanh(3 * fu1) / 3 - fu1 + 0.25 * fu1 * fu1) * fz_h;
+  fe0 = Lfz3.bq(Lfz2.bq(fe0, kfz2.b0, kfz2.b1, kfz2.b2, kfz2.a1, kfz2.a2), kfz3.b0, kfz3.b1, kfz3.b2, kfz3.a1, kfz3.a2);
+  fe1 = Rfz3.bq(Rfz2.bq(fe1, kfz2.b0, kfz2.b1, kfz2.b2, kfz2.a1, kfz2.a2), kfz3.b0, kfz3.b1, kfz3.b2, kfz3.a1, kfz3.a2);
+  fa_ = max(abs(fe0), abs(fe1)); fz_e += (fa_ - fz_e) * (fa_ > fz_e ? fz_a : fz_r);
+  fg_ = max(0.25, min(2, 0.05 * fz_p / (fz_e + 0.000001)));
+  wl += fg_ * fz_m * fe0; wr += fg_ * fz_m * fe1;
+) : ( Lfz2.bqz(); Lfz3.bqz(); Rfz2.bqz(); Rfz3.bqz(); fz_e = 0; );
+// the clipper, oversampled (OS); a factor change swaps in at the silent point (os_gate)
+os_gate();
+os_chg ? ( oul.os_clr(); our.os_clr(); odl.os_clr(); odr.os_clr(); memset(OSD, 0, 128); );
+oul.os_up(wl * clp_s); our.os_up(wr * clp_s);
+oul.s0 = mdl_clip(oul.s0, cth); our.s0 = mdl_clip(our.s0, cth);
+os_f > 1 ? (
+  oul.s1 = mdl_clip(oul.s1, cth); our.s1 = mdl_clip(our.s1, cth);
+  os_f > 2 ? (
+    oul.s2 = mdl_clip(oul.s2, cth); our.s2 = mdl_clip(our.s2, cth);
+    oul.s3 = mdl_clip(oul.s3, cth); our.s3 = mdl_clip(our.s3, cth);
+  );
+  OSD[osd_w] = dryl; OSD[64 + osd_w] = dryr;
+  osd_r = (osd_w - os_lat(os_f)) & 63; dryl = OSD[osd_r]; dryr = OSD[64 + osd_r];
+  osd_w = (osd_w + 1) & 63;
+);
+cl = odl.os_dn(oul.s0, oul.s1, oul.s2, oul.s3); cr = odr.os_dn(our.s0, our.s1, our.s2, our.s3);
+// DC blocker (5 Hz) after the lopsided clipper
+dcy_l = cl - dcx_l + dc_k * dcy_l; dcx_l = cl; cl = dcy_l;
+dcy_r = cr - dcx_r + dc_k * dcy_r; dcx_r = cr; cr = dcy_r;
+cpk = max(abs(wl), abs(wr)) * clp_s;
+cpk > cth * 0.7 ? clp_d = max(clp_d, 20 * log10(cpk / max(opt_clip(cpk, cth), 0.000001)));
+
+ol = dryl * (1 - mix_s) + cl * mix_s;
+orr = dryr * (1 - mix_s) + cr * mix_s;
+// HIGH CUT: the transmitter's top (24 dB/oct)
+hc_m > 0.0001 ? (
+  xl = Lhc2.bq(Lhc1.bq(ol, khc1.b0, khc1.b1, khc1.b2, khc1.a1, khc1.a2), khc2.b0, khc2.b1, khc2.b2, khc2.a1, khc2.a2);
+  xr = Rhc2.bq(Rhc1.bq(orr, khc1.b0, khc1.b1, khc1.b2, khc1.a1, khc1.a2), khc2.b0, khc2.b1, khc2.b2, khc2.a1, khc2.a2);
+  ol += (xl - ol) * hc_m; orr += (xr - orr) * hc_m;
+) : ( Lhc1.bqz(); Lhc2.bqz(); Rhc1.bqz(); Rhc2.bqz(); );
+ol *= out_s * os_g; orr *= out_s * os_g;
+
+// 4. the final limiter
+lk_u > 0 ? op_lim2(ol, orr) : (
+  op_lim(ol, orr);
+  op_ga = op_gb = op_g; op_hga = op_hgb = op_hg; op_hca = op_hcb = op_hc;
+);
+lim_d = max(lim_d, -20 * log10(max(op_gr, 0.0001))); op_gr = 1;
+spl0 = op_l; spl1 = op_r;
+
+// the resume fade: the dry input (as REAPER's bypass passed it, delayed by the latency) into the processed sound.
+// For the first (latency) samples nothing delayed exists yet, so the undelayed input plays, then crossfades (5 ms)
+// to the delayed one while the processed sound comes in (15 ms)
+DRY[dw] = rw_l; DRY[1024 + dw] = rw_r;
+rs_f < 1 ? (
+  rs_wait > 0 ? rs_wait -= 1 : ( rs_f = min(rs_f + rs_c, 1); rs_x = min(rs_x + 3 * rs_c, 1); );
+  rs_s = rs_f * rs_f * (3 - 2 * rs_f); rs_xs = rs_x * rs_x * (3 - 2 * rs_x);
+  rs_dl = rw_l + (DRY[(dw - pdc_delay) & RMASK] - rw_l) * rs_xs;
+  rs_dr = rw_r + (DRY[1024 + ((dw - pdc_delay) & RMASK)] - rw_r) * rs_xs;
+  spl0 = rs_dl + (spl0 - rs_dl) * rs_s; spl1 = rs_dr + (spl1 - rs_dr) * rs_s;
+);
+// BYPASS: crossfades (15 ms) to the dry input, delayed by the latency so it stays in time
+by_s += (by_t - by_s) * c_sw;
+by_s > 0.0001 ? (
+  spl0 += (DRY[(dw - pdc_delay) & RMASK] - spl0) * by_s;
+  spl1 += (DRY[1024 + ((dw - pdc_delay) & RMASK)] - spl1) * by_s;
+);
+dw = (dw + 1) & RMASK;
+out_l_d = max(out_l_d, abs(spl0)); out_r_d = max(out_r_d, abs(spl1));
+agc_d = agc_db;
+g1_d = max(g1_d, g1); g2_d = max(g2_d, g2); g3_d = max(g3_d, g3); g4_d = max(g4_d, g4);
+
+@gfx 1080 548
+ui_begin(1080, 548);
+// =====================================================================
+// GUI (design space 1080 x 548; S / M / L = 85 / 100 / 130 %). One layout; the faceplate follows the model:
+// LW beige, AM silver, FM dark blue. Two plates: the controls (MODEL | TONE | DENSITY | DRIVE; TONE over the
+// PROCESSING meters) and the
+// input / meters / output row.
+// =====================================================================
+o_model < 0.5 ? (                                        // LW: beige, brown name plates
+  BG = 0xCDC5A6; HDR = 0xBDB491; PL = 0xD6CFB2; PLD = 0xC4BC9B; INK = 0x3A2F22; DIM = 0x6E6248;
+  ACC = 0x5C4330; ACCI = 0xF1E8D2; RULE = 0x5C4330; EDGE_L = 0xEAE4CF; EDGE_D = 0x8C8366; WIN = 0x2B2219; WINK = 0xE8DDC2;
+  WELL = 0x2A231B; KBY = LK_ORA; kea_tc = 0x9A4E22;
+) : o_model < 1.5 ? (                                    // AM: silver, amber accents
+  BG = 0xB3B6BA; HDR = 0x9EA2A7; PL = 0xC1C4C8; PLD = 0xAAADB2; INK = 0x18191C; DIM = 0x4A4D52;
+  ACC = 0x1E1F23; ACCI = 0xF2A33A; RULE = 0xE08A1E; EDGE_L = 0xDCDEE1; EDGE_D = 0x7C8086; WIN = 0x141517; WINK = 0xE6E2D8;
+  WELL = 0x141517; KBY = LK_WHT; kea_tc = 0xC0661C;
+) : (                                                    // FM: dark blue, magenta rules
+  BG = 0x2F3768; HDR = 0x262C57; PL = 0x363F74; PLD = 0x2D3466; INK = 0xE9EBF5; DIM = 0xA6ACCC;
+  ACC = 0xB8368F; ACCI = 0xFFFFFF; RULE = 0xC2409A; EDGE_L = 0x4D5690; EDGE_D = 0x1C2147; WIN = 0x11132A; WINK = 0xDDE1F2;
+  WELL = 0x10122A; KBY = LK_WHT; kea_tc = 0xD8742A;
+);
+sc != o2_lsc ? (
+  o2_lsc = sc;
+  o2_f2 = ui_fitfont(2, 14 * sc);                    // knob labels / values: 14 px
+  gfx_setfont(10, "Trebuchet MS", 30 * sc, 'b');     // the unit's name
+  gfx_setfont(11, "Trebuchet MS", 15 * sc, 'b');     // section titles
+  gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');     // small print
+  gfx_setfont(14, "Trebuchet MS", 14 * sc, 'b');     // key legends, captions
+  gfx_setfont(15, "Trebuchet MS", 18 * sc, 'b');     // the OUT peak figure
+);
+gfx_setfont(2, "Trebuchet MS", o2_f2, 'b'); gfx_setfont(3, "Trebuchet MS", o2_f2, 'b');
+gfx_setfont(4, "Trebuchet MS", o2_f2, 'b');          // (the mini knobs print their value in slot 4)
+C_INK = INK; lk_font = 14; lk_font2 = 14; lk_well = WELL; ui_kea_tc = kea_tc;
+
+function o2_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function o2_rr(x, y, w, h, r) ( ui_rrs(x * sc, y * sc, w * sc, h * sc, r * sc); );
+function o2_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function o2_tc(cx, y, s) ( ui_text(cx * sc, y * sc, s); );
+function o2_tr(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = y * sc; gfx_drawstr(s); );
+function o2_hov(cx, cy, r) ( sqr(mouse_x - cx * sc) + sqr(mouse_y - cy * sc) <= sqr((r + 6) * sc); );
+// soft drop shadow, light from the top left: 4 layers, (+2, +3) to (+6, +8)
+function o2_shadow(x, y, w, h, r) local(j) (
+  j = 0; loop(4, ui_cola(0x000000, 0.13); o2_rr(x + 2 + j * 1.3, y + 3 + j * 1.7, w + j * 0.4, h + j * 0.4, r + j); j += 1; );
+);
+// a plate: shadow, a light top / left edge, a dark bottom / right edge
+function o2_plate(x, y, w, h) (
+  o2_shadow(x, y, w, h, 6);
+  ui_col(EDGE_D); o2_rr(x, y, w, h, 6);
+  ui_col(EDGE_L); o2_rr(x, y, w - 1, h - 1, 6);
+  ui_col(PL); o2_rr(x + 1, y + 1, w - 2.5, h - 2.5, 5);
+);
+// a section header band: the name on a plate in the model's accent colour, a rule under the band
+function o2_head(x, y, w, title) local(tw, th) (
+  ui_col(PLD); o2_r(x + 1, y + 1, w - 2, 32);
+  ui_cola(RULE, 0.8); o2_r(x + 1, y + 33, w - 2, 1);
+  gfx_setfont(11); gfx_measurestr(title, tw, th);
+  ui_col(ACC); o2_rr(x + 12, y + 6, tw / sc + 20, 22, 3);
+  ui_col(ACCI); gfx_x = (x + 22) * sc; gfx_y = (y + 17) * sc - th * 0.5; gfx_drawstr(title);
+);
+// a divider between two sections: a dark and a light hairline
+function o2_div(x, y, h) ( ui_col(EDGE_D); o2_r(x, y, 1, h); ui_cola(EDGE_L, 0.6); o2_r(x + 1, y, 1, h); );
+// an EA77 knob (black fluted skirt, cream pointer, printed scale); ui_knob does the mouse and the label
+function o2_ea(cx, cy, r, idx, lo, hi, def, lg, lbl, fmt) (
+  ui_kea = 1; ui_kea_r = r; ui_knob(cx * sc, cy * sc, idx, lo, hi, def, lg, lbl, fmt);
+);
+// a console cap knob (silver skirt, coloured cap)
+function o2_cap(cx, cy, r, idx, lo, hi, def, cap, lbl, fmt) (
+  ui_kcap = cap; ui_kcap_r = r; ui_knob(cx * sc, cy * sc, idx, lo, hi, def, 0, lbl, fmt);
+);
+// a filter knob (1 = HPF yellow, 2 = LPF black), its range printed at the ends
+function o2_flt(cx, cy, r, kind, idx, lo, hi, def, lg, lbl, fmt, slo, shi) local(d) (
+  ui_kfilter = kind; ui_kfilter_r = r;
+  ui_knob(cx * sc, cy * sc, idx, lo, hi, def, lg, lbl, fmt);
+  d = (r + 8) * 0.7071; gfx_setfont(13); ui_col(DIM);
+  o2_tr(cx - d - 2, cy + d - 14, slo); o2_tl(cx + d + 2, cy + d - 14, shi);
+);
+// a mini knob: its label below, the value in its place while it is touched
+function o2_mini(cx, cy, idx, lo, hi, def, lbl, fmt) local(act) (
+  act = o2_hov(cx, cy, 11) || drag_id == idx;
+  ui_kmini = 1; ui_knonum = 1; ui_knob(cx * sc, cy * sc, idx, lo, hi, def, 0, lbl, fmt); ui_kmini = 0; ui_knonum = 0;
+  !act ? ( gfx_setfont(2); ui_col(INK); o2_tc(cx, cy + 13.6, lbl); );
+);
+// a desk knob (flat coloured cap): its label below, the value in its place while it is touched
+function o2_desk(cx, cy, r, cap, idx, lo, hi, def, lbl, fmt) (
+  ui_kdesk = cap; ui_kdesk_r = r; ui_knonum = 1; ui_knob(cx * sc, cy * sc, idx, lo, hi, def, 0, lbl, fmt); ui_knonum = 0;
+);
+// a vertical fader: a slot with a printed scale, a black cap with a white line; drag (SHIFT = fine), wheel,
+// double-click = default; the value replaces the label while it is touched. (x = the slot's centre, y / h = its travel)
+function o2_fader(x, y, h, idx, lo, hi, def, lbl, fmt) local(v, n, hov, act, cy, i, t) (
+  v = slider(idx); n = (v - lo) / (hi - lo);
+  hov = mouse_x >= (x - 18) * sc && mouse_x < (x + 18) * sc && mouse_y >= (y - 10) * sc && mouse_y < (y + h + 10) * sc;
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - lastclick_t < 0.35 && lastclick_id == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; lastclick_t = 0; )
+    : ( drag_id = idx; drag_y = mouse_y; drag_n = n; lastclick_t = time_precise(); lastclick_id = idx; );
+  );
+  drag_id == idx ? (
+    drag_n = min(max(drag_n + (drag_y - mouse_y) / (((mouse_cap & 8) ? 1000 : 200) * sc), 0), 1); drag_y = mouse_y;
+    v = floor((lo + drag_n * (hi - lo)) * 10 + 0.5) / 10;
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    n = min(max(n + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.03), 0), 1);
+    slider(idx) = floor((lo + n * (hi - lo)) * 10 + 0.5) / 10; ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = (v - lo) / (hi - lo); act = hov || drag_id == idx;
+  // the scale: a tick every 6 dB, longer at 0
+  i = 0; loop(7, t = y + h - h * i / 6; ui_cola(INK, 0.6); o2_r(x - 16, t, abs(lo + i * (hi - lo) / 6) < 0.01 ? 7 : 4, 1); o2_r(x + 16 - (abs(lo + i * (hi - lo) / 6) < 0.01 ? 7 : 4), t, abs(lo + i * (hi - lo) / 6) < 0.01 ? 7 : 4, 1); i += 1; );
+  gfx_setfont(13); ui_col(DIM); o2_tl(x + 19, y + h - h * (-lo) / (hi - lo) - 7, "0");
+  // the slot
+  ui_col(0x050506); o2_rr(x - 3, y - 2, 6, h + 4, 3); ui_cola(0xFFFFFF, 0.08); o2_r(x + 3, y, 1, h);
+  // the cap: shadow, black body, a white line across
+  cy = y + h - n * h;
+  i = 0; loop(4, ui_cola(0x000000, 0.13); o2_rr(x - 14 + 2 + i * 1.3, cy - 9 + 3 + i * 1.7, 28 + i * 0.4, 18 + i * 0.4, 3 + i); i += 1; );
+  ui_col(0x0E0E10); o2_rr(x - 14, cy - 9, 28, 18, 3);
+  ui_col(act ? 0x3A3B40 : 0x2A2B2F); o2_rr(x - 13, cy - 8, 26, 8, 2);
+  ui_col(0x1A1B1E); o2_r(x - 13, cy, 26, 7);
+  ui_col(0xF4EEDC); o2_r(x - 12, cy - 0.75, 24, 1.5);
+  gfx_setfont(2); ui_col(INK);
+  act ? ( sprintf(#o2_fv, fmt, v); o2_tc(x, y + h + 14, #o2_fv); ) : o2_tc(x, y + h + 14, lbl);
+);
+// a lamp key from its slider: lit = on; the click toggles
+function o2_key(x, y, w, h, idx, c, s) (
+  lk_key(x, y, w, h, slider(idx) >= 0.5, c, s) ? ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+);
+// a status lamp: a small round LED in a black ring, its name beside it
+function o2_lamp(x, y, c, on, s) (
+  ui_col(0x0A0A0B); gfx_circle(x * sc, y * sc, 6.5 * sc, 1, 1);
+  ui_col(ui_mix(c, 0x000000, 0.7)); gfx_circle(x * sc, y * sc, 4.5 * sc, 1, 1);
+  on ? ( ui_cola(c, 0.3); gfx_circle(x * sc, y * sc, 9 * sc, 1, 1); ui_col(c); gfx_circle(x * sc, y * sc, 4.5 * sc, 1, 1);
+         ui_cola(0xFFFFFF, 0.6); gfx_circle((x - 1.5) * sc, (y - 1.5) * sc, 1.4 * sc, 1, 1); );
+  gfx_setfont(13); ui_col(WINK); gfx_measurestr(s, o2_tw, o2_th); gfx_x = (x + 12) * sc; gfx_y = y * sc - o2_th * 0.5; gfx_drawstr(s);
+);
+// a gain-reduction column: 10 LEDs of 2.5 dB lit from the top down; cen = 1: AGC, centre zero (+/-12 dB)
+function o2_grcol(x, y, w, h, v, c, cen) local(i, n, sh, lit, d) (
+  n = 10; sh = h / n;
+  ui_col(0x050506); o2_r(x - 2, y - 2, w + 4, h + 4);
+  i = 0;
+  loop(n,
+    cen ? ( d = (i < 5 ? 5 - i : i - 4) * 2.4; lit = i < 5 ? v >= d - 1.2 : -v >= d - 1.2; )
+        : ( d = (i + 1) * 2.5; lit = v >= d - 1.25; );
+    lit ? ( ui_cola(c, 0.3); o2_r(x - 1, y + i * sh - 0.5, w + 2, sh + 1); ui_col(c); ) : ui_cola(c, 0.13);
+    o2_r(x, y + i * sh + 0.75, w, sh - 1.5);
+    i += 1;
+  );
+);
+
+// ---------- the meters' hand-off (the audio thread fills, the panel takes and clears) ----------
+o2_il = in_l_d; o2_ir = in_r_d; in_l_d = in_r_d = 0;
+o2_ol = out_l_d; o2_or = out_r_d; out_l_d = out_r_d = 0;
+o2_g1 = max(g1_d, o2_g1 * 0.85); o2_g2 = max(g2_d, o2_g2 * 0.85); o2_g3 = max(g3_d, o2_g3 * 0.85); o2_g4 = max(g4_d, o2_g4 * 0.85);
+g1_d = g2_d = g3_d = g4_d = 0;
+o2_hf = max(hf_d, o2_hf * 0.85); hf_d = 0;
+o2_lm = max(lim_d, o2_lm * 0.85); lim_d = 0;
+o2_cl = clp_d > 0.05 ? 1 : o2_cl * 0.85; clp_d = 0;
+o2_ag = agc_d;
+
+// ---------- faceplate and header ----------
+ui_col(BG); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(HDR); o2_r(0, 0, 1080, 64);
+ui_col(RULE); o2_r(0, 63, 1080, 2); ui_cola(0x000000, 0.35); o2_r(0, 65, 1080, 1);
+ui_cola(0x000000, 0.25); o2_r(1077, 0, 3, 548); o2_r(0, 545, 1080, 3);      // a narrow darker right / bottom edge
+ui_screw(9 * sc, 9 * sc); ui_screw((1080 - 9) * sc, 9 * sc); ui_screw(9 * sc, (548 - 9) * sc); ui_screw((1080 - 9) * sc, (548 - 9) * sc);
+// the GFX roundel, the name, the model badge
+ui_col(INK); gfx_circle(40 * sc, 32 * sc, 16 * sc, 1, 1);
+gfx_setfont(13); ui_col(HDR); ui_keytext(40 * sc, 32 * sc, "GFX");
+gfx_setfont(10); ui_col(INK); o2_tl(68, 15, "OPTIMISER II"); gfx_measurestr("OPTIMISER II", o2_tw, o2_th);
+o2_x = 80 + o2_tw / sc;
+gfx_setfont(11); gfx_measurestr(o_model < 0.5 ? "LW" : o_model < 1.5 ? "AM" : "FM", o2_bw, o2_th);
+ui_col(ACC); o2_rr(o2_x, 19, o2_bw / sc + 14, 26, 3);
+ui_col(ACCI); gfx_x = (o2_x + 7) * sc; gfx_y = 32 * sc - o2_th * 0.5; gfx_drawstr(o_model < 0.5 ? "LW" : o_model < 1.5 ? "AM" : "FM");
+gfx_setfont(13); ui_col(DIM); o2_x += o2_bw / sc + 24;
+o2_tl(o2_x, 19, "BROADCAST"); o2_tl(o2_x, 33, "PROCESSOR");
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+pk_lcdstrip = 1; o2_k = pk_preset(392 * sc, 15 * sc, 300 * sc, 34 * sc, pr_cur, #o2_pmn);
+o2_k > 0 ? prs_dirty = o2_k;
+o2_key(724, 20, 64, 26, 20, LK_BLU_LT, "LINK");
+by_keywh(804, 19, 84, 28, 21, 16);                       // BYPASS: the house keycap (gfx-bypass's key only)
+os_key(942, 21, 19, INK, 12);
+ui_size_picker(998 * sc, 23 * sc);
+
+// ---------- the controls plate ----------
+o2_plate(16, 80, 1048, 236);
+o2_head(16, 80, 180, "MODEL"); o2_head(196, 80, 420, "TONE"); o2_head(616, 80, 180, "DENSITY"); o2_head(796, 80, 268, "DRIVE");
+o2_div(196, 81, 234); o2_div(616, 81, 234); o2_div(796, 81, 234);
+
+// MODEL: three yellow keys, each with its band printed beside it
+gfx_setfont(14);
+o2_i = 0;
+loop(3,
+  lk_key(34, 132 + o2_i * 56, 50, 38, o_model == o2_i, LK_YEL, o2_i == 0 ? "LW" : o2_i == 1 ? "AM" : "FM") ? (
+    o_model = o2_i; model_band(o2_i); ui_auto(1); ui_auto(22); ui_auto(23);
+  );
+  gfx_setfont(13); ui_col(o_model == o2_i ? INK : DIM);
+  o2_tl(98, 136 + o2_i * 56, o2_i == 0 ? "LONG WAVE" : o2_i == 1 ? "MEDIUM WAVE" : "FM / STREAM");
+  o2_tl(98, 152 + o2_i * 56, o2_i == 0 ? "100 Hz - 4.5 kHz" : o2_i == 1 ? "50 Hz - 9.5 kHz" : "30 Hz - 15 kHz");
+  o2_i += 1;
+);
+
+// DENSITY: AGC + GATE, then the bands' recovery
+o2_key(634, 134, 70, 36, 3, LK_GRN, "AGC");
+o2_key(718, 134, 70, 36, 4, LK_BLU_LT, "GATE");
+gfx_setfont(13); ui_col(DIM); o2_tc(706, 192, "RELEASE");
+o2_i = 0;
+loop(3,
+  pk_ledbtn((632 + o2_i * 52) * sc, 214 * sc, 44 * sc, 44 * sc, o_rel == o2_i, 0x52E07A) ? ( o_rel = o2_i; ui_auto(2); );
+  gfx_setfont(13); ui_col(o_rel == o2_i ? INK : DIM); o2_tc(654 + o2_i * 52, 266, o2_i == 0 ? "SLOW" : o2_i == 1 ? "MED" : "FAST");
+  o2_i += 1;
+);
+
+// DRIVE: the hero DRIVE, CLIP beside it
+o2_ea(880, 202, 36, 5, -12, 6, 6, 0, "DRIVE", "%+.1f dB");
+o2_ea(990, 210, 22, 10, 0, 66, 30, 0, "CLIP", "%.0f %%");
+
+// TONE: LPF above HPF on the left, then the four band levels
+o2_flt(258, 244, 16, 1, 22, 20, 200, 30, 1, "HPF", o_lc < 20.5 ? "OFF" : "%.0f Hz", "OFF", "200");
+o2_cap(330, 204, 18, 6, -6, 6, 0, 0x7A4A2A, "BASS", "%+.1f dB");
+o2_cap(408, 204, 18, 7, -6, 6, 0, 0x2F62B4, "MID", "%+.1f dB");
+o2_cap(486, 204, 18, 8, -6, 6, 0, 0x2E8A4E, "PRESENCE", "%+.1f dB");
+o2_cap(564, 204, 18, 9, -6, 6, 0, 0xC23A30, "AIR", "%+.1f dB");
+o2_flt(258, 152, 16, 2, 23, 2, 20, 15, 1, "LPF", o_hc > 19.95 ? "OFF" : "%.1f kHz", "2k", "OFF");
+gfx_setfont(13); ui_col(DIM); o2_i = 0; loop(4, o2_tc(330 + o2_i * 78, 164, "0"); o2_i += 1; );
+
+// ---------- the input / meters / output plate ----------
+o2_plate(16, 332, 1048, 200);
+o2_head(16, 332, 180, "INPUT"); o2_head(196, 332, 420, "PROCESSING"); o2_head(616, 332, 448, "OUTPUT");
+o2_div(196, 333, 198); o2_div(616, 333, 198);
+// the dark meter windows
+ui_col(WIN); o2_rr(98, 376, 88, 146, 4); o2_rr(212, 376, 388, 146, 4); o2_rr(906, 376, 146, 146, 4);
+ui_cola(0x000000, 0.5); o2_r(99, 377, 86, 2); o2_r(213, 377, 386, 2); o2_r(907, 377, 144, 2);
+
+// INPUT: TRIM + GUARD, the L / R ladders
+o2_desk(54, 412, 14, 0xC23A30, 14, -24, 12, 0, "TRIM", "%+.1f dB");
+lk_font = lk_font2 = 13; o2_key(24, 470, 60, 26, 15, LK_AMB, "GUARD"); lk_font = lk_font2 = 14;
+mil.ui_ledm(116 * sc, 388 * sc, 14 * sc, 114 * sc, o2_il); mir.ui_ledm(136 * sc, 388 * sc, 14 * sc, 114 * sc, o2_ir);
+gfx_setfont(13); ui_col(WINK); o2_tc(123, 506, "L"); o2_tc(143, 506, "R");
+ui_col(ui_mix(WINK, WIN, 0.35));
+o2_i = 0; loop(4, o2_tl(156, 388 + 114 * (3 + o2_i * 12) / 45 - 7, o2_i == 0 ? "0" : o2_i == 1 ? "-12" : o2_i == 2 ? "-24" : "-36"); o2_i += 1; );
+
+// PROCESSING: AGC (centre zero), the four bands, HF LIMIT and the final limiter; GATE and CLIP lamps
+o2_grcol(258, 390, 14, 104, o2_ag, 0x6FD3FF, 1);
+o2_grcol(312, 390, 14, 104, o2_g1, 0xFFC233, 0);
+o2_grcol(350, 390, 14, 104, o2_g2, 0xFFC233, 0);
+o2_grcol(388, 390, 14, 104, o2_g3, 0xFFC233, 0);
+o2_grcol(426, 390, 14, 104, o2_g4, 0xFFC233, 0);
+o2_grcol(470, 390, 14, 104, o2_hf, 0xFF8A3D, 0);
+o2_grcol(514, 390, 14, 104, o2_lm, 0xFF4A3A, 0);
+gfx_setfont(13); ui_col(WINK);
+o2_tc(265, 506, "AGC"); o2_tc(319, 506, "LOW"); o2_tc(357, 506, "MID"); o2_tc(395, 506, "PRES"); o2_tc(433, 506, "AIR");
+o2_tc(477, 506, "HF"); o2_tc(521, 506, "LIM");
+ui_col(ui_mix(WINK, WIN, 0.35));
+o2_tr(250, 383, "+12"); o2_tr(250, 435, "0"); o2_tr(250, 487, "-12");
+o2_tr(306, 383, "2.5"); o2_tr(306, 435, "12.5"); o2_tr(306, 487, "25");
+o2_lamp(556, 412, 0x6FD3FF, gate_d && o_agc, "GATE");
+o2_lamp(556, 452, 0xFF4A3A, o2_cl > 0.3, "CLIP");
+
+// OUTPUT: HF LIMIT, FIZZ, PHASE, then MIX, DRIFT, OUTPUT; the L / R ladders and the peak figure
+o2_cap(662, 414, 16, 11, 0, 100, 40, 0xD8742A, "HF LIMIT", "%.0f %%");
+o2_desk(736, 414, 14, 0x2F62B4, 12, 0, 100, 100, "MIX", "%.0f %%");
+o2_mini(796, 414, 16, 0, 100, 50, "DRIFT", "%.0f %%");
+o2_fader(866, 390, 96, 13, -24, 12, 0, "OUTPUT", "%+.1f dB");
+lk_font = lk_font2 = 13;
+o2_key(640, 476, 70, 30, 18, LK_ORA, "FIZZ");
+o2_key(726, 476, 70, 30, 17, LK_BLU_LT, "PHASE");
+lk_font = lk_font2 = 14;
+mol.ui_ledm(922 * sc, 388 * sc, 14 * sc, 114 * sc, o2_ol); mor.ui_ledm(942 * sc, 388 * sc, 14 * sc, 114 * sc, o2_or);
+gfx_setfont(13); ui_col(WINK); o2_tc(929, 506, "L"); o2_tc(949, 506, "R");
+o2_pk = max(mol.hold, mor.hold);
+gfx_setfont(15); ui_col(o2_pk > -0.05 ? 0xFF5A4A : WINK);
+o2_pk > -60 ? sprintf(#o2_s, "%.1f", o2_pk) : strcpy(#o2_s, "--"); o2_tr(1040, 414, #o2_s);
+gfx_setfont(13); ui_col(ui_mix(WINK, WIN, 0.35)); o2_tr(1040, 440, "PEAK");
+
+// BYPASS lit: the whole panel greyed a little, the top bar left clear
+o_byp >= 0.5 ? ( ui_cola(BG, 0.35); o2_r(16, 80, 1048, 452); );
+
+pk_end();
+ui_end();

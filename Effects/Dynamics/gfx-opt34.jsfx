@@ -1,0 +1,496 @@
+desc:OPT34 [opto leveller] (GFX)
+//tags: opto optical leveller leveling amplifier compressor limiter photocell valve vocal bass smooth t4
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel and gfx-clip (.jsfx-inc) in the same folder.
+//
+// OPT34. A two-knob electro-optical levelling amplifier in the spirit of the classic 60s studio leveller (the sound
+// is designed from scratch). The gain is set by light: the signal lights an electroluminescent panel, a photocell
+// beside it turns the level down. The photocell is slow and has a memory, and that is the sound:
+//   THE CELL   feedback (the panel watches the output, as on the hardware). The cell's fast part follows in about
+//              10 ms and lets go in about 60 ms; its slow part charges over a few hundred ms and lets go over one to
+//              several seconds - and the longer and harder it has been lit, the slower it lets go (the MEMORY, over
+//              about eight seconds). Short peaks recover at once, a loud passage leaves the level down for a while.
+//   GAIN       -12 .. +24 dB: the valve make-up amplifier after the cell (a little warmth, more when pushed).
+//   PEAK REDUCTION  0 - 100: how much signal reaches the panel - the amount of levelling.
+//   COMPRESS / LIMIT  about 3:1 with a broad knee, or a firmer limit (about 6:1 and up, a harder knee).
+//   HF EMPHASIS  0 - 10: the highs count more in the panel's drive (sibilance and cymbals are levelled harder).
+//   LINK       one panel for both sides (the louder wins) or one each (DUAL).
+//   METER      the VU: GR or OUTPUT (0 VU = -18 dBFS).
+//   MIX 0 - 100 % (parallel), IN (10 ms fade). The house output stage passes straight through (no clip).
+//   DRIFT      (0 - 100 %, 50 % = standard): the cell's sensitivity warms and wanders (a few tenths of a dB) and the
+//              valve's bias wanders (its 2nd harmonic breathes).
+//   VFD / MATRIX  the panel's look (VFD charcoal and blue-white; MATRIX battleship grey and blue-white). The look only.
+//   PRESETS    12 (Init + 11) plus Reset all to defaults. A preset sets every control but LINK, METER, DRIFT and the look.
+
+slider1:1<0,1,1{Out,In}>-In
+slider2:0<-12,24,0.1>-Gain (dB)
+slider3:40<0,100,0.1>-Peak reduction
+slider4:0<0,1,1{Compress,Limit}>-Mode
+slider5:0<0,10,0.1>-HF emphasis
+slider6:1<0,1,1{Dual,Link}>-Link
+slider7:0<0,1,1{GR,Output}>-Meter
+slider8:100<0,100,1>-Mix (%)
+slider9:50<0,100,1>-Drift (%)
+slider10:0<0,1,1{VFD,Matrix}>-Look
+slider11:prs_sel=0<0,12,1{No preset,Init,Vocal Leveller,Smooth Bass,Gentle Bus,Limit Vocal,Acoustic Guitar,Snare Body,Dialogue Rider,Piano,Strings and Pads,Heavy Opto,Parallel Opto}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-drift.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-clip.jsfx-inc
+
+@init
+#ui_man = "gfx-opt34";                                // the ? pop-up links to this manual
+ext_noinit = 1;
+clp_aa = 1; clp_pf_on = 0; clp_kt_on = 0;             // gfx-clip: ADAA clippers only (the valve)
+
+function op_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function op_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
+function op_sm(g) ( g * g * (3 - 2 * g); );
+// the HF emphasis in the panel's drive: a high shelf at 4 kHz (coefficients at EMC)
+EMC = 100;
+function op_shelf(gdb) local(A, w, cw, al, s, a0) (
+  A = 10 ^ (gdb / 40); w = 2 * $pi * min(4000, 0.45 * srate) / srate; cw = cos(w); al = sin(w) / 1.41421356; s = 2 * sqrt(A) * al;
+  a0 = (A + 1) - (A - 1) * cw + s;
+  EMC[0] = A * ((A + 1) + (A - 1) * cw + s) / a0; EMC[1] = -2 * A * ((A - 1) + (A + 1) * cw) / a0; EMC[2] = A * ((A + 1) + (A - 1) * cw - s) / a0;
+  EMC[3] = 2 * ((A - 1) - (A + 1) * cw) / a0; EMC[4] = ((A + 1) - (A - 1) * cw - s) / a0;
+);
+function op_bq(x) instance(s1, s2) local(y) ( y = EMC[0] * x + s1; s1 = EMC[1] * x - EMC[3] * y + s2; s2 = EMC[2] * x - EMC[4] * y; y; );
+
+// ---------- ONE CELL: the panel (light), the photocell (fast + slow, with memory) -> the gain ----------
+// d = the panel's drive (a level, >= 0). Returns the gain (0 .. 1); el / c1 / c2 / mem for the panel's display.
+function op_cell(d) instance(el, c1, c2, mem, g) local(kr2, cg) (
+  el += (d - el) * (d > el ? op_kel : op_kelr);                    // the electroluminescent panel: quick, a little lag
+  c1 += (el - c1) * (el > c1 ? op_ka1 : op_kr1);                   // the cell's fast part
+  kr2 = op_kr2 / (1 + 4 * min(mem / op_mref, 1.5));                // the slow part lets go more slowly, the more it has seen
+  c2 += (el - c2) * (el > c2 ? op_ka2 : kr2);
+  mem += (el - mem) * op_kmem;                                     // its memory (about 8 s)
+  cg = 0.55 * c1 + 0.45 * c2;                                       // the cell's conductance
+  g = 1 / (1 + op_K * cg ^ op_p);                                   // the divider: more light, less level
+  g;
+);
+
+// ---------- presets ----------
+#op_pm = "Init|Vocal Leveller|Smooth Bass|Gentle Bus|Limit Vocal|Acoustic Guitar|Snare Body|Dialogue Rider|Piano|Strings and Pads|Heavy Opto|Parallel Opto";
+function op_set(gn, pr, md, em, mx) ( slider1 = 1; slider2 = gn; slider3 = pr; slider4 = md; slider5 = em; slider8 = mx; );
+function load_preset(p) local(i) (
+  //                 gain  pr   mode emph mix
+  p == 1  ? op_set(0,    40,  0, 0,   100) :     // Init
+  p == 2  ? op_set(4,    55,  0, 3,   100) :     // Vocal Leveller
+  p == 3  ? op_set(3,    52,  0, 0,   100) :     // Smooth Bass
+  p == 4  ? op_set(1.5,  35,  0, 0,   100) :     // Gentle Bus
+  p == 5  ? op_set(6,    62,  1, 4,   100) :     // Limit Vocal
+  p == 6  ? op_set(3,    48,  0, 2,   100) :     // Acoustic Guitar
+  p == 7  ? op_set(4,    58,  1, 0,   100) :     // Snare Body
+  p == 8  ? op_set(5,    60,  0, 5,   100) :     // Dialogue Rider
+  p == 9  ? op_set(2.5,  42,  0, 1,   100) :     // Piano
+  p == 10 ? op_set(3,    50,  0, 0,   100) :     // Strings and Pads
+  p == 11 ? op_set(9,    78,  1, 2,   100) :     // Heavy Opto
+  p == 12 ? op_set(10,   80,  1, 0,   40)  :     // Parallel Opto
+  p == 13 ? ( op_set(0, 40, 0, 0, 100); slider6 = 1; slider7 = 0; slider9 = 50; slider10 = 0; );   // Reset all to defaults
+  i = 1; loop(10, ui_auto(i); i += 1; );
+  pr_cur = p == 13 ? 1 : p;
+);
+
+// ---------- state ----------
+function op_srinit() (
+  op_sr = srate;
+  op_kel = op_tc(0.8); op_kelr = op_tc(4);           // the panel
+  op_ka1 = op_tc(10);  op_kr1 = op_tc(60);           // the cell, fast part
+  op_ka2 = op_tc(300); op_kr2 = op_tc(1500);         // the cell, slow part (1.5 s, longer with memory)
+  op_kmem = op_tc(8000); op_mref = 0.5;              // the memory
+  op_fst = 1 / (0.01 * srate);
+  op_gsm = 1 - exp(-1 / (0.02 * srate));
+  op_kvu = op_tc(300);                               // the VU's integration
+  op_emi = -1;
+  op_kdc = 2 * $pi / srate;                          // the valve stage's DC blocker, 1 Hz
+  ost_init(0);
+);
+op_srinit();
+in_init();
+dS.drift_init(0.8 + rand(0.4)); dVb.drift_init(0.8 + rand(0.4));
+op_gl = op_gr = 1;
+drift_macro(50);
+op_snap = 1;
+
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@block
+prs_chk();
+srate != op_sr ? op_srinit();
+in_setup(0, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through
+drift_macro(slider9);
+op_n = samplesblock / srate;
+op_vs = dS.drift_tick(0.04 * dm_s * op_n); op_vb = dVb.drift_tick(0.05 * dm_s * op_n);
+op_tI = slider1 >= 0.5;
+op_lim = slider4 >= 0.5;
+op_K = op_lim ? 6 : 2.2; op_p = op_lim ? 5 : 2.2;              // the divider's law: COMPRESS / LIMIT
+// PEAK REDUCTION: the panel's drive amplifier, -30 .. +30 dB (the cell sensitivity wanders a little with DRIFT)
+op_dgt = 10 ^ ((-24 + 0.6 * min(max(slider3, 0), 100) + 0.25 * dm_a * op_vs) / 20) * 2.2;
+op_ei = floor(min(max(slider5, 0), 10) * 10 + 0.5); op_ei != op_emi ? ( op_emi = op_ei; op_shelf(op_ei / 100 * 12); );            // (0 - 100 tenths -> 0 - 12 dB)
+op_lnk = slider6 >= 0.5;
+op_gnt = 10 ^ (min(max(slider2, -12), 24) / 20);
+op_mxt = min(max(slider8, 0), 100) / 100;
+op_bias = 0.06 + 0.03 * dm_a * op_vb;                 // the valve's bias (its 2nd harmonic), wandering
+vlA.clp_set(1, 1, 0.85, 0); vlB.clp_set(1, 1, 0.85, 0); op_rest = vlA.clp_crv(op_bias);
+op_snap ? ( op_gI = op_tI; op_dg = op_dgt; op_gn = op_gnt; op_mx = op_mxt;
+            vlA.x1 = vlB.x1 = op_bias; vlA.ad1 = vlB.ad1 = vlA.clp_ad(op_bias); );
+op_snap = 0;
+vlA.clp_tidy(); vlB.clp_tidy();
+cA.c1 = op_tn(cA.c1); cA.c2 = op_tn(cA.c2); cB.c1 = op_tn(cB.c1); cB.c2 = op_tn(cB.c2); cA.el = op_tn(cA.el); cB.el = op_tn(cB.el);
+// the panel's mailboxes
+opa_gr = min(opa_gr, op_grm); op_grm = 0;
+opa_vu = op_vu;
+opa_el = max(cA.el, cB.el); opa_mem = max(cA.mem, cB.mem); opa_c2 = max(cA.c2, cB.c2);
+opa_ol = max(opa_ol, op_ol); opa_or = max(opa_or, op_or); op_ol = op_or = 0;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+in_process(spl0, spl1);
+op_xl = in_l; op_xr = in_r;
+op_gI != op_tI ? ( op_gI = op_tI ? min(op_gI + op_fst, 1) : max(op_gI - op_fst, 0); );
+op_fdI = op_sm(op_gI);
+op_dg += (op_dgt - op_dg) * op_gsm; op_gn += (op_gnt - op_gn) * op_gsm; op_mx += (op_mxt - op_mx) * op_gsm;
+// the cell attenuates; the panel is driven from the attenuated signal (feedback), through the HF emphasis
+op_al = op_xl * op_gl; op_ar = op_xr * op_gr;
+op_dl = op_ei > 0 ? eA.op_bq(op_al) : op_al; op_dr = op_ei > 0 ? eB.op_bq(op_ar) : op_ar;
+op_dl = abs(op_dl) * op_dg; op_dr = abs(op_dr) * op_dg;
+op_lnk ? (
+  op_gl = op_gr = cA.op_cell(max(op_dl, op_dr));
+  cB.el = cA.el; cB.c1 = cA.c1; cB.c2 = cA.c2; cB.mem = cA.mem; cB.g = cA.g;
+) : (
+  op_gl = cA.op_cell(op_dl); op_gr = cB.op_cell(op_dr);
+);
+op_grdb = 20 * log10(max(min(op_gl, op_gr), 0.000001));
+op_grm = min(op_grm, op_grdb * op_fdI);
+// the valve make-up amplifier (a gentle, slightly lopsided curve) after GAIN
+op_yl = op_al * op_gn; op_yr = op_ar * op_gn;
+op_ul = (vlA.clp_run(op_yl * 0.5 + op_bias) - op_rest) * 2; op_ur = (vlB.clp_run(op_yr * 0.5 + op_bias) - op_rest) * 2;
+op_hl += (op_ul - op_hl) * op_kdc; op_hr += (op_ur - op_hr) * op_kdc;              // (the bias's DC: blocked, ~1 Hz)
+op_ul -= op_hl; op_ur -= op_hr;
+op_ul = op_xl + op_mx * (op_ul - op_xl); op_ur = op_xr + op_mx * (op_ur - op_xr);
+op_ol_ = op_xl + op_fdI * (op_ul - op_xl); op_or_ = op_xr + op_fdI * (op_ur - op_xr);
+op_ol_ != op_ol_ ? op_ol_ = 0; op_or_ != op_or_ ? op_or_ = 0;
+ost_out(op_ol_, op_or_);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+op_ol = max(op_ol, abs(spl0)); op_or = max(op_or, abs(spl1));
+op_vu += (0.5 * (spl0 * spl0 + spl1 * spl1) - op_vu) * op_kvu;
+
+@gfx 1080 430
+ui_begin(1080, 430);
+// =====================================================================
+// GUI - in the 34 series manner: two big bakelite knobs, as on the hardware, a VU, and the cell itself - the panel's
+// glow and the photocell's memory. Rivets in the corners. Two looks, both with blue-white accents: VFD (charcoal)
+// and MATRIX (battleship grey). Design space 1080 x 430.
+// =====================================================================
+ov_mx = 0;                                  // one look (VFD); slider10 kept so old projects load
+!ov_mx ? (                                                // VFD: charcoal and blue-white
+  KRP = 0x2E2F31; KRF = 0x202123; KRI = 0xDDE9F5; KRA = 0xBFD9F2; KRW = 0x121314; KRM = 0x55575A;
+  KRC = 0xBFD9F2; KRPT = 0x0E1A26; KRCN = 0x6FB8E8; KRGH = 0x232A31; KRAMB = 0xFFD24A; KRRED = 0xFF3B1F; KRKT = 0x0E1A26;
+) : (                                                     // MATRIX: battleship grey and blue-white
+  KRP = 0x222528; KRF = ui_mix(0x222528, 0x000000, 0.25); KRI = 0xC7CCD2; KRA = 0xBFD9F2; KRW = ui_mix(0x222528, 0x000000, 0.45);
+  KRM = 0x4A4E4A; KRC = 0xBFD9F2; KRPT = 0x17191B; KRCN = 0x4F8FB8; KRGH = 0x2C302E; KRAMB = 0xD4A373; KRRED = 0xBC3908; KRKT = 0x17191B;
+);
+KRH = ui_mix(KRP, 0x000000, 0.35); KRI2 = ui_mix(KRI, KRF, 0.35);
+
+gfx_setfont(6,  "Trebuchet MS", 27 * sc, 'b');
+gfx_setfont(10, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(11, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(12, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(14, "Trebuchet MS", 15 * sc, 'b');
+gfx_setfont(15, "Trebuchet MS", 12 * sc, 'b');     // lamp key legends
+
+function kr_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+function kr_txt(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function kr_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function kr_rtxt(rx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = rx * sc - tw; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function kr_lbl(x, y, s) ( gfx_setfont(11); ui_col(KRI2); kr_txt(x, y, s); );
+function kr_hov(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function kr_thick(x1, y1, x2, y2, w) local(dx, dy, l, nx, ny, k) (       // (drawn here: works with any system files)
+  dx = x2 - x1; dy = y2 - y1; l = max(sqrt(dx * dx + dy * dy), 0.001); nx = -dy / l; ny = dx / l;
+  k = -0.5 * w; loop(floor(w * 2.5) + 1, gfx_line(x1 + nx * k, y1 + ny * k, x2 + nx * k, y2 + ny * k, 1); k += 0.4; );
+);
+// panel keys: house lamp keys (gfx-ui). kr_kc = the key's lamp colour (set before the call; cleared after;
+// none = the face's accent colour)
+function kr_key(x, y, w, h, lbl, on) local(c) (
+  c = kr_kc ? kr_kc : KRA; kr_kc = 0;
+  lk_well = 0x0A0A0B; lk_font = 15; lk_font2 = 15;
+  lk_fit(x, y, w, h, on, c, lbl);
+);
+// a section that's switched off: greyed slightly (its IN key is redrawn on top)
+function kr_off(x, y, w, h) ( ui_cola(KRF, 0.5); kr_r(x + 1, y + 1, w - 2, h - 2); );
+// a key that isn't live: an unlit lamp key, dimmed
+function kr_dim(x, y, w, h, lbl) local(c) (
+  c = kr_kc ? kr_kc : KRA; kr_kc = 0;
+  lk_well = 0x0A0A0B; lk_font = 15; lk_font2 = 15; lk_inert = 1;
+  lk_fit(x, y, w, h, 0, c, lbl);
+  ui_cola(KRF, 0.55); kr_r(x, y, w, h); 0;
+);
+function kr_sect(x, y, w, h, name) (
+  ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRF); kr_r(x + 1, y + 1, w - 2, h - 2);
+  strlen(name) ? kr_lbl(x + 9, y + 6, name);
+);
+function kr_scale(cx, cy, r, n, nr, labels, minor) local(i, k, k0, len, c, a, ca, sa, m) (
+  len = strlen(labels); k0 = 0; i = 0; k = 0;
+  minor > 0 ? (
+    m = 0; ui_col(KRI2);
+    loop((n - 1) * minor + 1,
+      a = -0.75 * $pi + m / ((n - 1) * minor) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      gfx_line((cx + ca * (r + 4)) * sc, (cy + sa * (r + 4)) * sc, (cx + ca * (r + 6)) * sc, (cy + sa * (r + 6)) * sc, 1);
+      m += 1;
+    );
+  );
+  gfx_setfont(10);
+  loop(len + 1,
+    c = k < len ? str_getchar(labels, k) : 124;
+    c == 124 ? (
+      strcpy_substr(#krv_sl, labels, k0, k - k0);
+      a = -0.75 * $pi + i / max(n - 1, 1) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      ui_col(KRI);
+      gfx_line((cx + ca * (r + 3)) * sc, (cy + sa * (r + 3)) * sc, (cx + ca * (r + 7)) * sc, (cy + sa * (r + 7)) * sc, 1);
+      strlen(#krv_sl) ? kr_ctxt(cx + ca * (r + nr), cy + sa * (r + nr), #krv_sl);
+      i += 1; k0 = k + 1;
+    );
+    k += 1;
+  );
+);
+function kr_bake(cx, cy, r, a) local(i, t, ca, sa, k) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.55); gfx_circle(cx + 2.5 * sc, cy + 4.5 * sc, r * 1.02, 1, 1);
+  ui_col(0x0A0A0A); gfx_circle(cx, cy, r + 1 * sc, 1, 1);
+  ui_col(0x191817); gfx_circle(cx, cy, r, 1, 1);
+  i = 0;
+  loop(16,
+    t = i / 16 * 2 * $pi; k = 0.5 + 0.5 * cos(t + 0.8);
+    ui_col(ui_mix(0x0D0C0B, 0x48443F, k * 0.8)); gfx_circle(cx + sin(t) * r * 0.86, cy - cos(t) * r * 0.86, r * 0.15, 1, 1);
+    ui_col(0x0D0C0B); gfx_circle(cx + sin(t + 0.196) * r * 0.9, cy - cos(t + 0.196) * r * 0.9, r * 0.075, 1, 1);
+    i += 1;
+  );
+  ui_col(0x090808); gfx_circle(cx, cy, r * 0.70 + 1 * sc, 1, 1);
+  ui_col(0x22201E); gfx_circle(cx, cy, r * 0.70, 1, 1);
+  ui_cola(0xFFFFFF, 0.08); gfx_circle(cx, cy, r * 0.70, 0, 1);
+  ui_col(0x060606); kr_thick(cx + ca * r * 0.18, cy + sa * r * 0.18, cx + ca * r * 0.98, cy + sa * r * 0.98, 4.2 * sc);
+  ui_col(KRA); kr_thick(cx + ca * r * 0.22, cy + sa * r * 0.22, cx + ca * r * 0.95, cy + sa * r * 0.95, 2.5 * sc);
+);
+function kr_scap(cx, cy, r, a, cap) local(ca, sa, k, pc) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.5); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+  ui_col(0x121212); gfx_circle(cx, cy, r, 1, 1);
+  ui_cola(0xFFFFFF, 0.12); gfx_circle(cx, cy, r, 0, 1);
+  k = r * 0.74;
+  ui_col(cap); gfx_circle(cx, cy, k, 1, 1);
+  ui_col(ui_mix(cap, 0x000000, 0.35)); gfx_circle(cx, cy, k, 0, 1);
+  pc = (cap & 255) + ((cap >> 8) & 255) + ((cap >> 16) & 255) > 380 ? KRPT : 0xF4F0E6;
+  ui_col(pc); kr_thick(cx + ca * k * 0.2, cy + sa * k * 0.2, cx + ca * r * 0.94, cy + sa * r * 0.94, 2.6 * sc);
+);
+krv_small = 0; krv_lg = 0; krv_step = 0; krv_cap = 0;
+function kr_kn(v, lo, hi) ( krv_lg ? log(max(v, lo) / lo) / log(hi / lo) : (v - lo) / (hi - lo); );
+function kr_kv(n, lo, hi) ( krv_lg ? lo * exp(n * log(hi / lo)) : lo + n * (hi - lo); );
+function kr_knob(cx, cy, r, idx, lo, hi, def) local(v, n, dx, dy, hov, did) (
+  did = 1700 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 5) * sc);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - krv_lt < 0.35 && krv_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; krv_lt = 0; ) : (
+      drag_id = did; krv_y = mouse_y; krv_lt = time_precise(); krv_lid = idx; krv_n = kr_kn(v, lo, hi);
+    );
+  );
+  drag_id == did ? (
+    krv_n = min(max(krv_n + (krv_y - mouse_y) / (((mouse_cap & 8) ? 1200 : (krv_step ? 160 : 240)) * sc), 0), 1); krv_y = mouse_y;
+    v = kr_kv(krv_n, lo, hi); krv_step ? v = floor(v + 0.5);
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    krv_step ? slider(idx) = min(max(floor(v + 0.5) + sign(mouse_wheel), lo), hi) : (
+      n = min(max(kr_kn(v, lo, hi) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.025), 0), 1);
+      slider(idx) = kr_kv(n, lo, hi);
+    );
+    ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(kr_kn(v, lo, hi), 0), 1);
+  krv_small ? kr_scap(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi, krv_cap ? krv_cap : KRC) : kr_bake(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi);
+  hov || drag_id == did ? ( ui_cola(0xFFFFFF, 0.07); gfx_circle(cx * sc, cy * sc, (r + 2) * sc, 1, 1); );
+  hov || drag_id == did;
+);
+function kr_name(cx, cy, act, name, val) ( gfx_setfont(14); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy, act ? val : name); );
+// a small knob with a tick ring (or n step ticks) and its name; the value while touched
+function kr_small(cx, cy, r, idx, lo, hi, def, nt, name, val) local(i, t, act) (
+  ui_cola(KRI, 0.85); i = 0;
+  loop(nt, t = -0.75 * $pi + i / (nt - 1) * 1.5 * $pi;
+    gfx_line((cx + sin(t) * (r + 4)) * sc, (cy - cos(t) * (r + 4)) * sc, (cx + sin(t) * (r + 8)) * sc, (cy - cos(t) * (r + 8)) * sc, 1); i += 1; );
+  krv_small = 1; act = kr_knob(cx, cy, r, idx, lo, hi, def); krv_small = 0;
+  strlen(name) ? ( gfx_setfont(11); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy + r + 15, act ? val : name); );
+  act;
+);
+function kr_cell(x, y, w, h, lit, zone) local(c) (
+  c = zone == 2 ? KRRED : zone == 1 ? KRAMB : KRCN;
+  lit ? ( ui_cola(c, 0.16); kr_r(x - 0.5, y - 1, w + 1, h + 2); ui_col(c); kr_r(x, y, w, h); ui_cola(0xFFFFFF, 0.22); kr_r(x, y, w, 1.5); )
+      : ( ui_col(KRGH); kr_r(x, y, w, h); ui_cola(0x000000, 0.25); kr_r(x, y + h - 1, w, 1); );
+);
+function kr_hbar(x, y, w, h, v) local(n, i, sw, d) (
+  n = 32; sw = w / n; i = 0;
+  loop(n, d = -48 + (i + 0.5) / n * 48; kr_cell(x + i * sw + 0.5, y, sw - 2, h, v >= d, d > -3 ? 2 : d > -12 ? 1 : 0); i += 1; );
+);
+function kr_grbar(x, y, w, h, gr) local(n, i, sw, d) (                     // gain reduction: 0 .. -24 dB, from the left
+  n = 24; sw = w / n; i = 0;
+  loop(n, d = -(i + 0.5); kr_cell(x + i * sw + 0.5, y, sw - 2, h, gr <= d, 1); i += 1; );
+);
+function kr_window(x, y, w, h) ( ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRW); kr_r(x + 1, y + 1, w - 2, h - 2); );
+function kr_db(v) ( sprintf(#krd, "%+.1f dB", v); #krd; );
+function kr_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+function kr_fall(v, pk) ( pk = pk > 0.0000001 ? 20 * log10(pk) : -90; pk > v ? pk : max(v - 0.6, -90); );
+
+function ov_rivet(cx, cy) local(c) (
+  c = ui_mix(KRM, 0xFFFFFF, 0.25);
+  ui_cola(0x000000, 0.45); gfx_circle((cx + 0.8) * sc, (cy + 1.2) * sc, 3.6 * sc, 1, 1);
+  ui_col(ui_mix(c, 0x000000, 0.35)); gfx_circle(cx * sc, cy * sc, 3.6 * sc, 1, 1);
+  ui_col(c); gfx_circle(cx * sc, cy * sc, 3 * sc, 1, 1);
+  ui_cola(0xFFFFFF, 0.35); gfx_circle((cx - 0.9) * sc, (cy - 0.9) * sc, 1.1 * sc, 1, 1);
+);
+function ov_set(idx, v) ( slider(idx) = v; ui_auto(idx); );
+
+// =====================================================================
+// Faceplate and header
+// =====================================================================
+ui_col(ui_mix(KRP, 0x000000, 0.35)); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0xFFFFFF, 0.08); kr_r(0, 0, 1080, 1.5); kr_r(0, 0, 1.5, 430);
+ui_cola(0x000000, 0.35); kr_r(0, 428.5, 1080, 1.5); kr_r(1078.5, 0, 1.5, 430);
+ui_col(KRP); kr_r(12, 12, 1056, 406);
+ui_cola(0x000000, 0.30); kr_r(12, 12, 1056, 1.5); kr_r(12, 12, 1.5, 406);
+ui_cola(0xFFFFFF, 0.07); kr_r(12, 416.5, 1056, 1.5); kr_r(1066.5, 12, 1.5, 406);
+ov_rivet(6.5, 6.5); ov_rivet(1073.5, 6.5); ov_rivet(6.5, 423.5); ov_rivet(1073.5, 423.5);
+ui_col(KRH); kr_r(13.5, 13.5, 1053, 50.5);
+ui_col(KRA); kr_r(13.5, 64, 1053, 2);
+ui_col(KRA); gfx_circle(45 * sc, 39 * sc, 16 * sc, 1, 1);
+gfx_setfont(4); ui_col(KRKT); ui_text(45 * sc, 33.5 * sc, "GFX");
+gfx_setfont(6); ui_col(KRI); kr_txt(72, 24, "OPT34"); gfx_measurestr("OPT34", ov_tw, ov_th);
+ov_tx = 72 + ov_tw / sc + 14;
+gfx_setfont(11); ui_col(KRI2); kr_txt(ov_tx, 25, "OPTICAL"); kr_txt(ov_tx, 40, "LEVELLING AMPLIFIER");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+k_ = pk_preset(366 * sc, 22 * sc, 280 * sc, 34 * sc, pr_cur, #op_pm);
+k_ > 0 ? prs_dirty = k_;
+ui_size_picker(1000 * sc, 30 * sc);
+
+// =====================================================================
+// LEVELLER: GAIN, PEAK REDUCTION, COMPRESS / LIMIT, IN, LINK, HF EMPHASIS
+// =====================================================================
+kr_sect(22, 72, 538, 338, "LEVELLER");
+ov_ky = 224;
+kr_scale(130, ov_ky, 58, 7, 22, "-12|-6|0|+6|+12|+18|+24", 2);
+ov_a = kr_knob(130, ov_ky, 58, 2, -12, 24, 0); kr_name(130, ov_ky + 98, ov_a, "GAIN", kr_db(slider2));
+kr_scale(452, ov_ky, 58, 6, 22, "0|20|40|60|80|100", 3);
+ov_a = kr_knob(452, ov_ky, 58, 3, 0, 100, 40); sprintf(#ovv, "%.0f", slider3); kr_name(452, ov_ky + 98, ov_a, "PEAK REDUCTION", #ovv);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(130, ov_ky + 118, "THE VALVE MAKE-UP"); kr_ctxt(452, ov_ky + 118, "THE LIGHT ON THE CELL");
+kr_kc = LK_YEL; kr_key(231, 104, 120, 30, "COMPRESS", slider4 < 0.5) ? ov_set(4, 0);
+kr_kc = LK_YEL; kr_key(231, 140, 120, 30, "LIMIT", slider4 >= 0.5) ? ov_set(4, 1);
+kr_kc = LK_AMB; kr_key(231, 196, 120, 30, "IN", slider1 >= 0.5) ? kr_tog(1);
+kr_kc = LK_RED; kr_key(231, 242, 120, 30, slider6 >= 0.5 ? "LINK" : "DUAL", slider6 >= 0.5) ? kr_tog(6);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(291, 284, slider6 >= 0.5 ? "ONE CELL, BOTH SIDES" : "A CELL EACH SIDE");
+sprintf(#ovv, "%.1f", slider5); kr_small(291, 336, 18, 5, 0, 10, 0, 11, "HF EMPHASIS", #ovv);
+
+slider1 < 0.5 ? ( kr_off(22, 72, 538, 338); kr_kc = LK_AMB; kr_key(231, 196, 120, 30, "IN", 0) ? kr_tog(1); );
+
+// =====================================================================
+// METER: the VU (GR or OUTPUT) and the output bars
+// =====================================================================
+kr_sect(566, 72, 280, 338, "METER");
+kr_window(576, 96, 260, 178);
+ov_gm = slider7 >= 0.5;
+ov_g = opa_gr; opa_gr = 0;
+ov_vdb = 10 * log10(max(opa_vu, 0.0000000001)) + 18;                            // 0 VU = -18 dBFS
+ov_t = ov_gm ? ov_vdb : max(ov_g, -20);
+ov_nd += 0.25 * (ov_t - ov_nd);                                                  // the VU's ballistics
+function ov_ang(v) ( v = min(max(v, -20), 3); v >= 0 ? 0.46 + v / 3 * 0.26 : 0.46 - 1.18 * (min(-v, 20) / 20) ^ 0.62; );
+ov_px = 706; ov_py = 300; ov_rr = 176;
+ui_cola(KRA, 0.06); kr_r(578, 98, 256, 174);
+ov_i = 0;
+loop(9,
+  ov_d = ov_i == 0 ? -20 : ov_i == 1 ? -10 : ov_i == 2 ? -7 : ov_i == 3 ? -5 : ov_i == 4 ? -3 : ov_i == 5 ? -1 : ov_i == 6 ? 0 : ov_i == 7 ? 1 : 3;
+  ov_t = ov_ang(ov_d); ov_ca = sin(ov_t); ov_sa = -cos(ov_t);
+  ui_col(ov_d > 0 ? KRRED : KRI);
+  kr_thick((ov_px + ov_ca * (ov_rr - 40)) * sc, (ov_py + ov_sa * (ov_rr - 40)) * sc, (ov_px + ov_ca * (ov_rr - 28)) * sc, (ov_py + ov_sa * (ov_rr - 28)) * sc, 1.6 * sc);
+  gfx_setfont(10); sprintf(#ovd, ov_d > 0 ? "+%d" : "%d", ov_d); kr_ctxt(ov_px + ov_ca * (ov_rr - 16), ov_py + ov_sa * (ov_rr - 16), #ovd);
+  ov_i += 1;
+);
+ui_cola(KRRED, 0.5); ov_i = 0; loop(12, ov_t = ov_ang(ov_i / 11 * 3); ov_ca = sin(ov_t); ov_sa = -cos(ov_t);
+  gfx_circle((ov_px + ov_ca * (ov_rr - 34)) * sc, (ov_py + ov_sa * (ov_rr - 34)) * sc, 1.2 * sc, 1, 1); ov_i += 1; );
+gfx_setfont(11); ui_col(KRI2); kr_ctxt(706, 112, ov_gm ? "VU  (0 VU = -18 dBFS)" : "GAIN REDUCTION  dB");
+ov_t = ov_ang(ov_nd); ov_ca = sin(ov_t); ov_sa = -cos(ov_t);
+ui_col(0x050505); kr_thick((ov_px + ov_ca * 54 + 1.5) * sc, (ov_py + ov_sa * 54 + 2) * sc, (ov_px + ov_ca * (ov_rr - 30) + 1.5) * sc, (ov_py + ov_sa * (ov_rr - 30) + 2) * sc, 2.4 * sc);
+ui_col(KRA); kr_thick((ov_px + ov_ca * 54) * sc, (ov_py + ov_sa * 54) * sc, (ov_px + ov_ca * (ov_rr - 30)) * sc, (ov_py + ov_sa * (ov_rr - 30)) * sc, 2 * sc);
+ui_col(KRW); kr_r(578, 250, 256, 22);
+ui_col(0x0A0A0A); gfx_circle(ov_px * sc, 268 * sc, 9 * sc, 1, 1);
+kr_kc = LK_WHT; kr_key(596, 282, 104, 26, "GR", !ov_gm) ? ov_set(7, 0);
+kr_kc = LK_WHT; kr_key(712, 282, 104, 26, "OUTPUT", ov_gm) ? ov_set(7, 1);
+ov_ml = kr_fall(ov_ml, opa_ol); ov_mr = kr_fall(ov_mr, opa_or); opa_ol = opa_or = 0;
+kr_window(576, 320, 260, 46);
+kr_hbar(604, 328, 224, 12, ov_ml); kr_hbar(604, 344, 224, 12, ov_mr);
+gfx_setfont(10); ui_col(KRI); kr_txt(584, 328, "L"); kr_txt(584, 344, "R");
+sprintf(#ovv, "GR %.1f dB", ov_g); gfx_setfont(13); ui_col(KRA); kr_ctxt(706, 386, #ovv);
+
+// =====================================================================
+// THE CELL: the panel's glow, the photocell, its memory; MIX, DRIFT
+// =====================================================================
+kr_sect(852, 72, 206, 338, "THE CELL");
+kr_window(864, 96, 182, 120);
+ov_el = min(sqrt(max(opa_el, 0)) * 1.6, 1); ov_els += 0.4 * (ov_el - ov_els);
+// the electroluminescent panel: a glowing strip
+ui_col(ui_mix(0x10161C, KRA, 0.08 + 0.85 * ov_els)); kr_r(882, 116, 52, 80);
+ov_els > 0.05 ? ( ui_cola(KRA, 0.25 * ov_els); kr_r(876, 110, 64, 92); );
+ui_cola(0xFFFFFF, 0.15); kr_r(882, 116, 52, 1.5);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(908, 206, "PANEL");
+// the photocell: a disc that darkens as it is lit (its resistance falls)
+ov_c2 = min(sqrt(max(opa_c2, 0)) * 1.6, 1);
+ui_col(0x050505); gfx_circle(994 * sc, 150 * sc, 26 * sc, 1, 1);
+ui_col(ui_mix(0xC8A060, 0x3A2A18, min(ov_els * 0.6 + ov_c2 * 0.4, 1))); gfx_circle(994 * sc, 150 * sc, 23 * sc, 1, 1);
+ui_col(0x1A120A); ov_i = 0; loop(5, kr_r(978, 136 + ov_i * 6, 32, 1.4); ov_i += 1; );           // its zig-zag track
+ui_cola(KRA, 0.35 * ov_els); gfx_circle(994 * sc, 150 * sc, 28 * sc, 0, 1);
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(994, 206, "PHOTOCELL");
+// the memory: how long and hard it has been lit (it lets go more slowly)
+ov_mm = min(opa_mem / 0.5 / 1.5, 1); ov_mms += 0.2 * (ov_mm - ov_mms);
+gfx_setfont(11); ui_col(KRI2); kr_txt(866, 228, "MEMORY");
+kr_window(866, 246, 180, 16); ov_i = 0;
+loop(16, kr_cell(870 + ov_i * 10.8, 249, 8.6, 10, ov_mms >= (ov_i + 0.5) / 16, ov_i >= 12 ? 1 : 0); ov_i += 1; );
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(956, 276, "THE LONGER IT IS LIT,"); kr_ctxt(956, 290, "THE SLOWER IT LETS GO");
+sprintf(#ovv, "%d%%", floor(slider8 + 0.5)); kr_small(910, 336, 18, 8, 0, 100, 100, 11, "MIX", #ovv);
+sprintf(#ovv, "%d%%", floor(slider9 + 0.5)); kr_small(1002, 336, 14, 9, 0, 100, 50, 11, "DRIFT", #ovv);
+
+pk_end();
+ui_end();

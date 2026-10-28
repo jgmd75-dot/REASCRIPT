@@ -1,0 +1,680 @@
+desc:MUTO [vari-mu comp] (GFX)
+//tags: dynamics compressor limiter vari-mu variable-mu valve tube vintage modern bus mid-side
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel, gfx-dyn and gfx-faceplate (.jsfx-inc) in the same folder.
+//
+// MUTO: two variable-mu valve compressors in one plug-in. The VINTAGE / MODERN keys swap the faceplate AND the
+// circuit; each unit keeps its own settings in its own sliders.
+//
+// THE CORE (both units): a remote-cutoff valve as the gain element - its gain falls smoothly as the control
+// bias rises, and the bias comes from a rectifier on the unit's OUTPUT (feedback detection). The rectifier
+// works on voltage, the valve on bias, so the harder it works the steeper the gain law gets: the ratio rises
+// with the gain reduction (a soft, ever-increasing knee). VINTAGE: about 2:1 at 1-2 dB GR, 2.6:1 at 3 dB,
+// 4.5:1 at 6 dB, 8:1 at 10 dB, 12-14:1 at 15-20 dB. MODERN (gentler): 2.5:1 at 3 dB, 4:1 at 6 dB, 5.5:1 at 10 dB,
+// 7:1 at 15 dB. The valve's curvature grows as it is biased towards cut-off,
+// so the harmonic colour (even + odd) grows with drive and with gain reduction; a little of the control
+// voltage leaks into the audio as a soft "thump" when the bias moves fast (kept tasteful), and output iron
+// thickens the lows.
+//
+// MU-1 VINTAGE - in the spirit of a famous London studio's in-house 1960s rebuild of a surplus broadcast valve
+//   limiter (push-pull remote-cutoff valves, simple controls). Mono units, used in pairs: LINK (default) or DUAL.
+//   INPUT      stepped attenuator, -8 .. +24 dB in 2 dB steps: drives the valves (more GR, more colour).
+//   THRESHOLD  side-chain sensitivity.
+//   RECOVERY   1 - 6: 1 = 80 ms, 2 = 200 ms, 3 = 450 ms (+ a little memory), 4 = 1 s (+ memory),
+//              5 = two-stage 150 ms / 2.5 s, 6 = two-stage 300 ms / 6 s (program dependent: short peaks recover
+//              fast, sustained compression charges a second, slow store and recovers slowly).
+//   HOLD       the side-chain is driven hard and saturates into a long, slow hold (1.6 s / 12 s): the valves sit
+//              deep in their bias - thick, dense, more distortion, more thump.
+//   Attack is fixed and fast (about 2 ms): it grabs transients surprisingly transparently.
+//   OUTPUT     make-up. MIX: parallel (dry level-matched). A faint 50 Hz mains hum wanders with DRIFT.
+// MU-2 MODERN - in the spirit of a modern boutique all-valve vari-mu with custom output iron.
+//   INPUT, THRESHOLD, ATTACK 0.1 - 30 ms (valve-sluggish to snappy), RELEASE 50 ms - 3 s or AUTO (two-stage),
+//   SC HPF per channel: OFF / 60 / 90 / 150 / 250 Hz on the side-chain only (L / R, or M / S in M-S mode),
+//   MODE STEREO / DUAL MONO / M-S, LINK amount (STEREO and M-S), IRON (output transformer weight: low-end
+//   saturation and a gentle low shelf), MIX (parallel), OUTPUT. Cleaner valve stage, heavier low end.
+// BOTH: DRIFT (valve ageing: slow wander of bias / threshold and recovery, a small L / R mismatch; the vintage
+//   unit's mains hum), 0 - 100 % (50 % = standard).
+//   Two needle meters: GR (the needle rests at 0 and swings left by the gain reduction in dB) or OUT
+//   (VU ballistics, Meter81 calibration: a sine peaking at -18 dBFS reads 0 VU).
+//
+// GUI: drag knobs (Shift = fine), mouse wheel, double-click = default. Values show while a knob is touched.
+// PRESETS / LCD = list, the arrows step. S / M / L / ? = size and help.
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+
+slider1:0<0,1,1{Vintage,Modern}>-Unit
+slider2:0<-8,24,2>-V Input (dB)
+slider3:-10<-40,0,0.5>-V Threshold (dB)
+slider4:2<0,5,1{1,2,3,4,5,6}>-V Recovery
+slider5:0<0,1,1{Off,On}>-V Hold
+slider6:0<-20,20,0.1>-V Output (dB)
+slider7:0<0,1,1{Link,Dual mono}>-V Stereo
+slider8:100<0,100,1>-V Mix (%)
+slider9:0<-12,24,0.1>-M Input (dB)
+slider10:-12<-40,0,0.1>-M Threshold (dB)
+slider11:10<0.1,30,0.01>-M Attack (ms)
+slider12:300<50,3000,1>-M Release (ms)
+slider13:0<0,1,1{Off,On}>-M Auto release
+slider14:0<0,4,1{Off,60 Hz,90 Hz,150 Hz,250 Hz}>-M SC HPF L / M
+slider15:0<0,4,1{Off,60 Hz,90 Hz,150 Hz,250 Hz}>-M SC HPF R / S
+slider16:0<0,2,1{Stereo,Dual mono,M-S}>-M Mode
+slider17:100<0,100,1>-M Link (%)
+slider18:30<0,100,1>-M Iron (%)
+slider19:100<0,100,1>-M Mix (%)
+slider20:0<-20,20,0.1>-M Output (dB)
+slider21:50<0,100,1>-Drift (%)
+slider22:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider23:0<0,1,1{GR,Output}>-Meter
+slider24:prs_sel=0<0,12,1{No preset,Init,Vintage Vocal,Vintage Drums Hold,Vintage Bass,Room Hold Crush,Piano Leveller,Modern Mix Bus,Modern Drum Bus Snap,Modern M-S Glue,Modern Vocal,Modern Mastering Touch,Modern Parallel Weight}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+ext_noinit = 1;                                       // keep the state across transport start / stop (no reset mid-signal)
+gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+#ui_man = "gfx-muto";                                    // the ? pop-up links to this manual
+
+function mu_db2g(d) ( exp(d * 0.11512925465); );
+function mu_tc(s) ( 1 - exp(-1 / (max(s, 0.000001) * srate)); );
+// Pade tanh: smooth, reaches +-1 with zero slope at +-3 (a soft clip beyond)
+function mu_sat(u) ( u = min(max(u, -3), 3); u * (27 + u * u) / (27 + 9 * u * u); );
+function mu_slope(u) local(q) ( u = min(max(u, -3), 3); q = 9 - u * u; q * q / (9 * sqr(3 + u * u)); );
+
+// ---------- one valve channel: bias store(s), gain element, thump, DC blocker ----------
+// vf = the fast store (charged by the rectifier), vs = the slow store (charged from vf), vc = the bias in use
+// (in dB of gain reduction). Coefficients per channel (drift) in ka (attack), kf (fast release), ks (slow release).
+// Anti-aliased (the house drive standard): first-order ADAA on the valve's curve, (F(u) - F(u1)) / (u - u1) with F the
+// curve's antiderivative (u = x d + b; the curve at the midpoint when the two are within 1e-5). That reading sits half
+// a sample late, so half the step, times the slope the signal sees, is added back: the curve's slope s at the working
+// point, eased by the swing round it (e: its smoothed RMS x sqrt 2, a sine's peak; about s / sqrt(1 + (s e)^2)). Small signals pass
+// exactly (no droop, no lag: MIX stays phase-true), the driven fundamental keeps its level, and the folded-back
+// products are those of ADAA. No oversampling, no latency; no pre-filter (INPUT is the compressor's drive: a low-pass
+// tracking it would dull the compressor as it is pushed); the curve is smooth (no knee to track).
+function mu_F(u) local(a) ( a = abs(u); a < 3 ? u * u * 0.0555555556 + 1.3333333333 * log(1 + u * u * 0.3333333333) : 2.3483924 + a - 3; );
+function mu_vca(x) instance(vc, vlp, dx, dy, gn, tk, x1, u1, f1, ms, es) local(d, b, s, u, f, du, y) (
+  d = mu_vd * (1 + min(vc, 10) * mu_vgd); b = mu_vb * (1 + min(vc, 12) * mu_vgb);   // curvature grows towards cut-off
+  s = mu_slope(b);
+  u = x1 * d + b; abs(u - u1) > 0.0001 ? ( u1 = u; f1 = mu_F(u); );   // the bias moved: last point re-read on the new curve
+  u = x * d + b; f = mu_F(u); du = u - u1;
+  y = abs(du) > 0.00001 ? (f - f1) / du : mu_sat(0.5 * (u + u1));
+  x1 = x; u1 = u; f1 = f;
+  ms += (sqr(u - b) - ms) * mu_aer; es += (ms - es) * mu_aes;
+  y += 0.5 * du * s / sqrt(1 + 2 * s * s * es);
+  y = (y - mu_sat(b)) / (d * s);                             // the valve's curve, unity small-signal slope
+  y *= exp(-0.11512925465 * vc) * gn;                        // remote-cutoff gain: falls as the bias rises
+  vlp += (vc - vlp) * mu_thc;
+  y += mu_thk * tk * (vc - vlp);                             // control-voltage thump (bias settling)
+  dy = y - dx + mu_dcr * dy; dx = y;                         // DC blocker (even harmonics, thump)
+  dy;
+);
+// rectifier target (dB of GR) for the rectified output e and this channel's threshold th; dt = its slope
+function mu_tgt(e, th) instance(dt) local(o, oc, ex, t, kd, q) (
+  o = 8.68588963807 * log(max(e, 0.000000001)) - th;
+  o > -mu_kh ? (
+    o >= mu_kh ? ( oc = o; kd = 1; ) : ( oc = sqr(o + mu_kh) / (2 * mu_kn); kd = (o + mu_kh) / mu_kn; );
+    ex = exp(min(mu_cc * oc, 6));
+    t = mu_bc / mu_cc * (ex - 1); dt = mu_bc * ex * kd;
+    mu_hold ? ( q = min(t / 20, 3); t = 20 * mu_sat(q); dt *= mu_slope(q); );   // HOLD: the side-chain saturates
+    t >= 30 ? ( t = 30; dt = 0; );
+  ) : ( t = 0; dt = 0; );
+  t;
+);
+function mu_cap(t, slope) instance(vc, vf, vs, ka, kf, ks) local(k) (
+  t > vf ? ( k = min(ka, 0.9 / (1 + slope)); vf += k * (t - vf); ) : vf *= kf;   // feedback loop kept stable
+  vf > vs ? vs += mu_kcs * (vf - vs) : vs *= ks;
+  vc = max(vf, mu_ws * vs);
+);
+// output iron: the low band saturates and gains a little weight
+function mu_iron(x) instance(lp) local(lo, ls) (
+  lp += (x - lp) * mu_ilc;
+  lo = lp; ls = mu_sat(lo * mu_id) / mu_id;
+  x + ls - lo + lo * mu_ish;
+);
+
+// ---------- parameters ----------
+function mu_hpf(i) ( i == 1 ? 60 : i == 2 ? 90 : i == 3 ? 150 : 250 );
+function mu_setup() local(tf, ts, tcs, rm, ta) (
+  mu_u = slider1 > 0.5;
+  mu_u == 0 ? (
+    mu_gin = mu_db2g(slider2); mu_thr = slider3; mu_hold = slider5 > 0.5;
+    mu_gout = mu_db2g(slider6 + 0.3 * sqr(max(slider2 - 12, 0) / 12));   // (+0.3 dB at INPUT +24: keeps the level of the plain curve)
+    mu_lk = slider7 < 0.5; mu_ms = 0; mu_mix = slider8 / 100;
+    mu_bc = 1.0; mu_cc = 0.75; mu_kn = 8;
+    rm = slider4 | 0;
+    rm == 0 ? ( tf = 0.08; mu_ws = 0; ts = 1; tcs = 1; ) :
+    rm == 1 ? ( tf = 0.2;  mu_ws = 0; ts = 1; tcs = 1; ) :
+    rm == 2 ? ( tf = 0.45; mu_ws = 0.5; ts = 1.5; tcs = 0.8; ) :
+    rm == 3 ? ( tf = 1.0;  mu_ws = 0.6; ts = 3; tcs = 1.0; ) :
+    rm == 4 ? ( tf = 0.15; mu_ws = 1; ts = 2.5; tcs = 0.6; ) :
+              ( tf = 0.3;  mu_ws = 1; ts = 6; tcs = 0.4; );
+    ta = 0.002;
+    mu_hold ? ( tf = 1.6; mu_ws = 1; ts = 12; tcs = 0.35; mu_thr -= 8; ta = 0.003; );
+    mu_vd = mu_hold ? 0.42 : 0.17; mu_vgd = 0.1; mu_vb = mu_hold ? 0.16 : 0.045; mu_vgb = 0.1;
+    mu_thk = mu_hold ? 0.0008 : 0.0004;
+    mu_id = 0.9; mu_ish = 0.04;
+    mu_hpa = mu_hpb = 0;
+  ) : (
+    mu_gin = mu_db2g(slider9); mu_thr = slider10; mu_hold = 0; mu_gout = mu_db2g(slider20);
+    mu_mode = slider16 | 0; mu_ms = mu_mode == 2; mu_lk = mu_mode == 1 ? 0 : slider17 / 100; mu_mix = slider19 / 100;
+    mu_bc = 0.8; mu_cc = 0.4; mu_kn = 6;
+    slider13 > 0.5 ? ( tf = 0.12; mu_ws = 1; ts = 1.6; tcs = 0.5; ) : ( tf = slider12 / 1000; mu_ws = 0; ts = 1; tcs = 1; );
+    ta = slider11 / 1000;
+    mu_vd = 0.1; mu_vgd = 0.08; mu_vb = 0.03; mu_vgb = 0.08;
+    mu_thk = 0.0001;
+    mu_id = 0.3 + 1.7 * slider18 / 100; mu_ish = 0.12 * slider18 / 100;
+    mu_hpa = slider14 | 0; mu_hpb = slider15 | 0;
+    mu_hpa != mu_hpal ? ( mu_hpal = mu_hpa; mu_hpa ? hpA.bq_set(1, mu_hpf(mu_hpa), 0.707, 0); );
+    mu_hpb != mu_hpbl ? ( mu_hpbl = mu_hpb; mu_hpb ? hpB.bq_set(1, mu_hpf(mu_hpb), 0.707, 0); );
+  );
+  mu_kh = mu_kn * 0.5;
+  mA.tk = 1; mB.tk = !mu_ms;                                     // M-S: no thump on the side valve (no side from mono)
+  mA.ka = mB.ka = mu_tc(ta);
+  mA.kf = exp(-1 / (tf * mu_rmA * srate)); mB.kf = exp(-1 / (tf * mu_rmB * srate));
+  mA.ks = mB.ks = exp(-1 / (ts * srate)); mu_kcs = mu_tc(tcs);
+  ost_setup(0, 0, 120, 6000, -0.3, 0);   // output stage: straight through
+);
+
+// ---------- presets ----------
+function mu_pv(i, t, r, h, o, l, m) ( slider1 = 0; slider2 = i; slider3 = t; slider4 = r; slider5 = h; slider6 = o; slider7 = l; slider8 = m; );
+function mu_pm(i, t, a, r, au, ha, hb, md, lk, ir, m, o) (
+  slider1 = 1; slider9 = i; slider10 = t; slider11 = a; slider12 = r; slider13 = au; slider14 = ha; slider15 = hb;
+  slider16 = md; slider17 = lk; slider18 = ir; slider19 = m; slider20 = o;
+);
+function load_preset(p) (
+  p == 1 ? (                                                     // Init: every control to its default, VINTAGE
+    mu_pm(0, -12, 10, 300, 0, 0, 0, 0, 100, 30, 100, 0);
+    mu_pv(0, -10, 2, 0, 0, 0, 100); slider21 = 50; slider22 = 1; slider23 = 0;
+  ) :
+  p == 2  ? mu_pv(4, -14, 2, 0, 3, 0, 100) :                     // Vintage Vocal
+  p == 3  ? mu_pv(4, -12, 3, 1, 3, 0, 80) :                      // Vintage Drums Hold
+  p == 4  ? mu_pv(6, -14, 1, 0, 2, 0, 100) :                     // Vintage Bass
+  p == 5  ? mu_pv(12, -20, 5, 1, 7, 0, 100) :                   // Room Hold Crush
+  p == 6  ? mu_pv(2, -14, 4, 0, 3, 0, 100) :                     // Piano Leveller
+  p == 7  ? mu_pm(0, -16, 20, 400, 1, 1, 1, 0, 100, 40, 100, 1.5) :     // Modern Mix Bus
+  p == 8  ? mu_pm(2, -16, 1, 120, 0, 2, 2, 0, 100, 50, 100, 3) :        // Modern Drum Bus Snap
+  p == 9  ? mu_pm(0, -16, 15, 500, 1, 1, 3, 2, 20, 30, 100, 1) :        // Modern M-S Glue
+  p == 10 ? mu_pm(4, -16, 3, 250, 0, 3, 3, 0, 100, 20, 100, 3) :        // Modern Vocal
+  p == 11 ? mu_pm(0, -12, 30, 800, 1, 2, 2, 0, 100, 25, 100, 0.5) :      // Modern Mastering Touch
+  p == 12 ? mu_pm(6, -24, 5, 200, 0, 1, 1, 0, 100, 80, 40, 0);          // Modern Parallel Weight
+  slider_automate(8388607);                                      // sliders 1-23
+);
+
+// ---------- state ----------
+ost_init(0);                                                     // the house output stage
+mu_rmA = mu_rmB = 1;
+mu_thc = 1 - exp(-2 * $pi * 15 / srate);
+mu_dcr = exp(-2 * $pi * 4 / srate);
+mu_ilc = 1 - exp(-2 * $pi * 120 / srate);
+mu_smc = 1 - exp(-1 / (0.03 * srate));
+mu_aer = 1 - exp(-1 / (0.01 * srate)); mu_aes = 1 - exp(-1 / (0.003 * srate));   // the ADAA lag's envelope
+mA.gn = mB.gn = 1;
+// drift: wandering sources, and each channel's fixed mismatch (the pair of valves never match exactly)
+mdT1.drift_init(0.8 + rand(0.5)); mdT2.drift_init(0.8 + rand(0.5));
+mdG1.drift_init(0.8 + rand(0.5)); mdG2.drift_init(0.8 + rand(0.5));
+mdR1.drift_init(0.8 + rand(0.5)); mdR2.drift_init(0.8 + rand(0.5)); mdH.drift_init(1);
+mu_mmA = rand(2) - 1; mu_mmB = rand(2) - 1; mu_mgA = rand(2) - 1; mu_mgB = rand(2) - 1;
+mu_hc = 1; mu_hs = 0;
+// VU needle (output meter): mass + spring + damping, as Meter81
+mu_w2 = 13.6 * 13.6; mu_zw = 2 * 0.81 * 13.6; mu_dt = 1 / srate;
+mu_hpal = mu_hpbl = -1;
+mu_setup();
+mA.u1 = mB.u1 = mu_vb; mA.f1 = mB.f1 = mu_F(mu_vb);             // the valves start at rest
+mu_gis = mu_gin; mu_gos = mu_gout; mu_mxs = mu_mix;
+ui_thm = 5; ui_hw = 1;                                           // house keycaps for the preset bar and size picker
+!ui_dflt ? ( ui_sz = 2; pr_cur = 1; );                           // new instances open in Large, on Init
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+// the @slider work, also run after a preset swap in @block (PRESET parameter)
+function prs_sl() (
+mu_setup();
+);
+function prs_chk() local(k) (
+  prs_dirty > 0 ? ( prs_pk = prs_dirty; prs_dirty = 0; prs_q = 1; ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( prs_pk = prs_sel; prs_q = 0; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+  // PRESET parameter: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+  prs_pk > 0 ? (
+    prs_g <= 0 ? (
+      k = prs_pk; prs_pk = 0; load_preset(k); prs_sl();
+      prs_q ? ( k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
+      prs_gs = 1 / (0.030 * srate);
+    ) : prs_gs = -1 / (0.005 * srate);
+  );
+);
+prs_ok = 0; prs_dirty = 0; prs_pk = 0; prs_g = 1; prs_gs = 0;
+
+@slider
+prs_chk();
+prs_sl();
+
+@block
+prs_chk();
+// ---- drift: valve ageing ----
+drift_macro(slider21);
+mu_inc = 0.05 * dm_s * samplesblock / srate;
+mu_w1 = mdT1.drift_tick(mu_inc); mu_w2b = mdT2.drift_tick(mu_inc);
+mu_g1 = mdG1.drift_tick(mu_inc * 1.3); mu_g2 = mdG2.drift_tick(mu_inc * 1.3);
+mu_r1 = mdR1.drift_tick(mu_inc * 0.7); mu_r2 = mdR2.drift_tick(mu_inc * 0.7);
+mu_hw = mdH.drift_tick(mu_inc * 2);
+mu_dtA = dm_a * (0.25 * mu_w1 + 0.15 * mu_mmA);                 // bias / threshold wander, dB (about +-0.4 at 50 %)
+mu_dtB = dm_a * (0.25 * mu_w2b + 0.15 * mu_mmB);
+mA.gn = mu_db2g(dm_a * (0.05 * mu_g1 + 0.04 * mu_mgA));          // gain mismatch, about +-0.1 dB at 50 %
+mB.gn = mu_db2g(dm_a * (0.05 * mu_g2 + 0.04 * mu_mgB));
+mu_rmA = 1 + 0.08 * dm_a * mu_r1; mu_rmB = 1 + 0.08 * dm_a * mu_r2;   // recovery wander
+mu_setup();
+mu_thA = mu_thr + mu_dtA; mu_thB = mu_thr + mu_dtB;
+// mains hum (vintage only): about -90 dBFS at 50 %, its frequency wandering round 50 Hz
+mu_ham = mu_u == 0 ? dm_a * 0.00003 * (mu_hold ? 1.5 : 1) : 0;
+mu_hf = 2 * $pi * (50 + 0.25 * mu_hw) / srate; mu_hcw = cos(mu_hf); mu_hsw = sin(mu_hf);
+mu_hn = 1 / sqrt(max(mu_hc * mu_hc + mu_hs * mu_hs, 0.000001)); mu_hc *= mu_hn; mu_hs *= mu_hn;
+// ---- flush decayed states (no denormals after long silence) ----
+abs(mA.vf) < 0.0000001 ? mA.vf = 0; abs(mB.vf) < 0.0000001 ? mB.vf = 0;
+abs(mA.vs) < 0.0000001 ? mA.vs = 0; abs(mB.vs) < 0.0000001 ? mB.vs = 0;
+abs(mA.vlp) < 0.0000001 ? mA.vlp = 0; abs(mB.vlp) < 0.0000001 ? mB.vlp = 0;
+abs(mA.dy) < 0.000000001 ? mA.dy = 0; abs(mB.dy) < 0.000000001 ? mB.dy = 0;
+abs(iL.lp) < 0.000000001 ? iL.lp = 0; abs(iR.lp) < 0.000000001 ? iR.lp = 0;
+abs(hpA.y1) + abs(hpA.y2) < 0.000000001 ? hpA.y1 = hpA.y2 = 0;
+abs(hpB.y1) + abs(hpB.y2) < 0.000000001 ? hpB.y1 = hpB.y2 = 0;
+abs(mu_vy0) + abs(mu_vv0) < 0.000000001 ? mu_vy0 = mu_vv0 = 0;
+abs(mu_vy1) + abs(mu_vv1) < 0.000000001 ? mu_vy1 = mu_vv1 = 0;
+// ---- meters for the panel (written here only, read by the panel) ----
+mu_grA = mu_pkA; mu_grB = mu_pkB; mu_pkA = mu_pkB = 0;
+mu_vuA = 8.68588963807 * log(max(mu_vy0, 0.00000001)) + 18;     // VU: a sine peaking at -18 dBFS = 0 VU
+mu_vuB = 8.68588963807 * log(max(mu_vy1, 0.00000001)) + 18;
+mu_blk += 1;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@sample
+// ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+mu_gis += (mu_gin - mu_gis) * mu_smc; mu_gos += (mu_gout - mu_gos) * mu_smc; mu_mxs += (mu_mix - mu_mxs) * mu_smc;
+mu_iL = spl0; mu_iR = spl1;
+mu_a = mu_iL * mu_gis; mu_b = mu_iR * mu_gis;
+mu_ms ? ( mu_t = mu_a; mu_a = 0.5 * (mu_t + mu_b); mu_b = 0.5 * (mu_t - mu_b); );
+// the valves
+mu_ya = mA.mu_vca(mu_a); mu_yb = mB.mu_vca(mu_b);
+// feedback side-chain: the rectified output (high-passed on the modern unit)
+mu_ea = abs(mu_hpa ? hpA.bq_run(mu_ya) : mu_ya); mu_eb = abs(mu_hpb ? hpB.bq_run(mu_yb) : mu_yb);
+mu_ta = tA.mu_tgt(mu_ea, mu_thA); mu_tb = tB.mu_tgt(mu_eb, mu_thB);
+mu_lk > 0 ? (
+  mu_t = max(mu_ta, mu_tb); mu_d = max(tA.dt, tB.dt);
+  mu_ta += (mu_t - mu_ta) * mu_lk; mu_tb += (mu_t - mu_tb) * mu_lk;
+  mA.mu_cap(mu_ta, mu_d); mB.mu_cap(mu_tb, mu_d);
+) : ( mA.mu_cap(mu_ta, tA.dt); mB.mu_cap(mu_tb, tB.dt); );
+mu_pkA = max(mu_pkA, mA.vc); mu_pkB = max(mu_pkB, mB.vc);
+mu_ms ? ( mu_l = mu_ya + mu_yb; mu_r = mu_ya - mu_yb; ) : ( mu_l = mu_ya; mu_r = mu_yb; );
+mu_l = iL.mu_iron(mu_l); mu_r = iR.mu_iron(mu_r);
+mu_ham > 0 ? (
+  mu_t = mu_hc * mu_hcw - mu_hs * mu_hsw; mu_hs = mu_hs * mu_hcw + mu_hc * mu_hsw; mu_hc = mu_t;
+  mu_t = mu_ham * (mu_hs + 0.3 * (3 * mu_hs - 4 * mu_hs * mu_hs * mu_hs));
+  mu_l += mu_t; mu_r += mu_t * 0.85;
+);
+// make-up, and the parallel mix against the level-matched dry signal
+mu_dl = mu_iL * mu_gis * mu_gos; mu_dr = mu_iR * mu_gis * mu_gos;
+mu_l = mu_dl + (mu_l * mu_gos - mu_dl) * mu_mxs; mu_r = mu_dr + (mu_r * mu_gos - mu_dr) * mu_mxs;
+ost_out(mu_l, mu_r);
+spl0 = ost_l; spl1 = ost_r;
+// output VU (rectified x pi/2: a sine reads its peak)
+mu_vv0 += (mu_w2 * (abs(spl0) * 1.5707963 - mu_vy0) - mu_zw * mu_vv0) * mu_dt; mu_vy0 += mu_vv0 * mu_dt;
+mu_vv1 += (mu_w2 * (abs(spl1) * 1.5707963 - mu_vy1) - mu_zw * mu_vv1) * mu_dt; mu_vy1 += mu_vv1 * mu_dt;
+prs_gs != 0 ? ( prs_g += prs_gs; prs_g <= 0 ? ( prs_g = 0; prs_gs = 0; ) : prs_g >= 1 ? ( prs_g = 1; prs_gs = 0; ); );
+prs_g < 1 ? ( prs_w = prs_g * prs_g * (3 - 2 * prs_g); spl0 *= prs_w; spl1 *= prs_w; );   // PRESET parameter duck: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+
+@gfx 900 340
+ui_begin(900, 340);
+mg_u = slider1 > 0.5;
+
+// ---------- drawing helpers (design coordinates) ----------
+function mg_R(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function mg_RR(x, y, w, h, r) ( rd_rr(x * sc, y * sc, w * sc, h * sc, r * sc); );
+function mg_font(sz) ( gfx_setfont(11, mg_fnt ? "Arial" : "Trebuchet MS", sz * sc, 'b'); );
+function mg_tc(cx, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = cx * sc - w * 0.5; gfx_y = y * sc; gfx_drawstr(s); );
+function mg_tl(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+// engraved / printed legend, centred: a soft shadow, then the ink
+function mg_lbl(cx, y, s, sz) (
+  mg_font(sz);
+  mg_shd ? ( ui_cola(mg_sh, 0.55); mg_tc(cx + 0.8, y + 0.9, s); );
+  ui_col(mg_ink); mg_tc(cx, y, s);
+);
+function mg_lbll(x, y, s, sz) (
+  mg_font(sz);
+  mg_shd ? ( ui_cola(mg_sh, 0.55); mg_tl(x + 0.8, y + 0.9, s); );
+  ui_col(mg_ink); mg_tl(x, y, s);
+);
+// the value pill under a touched knob
+function mg_val(cx, y, s) local(w, h) (
+  mg_font(13); gfx_measurestr(s, w, h);
+  ui_cola(0x000000, 0.72); rd_rr(cx * sc - w * 0.5 - 6 * sc, y * sc, w + 12 * sc, h + 2 * sc, 4 * sc);
+  ui_col(mg_vcol); gfx_x = cx * sc - w * 0.5; gfx_y = y * sc + 1 * sc; gfx_drawstr(s);
+);
+
+// ---------- MODERN: the house white cap - a thin smooth track, an anti-aliased value arc in the accent colour, a flat
+// satin cap with one soft highlight on its upper-left edge, a thin dark rim, a dark pointer (pixel coordinates);
+// yel = the yellow-capped (HPF) version of the same knob ----------
+function mg_arcw(cx, cy, r, a1, a2, w) local(k) (
+  ui_ssarc(cx, cy, r, a1, a2, w);   // (supersampled: an even ring)
+);
+function mg_wcap(cx, cy, r, n, yel) local(rr, a, a0, ca, sa, w, i) (
+  rr = r + 6 * sc; w = 3 * sc; a0 = -0.75 * $pi; a = a0 + n * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+  ui_col(ui_mix(FV, 0x000000, 0.35)); mg_arcw(cx, cy, rr, a0, 0.75 * $pi, 1.3 * sc);
+  n > 0.004 ? (
+    ui_col(mg_acc); mg_arcw(cx, cy, rr, a0, a, w);
+    gfx_circle(cx + sin(a0) * rr, cy - cos(a0) * rr, w * 0.5, 1, 1); gfx_circle(cx + ca * rr, cy + sa * rr, w * 0.5, 1, 1);
+  );
+  ui_cola(0x000000, 0.25); gfx_circle(cx + 1 * sc, cy + 2 * sc, r, 1, 1);
+  ui_col(yel ? 0x6E5408 : 0x50565E); gfx_circle(cx, cy, r, 1, 1);
+  ui_col(yel ? 0xF2C21B : 0xB3B9C0); gfx_circle(cx, cy, r - 1.5 * sc, 1, 1);
+  ui_col(yel ? 0xFADF7A : 0xD9DDE1); mg_arcw(cx, cy, r - 3 * sc, -0.66 * $pi, 0.06 * $pi, 1.4 * sc);
+  ui_col(0x1A1E24); i = -1;
+  ui_ssline(cx + ca * r * 0.3, cy + sa * r * 0.3, cx + ca * (r - 3 * sc), cy + sa * (r - 3 * sc), 2.4 * sc, 1);
+);
+
+// ---------- knob: drag (Shift = fine), wheel, double-click = default; ns > 0 = stepped (ns positions) ----------
+// sty: a pk_bkcap style (0 black, 1 machined aluminium, 2 chicken-head), or 20 = small filter-style cap (cap colour)
+function mg_knob(cx, cy, r, idx, lo, hi, def, lg, ns, sty, cap) local(v, n, dx, dy, hov, did, k) (
+  did = 1600 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 6) * sc);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - mg_lt < 0.35 && mg_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; mg_lt = 0; ) : (
+      drag_id = did; mg_y = mouse_y; mg_lt = time_precise(); mg_lid = idx;
+      mg_n = lg ? log(v / lo) / log(hi / lo) : (v - lo) / (hi - lo);
+    );
+  );
+  drag_id == did ? (
+    mg_n = min(max(mg_n + (mg_y - mouse_y) / (((mouse_cap & 8) ? 1200 : (ns > 0 ? 160 : 220)) * sc), 0), 1); mg_y = mouse_y;
+    v = lg ? lo * (hi / lo) ^ mg_n : lo + mg_n * (hi - lo);
+    ns > 0 ? ( k = floor(mg_n * (ns - 1) + 0.5); v = lo + k * (hi - lo) / (ns - 1); );
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    n = lg ? log(v / lo) / log(hi / lo) : (v - lo) / (hi - lo);
+    ns > 0 ? ( k = min(max(floor(n * (ns - 1) + 0.5) + sign(mouse_wheel), 0), ns - 1); v = lo + k * (hi - lo) / (ns - 1); ) : (
+      n = min(max(n + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.025), 0), 1);
+      v = lg ? lo * (hi / lo) ^ n : lo + n * (hi - lo);
+    );
+    slider(idx) = v; ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(lg ? log(v / lo) / log(hi / lo) : (v - lo) / (hi - lo), 0), 1);
+  mg_u && !(sty == 20 && cap == 0x9DA2A8) ? mg_wcap(cx * sc, cy * sc, r * sc, n, cap == 0xF2C21B) :
+  sty == 20 ? dy_fcap(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi, cap) : (
+    pk_kstyle = sty; pk_kcol = cap; pk_ptr = sty == 1 ? -1 : 0xF2EEE4; pk_ink = 0xF2EEE4;
+    sty == 1 ? pk_ptr = 0x141416;
+    pk_bkcap(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi);
+    pk_ptr = -1;
+  );
+  mg_act = hov || drag_id == did;
+  mg_act ? ( ui_cola(0xFFFFFF, 0.07); gfx_circle(cx * sc, cy * sc, (r + 3) * sc, 1, 1); );
+  n;
+);
+// printed scale: nt ticks over the travel; every mj-th one longer (MODERN: the knob's own ring takes their place)
+function mg_ticks(cx, cy, r, nt, mj) local(i, a, l) (
+  !mg_u ? (
+  ui_col(mg_ink);
+  i = 0; loop(nt,
+    a = -0.75 * $pi + i / (nt - 1) * 1.5 * $pi; l = i % mj ? 5 : 9;
+    gfx_line((cx + sin(a) * (r + 4)) * sc, (cy - cos(a) * (r + 4)) * sc, (cx + sin(a) * (r + 4 + l)) * sc, (cy - cos(a) * (r + 4 + l)) * sc, 1);
+    l == 9 ? gfx_line((cx + sin(a) * (r + 4)) * sc + 0.7, (cy - cos(a) * (r + 4)) * sc, (cx + sin(a) * (r + 4 + l)) * sc + 0.7, (cy - cos(a) * (r + 4 + l)) * sc, 1);
+    i += 1; );
+  );
+);
+// a number printed round a knob at position n (0..1)
+function mg_num(cx, cy, r, n, s, sz) local(a, w, h) (
+  a = -0.75 * $pi + n * 1.5 * $pi; mg_font(sz); gfx_measurestr(s, w, h);
+  mg_shd ? ( ui_cola(mg_sh, 0.5); gfx_x = (cx + sin(a) * r) * sc - w * 0.5 + 0.8; gfx_y = (cy - cos(a) * r) * sc - h * 0.5 + 0.9; gfx_drawstr(s); );
+  ui_col(mg_ink); gfx_x = (cx + sin(a) * r) * sc - w * 0.5; gfx_y = (cy - cos(a) * r) * sc - h * 0.5; gfx_drawstr(s);
+);
+
+// ---------- the needle meter ----------
+// v = reading in VU dB (GR mode: minus the gain reduction). sty 0 = valve-era (ivory face, black bezel),
+// 1 = modern warm-lit (amber backlight, machined bezel)
+mg_am = 0.52;                                                    // the scale's half-span (radians)
+function mg_ang(d) local(v) ( v = 10 ^ (min(max(d, -40), 4) / 20); mg_am * (2 * (v - 0.1) / (1.4125 - 0.1) - 1); );
+function mg_meter(x, y, w, h, v, sty, cap) instance(pos, vel, lt) local(dt, tgt, fx, fy, fw, fh, cx, py, ra, i, d, a, ink, red, s, gl, r0, sy) (
+  dt = min(max(time_precise() - lt, 0.001), 0.05); lt = time_precise();
+  tgt = mg_ang(v);
+  slider23 > 0.5 ? ( pos = tgt; vel = 0; ) : (                   // OUT: the audio thread already has VU ballistics
+    vel += (185 * (tgt - pos) - 22 * vel) * dt; pos += vel * dt; );
+  pos = min(max(pos, -mg_am - 0.06), mg_am + 0.06);
+  // bezel
+  ui_spill(x * sc, y * sc, w * sc, h * sc, 1);                               // backlit (gfx-ui ui_glow)
+  ui_cola(0x000000, 0.45); mg_RR(x + 2, y + 3, w, h, 7);
+  sty == 0 ? ( ui_col(0x16161A); mg_RR(x, y, w, h, 7); ui_col(0x2C2C32); mg_RR(x + 2, y + 2, w - 4, h - 4, 6); )
+           : ( ui_col(0xA4AAB2); mg_RR(x, y, w, h, 5); ui_col(0x6E747C); mg_RR(x + 1.5, y + 1.5, w - 3, h - 3, 4); ui_col(0x2E3238); mg_RR(x + 4, y + 4, w - 8, h - 8, 3); );
+  fx = x + 7; fy = y + 7; fw = w - 14; fh = h - 14;
+  ui_glow(fx * sc, fy * sc, fw * sc, fh * sc, 1);
+  sty == 0 ? ( ink = 0x23201A; red = 0xB02A1E; ) : ( ink = 0x2A1A0C; red = 0xC0301A; );
+  cx = fx + fw * 0.5; py = fy + fh + 22; ra = py - (fy + 36);
+  // scale: arc, red zone, ticks, numbers
+  ui_col(ink); gfx_arc(cx * sc, py * sc, ra * sc, mg_ang(-20), mg_ang(0), 1); gfx_arc(cx * sc, py * sc, ra * sc + 1, mg_ang(-20), mg_ang(0), 1);
+  ui_col(red); i = 0; ui_ssarc(cx * sc, py * sc, ra * sc + (0 + (floor(5) - 1) * 0.5), mg_ang(0), mg_ang(3), ((floor(5) - 1) * 1 + 1));
+  gfx_setfont(12, "Arial", 11 * sc, 'b');
+  i = 0;
+  loop(11,
+    d = i == 0 ? -20 : i == 1 ? -10 : i == 2 ? -7 : i == 3 ? -5 : i == 4 ? -3 : i == 5 ? -2 : i == 6 ? -1 : i == 7 ? 0 : i == 8 ? 1 : i == 9 ? 2 : 3;
+    a = mg_ang(d); ui_col(d > 0 ? red : ink);
+    gfx_line((cx + sin(a) * ra) * sc, (py - cos(a) * ra) * sc, (cx + sin(a) * (ra + 8)) * sc, (py - cos(a) * (ra + 8)) * sc, 1);
+    gfx_line((cx + sin(a) * ra) * sc + 0.8, (py - cos(a) * ra) * sc, (cx + sin(a) * (ra + 8)) * sc + 0.8, (py - cos(a) * (ra + 8)) * sc, 1);
+    i != 5 && i != 6 && i != 8 ? (
+      sprintf(#mg_s, "%d", abs(d)); gfx_measurestr(#mg_s, s, gl);
+      gfx_x = (cx + sin(a) * (ra + 17)) * sc - s * 0.5; gfx_y = (py - cos(a) * (ra + 17)) * sc - gl * 0.55; gfx_drawstr(#mg_s);
+    );
+    i += 1;
+  );
+  i = 0; loop(9, a = mg_ang(-20) + (mg_ang(-10) - mg_ang(-20)) * i / 8; ui_col(ink);
+    gfx_line((cx + sin(a) * ra) * sc, (py - cos(a) * ra) * sc, (cx + sin(a) * (ra + 4)) * sc, (py - cos(a) * (ra + 4)) * sc, 1); i += 1; );
+  gfx_setfont(12, "Arial", 13 * sc, 'b'); ui_col(ink);
+  s = slider23 > 0.5 ? "VU" : "GR  dB"; gfx_measurestr(s, d, gl); gfx_x = cx * sc - d * 0.5; gfx_y = (fy + fh * 0.52) * sc; gfx_drawstr(s);
+  // needle (from under the shield) with its shadow
+  sy = fy + fh - 17; r0 = (py - sy) / cos(pos);
+  ui_cola(0x000000, 0.22);
+  gfx_line((cx + sin(pos) * r0 + 2) * sc, (py - cos(pos) * r0 + 2) * sc, (cx + sin(pos) * (ra + 6) + 2) * sc, (py - cos(pos) * (ra + 6) + 2) * sc, 1);
+  ui_col(sty == 0 ? 0x111111 : 0x1A0E08);
+  gfx_line((cx + sin(pos) * r0) * sc, (py - cos(pos) * r0) * sc, (cx + sin(pos) * (ra + 6)) * sc, (py - cos(pos) * (ra + 6)) * sc, 1);
+  gfx_line((cx + sin(pos) * r0) * sc + 0.8, (py - cos(pos) * r0) * sc, (cx + sin(pos) * (ra + 6)) * sc + 0.8, (py - cos(pos) * (ra + 6)) * sc, 1);
+  // the shield over the movement, with the meter's caption
+  ui_col(sty == 0 ? 0x1C1C20 : 0x2A2E34); mg_R(fx, sy, fw, fh - (sy - fy));
+  ui_cola(0xFFFFFF, 0.12); mg_R(fx, sy, fw, 1);
+  gfx_setfont(12, "Arial", 10 * sc, 'b'); ui_col(sty == 0 ? 0xE6DCC0 : 0xFFC878);
+  gfx_measurestr(cap, d, gl); gfx_x = cx * sc - d * 0.5; gfx_y = (sy + 3) * sc; gfx_drawstr(cap);
+  // glass
+  ui_cola(0xFFFFFF, 0.09); gfx_triangle(fx * sc, fy * sc, (fx + fw * 0.62) * sc, fy * sc, fx * sc, (fy + fh * 0.55) * sc);
+);
+
+// ---------- a panel key: the house lamp key (gfx-ui), legend on the cap (sz: kept for the call sites) ----------
+sc != mg_lsc ? ( mg_lsc = sc; gfx_setfont(15, "Trebuchet MS", 12.5 * sc, 'b'); gfx_setfont(16, "Trebuchet MS", 10.5 * sc, 'b'); );   // lamp key legends
+function mg_key(x, y, w, h, on, col, s, sz) (
+  lk_well = mg_kbg; lk_font = 15; lk_font2 = 16;
+  lk_fit(x, y, w, h, on, col, s);
+);
+
+// ---------- a pair of lit keys for a two-way setting: left = 0, right = 1 ----------
+function mg_tog(cx, y, idx, a, b, title, col) local(v) (
+  v = slider(idx) > 0.5;
+  strlen(title) ? mg_lbl(cx, y - 20, title, 13);
+  mg_key(cx - 60, y, 56, 26, !v, col, a, 12) ? ( slider(idx) = 0; ui_auto(idx); );
+  mg_key(cx + 4, y, 56, 26, v, col, b, 12) ? ( slider(idx) = 1; ui_auto(idx); );
+);
+// ---------- presets, unit switch, size (the header both faceplates share) ----------
+function mg_header(face, ink, sub) (
+  ui_col(ink); gfx_circle(30 * sc, 30 * sc, 15 * sc, 1, 1);
+  gfx_setfont(4); ui_col(face); ui_text(30 * sc, 25 * sc, "GFX");
+  mg_font(28); mg_shd ? ( ui_cola(mg_sh, 0.55); mg_tl(55.8, 8.9, "MUTO"); ); ui_col(ink); mg_tl(55, 8, "MUTO");
+  mg_lbll(56, 40, sub, 12);
+  mg_key(250, 14, 84, 32, mg_u == 0, LK_YEL, "VINTAGE", 13) ? ( slider1 = 0; ui_auto(1); );
+  mg_key(340, 14, 84, 32, mg_u == 1, LK_YEL, "MODERN", 13) ? ( slider1 = 1; ui_auto(1); );
+  prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+  mg_k = pk_preset(440 * sc, 13 * sc, 384 * sc, 34 * sc, pr_cur,
+    "Init|Vintage Vocal|Vintage Drums Hold|Vintage Bass|Room Hold Crush|Piano Leveller|Modern Mix Bus|Modern Drum Bus Snap|Modern M-S Glue|Modern Vocal|Modern Mastering Touch|Modern Parallel Weight");
+  mg_k > 0 ? ( prs_dirty = mg_k; pr_cur = mg_k; );
+  ui_size_picker(834 * sc, 21 * sc);
+);
+
+
+// a section plate: a groove (edge colour), a light lip below, the plate
+function mg_plate(x, y, w, h, c, edge, ea, la) ( ui_cola(edge, ea); mg_RR(x - 1, y - 1, w + 2, h + 2, 6); ui_cola(0xFFFFFF, la); mg_RR(x, y, w + 1, h + 1, 6); ui_col(c); mg_RR(x, y, w, h, 6); );
+// value strings
+function mg_db(v) ( sprintf(#mg_v, "%+.1f dB", v); #mg_v; );
+function mg_pc(v) ( sprintf(#mg_v, "%.0f%%", v); #mg_v; );
+
+ui_col(0x0A0A0B); gfx_rect(0, 0, gfx_w, gfx_h);
+mg_vcol = 0xFFD27A;
+
+mg_u == 0 ? (
+  // =====================================================================
+  // MU-1 VINTAGE: 1960s British studio broadcast enamel - blue-grey, engraved white legends, black knobs
+  // =====================================================================
+  FV = 0x7D8D96; mg_ink = 0xF4F3EC; mg_sh = 0x2A343A; mg_shd = 1; mg_fnt = 1; mg_acc = 0xF0B040; mg_kbg = 0x2A3034; mg_kink = 0xE8E6E0;
+  ui_col(ui_mix(FV, 0x000000, 0.5)); mg_RR(3, 3, 894, 334, 8);
+  ui_col(FV); mg_RR(4, 4, 892, 332, 7);
+  gfx_gradrect(4 * sc, 4 * sc, 892 * sc, 120 * sc, 1, 1, 1, 0.07, 0, 0, 0, 0, 0, 0, 0, -0.07 / (120 * sc));
+  // enamel orange-peel: a faint fixed speckle
+  mg_i = 0; loop(700, ui_cola(rd_hash(mg_i * 3.1) > 0.5 ? 0xFFFFFF : 0x000000, 0.035);
+    gfx_circle((8 + 884 * rd_hash(mg_i * 1.7 + 0.3)) * sc, (8 + 324 * rd_hash(mg_i * 2.3 + 0.7)) * sc, (0.8 + 1.6 * rd_hash(mg_i + 0.11)) * sc, 1, 1); mg_i += 1; );
+  rd_screw(14, 14); rd_screw(886, 14); rd_screw(14, 326); rd_screw(886, 326);
+  mg_header(FV, mg_ink, "MU-1   VARIABLE-MU LIMITER");
+  ui_cola(mg_sh, 0.5); mg_R(16, 58, 868, 1); ui_cola(0xFFFFFF, 0.25); mg_R(16, 59, 868, 1);
+
+  // sections: lighter plates for the main controls, a darker strip for the switches
+  mg_plate(16, 66, 274, 162, ui_mix(FV, 0xFFFFFF, 0.06), mg_sh, 0.35, 0.18); mg_plate(610, 66, 274, 162, ui_mix(FV, 0xFFFFFF, 0.06), mg_sh, 0.35, 0.18);
+  mg_plate(16, 236, 274, 92, ui_mix(FV, 0x000000, 0.06), mg_sh, 0.35, 0.18); mg_plate(610, 236, 274, 92, ui_mix(FV, 0x000000, 0.06), mg_sh, 0.35, 0.18);
+  // the meter bay: a recessed, slightly darker panel
+  FM = ui_mix(FV, 0x1A2228, 0.22);
+  pk_inset(300 * sc, 72 * sc, 300 * sc, 252 * sc, FM);
+  mg_s = slider23 > 0.5 || slider7 > 0.5 ? "LEFT" : "LINKED"; mg_t = slider23 > 0.5 || slider7 > 0.5 ? "RIGHT" : "LINKED";
+  mgA.mg_meter(305, 77, 144, 130, slider23 > 0.5 ? mu_vuA : -mu_grA, 0, mg_s);
+  mgB.mg_meter(451, 77, 144, 130, slider23 > 0.5 ? mu_vuB : -mu_grB, 0, mg_t);
+
+  // INPUT (stepped) and THRESHOLD
+  mg_ticks(86, 148, 36, 17, 4);
+  mg_num(86, 148, 58, 0, "-8", 12); mg_num(86, 148, 58, 0.25, "0", 12); mg_num(86, 148, 58, 0.5, "+8", 12); mg_num(86, 148, 58, 1, "+24", 12);
+  mg_knob(86, 148, 36, 2, -8, 24, 0, 0, 17, 2, 0);
+  mg_lbl(86, 202, "INPUT", 15); mg_act ? mg_val(86, 222, mg_db(slider2));
+  mg_ticks(206, 148, 36, 11, 2);
+  mg_num(206, 148, 58, 0, "40", 12); mg_num(206, 148, 58, 0.25, "30", 12); mg_num(206, 148, 58, 0.5, "20", 12);
+  mg_num(206, 148, 58, 0.75, "10", 12); mg_num(206, 148, 58, 1, "0", 12);
+  mg_knob(206, 148, 36, 3, -40, 0, -10, 0, 0, 0, 0);
+  mg_lbl(206, 202, "THRESHOLD", 15); mg_act ? mg_val(206, 222, mg_db(slider3));
+
+  // RECOVERY (1 - 6) and OUTPUT
+  mg_ticks(714, 148, 36, 6, 1);
+  mg_i = 0; loop(6, sprintf(#mg_s, "%d", mg_i + 1); mg_num(714, 148, 58, mg_i / 5, #mg_s, 14); mg_i += 1; );
+  mg_knob(714, 148, 36, 4, 0, 5, 2, 0, 6, 2, 0);
+  mg_lbl(714, 202, "RECOVERY", 15);
+  mg_act ? mg_val(714, 222, slider5 > 0.5 ? "HOLD" : slider4 < 0.5 ? "80 ms" : slider4 < 1.5 ? "200 ms" : slider4 < 2.5 ? "450 ms" :
+                    slider4 < 3.5 ? "1 s" : slider4 < 4.5 ? "150 ms / 2.5 s" : "300 ms / 6 s");
+  mg_ticks(834, 148, 36, 11, 5);
+  mg_num(834, 148, 58, 0, "-20", 12); mg_num(834, 148, 58, 0.5, "0", 12); mg_num(834, 148, 58, 1, "+20", 12);
+  mg_knob(834, 148, 36, 6, -20, 20, 0, 0, 0, 0, 0);
+  mg_lbl(834, 202, "OUTPUT", 15); mg_act ? mg_val(834, 222, mg_db(slider6));
+
+  // lower row: STEREO, METER | MIX, DRIFT | HOLD, pilot
+  mg_tog(82, 274, 7, "LINK", "DUAL", "STEREO", LK_RED);
+  mg_tog(220, 274, 23, "GR", "OUT", "METER", LK_WHT);
+  mg_ticks(405, 270, 22, 11, 5);
+  mg_knob(405, 270, 22, 8, 0, 100, 100, 0, 0, 0, 0);
+  mg_lbl(405, 304, "MIX", 14); mg_act ? mg_val(405, 214, mg_pc(slider8));
+  mg_knob(495, 270, 15, 21, 0, 100, 50, 0, 0, 20, 0x9DA2A8);
+  mg_lbl(495, 304, "DRIFT", 14); mg_act ? mg_val(495, 214, mg_pc(slider21));
+  mg_tog(714, 274, 5, "NORMAL", "HOLD", "RECOVERY MODE", LK_BLU);
+  mg_lbl(834, 248, "POWER", 11);
+  rd_lamp(834, 286, 13, 0.85 + 0.1 * sin(time_precise() * 0.7), 0xFF6A1A);
+) : (
+  // =====================================================================
+  // MU-2 MODERN: deep anodised faceplate, machined aluminium knobs, precise legends, warm-lit meters
+  // =====================================================================
+  FV = 0x1E2A31; mg_ink = 0xDDE3E6; mg_sh = 0x000000; mg_shd = 0; mg_fnt = 1; mg_acc = 0xFFB040; mg_kbg = 0x101416; mg_kink = 0xCBD2D6;
+  ui_col(0x0C1114); mg_RR(3, 3, 894, 334, 6);
+  ui_col(FV); mg_RR(4, 4, 892, 332, 5);
+  gfx_gradrect(4 * sc, 4 * sc, 892 * sc, 332 * sc, 1, 1, 1, 0.05, 0, 0, 0, 0, 0, 0, 0, -0.05 / (332 * sc));
+  mg_i = 0; loop(166, ui_cola(0xFFFFFF, mg_i % 2 ? 0.012 : 0.022); mg_R(8, 6 + mg_i * 2, 884, 0.5); mg_i += 1; );   // fine anodised grain
+  rd_screw(14, 14); rd_screw(886, 14); rd_screw(14, 326); rd_screw(886, 326);
+  mg_header(FV, mg_ink, "MU-2   STEREO VARI-MU");
+  ui_col(0xFFB040); mg_R(16, 58, 868, 2);
+
+  mg_plate(16, 66, 274, 162, 0x22303A, 0x0A1013, 1, 0.08); mg_plate(610, 66, 274, 162, 0x22303A, 0x0A1013, 1, 0.08);
+  mg_plate(16, 236, 274, 92, 0x1A252B, 0x0A1013, 1, 0.08); mg_plate(610, 236, 274, 92, 0x1A252B, 0x0A1013, 1, 0.08);
+  FM = 0x172126;
+  pk_inset(300 * sc, 72 * sc, 300 * sc, 252 * sc, FM);
+  mg_ms = slider16 > 1.5; mg_lkd = slider16 < 0.5 && slider17 >= 99.5;
+  mg_s = mg_ms ? "MID" : mg_lkd ? "LINKED" : "LEFT";
+  mg_t = mg_ms ? "SIDE" : mg_lkd ? "LINKED" : "RIGHT";
+  slider23 > 0.5 ? ( mg_s = "LEFT"; mg_t = "RIGHT"; );
+  mgA.mg_meter(305, 77, 144, 130, slider23 > 0.5 ? mu_vuA : -mu_grA, 1, mg_s);
+  mgB.mg_meter(451, 77, 144, 130, slider23 > 0.5 ? mu_vuB : -mu_grB, 1, mg_t);
+
+  // INPUT, THRESHOLD | ATTACK, RELEASE
+  mg_ticks(86, 148, 34, 13, 3);
+  mg_num(86, 148, 56, 0, "-12", 12); mg_num(86, 148, 56, 1 / 3, "0", 12); mg_num(86, 148, 56, 2 / 3, "+12", 12); mg_num(86, 148, 56, 1, "+24", 12);
+  mg_knob(86, 148, 34, 9, -12, 24, 0, 0, 0, 1, 0);
+  mg_lbl(86, 202, "INPUT", 15); mg_act ? mg_val(86, 222, mg_db(slider9));
+  mg_ticks(206, 148, 36, 9, 2);
+  mg_num(206, 148, 58, 0, "-40", 12); mg_num(206, 148, 58, 0.25, "-30", 12); mg_num(206, 148, 58, 0.5, "-20", 12);
+  mg_num(206, 148, 58, 0.75, "-10", 12); mg_num(206, 148, 58, 1, "0", 12);
+  mg_knob(206, 148, 36, 10, -40, 0, -12, 0, 0, 1, 0);
+  mg_lbl(206, 202, "THRESHOLD", 15); mg_act ? mg_val(206, 222, mg_db(slider10));
+  mg_ticks(714, 148, 34, 11, 5);
+  mg_num(714, 148, 56, 0, "0.1", 12); mg_num(714, 148, 56, 0.404, "1", 12); mg_num(714, 148, 56, 0.807, "10", 12); mg_num(714, 148, 56, 1, "30", 12);
+  mg_knob(714, 148, 34, 11, 0.1, 30, 10, 1, 0, 1, 0);
+  mg_lbl(714, 202, "ATTACK", 15); slider11 < 1 ? sprintf(#mg_v, "%.2f ms", slider11) : sprintf(#mg_v, "%.1f ms", slider11);
+  mg_act ? mg_val(714, 222, #mg_v);
+  mg_ticks(834, 148, 34, 11, 5);
+  mg_num(834, 148, 56, 0, ".05", 12); mg_num(834, 148, 56, 0.339, ".2", 12); mg_num(834, 148, 46, 0.732, "1", 12); mg_num(834, 148, 56, 1, "3 s", 12);
+  mg_knob(834, 148, 34, 12, 50, 3000, 300, 1, 0, 1, 0);
+  mg_lbl(834, 202, "RELEASE", 15); slider12 >= 1000 ? sprintf(#mg_v, "%.2f s", slider12 / 1000) : sprintf(#mg_v, "%.0f ms", slider12);
+  mg_act ? mg_val(834, 222, slider13 > 0.5 ? "AUTO" : #mg_v);
+
+  // lower row: SC HPF x2, MODE | LINK, IRON, MIX, METER | AUTO, DRIFT, OUTPUT
+  mg_i = 0; loop(2,
+    mg_x = 44 + mg_i * 72; mg_ix = 14 + mg_i;
+    mg_ticks(mg_x, 274, 17, 5, 1);
+    mg_knob(mg_x, 274, 17, mg_ix, 0, 4, 0, 0, 5, 20, 0xF2C21B);
+    mg_lbl(mg_x, 296, mg_ms ? (mg_i ? "HPF S" : "HPF M") : (mg_i ? "HPF R" : "HPF L"), 13);
+    mg_hv = slider(mg_ix); mg_act ? mg_val(mg_x, 214, mg_hv < 0.5 ? "OFF" : mg_hv < 1.5 ? "60 Hz" : mg_hv < 2.5 ? "90 Hz" : mg_hv < 3.5 ? "150 Hz" : "250 Hz");
+    mg_i += 1; );
+  mg_lbl(80, 314, "SIDE-CHAIN", 11);
+  mg_key(180, 242, 92, 22, slider16 == 0, LK_RED, "STEREO", 12) ? ( slider16 = 0; ui_auto(16); );
+  mg_key(180, 266, 92, 22, slider16 == 1, LK_RED, "DUAL MONO", 12) ? ( slider16 = 1; ui_auto(16); );
+  mg_key(180, 290, 92, 22, slider16 == 2, LK_RED, "M-S", 12) ? ( slider16 = 2; ui_auto(16); );
+  mg_lbl(226, 314, "MODE", 11);
+  mg_ticks(370, 266, 20, 11, 5);
+  mg_knob(370, 266, 20, 17, 0, 100, 100, 0, 0, 1, 0);
+  mg_lbl(370, 298, "LINK", 13); mg_act ? mg_val(370, 214, slider16 == 1 ? "DUAL MONO" : mg_pc(slider17));
+  mg_ticks(450, 266, 20, 11, 5);
+  mg_knob(450, 266, 20, 18, 0, 100, 30, 0, 0, 1, 0);
+  mg_lbl(450, 298, "IRON", 13); mg_act ? mg_val(450, 214, mg_pc(slider18));
+  mg_ticks(530, 266, 20, 11, 5);
+  mg_knob(530, 266, 20, 19, 0, 100, 100, 0, 0, 1, 0);
+  mg_lbl(530, 298, "MIX", 13); mg_act ? mg_val(530, 214, mg_pc(slider19));
+  mg_key(628, 244, 64, 24, slider13 > 0.5, LK_YEL, "AUTO", 12) ? ( slider13 = slider13 > 0.5 ? 0 : 1; ui_auto(13); );
+  mg_lbl(660, 270, "RELEASE", 11);
+  mg_key(628, 288, 64, 24, slider23 > 0.5, LK_WHT, slider23 > 0.5 ? "OUT" : "GR", 12) ? ( slider23 = slider23 > 0.5 ? 0 : 1; ui_auto(23); );
+  mg_lbl(660, 314, "METER", 11);
+  mg_knob(742, 276, 15, 21, 0, 100, 50, 0, 0, 20, 0x9DA2A8);
+  mg_lbl(742, 300, "DRIFT", 13); mg_act ? mg_val(742, 214, mg_pc(slider21));
+  mg_ticks(834, 274, 24, 11, 5);
+  mg_knob(834, 274, 24, 20, -20, 20, 0, 0, 0, 1, 0);
+  mg_lbl(834, 306, "OUTPUT", 13); mg_act ? mg_val(834, 214, mg_db(slider20));
+);
+
+pk_end();
+ui_end();
