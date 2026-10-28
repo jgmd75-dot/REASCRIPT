@@ -16,9 +16,11 @@ versions (Lab/versions.json).
    downloads exactly the files it was released with) and commits the index.
 Push afterwards: git push origin HEAD:main.
 
-ReaPack installs effects into <REAPER>/Effects/GFX/Stable/ (index name / category), so the plug-ins and the system
-files they import share one folder. The system files are their own package ("GFX system files"): ReaPack has no
-dependencies, so every user installs that package once (the description says so).
+ReaPack installs effects into <REAPER>/Effects/GFX/Stable/ (index name / category), each plug-in in its website
+category's folder and the system files in "System files - do not delete" (REAPER finds imports in any folder under
+Effects; JG tested that an old project still finds a plug-in moved into a subfolder, 28 Oct 2026). The folders come
+from the website checkout (--site PATH, default ../website). The system files are their own package ("GFX system
+files"): ReaPack has no dependencies, so every user installs that package once (the description says so).
 """
 import hashlib, json, os, re, shutil, subprocess, sys, datetime
 from xml.sax.saxutils import escape, quoteattr
@@ -42,6 +44,25 @@ def sha(path):
     return hashlib.sha256(open(path, 'rb').read()).hexdigest()
 
 
+def folders():
+    """file -> install subfolder: the same folders as the website's download ZIPs (JG, 28 Oct 2026: screen-reader users
+    browse by category). Read from the website checkout (--site PATH, default ../website next to this repo):
+    the Stable's categories from stable.js, the Lab's groups from lab/index.html."""
+    import importlib.util
+    site = sys.argv[sys.argv.index('--site') + 1] if '--site' in sys.argv else os.path.join(os.path.dirname(TOP), 'website')
+    def load(n):
+        spec = importlib.util.spec_from_file_location(n.replace('-', '_'), os.path.join(site, 'tools', n + '.py'))
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
+    if not os.path.isdir(os.path.join(site, 'tools')):
+        sys.exit(f'No website checkout at {site} (pass --site PATH): the install folders come from it.')
+    if LAB:
+        m = load('build-lab-zip')
+        return {f: g for g, items in m.groups() for _, _, f in items}, m.SYS_DIR, 'Other'
+    m = load('sync-plugins')
+    cats, plugs = m.site_data()
+    return {f + '.jsfx': cats[c] for f, (_, c) in plugs.items()}, m.SYS_DIR, m.LEGACY_DIR
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -52,6 +73,7 @@ def main():
 
     # ---------- 1. the packages, from the Stable checkout ----------
     pk = {}   # name -> dict(type, category, desc, files: [(src, dest, main)], about)
+    fold, sysdir, other = folders()
     incs = sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx-inc'))
     for f in sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx')):
         head = open(os.path.join(src, f), encoding='utf-8', errors='replace').read(4000)
@@ -65,11 +87,11 @@ def main():
         if req:
             about += f' Needs the {sysname} package ({req.rstrip()}).'
         pk[f] = dict(type='effect', category=CAT, desc=desc, about=about,
-                     files=[(f, f'Effects/{f}', False)])
+                     files=[(f, f'Effects/{fold.get(f, other)}/{f}', False)])
     pk[sysname] = dict(
         type='effect', category=CAT, desc=f'{sysname} (install this first: every GFX{" Lab" if LAB else ""} plug-in needs them)',
         about=f'The shared engine and panel files (.jsfx-inc) that every GFX{" Lab" if LAB else ""} plug-in imports. Install once.',
-        files=[(f, f'Effects/{f}', False) for f in incs])
+        files=[(f, f'Effects/{sysdir}/{f}', False) for f in incs])
     for f in ([] if LAB else sorted(t for t in tracked if t.endswith('.lua'))):
         base = os.path.basename(f)
         head = open(os.path.join(src, f), encoding='utf-8', errors='replace').read(3000)
@@ -95,7 +117,9 @@ def main():
     old = json.load(open(vpath)) if os.path.exists(vpath) else {}
     new, changed = {}, []
     for name, p in pk.items():
-        h = hashlib.sha256(''.join(sha(os.path.join(HERE, d)) for _, d, _ in p['files']).encode()).hexdigest()
+        # an effect's install path counts too: a plug-in moved to another folder is a new version (ReaPack moves it)
+        h = hashlib.sha256(''.join((d if p['type'] == 'effect' else '') + sha(os.path.join(HERE, d))
+                                   for _, d, _ in p['files']).encode()).hexdigest()
         o = old.get(name)
         if o and o['hash'] == h:
             new[name] = o
