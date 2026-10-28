@@ -338,6 +338,7 @@ pdc_delay = os_lat(os_f);                                                    // 
 // display hand-offs
 gr_disp = min(gr_disp, grmin);  grmin = 0;
 vul_disp = vu_n > 0 ? vul_acc / vu_n : 0;  vur_disp = vu_n > 0 ? vur_acc / vu_n : 0;  vul_acc = vur_acc = 0;  vu_n = 0;
+ipk_disp = max(ipk_disp, ipk);  opk_disp = max(opk_disp, opk);  ipk = opk = 0;
 ost_clipped ? ( clip_disp = 1;  ost_clipped = 0; );
 wu_disp = has_v ? wu : -1;
 // the track's other channels (3 and up, e.g. stems on a multichannel bus) pass through untouched but delayed by
@@ -352,6 +353,7 @@ file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;
 
 @sample
 by_in();
+ipk = max(ipk, max(abs(spl0), abs(spl1)));                                   // IN meter (peak)
 cr_n <= 0 ? (
   cr_n = CR;
   s_ig += (t_ig - s_ig) * sm_c;  s_thr += (t_thr - s_thr) * sm_c;
@@ -454,6 +456,7 @@ yl = ostL.ost_band(yl);  yr = ostR.ost_band(yr);
 ost_out(yl, yr);
 spl0 = ost_l;  spl1 = ost_r;
 by_out();
+opk = max(opk, max(abs(spl0), abs(spl1)));                                   // OUT meter (peak)
 // channels 3 and up: delayed by the latency (see @block)
 xch_n > 0 ? (
   xch_k = 0;
@@ -470,7 +473,7 @@ xch_n > 0 ? (
 //   unit 1 (0 - 322): header band 0 - 64; PREAMP STACK laid out at y 74 - 300, drawn 10 lower (INPUT GAIN + GUARD, four
 //   stage modules at x 170 / 350 / 530 / 710 in stack order, PREAMP / THICK / HEATERS). A black rack gap 322 - 330.
 //   unit 2 (330 - 682): band 330 - 374; COMPRESSOR 16 - 592 and OUTPUT 608 - 1064 (LEVEL with CLIP / DRIFT under it, then
-//   the VU with OUT / GR, centred), laid out at y 316 - 596 and drawn 74 lower.
+//   the IN / OUT LED ladders; the GAIN REDUCTION LED row under THRESHOLD - trial, JG 28 Oct), laid out at y 316 - 596 and drawn 74 lower.
 C_FACE = 0x2B2D2F;  C_HEAD = 0x1D1E20;  C_INK = 0xF1F0EB;  C_INK2 = 0xB9B8B2;  C_LINE = 0xC7BEB3;
 C_YEL = 0xF2C230;  C_LCDBG = 0x0B0D0E;  C_LCDTX = 0xF2C26A;  C_CREAM = 0xF1E6C4;
 C_ORG = 0xC4621C;  C_ORGL = 0xF2A25A;      // the warm orange accents (JG, 28 Oct 2026; ACC24 has green)
@@ -723,6 +726,29 @@ function ladder(x, y, v, slot) local(j, d, c, pk) (
   loop(16,
     d = -42 + j * 3;  c = d >= 0 ? 0xFF3A2A : d >= -6 ? 0xFFC81E : 0x3CE05A;
     led(x + j * 11, y, 8, 12, c, v >= d || (pk >= d && pk < d + 3));
+    j += 1;
+  );
+);
+
+// vertical LED ladder (the house LED ladder meter): 15 LEDs, -42 .. 0 dBFS in 3 dB steps, green / amber from -9 /
+// red at 0, a floating peak held 1.2 s then falling 0.6 dB a frame; slot = its hold (GUI memory); a click clears holds
+function vladder(x, y, w, h, v, slot) local(j, d, c, pk, sh, on) (
+  now_t = time_precise();
+  click && mouse_x >= px(x - 4) && mouse_x < px(x + w + 4) && mouse_y >= py(y) && mouse_y < py(y + h) ? lad_clr = now_t;
+  VUS[slot + 1] < lad_clr ? ( VUS[slot] = -100;  VUS[slot + 1] = lad_clr; );
+  v > VUS[slot] ? ( VUS[slot] = v;  VUS[slot + 1] = now_t; ) :
+    now_t - VUS[slot + 1] > 1.2 ? VUS[slot] = max(v, VUS[slot] - 0.6);
+  pk = VUS[slot];
+  col(0x000000, 1);  u_rect(x - 3, y - 3, w + 6, h + 6);
+  col(0x161617, 1);  u_rect(x - 1, y - 1, w + 2, h + 2);
+  sh = h / 15;
+  j = 0;
+  loop(15,
+    d = -42 + j * 3;  c = d >= 0 ? 0xFF3A2A : d >= -9 ? 0xFFC81E : 0x3CE05A;
+    on = v >= d || (pk >= d && pk < d + 3 && pk > -42);
+    on ? ( col(c, 0.3);  u_rect(x - 1, y + h - (j + 1) * sh - 1, w + 2, sh + 1); );
+    col(on ? c : shade(c, 0.2), 1);  u_rect(x, y + h - (j + 1) * sh + 1, w, sh - 1.5);
+    on ? ( col(0xFFFFFF, 0.25);  u_rect(x + 1, y + h - (j + 1) * sh + 1, w - 2, 1); );
     j += 1;
   );
 );
@@ -999,14 +1025,24 @@ kn(510, 410, 38, 14, 0, 100, 100, "MIX", 7);
 gfx_setfont(7);  col(C_INK2, 1);
 text_c(px(110), py(483), "dBu");  text_c(px(252), py(458), "ms");  text_c(px(376), py(458), "s");  text_c(px(376), py(578), "dB");
 text_c(px(510), py(483), "%");
+// GAIN REDUCTION under THRESHOLD: eight round LEDs, blue > green > yellow > orange > red (JG), VU-like ballistics
+g_gm = c_in >= 0.5 ? -gr_disp : 0;  gr_disp = 0;
+gr_s = g_gm > gr_s ? gr_s + (g_gm - gr_s) * 0.5 : gr_s + (g_gm - gr_s) * 0.12;
+g_j = 0;
+loop(8,
+  g_d = g_j == 0 ? 1 : g_j == 1 ? 2 : g_j == 2 ? 3 : g_j == 3 ? 4 : g_j == 4 ? 6 : g_j == 5 ? 8 : g_j == 6 ? 10 : 15;
+  g_c = g_j < 2 ? 0x3A9CFF : g_j < 4 ? 0x3CE05A : g_j == 4 ? 0xFFC81E : g_j == 5 ? 0xFF8A1E : 0xFF3A2A;
+  sprintf(#ml, "%d", g_d);
+  gfx_setfont(7);  col(C_INK, 1);  text_c(px(37 + g_j * 21), py(508), #ml);
+  lamp_k = 1.2;  lamp(37 + g_j * 21, 528, g_c, gr_s >= g_d - 0.01);
+  g_j += 1;
+);
+gfx_setfont(7);  col(C_INK2, 1);  text_c(px(110), py(552), "GAIN REDUCTION  dB");
 c_in < 0.5 ? ( col(C_FACE, 0.55);  u_rect(24, 328, 560, 260); );
 lk_key(475, 520, 70, 30, c_in >= 0.5, LK_AMB, "IN") ? ( slider(1) = c_in >= 0.5 ? 0 : 1;  param_touched(1); );
 
 // ---------- OUTPUT ----------
 box(608, 316, 456, 280, "OUTPUT", 0, 0);
-g_gr = gr_disp;  gr_disp = 0;
-g_l = vul_disp > 0 ? 10 * log10(vul_disp) + 18 : -60;
-g_r = vur_disp > 0 ? 10 * log10(vur_disp) + 18 : -60;
 // LEVEL (large) to the left of the VU, CLIP and DRIFT under LEVEL; OUT / GR under the VU
 klab_y = 467;
 smark(690, 410, 38, 0, "-18");  smark(690, 410, 38, 0.375, "-9");  smark(690, 410, 38, 0.75, "0");  smark(690, 410, 38, 1, "+6");
@@ -1018,9 +1054,14 @@ lamp(652, 532, 0xFF3A2A, time_precise() - clip_t < 0.4);
 gfx_setfont(7);  col(C_INK, 1);  text_c(px(652), py(555), "CLIP");
 // DRIFT: a two-position key - lit = 33 %, dark = 5 % (a whisper of it)
 sq_key(698, 521, drift >= 19, "DRIFT") ? ( slider(10) = drift >= 19 ? 5 : 33;  param_touched(10); );
-vu(800, 382, 240, 110, vu_mode >= 0.5 ? (c_in >= 0.5 ? g_gr : 0) : g_l, g_r, vu_mode >= 0.5, vu_mode >= 0.5 ? "GR" : "VU", 3);
-wk_key(800, 504, 116, 26, vu_mode < 0.5, "OUT") ? ( slider(11) = 0;  param_touched(11); );
-wk_key(924, 504, 116, 26, vu_mode >= 0.5, "GR") ? ( slider(11) = 1;  param_touched(11); );
+// IN / OUT: the house LED ladder pair (peak, dBFS), in one dark bezel
+g_il = ipk_disp > 0.00001 ? 20 * log10(ipk_disp) : -100;  g_ol = opk_disp > 0.00001 ? 20 * log10(opk_disp) : -100;
+ipk_disp = opk_disp = 0;
+col(0x2A2B2E, 1);  u_rect(856, 360, 120, 228);
+col(0x000000, 0.5);  u_rect(856, 360, 120, 2);  u_rect(856, 360, 2, 228);
+vladder(882, 374, 24, 180, g_il, 200);
+vladder(926, 374, 24, 180, g_ol, 202);
+gfx_setfont(7);  col(C_INK, 1);  text_c(px(894), py(572), "IN");  text_c(px(938), py(572), "OUT");
 
 oy = 0;
 
