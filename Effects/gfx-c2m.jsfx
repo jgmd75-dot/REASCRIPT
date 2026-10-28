@@ -63,6 +63,7 @@ slider23:link=1<0,1,1{Off,On}>-Link
 slider24:iron=1<0,1,1{Off,On}>-Iron
 slider25:drift=3<0,10,0.1>-Drift (bloom + iron)
 slider26:mix=100<0,100,1>-Mix (%)
+slider27:prs_sel=0<0,12,1{No preset,Init,Mix Bus Glue,Drum Bus Pump,Vocal Ride,Bass Even,Broadcast Voice,Piano Gentle,Acoustic Guitar,Room Squash,Programme Limiter,Slow Leveller,Clean (No Iron)}>-Preset
 
 @init
 ext_noinit = 1;
@@ -165,10 +166,58 @@ function update_params() (
   );
 );
 
+// (moved here from @gfx: the PRESET parameter loads presets on the audio side)
+function set_ch(o, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec) (
+  slider(1 + o) = cin;  slider(2 + o) = cthr;  slider(3 + o) = rat;  slider(4 + o) = rec;  slider(5 + o) = gain;
+  slider(6 + o) = fast;  slider(7 + o) = aut;  slider(8 + o) = lin;  slider(9 + o) = lthr;  slider(10 + o) = lrec;
+  slider(11 + o) = 1;
+);
+function set_pr(cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec, irn, dft) (
+  set_ch(0, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec);
+  set_ch(11, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec);
+  slider(23) = 1;  slider(24) = irn;  slider(25) = dft;  slider(26) = 100;
+);
+function load_preset(p) (
+  //                   COMP THR   RATIO REC   GAIN FAST AUTO LIM  LTHR LREC IRON DRIFT
+  p == 1  ? set_pr(1,   0,   3,   0.4,  2,   0,   0,   1,  12,  0,   1,   3) :   // Init
+  p == 2  ? set_pr(1,   2,   1.5, 0.4,  1.5, 0,   1,   1,  14,  2,   1,   3) :   // Mix Bus Glue
+  p == 3  ? set_pr(1,  -6,   4,   0.2,  6,   1,   0,   1,  10,  0,   1,   4) :   // Drum Bus Pump
+  p == 4  ? set_pr(1,  -4,   3,   0.6,  5,   0,   1,   1,  10,  2,   1,   3) :   // Vocal Ride
+  p == 5  ? set_pr(1,  -6,   4,   0.3,  6,   1,   0,   1,   8,  0,   1,   3) :   // Bass Even
+  p == 6  ? set_pr(1, -10,   5,   1,    9,   1,   1,   1,   6,  2,   1,   2) :   // Broadcast Voice
+  p == 7  ? set_pr(1,  -2,   2,   1,    2,   0,   1,   1,  14,  1,   1,   2) :   // Piano Gentle
+  p == 8  ? set_pr(1,  -6,   2.5, 0.3,  4,   0,   0,   1,  12,  0,   1,   3) :   // Acoustic Guitar
+  p == 9  ? set_pr(1, -18,   5,   0.1, 16,   1,   0,   1,   4,  0,   1,   6) :   // Room Squash
+  p == 10 ? set_pr(0,   0,   3,   0.4,  0,   0,   0,   1,   4,  2,   1,   2) :   // Programme Limiter
+  p == 11 ? set_pr(1,  -8,   1.5, 4,    4,   0,   0,   1,  12,  1,   1,   3) :   // Slow Leveller
+  p == 12 ? set_pr(1,   0,   3,   0.4,  2,   0,   0,   1,  12,  0,   0,   0) :   // Clean (No Iron)
+            set_pr(1,   0,   3,   0.4,  2,   0,   0,   1,  12,  0,   1,   3);     // Reset all to defaults
+  slider_automate(67108863);
+  gui_dirty = 1;
+);
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
 @slider
+prs_chk();
 update_params();
 
 @block
+prs_chk();
 prm_dirty ? ( prm_dirty = 0;  update_params(); );
 // drift: bloom (VCA + recovery) and iron (each side's core)
 bdt = samplesblock / srate;
@@ -222,6 +271,7 @@ spl0 = ol;  spl1 = orr;
 
 @serialize
 file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
 
 @gfx 700 640
 // =====================================================================
@@ -560,34 +610,6 @@ function preset_bar(x, y, h, lw, cur, menu) local(n, sel, open, lx, tw, th, i) (
 );
 
 // ---------- presets (both modules set alike, LINK on; GUI thread only) ----------
-function set_ch(o, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec) (
-  slider(1 + o) = cin;  slider(2 + o) = cthr;  slider(3 + o) = rat;  slider(4 + o) = rec;  slider(5 + o) = gain;
-  slider(6 + o) = fast;  slider(7 + o) = aut;  slider(8 + o) = lin;  slider(9 + o) = lthr;  slider(10 + o) = lrec;
-  slider(11 + o) = 1;
-);
-function set_pr(cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec, irn, dft) (
-  set_ch(0, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec);
-  set_ch(11, cin, cthr, rat, rec, gain, fast, aut, lin, lthr, lrec);
-  slider(23) = 1;  slider(24) = irn;  slider(25) = dft;  slider(26) = 100;
-);
-function load_preset(p) (
-  //                   COMP THR   RATIO REC   GAIN FAST AUTO LIM  LTHR LREC IRON DRIFT
-  p == 1  ? set_pr(1,   0,   3,   0.4,  2,   0,   0,   1,  12,  0,   1,   3) :   // Init
-  p == 2  ? set_pr(1,   2,   1.5, 0.4,  1.5, 0,   1,   1,  14,  2,   1,   3) :   // Mix Bus Glue
-  p == 3  ? set_pr(1,  -6,   4,   0.2,  6,   1,   0,   1,  10,  0,   1,   4) :   // Drum Bus Pump
-  p == 4  ? set_pr(1,  -4,   3,   0.6,  5,   0,   1,   1,  10,  2,   1,   3) :   // Vocal Ride
-  p == 5  ? set_pr(1,  -6,   4,   0.3,  6,   1,   0,   1,   8,  0,   1,   3) :   // Bass Even
-  p == 6  ? set_pr(1, -10,   5,   1,    9,   1,   1,   1,   6,  2,   1,   2) :   // Broadcast Voice
-  p == 7  ? set_pr(1,  -2,   2,   1,    2,   0,   1,   1,  14,  1,   1,   2) :   // Piano Gentle
-  p == 8  ? set_pr(1,  -6,   2.5, 0.3,  4,   0,   0,   1,  12,  0,   1,   3) :   // Acoustic Guitar
-  p == 9  ? set_pr(1, -18,   5,   0.1, 16,   1,   0,   1,   4,  0,   1,   6) :   // Room Squash
-  p == 10 ? set_pr(0,   0,   3,   0.4,  0,   0,   0,   1,   4,  2,   1,   2) :   // Programme Limiter
-  p == 11 ? set_pr(1,  -8,   1.5, 4,    4,   0,   0,   1,  12,  1,   1,   3) :   // Slow Leveller
-  p == 12 ? set_pr(1,   0,   3,   0.4,  2,   0,   0,   1,  12,  0,   0,   0) :   // Clean (No Iron)
-            set_pr(1,   0,   3,   0.4,  2,   0,   0,   1,  12,  0,   1,   3);     // Reset all to defaults
-  slider_automate(67108863);
-  gui_dirty = 1;
-);
 PRESET_MENU = "Init|Mix Bus Glue|Drum Bus Pump|Vocal Ride|Bass Even|Broadcast Voice|Piano Gentle|Acoustic Guitar|Room Squash|Programme Limiter|Slow Leveller|Clean (No Iron)";
 PB_KEY = 0xD8D4C4;  PB_INK = 0x2A2E2B;
 
@@ -632,8 +654,9 @@ gfx_setfont(5);  col(0xC7BEB3, 1);  gfx_x = px(24);  gfx_y = py(36);  gfx_drawst
 gfx_setfont(4);  col(0xE8782A, 1);  gfx_x = px(660); gfx_y = py(18);  gfx_drawstr("GFX");
 
 // ---------- preset bar ----------
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
 pb_k = preset_bar(246, 11, 34, 200, pr_cur, PRESET_MENU);
-pb_k > 0 ? ( load_preset(pb_k);  pr_cur = pb_k > 12 ? 1 : pb_k; );
+pb_k > 0 ? ( prs_dirty = pb_k;  pr_cur = pb_k > 12 ? 1 : pb_k; );
 
 // ---------- the two modules ----------
 module(20, 0, "A", gca_m, gla_m, la_hold > 0);
