@@ -14,7 +14,9 @@ REAPER keeps the range up to date.
 4. **Extensions > ReaPack > Browse packages**, search for **GFX**:
    - install **GFX system files** first - every GFX plug-in needs them;
    - then install the plug-ins you want (or right-click > Install all), plus any of the scripts.
-5. Press **Apply**. The plug-ins appear in the FX browser as "GFX ..." (under Effects/GFX/Stable).
+5. Press **Apply**. The plug-ins appear in the FX browser by name, ending in "(GFX)" (under Effects/GFX/Stable).
+6. **Extensions > ReaPack > Manage repositories > Options**: tick **Install new packages when synchronizing**, so
+   plug-ins added to GFX later arrive by themselves (otherwise ReaPack only updates the ones you already have).
 
 From then on, **Extensions > ReaPack > Synchronize packages** (or ReaPack's automatic sync) brings in every fix.
 
