@@ -60,7 +60,11 @@ def folders():
         return {f: g for g, items in m.groups() for _, _, f in items}, m.SYS_DIR, 'Other'
     m = load('sync-plugins')
     cats, plugs = m.site_data()
-    return {f + '.jsfx': cats[c] for f, (_, c) in plugs.items()}, m.SYS_DIR, m.LEGACY_DIR
+    fold = {f + '.jsfx': cats[c] for f, (_, c) in plugs.items()}
+    v2dir = getattr(m, 'V2_DIR', None)   # v3.0: the kept earlier versions (<name>-v2.jsfx) in their own folder, as in the ZIP
+    if v2dir:
+        fold.update({f: v2dir for f in os.listdir(os.path.abspath(sys.argv[1])) if f.endswith('-v2.jsfx')})
+    return fold, m.SYS_DIR, m.LEGACY_DIR
 
 
 def main():
