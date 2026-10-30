@@ -3,7 +3,8 @@ desc:DRP81 [reverb/delay] (GFX)
 //author: GardenFX
 // by JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn and gfx-faceplate (.jsfx-inc) in the same folder.
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate and gfx-os (.jsfx-inc) in the
+// same folder.
 //
 // DRP81. An early-80s digital broadcast reverb / delay with two machines in one case, switched by the
 // MODE keys VFD / MATRIX (the faceplate, the label language and the algorithms change together):
@@ -22,6 +23,10 @@ desc:DRP81 [reverb/delay] (GFX)
 //     TOKYO: 0 to +18 dB into a clean 16-bit converter: transparent until full scale, then a firm soft clip.
 //     BERLIN: 0 to +24 dB into the input transformer (the lows saturate the core first) and an asymmetric
 //             early-silicon stage (even harmonics); then a 4-pole 9 kHz anti-alias filter.
+//   OS (the key left of S / M / L / ?): the DRIVE stage runs at 1x, 2x (the default) or 4x (polyphase IIR half-bands,
+//     minimum phase: no latency, the dry signal untouched), so a hot DRIVE doesn't fold back into the reverb as
+//     off-key whistles. The reverb itself stays at the host rate. A change dips the drive 5 ms and swaps at the silent
+//     point (no click).
 //   -> PRE-DELAY 0 - 300 ms (glides; BERLIN: coarse 20 ms steps + fine)
 //   -> the algorithm:
 //     FDN algorithms (HALL, ROOM, PLATE, RAUM A, RAUM B, PLATTE B): four input diffusers per side into a 16-line
@@ -78,6 +83,7 @@ import gfx-ui.jsfx-inc
 import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
 import gfx-faceplate.jsfx-inc
+import gfx-os.jsfx-inc
 
 slider1:0<0,1,1{TKY,Berlin}>-(unused, was Version: mirrors Mode)
 slider2:0<0,6,1{Hall,Room,Plate,Early Ref,Gate,Reverse,Dialogue}>-Algorithm (VFD)
@@ -108,6 +114,7 @@ slider26:1<0.5,2.5,0.05>-Low decay (x, TKY)
 slider27:1<0,2,1{12 bit,16 bit,24 bit}>-Converter (TKY)
 slider28:0<0,2,1{Standard,Image,3D}>-Reflections (TKY)
 slider29:prs_sel=0<0,18,1{No preset,Init,TKY Snare Gate,Arcade Hall,Glass Plate,Early Punch,Reverse Vocal,Neon Room,Berlin Room,Post-Punk Drums,Tower Block Hall,Grey Echo,Smeared Wash,Studio Send 100%,Broadcast House Vocal,Dialogue Booth,3D Scoring Stage,Warm Low Hall,12-Bit Room}>-Preset
+slider30:1<0,2,1{1x,2x,4x}>-Oversampling (drive)
 
 in_pin:left input
 in_pin:right input
@@ -331,6 +338,60 @@ function dp_sate(u) instance(lp, v1, f1) local(f, d) (
   (d - dp_eb) * dp_en;
 );
 
+
+// ---------- OS for the DRIVE stage: polyphase IIR half-band (two allpass chains, 12 coefficients: flat to 20 kHz;
+// minimum phase, no latency); 4x = a second stage at the 2x rate ----------
+dp_h0 = 0.036681502164; dp_h1 = 0.136547624632; dp_h2 = 0.274631759379; dp_h3 = 0.423138617437;
+dp_h4 = 0.561098697879; dp_h5 = 0.677540049974; dp_h6 = 0.769741833863; dp_h7 = 0.839889624850;
+dp_h8 = 0.892260818004; dp_h9 = 0.931541959963; dp_h10 = 0.962094548378; dp_h11 = 0.987816370733;
+function hb_up(x) instance(ua0, ua1, ua2, ua3, ua4, ua5, ux0, ux1, ux2, ux3, ux4, ux5, ub0, ub1, ub2, ub3, ub4, ub5, uy0, uy1, uy2, uy3, uy4, uy5, o0, o1) local(t, y) (
+  t = x;
+  y = dp_h0 * (t - ua0) + ux0; ux0 = t; ua0 = y; t = y;
+  y = dp_h2 * (t - ua1) + ux1; ux1 = t; ua1 = y; t = y;
+  y = dp_h4 * (t - ua2) + ux2; ux2 = t; ua2 = y; t = y;
+  y = dp_h6 * (t - ua3) + ux3; ux3 = t; ua3 = y; t = y;
+  y = dp_h8 * (t - ua4) + ux4; ux4 = t; ua4 = y; t = y;
+  y = dp_h10 * (t - ua5) + ux5; ux5 = t; ua5 = y; o0 = y;
+  t = x;
+  y = dp_h1 * (t - ub0) + uy0; uy0 = t; ub0 = y; t = y;
+  y = dp_h3 * (t - ub1) + uy1; uy1 = t; ub1 = y; t = y;
+  y = dp_h5 * (t - ub2) + uy2; uy2 = t; ub2 = y; t = y;
+  y = dp_h7 * (t - ub3) + uy3; uy3 = t; ub3 = y; t = y;
+  y = dp_h9 * (t - ub4) + uy4; uy4 = t; ub4 = y; t = y;
+  y = dp_h11 * (t - ub5) + uy5; uy5 = t; ub5 = y; o1 = y;
+);
+function hb_dn(s0, s1) instance(da0, da1, da2, da3, da4, da5, dx0, dx1, dx2, dx3, dx4, dx5, db0, db1, db2, db3, db4, db5, dy0, dy1, dy2, dy3, dy4, dy5) local(t, y, p) (
+  t = s1;
+  y = dp_h0 * (t - da0) + dx0; dx0 = t; da0 = y; t = y;
+  y = dp_h2 * (t - da1) + dx1; dx1 = t; da1 = y; t = y;
+  y = dp_h4 * (t - da2) + dx2; dx2 = t; da2 = y; t = y;
+  y = dp_h6 * (t - da3) + dx3; dx3 = t; da3 = y; t = y;
+  y = dp_h8 * (t - da4) + dx4; dx4 = t; da4 = y; t = y;
+  y = dp_h10 * (t - da5) + dx5; dx5 = t; da5 = y; p = y;
+  t = s0;
+  y = dp_h1 * (t - db0) + dy0; dy0 = t; db0 = y; t = y;
+  y = dp_h3 * (t - db1) + dy1; dy1 = t; db1 = y; t = y;
+  y = dp_h5 * (t - db2) + dy2; dy2 = t; db2 = y; t = y;
+  y = dp_h7 * (t - db3) + dy3; dy3 = t; db3 = y; t = y;
+  y = dp_h9 * (t - db4) + dy4; dy4 = t; db4 = y; t = y;
+  y = dp_h11 * (t - db5) + dy5; dy5 = t; db5 = y;
+  0.5 * (p + y);
+);
+function hb_clr() instance(ua0, ua1, ua2, ua3, ua4, ua5, ux0, ux1, ux2, ux3, ux4, ux5, ub0, ub1, ub2, ub3, ub4, ub5, uy0, uy1, uy2, uy3, uy4, uy5, o0, o1,
+                          da0, da1, da2, da3, da4, da5, dx0, dx1, dx2, dx3, dx4, dx5, db0, db1, db2, db3, db4, db5, dy0, dy1, dy2, dy3, dy4, dy5) (
+  ua0 = ua1 = ua2 = ua3 = ua4 = ua5 = ux0 = ux1 = ux2 = ux3 = ux4 = ux5 = ub0 = ub1 = ub2 = ub3 = ub4 = ub5 = uy0 = uy1 = uy2 = uy3 = uy4 = uy5 = o0 = o1 = 0;
+  da0 = da1 = da2 = da3 = da4 = da5 = dx0 = dx1 = dx2 = dx3 = dx4 = dx5 = db0 = db1 = db2 = db3 = db4 = db5 = dy0 = dy1 = dy2 = dy3 = dy4 = dy5 = 0;
+);
+function dp_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function hb_tidy() instance(ua0, ua1, ua2, ua3, ua4, ua5, ub0, ub1, ub2, ub3, ub4, ub5, da0, da1, da2, da3, da4, da5, db0, db1, db2, db3, db4, db5) (
+  ua0 = dp_tn(ua0); ua1 = dp_tn(ua1); ua2 = dp_tn(ua2); ua3 = dp_tn(ua3); ua4 = dp_tn(ua4); ua5 = dp_tn(ua5);
+  ub0 = dp_tn(ub0); ub1 = dp_tn(ub1); ub2 = dp_tn(ub2); ub3 = dp_tn(ub3); ub4 = dp_tn(ub4); ub5 = dp_tn(ub5);
+  da0 = dp_tn(da0); da1 = dp_tn(da1); da2 = dp_tn(da2); da3 = dp_tn(da3); da4 = dp_tn(da4); da5 = dp_tn(da5);
+  db0 = dp_tn(db0); db1 = dp_tn(db1); db2 = dp_tn(db2); db3 = dp_tn(db3); db4 = dp_tn(db4); db5 = dp_tn(db5);
+);
+// one side's drive at one OS phase (TOKYO: the converter; BERLIN: the transformer and silicon stage)
+function dp_drv1(x) ( dp_ber ? this.sa.dp_sate(x) : this.dz.dz_satt(x); );
+
 // ---------- diffusers / cluster ----------
 function dp_dap(x) instance(b, ln) local(y) (           // one diffuser allpass (b, ln: synced by dp_ctl)
   y = b[(dp_aw - ln) & dp_am] - dp_dg * x; b[dp_aw] = x + dp_dg * y; y;
@@ -551,9 +612,11 @@ function load_preset(p) (
 // ---------- state ----------
 // everything else that depends on the sample rate (run again from @block if the rate changes: ext_noinit keeps
 // @init from running then)
+function dp_f2n(v) ( v >= 1.5 ? 4 : v >= 0.5 ? 2 : 1; );
 function dp_srinit() local(i) (
   dp_sr = srate;
-  dp_xc = 1 - exp(-2 * $pi * 120 / srate);              // BERLIN: the input transformer's low band
+  dp_xc = 1 - exp(-2 * $pi * 120 / (srate * dp_osF));   // BERLIN: the input transformer's low band (at the OS rate)
+  dp_ogc = 1 / (0.005 * srate);                         // OS: the change's dip (5 ms down, 5 ms back)
   dp_tk = 1 - exp(-32 / (0.12 * srate));                // decay / size glide
   in_init(); in_setup(0, 0);
   dp_lcl = -1;
@@ -572,6 +635,7 @@ function dp_srinit() local(i) (
   bpD.bq_set(5, 2500, 1.4, 0); bpE.bq_set(5, 6000, 1.4, 0); bpF.bq_set(5, min(12000, srate * 0.42), 1.4, 0);
   i = 0; loop(16, dp_dinit(dp_dr + i * 4); i += 1; );
 );
+dp_osF = dp_osT = dp_f2n(slider30); dp_og = 1;
 dp_srinit();
 ostL.ost_ch_init(); ostR.ost_ch_init();
 drD.drift_init(0.8 + rand(1) * 0.5); drH.drift_init(0.8 + rand(1) * 0.5);
@@ -625,6 +689,8 @@ srate != dp_sr ? (                                      // a new rate: lay the m
   dp_w = 0; dp_aw = 0; dp_pw = 0; dp_tw = 0;
 );
 update();
+dp_osT = dp_f2n(slider30);                              // OS: the drive's factor asked for (swapped in at a silent point)
+dLu.hb_tidy(); dRu.hb_tidy(); dLu2.hb_tidy(); dRu2.hb_tidy();
 // DRIFT: BERLIN - every tank line's clock wanders on its own, hiss and hum; TOKYO - only the decay wanders a little
 dp_di = 0.15 * dm_s * samplesblock / srate;
 dp_ddv = (dp_ber ? 0.02 : 0.015) * dm_a * drD.drift_tick(dp_di);
@@ -655,14 +721,35 @@ dp_ktar != dp_key || dp_patt != dp_pat ? (
 dp_dn = -dp_dn;
 
 // ---------- DRIVE: the converter (TOKYO) / the input transformer (BERLIN) ----------
+// OS: a new factor dips the drive's input 5 ms, swaps at silence (clean half-bands, the stages re-read), comes back
+dp_osT != dp_osF ? (
+  dp_og = max(dp_og - dp_ogc, 0);
+  dp_og == 0 ? ( dp_osF = dp_osT; dp_xc = 1 - exp(-2 * $pi * 120 / (srate * dp_osF));
+                 dLu.hb_clr(); dRu.hb_clr(); dLu2.hb_clr(); dRu2.hb_clr(); dz_snap = 1; );
+) : dp_og < 1 ? dp_og = min(dp_og + dp_ogc, 1);
 dp_xa = dp_l * dp_dgt; dp_xb = dp_r * dp_dgt;
+dp_og < 1 ? ( dp_xa *= dp_og * dp_og * (3 - 2 * dp_og); dp_xb *= dp_og * dp_og * (3 - 2 * dp_og); );
 dp_ipk = max(dp_ipk, max(abs(dp_xa), abs(dp_xb)));
-dp_ber ? ( dp_xa = saA.dp_sate(dp_xa); dp_xb = saB.dp_sate(dp_xb); )
-       : ( dp_xa = dzA.dz_satt(dp_xa); dp_xb = dzB.dz_satt(dp_xb); );
-dz_snap ? (                                             // a new machine: the droop shelf starts settled too
-  dz_snap = 0; dzsA.x1 = dzsA.x2 = dzsA.y1 = dzsA.y2 = dp_xa; dzsB.x1 = dzsB.x2 = dzsB.y1 = dzsB.y2 = dp_xb;
+dp_osF == 1 ? (
+  dp_ber ? ( dp_xa = saA.dp_sate(dp_xa); dp_xb = saB.dp_sate(dp_xb); )
+         : ( dp_xa = dzA.dz_satt(dp_xa); dp_xb = dzB.dz_satt(dp_xb); );
+  dz_snap ? (                                           // a new machine: the droop shelf starts settled too
+    dz_snap = 0; dzsA.x1 = dzsA.x2 = dzsA.y1 = dzsA.y2 = dp_xa; dzsB.x1 = dzsB.x2 = dzsB.y1 = dzsB.y2 = dp_xb;
+  );
+  dp_xa = dzsA.bq_run(dp_xa) / dp_dgt; dp_xb = dzsB.bq_run(dp_xb) / dp_dgt;
+) : (                                                   // 2x / 4x: up, the stage at each phase, down (no droop shelf:
+  dLu.hb_up(dp_xa); dRu.hb_up(dp_xb);                   // the ADAA's droop is above the audio band)
+  dp_osF == 2 ? (
+    dp_q0 = dcA.dp_drv1(dLu.o0); dp_q1 = dcA.dp_drv1(dLu.o1); dp_r0 = dcB.dp_drv1(dRu.o0); dp_r1 = dcB.dp_drv1(dRu.o1);
+  ) : (
+    dLu2.hb_up(dLu.o0); dp_q0 = dcA.dp_drv1(dLu2.o0); dp_q1 = dcA.dp_drv1(dLu2.o1); dp_q0 = dLu2.hb_dn(dp_q0, dp_q1);
+    dLu2.hb_up(dLu.o1); dp_q1 = dcA.dp_drv1(dLu2.o0); dp_q2 = dcA.dp_drv1(dLu2.o1); dp_q1 = dLu2.hb_dn(dp_q1, dp_q2);
+    dRu2.hb_up(dRu.o0); dp_r0 = dcB.dp_drv1(dRu2.o0); dp_r1 = dcB.dp_drv1(dRu2.o1); dp_r0 = dRu2.hb_dn(dp_r0, dp_r1);
+    dRu2.hb_up(dRu.o1); dp_r1 = dcB.dp_drv1(dRu2.o0); dp_r2 = dcB.dp_drv1(dRu2.o1); dp_r1 = dRu2.hb_dn(dp_r1, dp_r2);
+  );
+  dz_snap = 0;
+  dp_xa = dLu.hb_dn(dp_q0, dp_q1) / dp_dgt; dp_xb = dRu.hb_dn(dp_r0, dp_r1) / dp_dgt;
 );
-dp_xa = dzsA.bq_run(dp_xa) / dp_dgt; dp_xb = dzsB.bq_run(dp_xb) / dp_dgt;
 dp_ber ? ( dp_xa = aaL2.bq_run(aaL1.bq_run(dp_xa)); dp_xb = aaR2.bq_run(aaR1.bq_run(dp_xb)); );
 
 // ---------- pre-delay (gliding, linear interpolation) ----------
@@ -1021,9 +1108,10 @@ dq_hkey(356, 13, 56, 28, "VFD", !dq_b) ? ( slider17 = 1; ui_auto(17); );
 dq_hkey(416, 13, 76, 28, "MATRIX", dq_b) ? ( slider17 = 2; ui_auto(17); );
 pk_pextra = "Reset all to defaults";                    // the house preset bar: PRESETS, prev / next, LCD
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
-k_ = pk_preset(498 * sc, 10 * sc, 310 * sc, 34 * sc, pr_cur,
+k_ = pk_preset(498 * sc, 10 * sc, 252 * sc, 34 * sc, pr_cur,
   "Init|TKY Snare Gate|Arcade Hall|Glass Plate|Early Punch|Reverse Vocal|Neon Room|Berlin Room|Post-Punk Drums|Tower Block Hall|Grey Echo|Smeared Wash|Studio Send 100%|Broadcast House Vocal|Dialogue Booth|3D Scoring Stage|Warm Low Hall|12-Bit Room");
 k_ > 0 ? ( prs_dirty = k_; pr_cur = k_ > 18 ? 1 : k_; );
+os_key(812, 16, 30, DQI2, 17);                         // OS (oversampling, the drive): 1x / 2x / 4x
 ui_size_picker(858 * sc, 18 * sc);
 
 function dq_pinfo(p) (

@@ -3,7 +3,7 @@ desc:5F6 [tweed bass amp] (GFX)
 //author: GardenFX
 // by JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel and gfx-s74 (.jsfx-inc) in the same folder.
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-s74, gfx-clip and gfx-os (.jsfx-inc) in the same folder.
 //
 // 5F6. A four-input valve bass amp with four 10" speakers in an open-back cabinet, after the 1950s tweed bass-amp
 // circuit (5F6-A) that became the template for the rock amp: a cathode-follower-driven tone stack, presence in the
@@ -31,12 +31,16 @@ desc:5F6 [tweed bass amp] (GFX)
 //   ground (less feedback up top, a brighter, more open top end) -> supply sag (the rectifier and reservoir: the
 //   rails drop under load and recover slowly) -> output transformer (the core saturates on low-frequency flux) ->
 //   the speaker load (low feedback lets the speaker's resonance and rising impedance colour the output).
-//   ANTI-ALIASING (the house drive standard): the amp runs at the host rate (no latency) with first-order ADAA on every
+//   OS (the key left of S / M / L / ?): the amp (both valve stages to the output transformer) runs at 1x, 2x (the
+//   default) or 4x; the speaker load, the cabinet and the output section stay at the host rate. 2x and 4x stop the
+//   crunch folding back into the audio as off-key whistles. Latency 0 / 31 / 37 samples (reported). A change dips the
+//   sound 5 ms and swaps at the silent point (no click).
+//   ANTI-ALIASING (the house drive standard): at 1x the amp runs at the host rate (no latency) with first-order ADAA on every
 //   valve stage, the follower and the power stage (its closed feedback loop has an exact antiderivative), a
 //   drive-tracking pre-filter into the first valve (a low-pass sliding from 40 kHz, capped near the Nyquist, down to
 //   9 kHz, and a low shelf easing the lows below 150 Hz down by up to 1.5 dB as VOLUME rises), a drive-tracking knee
 //   on the follower's grid-current clip (it softens as VOLUME rises) and a fixed post-shelf that makes up the
-//   stages' top-end droop.
+//   stages' top-end droop (at 2x and 4x the droop is above the audio band: the shelf is off).
 // CHANNELS: BLEND is the old jumper trick as one knob. Left = NORMAL only, right = BRIGHT only, the middle = both
 //   channels jumpered at the same VOLUME (the fat bottom of one and the top of the other, and up to 6 dB more drive).
 // VOLUME: the preamp drive. Every VOLUME setting is level-matched (measured on pink noise), so it changes the colour,
@@ -57,6 +61,7 @@ import gfx-ui.jsfx-inc
 import gfx-panel.jsfx-inc
 import gfx-s74.jsfx-inc
 import gfx-clip.jsfx-inc
+import gfx-os.jsfx-inc
 
 slider1:0<0,1,1{Tweed,Greybeard}>-Model
 slider2:5<0,10,0.1>-Volume
@@ -78,13 +83,14 @@ slider17:120<40,400,1>-Sat low band (Hz)
 slider18:6000<2000,16000,10>-Sat high band (Hz)
 slider19:-0.3<-24,0,0.1>-Ceiling (dB)
 slider20:prs_sel=0<0,12,1{No preset,Init,Chicago Shuffle,Rockabilly Snap,Harp Howl,Roots Rock Crunch,Desert Bloom,Upright Thump,Surf Glass,Country Chicken Pick,Soul Clean,Sixties Session Bass,Garage Stomp}>-Preset
+slider21:1<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
 out_pin:left output
 out_pin:right output
 
-options:maxmem=1048576
+options:maxmem=8388608
 
 @init
 #ui_man = "gfx-5f6";                                    // the ? pop-up links to this manual
@@ -94,7 +100,7 @@ ext_noinit = 1;
 s74_mem = 0;
 F6_MKTAB = s74_alloc(32);                                   // the makeup tables: TWEED, GREYBEARD (11 points each, dB)
 F6_BTAB = s74_alloc(32);                                    // BLEND towards NORMAL / BRIGHT: the level lost (6 points each, dB)
-F6_LAT = 0;                                              // no oversampling: no latency
+F6_LAT = 0;                                              // the amp's own latency: none (OS adds its own)
 
 // ---------- valve curves ----------
 // a smooth saturator (rational, exactly 1 from |x| = 3) and its slope
@@ -264,9 +270,9 @@ function f6_core(x) instance(pf, cs1, v1, hc1, vb, cs2, v2, cf, ts, pin, hpp, pw
 );
 // per block: the follower's knee (it widens as VOLUME rises: the drive-tracking knee) and the pre-filter
 function f6_cblk(n) instance(pf, cf) local(k) (
-  k = cf.clp_kt_block(f6_s2 / 10, srate, n);
+  k = cf.clp_kt_block(f6_s2 / 10, f6_fs2, n);
   cf.clp_set(2, f6_kc, 100000, 0); cf.clp_knee(k * f6_kc);
-  pf.clp_pf_block(f6_s2 / 10, srate, n);
+  pf.clp_pf_block(f6_s2 / 10, f6_fs2, n);
   cf.clp_tidy();
 );
 
@@ -331,20 +337,26 @@ function f6_fix(fs2) instance(hc1, hpp, hdc, pw, pf, cf) (
   pf.clp_pf_cfg(40000, 9000, -1.5, 150); pf.clp_pf_reset();   // the house pre-filter: 40 kHz (capped) to 9 kHz, -1.5 dB lows
   cf.clp_kt_cfg(0.5, 1); cf.clp_reset();                      // the follower's knee: half-width 0.5 to 1 x its limit
 );
-function f6_srinit() local(fs2) (
-  f6_sr = srate; fs2 = srate;                            // the amp runs at the host rate (anti-aliased stages)
+// the amp's rate (the host rate x the OS factor) and everything worked out from it
+function f6_osrate() local(fs2) (
+  f6_fs2 = fs2 = srate * os_f;
   cL.f6_fix(fs2); cR.f6_fix(fs2);
+  f6_phb0 = 2 * fs2 / (2 * fs2 + 2 * $pi * 2000); f6_pha1 = (2 * $pi * 2000 - 2 * fs2) / (2 * fs2 + 2 * $pi * 2000);
+  f6_bsa = 1 - exp(-1 / (0.002 * fs2));
+  f6_lts = -1;                                           // (f6_tone works the circuit out again)
+);
+function f6_srinit() local(fs2) (
+  f6_sr = srate; f6_osrate(); fs2 = f6_fs2;              // the amp runs at the OS rate (anti-aliased stages)
   // the fixed post-shelf: makes up the top-end droop of the anti-aliased stages and the pre-filter (fitted so the
   // small-signal response at VOLUME 5 matches the old 2x amp within 0.1 dB to 10 kHz; it eases off above 12 kHz)
   k1L.s74_bqset(3, 0.2470 * srate, 11.58, 1.13, srate); k1R.s74_bqset(3, 0.2470 * srate, 11.58, 1.13, srate);
   k2L.s74_bqset(5, 0.1506 * srate, 3.98, 0.57, srate); k2R.s74_bqset(5, 0.1506 * srate, 3.98, 0.57, srate);
-  f6_phb0 = 2 * fs2 / (2 * fs2 + 2 * $pi * 2000); f6_pha1 = (2 * $pi * 2000 - 2 * fs2) / (2 * fs2 + 2 * $pi * 2000);
-  f6_bsa = 1 - exp(-1 / (0.002 * fs2));
   f6_smk = 1 - exp(-1 / (0.02 * srate));
   f6_tk = 1 - exp(-64 / (0.03 * srate));                 // the per-block glide (30 ms)
   f6_mk_ = 1 - exp(-64 / (0.02 * srate));                // the MODEL glide (2 x 20 ms)
   in_init(); in_setup(0, 0);
   ost_init(0);
+  os_gsetup();
   f6_lts = -1;
 );
 
@@ -358,14 +370,15 @@ function update() (
   drift_macro(slider13);
   f6_outt = 10 ^ (slider14 / 20);
   ost_setup(slider15 / 100, slider16 / 100, slider17, slider18, slider19, 1);   // output stage: CLIP, always on
-  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = F6_LAT;
+  os_tf = os_f2n(slider21);                              // OS: the factor asked for (os_gate swaps it in)
+  pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = os_base + os_lat(os_f);
 );
 
 // the model and the knobs glide (per block); everything they move is recomputed from the glided values
 function f6_lerp(a, b) ( a + (b - a) * f6_mm; );
 function f6_glerp(a, b) ( a * (b / a) ^ f6_mm; );
 function f6_tone(force) local(k, ch, fs2, t, b) (
-  fs2 = srate;
+  fs2 = f6_fs2;
   k = force ? 1 : f6_tk;
   f6_mm1 += (f6_mt - f6_mm1) * (force ? 1 : f6_mk_);   // two glides in series: the change eases in and out
   f6_mm += (f6_mm1 - f6_mm) * (force ? 1 : f6_mk_);
@@ -452,6 +465,7 @@ function f6_start() (
   f6_mn = f6_mot; f6_cb = f6_cbt; f6_o = f6_outt * f6_mkt;
 );
 f6_dn = 0.000000000000000001;
+os_design(); os_base = F6_LAT; os_f = os_tf = os_f2n(slider21);
 f6_start();
 ostL.ost_ch_init(); ostR.ost_ch_init();
 dw1.drift_init(0.8 + rand(1) * 0.5); dw2.drift_init(0.8 + rand(1) * 0.5); dw3.drift_init(0.8 + rand(1) * 0.5); dw4.drift_init(0.8 + rand(1) * 0.5);
@@ -488,7 +502,7 @@ srate != f6_sr ? f6_start();
 update();
 f6_tone(0);
 clp_kt_on = 1;                                           // the follower's knee tracks VOLUME (a valve stage: character)
-cL.f6_cblk(samplesblock); cR.f6_cblk(samplesblock);
+cL.f6_cblk(samplesblock * os_f); cR.f6_cblk(samplesblock * os_f);
 // DRIFT: valve bias, supply and power-valve balance per side
 f6_di = 0.2 * dm_s * samplesblock / srate;
 cL.f6_bias(dw1.drift_tick(f6_di), dw2.drift_tick(f6_di), dw3.drift_tick(f6_di), dw4.drift_tick(f6_di));
@@ -507,8 +521,23 @@ f6_mn += (f6_mot - f6_mn) * f6_smk;
 f6_xm = 0.5 * (f6_xl + f6_xr); f6_xl += (f6_xm - f6_xl) * f6_mn; f6_xr += (f6_xm - f6_xr) * f6_mn;
 f6_dn = -f6_dn;
 
-// the amps (anti-aliased stages, the fixed shelf that makes up their top-end droop)
-f6_yl = k2L.s74_bq(k1L.s74_bq(cL.f6_core(f6_xl))); f6_yr = k2R.s74_bq(k1R.s74_bq(cR.f6_core(f6_xr)));
+// OS: a new factor swaps in at a silent point - the amp's rate, its coefficients, clean filters
+os_gate();
+os_chg ? (
+  f6_osrate(); f6_tone(0); cL.f6_cblk(0); cR.f6_cblk(0);
+  uL.os_clr(); uR.os_clr(); dL.os_clr(); dR.os_clr();
+);
+// the amps: at 1x anti-aliased stages and the fixed shelf that makes up their top-end droop; at 2x / 4x up, the amp
+// at each phase, back down
+os_f == 1 ? (
+  f6_yl = k2L.s74_bq(k1L.s74_bq(cL.f6_core(f6_xl))); f6_yr = k2R.s74_bq(k1R.s74_bq(cR.f6_core(f6_xr)));
+) : (
+  uL.os_up(f6_xl); uR.os_up(f6_xr);
+  f6_a0 = cL.f6_core(uL.s0); f6_b0 = cR.f6_core(uR.s0); f6_a1 = cL.f6_core(uL.s1); f6_b1 = cR.f6_core(uR.s1);
+  os_f == 4 ? ( f6_a2 = cL.f6_core(uL.s2); f6_b2 = cR.f6_core(uR.s2); f6_a3 = cL.f6_core(uL.s3); f6_b3 = cR.f6_core(uR.s3); );
+  f6_yl = dL.os_dn(f6_a0, f6_a1, f6_a2, f6_a3); f6_yr = dR.os_dn(f6_b0, f6_b1, f6_b2, f6_b3);
+);
+os_g < 1 ? ( f6_yl *= os_g; f6_yr *= os_g; );
 
 // the speaker load, the cabinet (CAB glides in and out), the output section
 f6_yl = ldL.f6_ldrun(f6_yl); f6_yr = ldR.f6_ldrun(f6_yr);
@@ -655,12 +684,13 @@ gfx_measurestr("TWEED BASS AMP", f6g_w, f6g_h); f6g_e = f6g_w; gfx_measurestr("4
 f6g_x += max(f6g_e, f6g_w) / sc + 18; f6g_x = max(f6g_x, 262);
 pk_pextra = "Reset all to defaults";
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
-k_ = pk_preset(f6g_x * sc, 10 * sc, (690 - f6g_x) * sc, 34 * sc, pr_cur,
+k_ = pk_preset(f6g_x * sc, 10 * sc, (640 - f6g_x) * sc, 34 * sc, pr_cur,
   "Init|Chicago Shuffle|Rockabilly Snap|Harp Howl|Roots Rock Crunch|Desert Bloom|Upright Thump|Surf Glass|Country Chicken Pick|Soul Clean|Sixties Session Bass|Garage Stomp");
 k_ > 0 ? prs_dirty = k_;
 lk_well = 0x141518;                                     // the header keys sit on the dark steel
-s74_lk = LK_YEL; gx_lens(708, 13, 74, 28, slider1 < 0.5, "TWEED") ? s74_set(1, 0);
-s74_lk = LK_YEL; gx_lens(788, 13, 112, 28, slider1 >= 0.5, "GREYBEARD") ? s74_set(1, 1);
+s74_lk = LK_YEL; gx_lens(658, 13, 74, 28, slider1 < 0.5, "TWEED") ? s74_set(1, 0);
+s74_lk = LK_YEL; gx_lens(738, 13, 112, 28, slider1 >= 0.5, "GREYBEARD") ? s74_set(1, 1);
+os_key(924, 16, 21, F6_HDIM, 17);                      // OS (oversampling): 1x / 2x / 4x
 lk_well = slider1 >= 0.5 ? 0x141518 : 0x2A2722;         // the panel keys: TWEED's cream chassis is a light face
 ui_size_picker(962 * sc, 18 * sc);
 

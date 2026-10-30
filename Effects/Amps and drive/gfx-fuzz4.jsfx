@@ -3,7 +3,7 @@ desc:Fuzz4 [fuzz rack] (GFX)
 //author: GardenFX
 // by JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn and gfx-clip (.jsfx-inc) in the same folder.
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn, gfx-clip and gfx-os (.jsfx-inc) in the same folder.
 //
 // FUZZ4. A studio rack unit holding four classic fuzz circuits, one at a time (the sound is designed from scratch):
 //   HYPER - a 2000s hyper fuzz (silicon / op-amp stages). Three modes:
@@ -34,7 +34,7 @@ desc:Fuzz4 [fuzz rack] (GFX)
 //           THICK: the octave tucked under the fundamental but clearly there (octave path 1.3 : direct 0.3 into the
 //           fuzz), softer clipping, more low end. FUZZ, TONE (a low-pass 1.2 - 10 kHz, BLUE cap), LEVEL,
 //           HI-MID (+/-12 dB at 2.8 kHz, GREEN cap; 3 by default = -4.8 dB), plus a fixed -4 dB at 4.5 kHz.
-//   SMOOTHER - after every circuit (at 2x, anti-aliased): the lows below 150 Hz saturate softly and a little lopsided
+//   SMOOTHER - after every circuit (at the OS rate, anti-aliased): the lows below 150 Hz saturate softly and a little lopsided
 //           (body, low-mid harmonics) and the band above 3 - 4 kHz is soft-limited, so the fizz's edges round off.
 //           Unity for small signals. (What the output stage's SAT did for the fuzzes, built in at the circuit's level.)
 // Click a module's name key to make it the active one (it lights; the others dim but stay editable). Changing the
@@ -49,7 +49,9 @@ desc:Fuzz4 [fuzz rack] (GFX)
 //   input (HYPER, MODEL: 1M) only darkens a little with the cable's 470 pF as the volume comes down) -> GATE detector
 //   -> the module's pre-shaping (coupling high-pass, emphasis) -> the gfx-clip drive-tracking pre-filter (2-pole
 //   low-pass 18 kHz at no drive to 12 kHz at full drive, low shelf at 180 Hz pulling the lows down by up to 2 dB) ->
-//   2x oversampling (polyphase IIR half-bands, 12 coefficients, flat to 20 kHz, ~105 dB rejection, no latency) -> the module's
+//   OS: 1x, 2x or 4x oversampling (polyphase IIR half-bands, 12 coefficients, flat to 20 kHz, ~105 dB rejection, no
+//   latency at any setting; the OS key left of S / M / L / ?, 4x by default: a hard fuzz still folds back at 2x; a change
+//   fades out 10 ms, swaps at the silent point and fades back in, as a module change does) -> the module's
 //   circuit (all clippers first-order antiderivative anti-aliased: gfx-clip) -> back to 1x -> the module's
 //   SMOOTHER -> post-shaping and tone controls -> TAME -> LEVEL / VOLUME -> the GATE -> OUTPUT -> the house output stage (band SAT, the
 //   soft CLIP always on).
@@ -109,6 +111,7 @@ slider46:75<0,100,1>-Tame (%)
 slider47:1<0,1,1{Off,On}>-Tame on
 slider48:0<0,1,1{Off,On}>-Width
 slider49:prs_sel=0<0,12,1{No preset,Init,Hyper Wall,Singing Lead,Boosted Crunch,Brass Buzz,Modelled Round,Ring Upper,Germanium Round,Volume Clean-Up,Silicon Scream,Octave Lead,Thick Octave}>-Preset
+slider50:2<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
@@ -122,6 +125,7 @@ import gfx-ui.jsfx-inc
 import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
 import gfx-clip.jsfx-inc
+import gfx-os.jsfx-inc
 
 @init
 #ui_man = "gfx-fuzz4";                                // the ? pop-up links to this manual
@@ -178,7 +182,7 @@ function clpR_pf_tidy() instance(ric1, ric2, rsx1, rsy1) (
   ric1 = fz_tn(ric1); ric2 = fz_tn(ric2); rsx1 = fz_tn(rsx1); rsy1 = fz_tn(rsy1);
 );
 
-// ---------- 2x oversampling: polyphase IIR half-band (two allpass chains, 12 coefficients: flat to 20 kHz,
+// ---------- oversampling (2x per stage): polyphase IIR half-band (two allpass chains, 12 coefficients: flat to 20 kHz,
 // transition 0.01 of the 2x rate, ~105 dB rejection; minimum phase, no latency to report) ----------
 fz_h0 = 0.036681502164; fz_h1 = 0.136547624632; fz_h2 = 0.274631759379; fz_h3 = 0.423138617437;
 fz_h4 = 0.561098697879; fz_h5 = 0.677540049974; fz_h6 = 0.769741833863; fz_h7 = 0.839889624850;
@@ -301,6 +305,56 @@ function fzq_dn(s0, s1) local(t, y, p) (
   y = fz_h11 * (t - fzq_db5) + fzq_dy5; fzq_dy5 = t; fzq_db5 = y; y = y;
   0.5 * (p + y);
 );
+// the 2x stage's state cleared (a new OS factor)
+function fz_osclr() (
+  fz_ua0 = fz_ua1 = fz_ua2 = fz_ua3 = fz_ua4 = fz_ua5 = fz_ux0 = fz_ux1 = fz_ux2 = fz_ux3 = fz_ux4 = fz_ux5 = fz_ub0 = fz_ub1 = fz_ub2 = fz_ub3 = fz_ub4 = fz_ub5 = fz_uy0 = fz_uy1 = fz_uy2 = fz_uy3 = fz_uy4 = fz_uy5 = fz_da0 = fz_da1 = fz_da2 = fz_da3 = fz_da4 = fz_da5 = fz_dx0 = fz_dx1 = fz_dx2 = fz_dx3 = fz_dx4 = fz_dx5 = fz_db0 = fz_db1 = fz_db2 = fz_db3 = fz_db4 = fz_db5 = fz_dy0 = fz_dy1 = fz_dy2 = fz_dy3 = fz_dy4 = fz_dy5 = 0;
+  fzq_ua0 = fzq_ua1 = fzq_ua2 = fzq_ua3 = fzq_ua4 = fzq_ua5 = fzq_ux0 = fzq_ux1 = fzq_ux2 = fzq_ux3 = fzq_ux4 = fzq_ux5 = fzq_ub0 = fzq_ub1 = fzq_ub2 = fzq_ub3 = fzq_ub4 = fzq_ub5 = fzq_uy0 = fzq_uy1 = fzq_uy2 = fzq_uy3 = fzq_uy4 = fzq_uy5 = fzq_da0 = fzq_da1 = fzq_da2 = fzq_da3 = fzq_da4 = fzq_da5 = fzq_dx0 = fzq_dx1 = fzq_dx2 = fzq_dx3 = fzq_dx4 = fzq_dx5 = fzq_db0 = fzq_db1 = fzq_db2 = fzq_db3 = fzq_db4 = fzq_db5 = fzq_dy0 = fzq_dy1 = fzq_dy2 = fzq_dy3 = fzq_dy4 = fzq_dy5 = 0;
+);
+// 4x: a second half-band stage (the same 12 coefficients, at the 2x rate), one instance per direction and side
+function f2_up(x) instance(ua0, ua1, ua2, ua3, ua4, ua5, ux0, ux1, ux2, ux3, ux4, ux5, ub0, ub1, ub2, ub3, ub4, ub5, uy0, uy1, uy2, uy3, uy4, uy5, o0, o1) local(t, y) (
+  t = x;
+  y = fz_h0 * (t - ua0) + ux0; ux0 = t; ua0 = y; t = y;
+  y = fz_h2 * (t - ua1) + ux1; ux1 = t; ua1 = y; t = y;
+  y = fz_h4 * (t - ua2) + ux2; ux2 = t; ua2 = y; t = y;
+  y = fz_h6 * (t - ua3) + ux3; ux3 = t; ua3 = y; t = y;
+  y = fz_h8 * (t - ua4) + ux4; ux4 = t; ua4 = y; t = y;
+  y = fz_h10 * (t - ua5) + ux5; ux5 = t; ua5 = y; o0 = y;
+  t = x;
+  y = fz_h1 * (t - ub0) + uy0; uy0 = t; ub0 = y; t = y;
+  y = fz_h3 * (t - ub1) + uy1; uy1 = t; ub1 = y; t = y;
+  y = fz_h5 * (t - ub2) + uy2; uy2 = t; ub2 = y; t = y;
+  y = fz_h7 * (t - ub3) + uy3; uy3 = t; ub3 = y; t = y;
+  y = fz_h9 * (t - ub4) + uy4; uy4 = t; ub4 = y; t = y;
+  y = fz_h11 * (t - ub5) + uy5; uy5 = t; ub5 = y; o1 = y;
+);
+function f2_dn(s0, s1) instance(da0, da1, da2, da3, da4, da5, dx0, dx1, dx2, dx3, dx4, dx5, db0, db1, db2, db3, db4, db5, dy0, dy1, dy2, dy3, dy4, dy5) local(t, y, p) (
+  t = s1;
+  y = fz_h0 * (t - da0) + dx0; dx0 = t; da0 = y; t = y;
+  y = fz_h2 * (t - da1) + dx1; dx1 = t; da1 = y; t = y;
+  y = fz_h4 * (t - da2) + dx2; dx2 = t; da2 = y; t = y;
+  y = fz_h6 * (t - da3) + dx3; dx3 = t; da3 = y; t = y;
+  y = fz_h8 * (t - da4) + dx4; dx4 = t; da4 = y; t = y;
+  y = fz_h10 * (t - da5) + dx5; dx5 = t; da5 = y; p = y;
+  t = s0;
+  y = fz_h1 * (t - db0) + dy0; dy0 = t; db0 = y; t = y;
+  y = fz_h3 * (t - db1) + dy1; dy1 = t; db1 = y; t = y;
+  y = fz_h5 * (t - db2) + dy2; dy2 = t; db2 = y; t = y;
+  y = fz_h7 * (t - db3) + dy3; dy3 = t; db3 = y; t = y;
+  y = fz_h9 * (t - db4) + dy4; dy4 = t; db4 = y; t = y;
+  y = fz_h11 * (t - db5) + dy5; dy5 = t; db5 = y;
+  0.5 * (p + y);
+);
+function f2_clr() instance(ua0, ua1, ua2, ua3, ua4, ua5, ux0, ux1, ux2, ux3, ux4, ux5, ub0, ub1, ub2, ub3, ub4, ub5, uy0, uy1, uy2, uy3, uy4, uy5, o0, o1,
+                           da0, da1, da2, da3, da4, da5, dx0, dx1, dx2, dx3, dx4, dx5, db0, db1, db2, db3, db4, db5, dy0, dy1, dy2, dy3, dy4, dy5) (
+  ua0 = ua1 = ua2 = ua3 = ua4 = ua5 = ux0 = ux1 = ux2 = ux3 = ux4 = ux5 = ub0 = ub1 = ub2 = ub3 = ub4 = ub5 = uy0 = uy1 = uy2 = uy3 = uy4 = uy5 = o0 = o1 = 0;
+  da0 = da1 = da2 = da3 = da4 = da5 = dx0 = dx1 = dx2 = dx3 = dx4 = dx5 = db0 = db1 = db2 = db3 = db4 = db5 = dy0 = dy1 = dy2 = dy3 = dy4 = dy5 = 0;
+);
+function f2_tidy() instance(ua0, ua1, ua2, ua3, ua4, ua5, ub0, ub1, ub2, ub3, ub4, ub5, da0, da1, da2, da3, da4, da5, db0, db1, db2, db3, db4, db5) (
+  ua0 = fz_tn(ua0); ua1 = fz_tn(ua1); ua2 = fz_tn(ua2); ua3 = fz_tn(ua3); ua4 = fz_tn(ua4); ua5 = fz_tn(ua5);
+  ub0 = fz_tn(ub0); ub1 = fz_tn(ub1); ub2 = fz_tn(ub2); ub3 = fz_tn(ub3); ub4 = fz_tn(ub4); ub5 = fz_tn(ub5);
+  da0 = fz_tn(da0); da1 = fz_tn(da1); da2 = fz_tn(da2); da3 = fz_tn(da3); da4 = fz_tn(da4); da5 = fz_tn(da5);
+  db0 = fz_tn(db0); db1 = fz_tn(db1); db2 = fz_tn(db2); db3 = fz_tn(db3); db4 = fz_tn(db4); db5 = fz_tn(db5);
+);
 function fzq_ostidy() (
   fzq_ua0 = fz_tn(fzq_ua0); fzq_ua1 = fz_tn(fzq_ua1); fzq_ua2 = fz_tn(fzq_ua2); fzq_ua3 = fz_tn(fzq_ua3); fzq_ua4 = fz_tn(fzq_ua4); fzq_ua5 = fz_tn(fzq_ua5); fzq_ux0 = fz_tn(fzq_ux0); fzq_ux1 = fz_tn(fzq_ux1);
   fzq_ux2 = fz_tn(fzq_ux2); fzq_ux3 = fz_tn(fzq_ux3); fzq_ux4 = fz_tn(fzq_ux4); fzq_ux5 = fz_tn(fzq_ux5); fzq_ub0 = fz_tn(fzq_ub0); fzq_ub1 = fz_tn(fzq_ub1); fzq_ub2 = fz_tn(fzq_ub2); fzq_ub3 = fz_tn(fzq_ub3);
@@ -357,7 +411,7 @@ function fz_trm(m, d) (
            ( d == 0 ? -9.05 : -11.63 );                    // OCTA: OCTAVE, THICK
 );
 function fz_coef() local(g, f, t, tk, dz, z) (
-  fz_fs2 = 2 * srate; fz_npo = 2; fz_n56 = 1;
+  fz_fs2 = fz_F * srate; fz_npo = 2; fz_n56 = 1;      // (fz_fs2: the OS rate)
   fzDB.fz_bqs(5, 4200, 1.1, 0, srate); fz_href = fz_h0(fz_m, fz_md);
   dz = 1 - fz_kblk;                                   // how far the battery has sagged (grows the dead zones)
   fz_m == 0 ? (                                       // ---- HYPER
@@ -491,8 +545,8 @@ function fz_tg() (
 );
 function fz_snap() ( fz_tg(); fz_vin = fz_qin; fz_vg = fz_qg; fz_vb = fz_qb; fz_vt = fz_qt; fz_vf = fz_qf; fz_vl = fz_ql; fz_vv = fz_qv; fz_vh = fz_qh; );
 function fz_switch() (
-  fz_m = fz_tm; fz_md = fz_tmd;
-  fz_clear(); fz_snap(); fz_coef(); fz_hL = fz_sHL; fz_hk = 1 / fz_sHL;
+  fz_m = fz_tm; fz_md = fz_tmd; fz_F = fz_Ft;
+  fz_clear(); fz_osclr(); fzU2.f2_clr(); fzD2.f2_clr(); fqU2.f2_clr(); fqD2.f2_clr(); fz_snap(); fz_coef(); fz_hL = fz_sHL; fz_hk = 1 / fz_sHL;
   fzP.clp_pf_block(fz_drv, srate, samplesblock);
   fz_gin = fz_tgin; fz_lv = fz_tlv;
   fz_pend = 0;
@@ -544,6 +598,7 @@ function fz_srinit() (
   fz_gga = 1 - exp(-1 / (0.001 * srate)); fz_ggr = 1 - exp(-1 / (0.06 * srate));       // gate gain
   ost_init(0);
 );
+fz_F = fz_Ft = slider50 >= 1.5 ? 4 : slider50 >= 0.5 ? 2 : 1;
 fz_srinit();
 in_init();
 ostL.ost_ch_init(); ostR.ost_ch_init();
@@ -582,6 +637,15 @@ function fz_lr_copy() (
   fzq_uy4 = fz_uy4; fzq_uy5 = fz_uy5; fzr1.zr1 = fzr1.z1; fzr1.zr2 = fzr1.z2; fzr2.zr1 = fzr2.z1; fzr2.zr2 = fzr2.z2; ostR.ah.c1 = ostL.ah.c1;
   ostR.ah.lc1 = ostL.ah.lc1; ostR.ah.th1 = ostL.ah.th1; ostR.ah.x1 = ostL.ah.x1; ostR.ah.z1 = ostL.ah.z1; ostR.dcx = ostL.dcx; ostR.dcy = ostL.dcy;
   ostR.env = ostL.env; ostR.hz1 = ostL.hz1; ostR.hz2 = ostL.hz2; ostR.lz1 = ostL.lz1; ostR.lz2 = ostL.lz2;
+  // (the 4x stage)
+  fqU2.ua0 = fzU2.ua0; fqU2.ua1 = fzU2.ua1; fqU2.ua2 = fzU2.ua2; fqU2.ua3 = fzU2.ua3; fqU2.ua4 = fzU2.ua4; fqU2.ua5 = fzU2.ua5; fqU2.ux0 = fzU2.ux0;
+  fqU2.ux1 = fzU2.ux1; fqU2.ux2 = fzU2.ux2; fqU2.ux3 = fzU2.ux3; fqU2.ux4 = fzU2.ux4; fqU2.ux5 = fzU2.ux5; fqU2.ub0 = fzU2.ub0; fqU2.ub1 = fzU2.ub1;
+  fqU2.ub2 = fzU2.ub2; fqU2.ub3 = fzU2.ub3; fqU2.ub4 = fzU2.ub4; fqU2.ub5 = fzU2.ub5; fqU2.uy0 = fzU2.uy0; fqU2.uy1 = fzU2.uy1; fqU2.uy2 = fzU2.uy2;
+  fqU2.uy3 = fzU2.uy3; fqU2.uy4 = fzU2.uy4; fqU2.uy5 = fzU2.uy5; fqU2.o0 = fzU2.o0; fqU2.o1 = fzU2.o1; fqD2.da0 = fzD2.da0; fqD2.da1 = fzD2.da1;
+  fqD2.da2 = fzD2.da2; fqD2.da3 = fzD2.da3; fqD2.da4 = fzD2.da4; fqD2.da5 = fzD2.da5; fqD2.dx0 = fzD2.dx0; fqD2.dx1 = fzD2.dx1; fqD2.dx2 = fzD2.dx2;
+  fqD2.dx3 = fzD2.dx3; fqD2.dx4 = fzD2.dx4; fqD2.dx5 = fzD2.dx5; fqD2.db0 = fzD2.db0; fqD2.db1 = fzD2.db1; fqD2.db2 = fzD2.db2; fqD2.db3 = fzD2.db3;
+  fqD2.db4 = fzD2.db4; fqD2.db5 = fzD2.db5; fqD2.dy0 = fzD2.dy0; fqD2.dy1 = fzD2.dy1; fqD2.dy2 = fzD2.dy2; fqD2.dy3 = fzD2.dy3; fqD2.dy4 = fzD2.dy4;
+  fqD2.dy5 = fzD2.dy5;
 );
 function fz_lr_same() (
   fzA.rad1 == fzA.ad1 && fzA.rcd == fzA.cd && fzA.rcn == fzA.cn && fzA.rcp == fzA.cp && fzA.rcw == fzA.cw && fzA.rty == fzA.ty &&
@@ -604,7 +668,17 @@ function fz_lr_same() (
   fzq_ux5 == fz_ux5 && fzq_uy0 == fz_uy0 && fzq_uy1 == fz_uy1 && fzq_uy2 == fz_uy2 && fzq_uy3 == fz_uy3 && fzq_uy4 == fz_uy4 && fzq_uy5 == fz_uy5 &&
   fzr1.zr1 == fzr1.z1 && fzr1.zr2 == fzr1.z2 && fzr2.zr1 == fzr2.z1 && fzr2.zr2 == fzr2.z2 && ostR.ah.c1 == ostL.ah.c1 &&
   ostR.ah.lc1 == ostL.ah.lc1 && ostR.ah.th1 == ostL.ah.th1 && ostR.ah.x1 == ostL.ah.x1 && ostR.ah.z1 == ostL.ah.z1 && ostR.dcx == ostL.dcx &&
-  ostR.dcy == ostL.dcy && ostR.env == ostL.env && ostR.hz1 == ostL.hz1 && ostR.hz2 == ostL.hz2 && ostR.lz1 == ostL.lz1 && ostR.lz2 == ostL.lz2;
+  ostR.dcy == ostL.dcy && ostR.env == ostL.env && ostR.hz1 == ostL.hz1 && ostR.hz2 == ostL.hz2 && ostR.lz1 == ostL.lz1 && ostR.lz2 == ostL.lz2 &&
+  // (the 4x stage)
+  fqU2.ua0 == fzU2.ua0 && fqU2.ua1 == fzU2.ua1 && fqU2.ua2 == fzU2.ua2 && fqU2.ua3 == fzU2.ua3 && fqU2.ua4 == fzU2.ua4 && fqU2.ua5 == fzU2.ua5 &&
+  fqU2.ux0 == fzU2.ux0 && fqU2.ux1 == fzU2.ux1 && fqU2.ux2 == fzU2.ux2 && fqU2.ux3 == fzU2.ux3 && fqU2.ux4 == fzU2.ux4 && fqU2.ux5 == fzU2.ux5 &&
+  fqU2.ub0 == fzU2.ub0 && fqU2.ub1 == fzU2.ub1 && fqU2.ub2 == fzU2.ub2 && fqU2.ub3 == fzU2.ub3 && fqU2.ub4 == fzU2.ub4 && fqU2.ub5 == fzU2.ub5 &&
+  fqU2.uy0 == fzU2.uy0 && fqU2.uy1 == fzU2.uy1 && fqU2.uy2 == fzU2.uy2 && fqU2.uy3 == fzU2.uy3 && fqU2.uy4 == fzU2.uy4 && fqU2.uy5 == fzU2.uy5 &&
+  fqU2.o0 == fzU2.o0 && fqU2.o1 == fzU2.o1 && fqD2.da0 == fzD2.da0 && fqD2.da1 == fzD2.da1 && fqD2.da2 == fzD2.da2 && fqD2.da3 == fzD2.da3 &&
+  fqD2.da4 == fzD2.da4 && fqD2.da5 == fzD2.da5 && fqD2.dx0 == fzD2.dx0 && fqD2.dx1 == fzD2.dx1 && fqD2.dx2 == fzD2.dx2 && fqD2.dx3 == fzD2.dx3 &&
+  fqD2.dx4 == fzD2.dx4 && fqD2.dx5 == fzD2.dx5 && fqD2.db0 == fzD2.db0 && fqD2.db1 == fzD2.db1 && fqD2.db2 == fzD2.db2 && fqD2.db3 == fzD2.db3 &&
+  fqD2.db4 == fzD2.db4 && fqD2.db5 == fzD2.db5 && fqD2.dy0 == fzD2.dy0 && fqD2.dy1 == fzD2.dy1 && fqD2.dy2 == fzD2.dy2 && fqD2.dy3 == fzD2.dy3 &&
+  fqD2.dy4 == fzD2.dy4 && fqD2.dy5 == fzD2.dy5;
 );
 fz_sync = 0; fz_rst = 0;
 
@@ -642,7 +716,8 @@ fz_tout = 10 ^ (slider5 / 20);
 fz_gthr = slider3 <= -79.5 ? 0 : 10 ^ (slider3 / 20); // the gate (0 = off)
 // module or mode changed: fade out, switch at the silent point (in @sample), fade back in
 fz_tg();
-fz_tm != fz_m || fz_tmd != fz_md ? fz_pend = 1;
+fz_Ft = slider50 >= 1.5 ? 4 : slider50 >= 0.5 ? 2 : 1;   // OS: the factor asked for (swapped in like a module change)
+fz_tm != fz_m || fz_tmd != fz_md || fz_Ft != fz_F ? fz_pend = 1;
 // knob glides (30 ms)
 fz_gl = 1 - exp(-samplesblock / (0.03 * srate));
 fz_vin += (fz_qin - fz_vin) * fz_gl; fz_vg += (fz_qg - fz_vg) * fz_gl; fz_vb += (fz_qb - fz_vb) * fz_gl;
@@ -659,7 +734,7 @@ fz_coef();
 fzP.clp_pf_cfg(18000, 12000, -2, 180);                 // the pre-filter for fuzz: keeps the rasp, trims the flub
 fzP.clp_pf_block(fz_drv, srate, samplesblock);
 // denormal housekeeping
-fzA.clp_tidy(); fzB.clp_tidy(); fzR.clp_tidy(); fz_ostidy();
+fzA.clp_tidy(); fzB.clp_tidy(); fzR.clp_tidy(); fz_ostidy(); fzU2.f2_tidy(); fzD2.f2_tidy(); fqU2.f2_tidy(); fqD2.f2_tidy();
 fzr1.fz_bqt(); fzr2.fz_bqt(); fzo1.fz_bqt(); fzo2.fz_bqt(); fzo3.fz_bqt(); fzo4.fz_bqt();
 fzo5.fz_bqt(); fzo6.fz_bqt(); fzSl.fz_bqt(); fzSh.fz_bqt(); fzSL.clp_tidy(); fzSH.clp_tidy();
 fz_s1 = fz_tn(fz_s1); fz_s2 = fz_tn(fz_s2); fz_s3 = fz_tn(fz_s3); fz_fb = fz_tn(fz_fb); fz_env = fz_tn(fz_env);
@@ -701,7 +776,7 @@ fz_m1 ? fz_xr = fz_xl : ( fzq_lp1 += fz_cl1 * (fz_xr - fzq_lp1); fzq_lp2 += fz_c
 fz_a = max(abs(fz_xl), abs(fz_xr)); fz_gev += (fz_a > fz_gev ? fz_gda : fz_gdr) * (fz_a - fz_gev);
 fz_gthr > 0 ? ( fz_gev > fz_gthr ? fz_gop = 1 : fz_gev < 0.63 * fz_gthr ? fz_gop = 0; ) : fz_gop = 1;
 fz_gg += (fz_gop ? fz_gga : fz_ggr) * (fz_gop - fz_gg);
-// the module: pre-shaping, the pre-filter, 2x, the circuit, back to 1x, post-shaping
+// the module: pre-shaping, the pre-filter, up to the OS rate, the circuit, back to 1x, post-shaping
 fz_xl *= fz_fg; fz_xr *= fz_fg;
 fz_a = max(fz_xl * fz_xl, fz_xr * fz_xr); fz_ep += (fz_a > fz_ep ? fz_dpa : fz_dqr) * (fz_a - fz_ep);   // TAME: how hard the string is picked
 fz_xl = fzr2.fz_bq(fzr1.fz_bq(fz_xl)); fz_xr = fz_m1 ? fz_xl : fzr2.fz_bqR(fzr1.fz_bqR(fz_xr));
@@ -709,12 +784,20 @@ fz_wd > 0.0001 ? ( fzq_tl += fz_ktl * (fz_xr - fzq_tl); fz_xr += 0.35 * fz_wd * 
 fz_xl = fzP.clp_pf_run(fz_xl); fz_xr = fz_m1 ? fz_xl : fzP.clpR_pf_run(fz_xr);
 fz_rA = fzA.clp_crv(fz_bA * fz_ik); fz_rB = fz_tp == 0 ? 0 : fzB.clp_crv(fz_bB * fz_ik);
 fzq_rA = fzA.clp_crv((fz_bA + fz_wb) * fz_ik);
-fz_up(fz_xl);
-fz_y0 = fz_cs(fz_o0); fz_y1 = fz_cs(fz_o1);
-fz_yl = fz_dn(fz_y0, fz_y1);
-fz_m1 ? fz_yr = fz_yl : (
+fz_F == 1 ? fz_yl = fz_cs(fz_xl) : (
+  fz_up(fz_xl);
+  fz_F == 2 ? ( fz_y0 = fz_cs(fz_o0); fz_y1 = fz_cs(fz_o1); ) : (          // 4x: each 2x sample up again, and back
+    fzU2.f2_up(fz_o0); fz_y0 = fz_cs(fzU2.o0); fz_y1 = fz_cs(fzU2.o1); fz_y2 = fzD2.f2_dn(fz_y0, fz_y1);
+    fzU2.f2_up(fz_o1); fz_y0 = fz_cs(fzU2.o0); fz_y1 = fz_cs(fzU2.o1); fz_y1 = fzD2.f2_dn(fz_y0, fz_y1); fz_y0 = fz_y2;
+  );
+  fz_yl = fz_dn(fz_y0, fz_y1);
+);
+fz_m1 ? fz_yr = fz_yl : fz_F == 1 ? fz_yr = fzq_cs(fz_xr) : (
   fzq_up(fz_xr);
-  fz_y0 = fzq_cs(fzq_o0); fz_y1 = fzq_cs(fzq_o1);
+  fz_F == 2 ? ( fz_y0 = fzq_cs(fzq_o0); fz_y1 = fzq_cs(fzq_o1); ) : (
+    fqU2.f2_up(fzq_o0); fz_y0 = fzq_cs(fqU2.o0); fz_y1 = fzq_cs(fqU2.o1); fz_y2 = fqD2.f2_dn(fz_y0, fz_y1);
+    fqU2.f2_up(fzq_o1); fz_y0 = fzq_cs(fqU2.o0); fz_y1 = fzq_cs(fqU2.o1); fz_y1 = fqD2.f2_dn(fz_y0, fz_y1); fz_y0 = fz_y2;
+  );
   fz_yr = fzq_dn(fz_y0, fz_y1);
 );
 abs(fz_yl) < 0.0000000001 ? fz_yl = 0;                // (a drifting bias leaves a -200 dB residue: decay to a true zero)
@@ -922,6 +1005,7 @@ pk_pextra = "Reset all to defaults";
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
 fg_k = pk_preset(470 * sc, 14 * sc, 430 * sc, 30 * sc, pr_cur, #fz_pm);
 fg_k > 0 ? prs_dirty = fg_k;
+os_key(942, 18, 50, FG_DIM, 17);                     // OS (oversampling): 1x / 2x / 4x
 ui_size_picker(990 * sc, 20 * sc);
 
 // ---------- the four modules ----------

@@ -3,7 +3,7 @@ desc:BED34 [practice amp] (GFX)
 //author: GardenFX
 // by JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn and gfx-clip (.jsfx-inc) in the same folder.
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn, gfx-clip and gfx-os (.jsfx-inc) in the same folder.
 //
 // BED34. Three little practice amps from the 80s and 90s bedroom, in the spirit of the classics (the sound is designed
 // from scratch), modular: pick the AMP and the SPEAKER separately, and mix and match.
@@ -28,6 +28,9 @@ desc:BED34 [practice amp] (GFX)
 //   SPEAKER fades (10 ms): no click. Linked stereo (a mono guitar comes out the same on both sides).
 //   DRIFT    (0 - 100 %, 50 % = standard, 0 = none): the supply sags on hard chords (the power amp clips sooner and
 //            breathes) and wanders; the speaker's paper cone loosens as it works (its bass resonance drops a little).
+//   OS       the oversampling key (left of S / M / L / ?): the amp's clipping stages and the tone stack between them run at
+//            1x, 2x (the default) or 4x - each click moves on one step. 2x and 4x keep the fizz from folding back into
+//            the audio as off-key whistles. Latency: 0 / 31 / 37 samples (reported).
 //   VFD / MATRIX  the panel's look (VFD charcoal and amber; MATRIX black tolex and silver). The look only.
 //   PRESETS  12 (Init + 11) plus Reset all to defaults. A preset sets the amp, the speaker, the knobs and BROKEN SPEAKER;
 //            OUTPUT, DRIFT and the look are left alone (Reset all restores them too).
@@ -54,6 +57,7 @@ slider19:0<0,10,0.1>-TENOR reverb
 slider20:0<-5,5,0.1>-APE EQ (tilt)
 slider21:0<0,1,1{Normal,Overdrive}>-SPRITE input
 slider22:prs_sel=0<0,12,1{No preset,Init,Punk Fizz,Ape Crunch,Bedroom Clean,Sprite Crunch,Tenor Blues,Tenor Lead,Mix and Match,Tiny Box,Broken Fuzz,Broken Blues,Garage Wreck}>-Preset
+slider23:1<0,2,1{1x,2x,4x}>-Oversampling
 
 in_pin:left input
 in_pin:right input
@@ -67,6 +71,7 @@ import gfx-ui.jsfx-inc
 import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
 import gfx-clip.jsfx-inc
+import gfx-os.jsfx-inc
 
 @init
 #ui_man = "gfx-bed34";                                // the ? pop-up links to this manual
@@ -79,7 +84,7 @@ function bd_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
 function bd_sm(g) ( g * g * (3 - 2 * g); );
 
 // ---------- biquads: coefficients at o (b0 b1 b2 a1 a2), states at s (2) ----------
-function bd_w(f) ( 2 * $pi * min(max(f, 5), 0.45 * srate) / srate; );
+function bd_w(f) ( 2 * $pi * min(max(f, 5), 0.45 * bd_fs) / bd_fs; );          // at bd_fs (the base rate, or the OS rate)
 function bd_pk(o, f, gdb, q) local(A, w, cw, al, n) (
   A = 10 ^ (gdb / 40); w = bd_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al / A;
   o[0] = (1 + al * A) / n; o[1] = -2 * cw / n; o[2] = (1 - al * A) / n; o[3] = -2 * cw / n; o[4] = (1 - al / A) / n;
@@ -113,14 +118,19 @@ function bd_bq(x, o, s) local(y) ( y = o[0] * x + s[0]; s[0] = o[1] * x - o[3] *
 // ---------- one chain set's coefficients at o (by amp a, speaker k): 12 biquads ----------
 //   0 coupling HP  5 pre-emphasis  10 BASS  15 MID  20 TREBLE  25 the amp's voicing
 //   30 speaker HP  35 its bump  40 its presence  45 / 50 its roll-off (two LPs)  55 its dip
+//   (at the base rate: 0, 5, 65, 70 and the speaker; at the OS rate, between the clippers: 10 - 25 and 60)
 function bd_coef(o, a, k) local(bb, mm, tt) (
   bb = (bd_bs - 5) * 2.4; mm = (bd_md - 5) * 2.4; tt = (bd_tr - 5) * 2.4;
   a == 0 ? ( bb = -1.6 * bd_tl; mm = 0; tt = 1.6 * bd_tl; );         // APE: one EQ, a tilt
+  bd_fs = srate;
   bd_hp(o, 70, 0.7);
-  a == 0 ? ( bd_hsh(o + 5, 1000, 6); bd_lsh(o + 10, 400, bb); bd_pk(o + 15, 600, mm, 0.9); bd_hsh(o + 20, 1200, tt); bd_pk(o + 25, 500, -5, 0.8); ) :
-  a == 1 ? ( bd_hsh(o + 5, 2000, 4); bd_lsh(o + 10, 250, bb); bd_pk(o + 15, 650, mm, 0.9); bd_hsh(o + 20, 3000, tt); bd_pk(o + 25, 1600, 2, 0.8); ) :
-           ( bd_pk(o + 5, 800, 4, 0.7); bd_lsh(o + 10, 220, bb); bd_pk(o + 15, 700, mm, 0.8); bd_hsh(o + 20, 2200, tt); bd_pk(o + 25, 1200, 2, 0.7);
-             bd_pk(o + 60, bd_pf, bd_pl, bd_pq); bd_hsh(o + 65, 2500, bd_pr * 1.2); bd_bpf(o + 70, 700, 0.9); );
+  a == 0 ? bd_hsh(o + 5, 1000, 6) : a == 1 ? bd_hsh(o + 5, 2000, 4) : ( bd_pk(o + 5, 800, 4, 0.7); bd_hsh(o + 65, 2500, bd_pr * 1.2); bd_bpf(o + 70, 700, 0.9); );
+  bd_fs = srate * os_f;
+  a == 0 ? ( bd_lsh(o + 10, 400, bb); bd_pk(o + 15, 600, mm, 0.9); bd_hsh(o + 20, 1200, tt); bd_pk(o + 25, 500, -5, 0.8); ) :
+  a == 1 ? ( bd_lsh(o + 10, 250, bb); bd_pk(o + 15, 650, mm, 0.9); bd_hsh(o + 20, 3000, tt); bd_pk(o + 25, 1600, 2, 0.8); ) :
+           ( bd_lsh(o + 10, 220, bb); bd_pk(o + 15, 700, mm, 0.8); bd_hsh(o + 20, 2200, tt); bd_pk(o + 25, 1200, 2, 0.7);
+             bd_pk(o + 60, bd_pf, bd_pl, bd_pq); );
+  bd_fs = srate;
   k == 0 ? ( bd_hp(o + 30, 185, 1); bd_pk(o + 35, 235 * bd_cone, 6, 2); bd_pk(o + 40, 1300, 5, 1.2); bd_lp(o + 45, 3500, 0.8); bd_lp(o + 50, 3500, 0.7); bd_pk(o + 55, 600, -3, 1.2); ) :   // 6.5": boxy, nasal, no lows
   k == 1 ? ( bd_hp(o + 30, 115, 0.9); bd_pk(o + 35, 150 * bd_cone, 4, 1.6); bd_pk(o + 40, 2400, 5, 1.4); bd_lp(o + 45, 4800, 0.7); bd_lp(o + 50, 4800, 0.7); bd_pk(o + 55, 800, -3, 1); ) :      // 8": barky, an edge
            ( bd_hp(o + 30, 70, 0.8); bd_pk(o + 35, 95 * bd_cone, 5, 1.3); bd_pk(o + 40, 1600, 2, 0.9); bd_lp(o + 45, 5800, 0.7); bd_lp(o + 50, 5800, 0.7); bd_pk(o + 55, 1100, -2, 1); );     // 10": round and full
@@ -142,11 +152,9 @@ function set_cfg(n) instance(cf, amp, spk, r1, bi) (
   bi = bd_b1; r1 = this.c1a.clp_crv(bi);
   bd_coef(cf, amp, spk);
 );
-function set_run() instance(cf, st, amp, r1, bi, ok) local(a, b, g1, gm) (
-  a = bd_bq(bd_bq(bd_a, cf, st), cf + 5, st + 2); b = bd_bq(bd_bq(bd_b, cf, st + 32), cf + 5, st + 34);
-  amp == 2 ? ( a += bd_mbs * bd_bq(a, cf + 70, st + 24); b += bd_mbs * bd_bq(b, cf + 70, st + 56); );   // TENOR: the mid boost (+6 dB at 700 Hz)
-  g1 = amp == 0 ? bd_gape : amp == 1 ? bd_gspk : bd_gten;              // the preamp's gain (glided; TENOR: its channel's)
-  a = this.c1a.clp_pf_run(a * g1); b = this.c1b.clp_pf_run(b * g1);
+// the stages that distort, at the OS rate: the preamp's clippers, the tone stack, MASTER into the power amp (bd_a / bd_b)
+function set_nl() instance(cf, st, amp, r1, bi) local(a, b, gm) (
+  a = bd_a; b = bd_b;
   a = this.c1a.clp_run(a + bi) - r1; b = this.c1b.clp_run(b + bi) - r1;
   a = this.c2a.clp_run(a * 2) * 0.5; b = this.c2b.clp_run(b * 2) * 0.5;
   a = bd_bq(bd_bq(bd_bq(bd_bq(a, cf + 25, st + 4), cf + 10, st + 6), cf + 15, st + 8), cf + 20, st + 10);
@@ -155,6 +163,24 @@ function set_run() instance(cf, st, amp, r1, bi, ok) local(a, b, g1, gm) (
   gm = bd_ms;                                                           // MASTER into the power amp
   a = this.pa.clp_run(a * gm) / bd_msc; b = this.pb.clp_run(b * gm) / bd_msc;
   bd_pw = max(bd_pw, max(abs(a), abs(b)) * bd_msc);
+  bd_a = a; bd_b = b;
+);
+function set_run() instance(cf, st, amp, r1, bi, ok) local(a, b, g1, a0, a1, a2, a3, b0, b1, b2, b3) (
+  a = bd_bq(bd_bq(bd_a, cf, st), cf + 5, st + 2); b = bd_bq(bd_bq(bd_b, cf, st + 32), cf + 5, st + 34);
+  amp == 2 ? ( a += bd_mbs * bd_bq(a, cf + 70, st + 24); b += bd_mbs * bd_bq(b, cf + 70, st + 56); );   // TENOR: the mid boost (+6 dB at 700 Hz)
+  g1 = amp == 0 ? bd_gape : amp == 1 ? bd_gspk : bd_gten;              // the preamp's gain (glided; TENOR: its channel's)
+  a = this.c1a.clp_pf_run(a * g1); b = this.c1b.clp_pf_run(b * g1);
+  // OS: up to the running factor, the stages that distort at each phase, back down
+  os_f == 1 ? ( bd_a = a; bd_b = b; this.set_nl(); a = bd_a; b = bd_b; ) : (
+    this.ua.os_up(a); this.ub.os_up(b);
+    bd_a = this.ua.s0; bd_b = this.ub.s0; this.set_nl(); a0 = bd_a; b0 = bd_b;
+    bd_a = this.ua.s1; bd_b = this.ub.s1; this.set_nl(); a1 = bd_a; b1 = bd_b;
+    os_f == 4 ? (
+      bd_a = this.ua.s2; bd_b = this.ub.s2; this.set_nl(); a2 = bd_a; b2 = bd_b;
+      bd_a = this.ua.s3; bd_b = this.ub.s3; this.set_nl(); a3 = bd_a; b3 = bd_b;
+    );
+    a = this.da.os_dn(a0, a1, a2, a3); b = this.db.os_dn(b0, b1, b2, b3);
+  );
   amp == 2 ? ( a = bd_bq(a, cf + 65, st + 28); b = bd_bq(b, cf + 65, st + 60); );   // TENOR: presence
   a = bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(a, cf + 30, st + 12), cf + 35, st + 14), cf + 40, st + 16), cf + 45, st + 18), cf + 50, st + 20), cf + 55, st + 22);
   b = bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(b, cf + 30, st + 44), cf + 35, st + 46), cf + 40, st + 48), cf + 45, st + 50), cf + 50, st + 52), cf + 55, st + 54);
@@ -165,6 +191,7 @@ function set_reset() instance(st, bi) (
   memset(st, 0, 64); this.c1a.clp_reset(); this.c1b.clp_reset(); this.c2a.clp_reset(); this.c2b.clp_reset();
   this.pa.clp_reset(); this.pb.clp_reset(); this.c1a.clp_pf_reset(); this.c1b.clp_pf_reset();
   this.c1a.x1 = this.c1b.x1 = bi; this.c1a.ad1 = this.c1b.ad1 = this.c1a.clp_ad(bi);
+  this.ua.os_clr(); this.ub.os_clr(); this.da.os_clr(); this.db.os_clr();
 );
 function set_tidy() instance(st) local(i) (
   i = 0; loop(64, st[i] = bd_tn(st[i]); i += 1; );
@@ -227,7 +254,7 @@ function load_preset(p) local(i) (
 
 // ---------- state ----------
 function bd_srinit() (
-  bd_sr = srate;
+  bd_sr = srate; bd_fs = srate;
   bd_fst = 1 / (0.01 * srate); bd_xst = 1 / (0.025 * srate);
   bd_gsm = 1 - exp(-1 / (0.015 * srate));
   bd_ksa = bd_tc(40); bd_ksr = bd_tc(500);            // the supply: sag / recovery
@@ -235,7 +262,10 @@ function bd_srinit() (
   bk_kx = bd_op(250); rv_kh = bd_op(300); rv_n1 = min(floor(0.0333 * srate), 4000); rv_n2 = min(floor(0.0414 * srate), 4000);
   bd_pk(BKC, 1400, -10, 4); bd_pk(BKC + 5, 3200, 4, 2); bd_lsh(BKC + 10, 180, -6); bd_hp(BKC + 15, 900, 0.7);
   ost_init(0);
+  os_gsetup();
 );
+bd_fs = srate;
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider23);
 bd_srinit();
 in_init();
 dS.drift_init(0.8 + rand(1) * 0.4); dC.drift_init(0.8 + rand(1) * 0.4);
@@ -288,8 +318,10 @@ file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;
 @block
 prs_chk();
 srate != bd_sr ? bd_srinit();
+os_tf = os_f2n(slider23);                             // OS: the factor asked for (os_gate swaps it in at a silent point)
 in_setup(0, 0);
 ost_setup(0, 0.3, 120, 6000, -0.3, 1);                // the house output stage: CLIP (an amp)
+pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = os_base + os_lat(os_f);
 drift_macro(slider10);
 bd_n = samplesblock / srate;
 bd_vs = dS.drift_tick(0.04 * dm_s * bd_n); bd_vc = dC.drift_tick(0.04 * dm_s * bd_n);
@@ -340,6 +372,8 @@ bda_pw = max(bda_pw, bd_pw); bd_pw = 0;
 spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
 in_process(spl0, spl1);
 bd_xl = in_l; bd_xr = in_r;
+os_gate();
+os_chg ? ( sA.set_cfg(0); sB.set_cfg(0); sA.set_reset(); sB.set_reset(); );   // OS: a new factor - its coefficients, clean filters
 abs(bd_xl) < 0.000000000000001 ? bd_xl = 0; abs(bd_xr) < 0.000000000000001 ? bd_xr = 0;
 bd_gK != bd_tK && (bd_xf <= 0 || !bd_tK) ? ( bd_gK = bd_tK ? min(bd_gK + bd_fst, 1) : max(bd_gK - bd_fst, 0); );   // (on: after an amp / speaker change has crossfaded)
 bd_eK = bd_sm(bd_gK);
@@ -365,6 +399,7 @@ bd_gK > 0 ? bk_run();
 bd_exm = max(bd_exm, max(abs(bk_ea), abs(bk_eb)));
 bd_yl = bd_a * bd_outs; bd_yr = bd_b * bd_outs;
 bd_yl != bd_yl ? bd_yl = 0; bd_yr != bd_yr ? bd_yr = 0;
+os_g < 1 ? ( bd_yl *= os_g; bd_yr *= os_g; );
 ost_out(bd_yl, bd_yr);
 spl0 = max(-4, min(4, ost_l));
 spl1 = max(-4, min(4, ost_r));
@@ -578,6 +613,7 @@ pk_pextra = "Reset all to defaults";
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
 k_ = pk_preset(318 * sc, 22 * sc, 290 * sc, 34 * sc, pr_cur, #bd_pm);
 k_ > 0 ? prs_dirty = k_;
+os_key(950, 28, 23, KRI2, 17);                       // OS (oversampling): 1x / 2x / 4x
 ui_size_picker(1000 * sc, 30 * sc);
 
 // ---------- AMP ----------
