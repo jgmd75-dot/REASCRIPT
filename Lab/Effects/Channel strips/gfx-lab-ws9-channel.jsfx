@@ -1,0 +1,626 @@
+desc:WS9 Channel [channel strip] (GFX Lab)
+//tags: channel strip location mixer transformer iron saturation sidebar peak harmonics eq compressor clipper broadcast
+//author: GardenFX
+// by JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel, gfx-lab-os, gfx-lab-bypass, gfx-lab-sidebar
+// (.jsfx-inc) in the same folder.
+//
+// WS9 CHANNEL. One channel of a late-70s British location mixer, in the spirit of the portable broadcast desks of the
+// time (a discrete path, iron at each end, a battery supply); the sound is designed from scratch. WS9 Comp's sibling:
+// the same iron. Its own idea is the SIDEBAR (JGWizrad's design): the channel's signal is padded down 18 dB inside the
+// circuit, only the peaks that still reach the stage's ceiling are saturated, and what that saturation adds (the
+// "sidebar") is lifted back up and folded into the clean signal at its full level, before the EQ. The clean signal
+// is never squashed; the peaks gain harmonics.
+//
+// SIGNAL FLOW
+//   input -> TRIM -> [oversampled: IN IRON -> SIDEBAR -> EQ -> COMP (VCA) -> LEVEL -> OUT IRON]
+//   -> DC blocker -> CLIP (-0.3 dBFS) -> out.
+//   Stereo in = stereo out: each side runs its own channel circuit; the compressor is linked.
+//
+//   TRIM       -20 .. +20 dB, the channel's input gain. It hits the SIDEBAR stage harder and also drives the input
+//              iron (WS9 Comp's: a soft knee on fast peaks, flux saturation below ~150 Hz) - the iron's drive follows
+//              TRIM by the golden ratio, 0.618 of its travel (JG): 3 of 10 at 0 dB, 9.2 at +20 dB, clean from -10 dB down.
+//   SIDEBAR    automatic, not on the panel (JG): inside, the signal is padded 18 dB; peaks within 14 dB of 0 VU's
+//              ceiling (from about -4 dBFS) go through a soft curve (smooth from its first point, a little asymmetric
+//              for some 2nd harmonic). What it adds (the sidebar: the saturated minus the clean padded signal) is
+//              lifted back 18 dB, DC-blocked (5 Hz), high-passed at 220 Hz (so mostly upper harmonics come back and
+//              the peaks keep their size), smoothed (15 kHz) and added to the clean signal sample for sample - no
+//              delay between them. TRIM sets how often it works. gfx-lab-sidebar, shared by the WS9 series.
+//   (lamp)     the round lamp by EQ and COMP switches that section in and out (15 ms crossfade).
+//   EQ         HPF (stepped) OFF, 33, 66, 110, 220 Hz, 12 dB/oct.  LF shelf +-12 dB at 110 Hz.  MID bell +-12 dB,
+//              FREQ (stepped) 220, 440, 770 Hz, 1.1, 2.2, 3.3, 4.4, 6.6 kHz.  HF shelf +-12 dB at 8.8 kHz.
+//   COMP       0 - 10, one knob: the threshold falls (-4 to -26 dBFS) as the ratio rises (1.5 to 4.5 : 1), 8 dB knee,
+//              half the reduction made up. SPEED (stepped) FAST / MED / SLOW (attack 1 / 5 / 20 ms, release 80 / 250 /
+//              700 ms), with WS9 Comp's GRAB release at 50 % (peaks let go sooner than the body).
+//   LEVEL      -24 .. +12 dB, the channel's fader, into the output iron (WS9 Comp's: low weight, a little 2nd harmonic, a
+//              softer knee), whose drive follows LEVEL the same way: 3 of 10 at 0 dB, 6.7 at +12 dB, clean from -10 dB down.
+//   DRIFT      (0 - 100 %, 50 % = standard, 0 = none): the battery supply wandering (both irons and the SIDEBAR ceiling
+//              move with it, a few tenths of a dB at 50 %), the supply sagging a little on loud passages, and the
+//              compressor's control voltage wandering.
+//   OS         1x / 2x / 4x (default 2x): everything between TRIM and the DC blocker runs at that rate (one oversampled
+//              section). Changing it dips the sound for 5 ms and swaps at the silent point.
+//   BYPASS     the house BYPASS key: 15 ms crossfade to the untouched input, delayed by the latency.
+//   CLIP       the house output stage's clipper, always on, ceiling -0.3 dBFS (anti-aliased).
+// GUI: output VU (the house steady backlit glow, dimmed while bypassed), GAIN REDUCTION LED row, CLIP LED.
+// PRESETS    10 (Init + 9) plus Reset all to defaults. A preset sets every control but DRIFT, OS and BYPASS.
+// Latency: 0 / 31 / 37 samples at 1x / 2x / 4x (reported).
+
+slider1:0<0,1,1{Off,On}>-Bypass
+slider2:0<-20,20,0.1>-Trim (dB)
+slider3:0<0,4,1{Off,33 Hz,66 Hz,110 Hz,220 Hz}>-HPF
+slider4:0<-12,12,0.1>-LF (dB)
+slider5:0<-12,12,0.1>-Mid (dB)
+slider6:3<0,7,1{220 Hz,440 Hz,770 Hz,1.1 kHz,2.2 kHz,3.3 kHz,4.4 kHz,6.6 kHz}>-Mid frequency
+slider7:0<-12,12,0.1>-HF (dB)
+slider8:1<0,1,1{Off,On}>-EQ in
+slider9:3<0,10,0.1>-Comp
+slider10:1<0,2,1{Fast,Medium,Slow}>-Speed
+slider11:1<0,1,1{Off,On}>-Comp in
+slider12:0<-24,12,0.1>-Level (dB)
+slider13:50<0,100,1>-Drift (%)
+slider14:1<0,2,1{1x,2x,4x}>-Oversampling
+slider15:prs_sel=0<0,10,1{No preset,Init,Dialogue Boom,Location Music,Drum Room,Vocal Presence,Acoustic Guitar,Bass DI,Hot Peaks,Open Top,Clean Desk}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-input.jsfx-inc
+import gfx-lab-output.jsfx-inc
+import gfx-lab-drift.jsfx-inc
+import gfx-lab-ui.jsfx-inc
+import gfx-lab-panel.jsfx-inc
+import gfx-lab-os.jsfx-inc
+import gfx-lab-bypass.jsfx-inc
+import gfx-lab-sidebar.jsfx-inc
+
+@init
+#ui_man = "gfx-lab-ws9-channel";                              // the ? pop-up links to this manual
+ext_noinit = 1;
+
+function lc_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function lc_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
+function lc_db(d) ( exp(d * 0.11512925464970228); );
+function lc_hpf(i) ( i == 1 ? 33 : i == 2 ? 66 : i == 3 ? 110 : 220; );
+function lc_mid(i) ( i == 0 ? 220 : i == 1 ? 440 : i == 2 ? 770 : i == 3 ? 1100 : i == 4 ? 2200 : i == 5 ? 3300 : i == 6 ? 4400 : 6600; );
+
+// ---------- the iron (WS9 Comp's) ----------
+// One transformer core at the running rate (base x os_f). Below the core's corner (a one-pole split, ~150 Hz IN,
+// ~120 Hz OUT) the flux saturates on its own curve, with a small bias for the even harmonics (gl = its drive, b the
+// bias, rb / kb keep it level and DC-free for small signals); then the whole signal meets the core's soft knee (g).
+function ir_sat(x) ( x / sqrt(1 + x * x); );
+function ir_run(u, g, gl, b, rb, kb, kc) instance(lp) local(lo) (
+  lp += (u - lp) * kc;
+  lo = (ir_sat(lp * gl + b) - rb) * kb / gl;
+  ir_sat((u - lp + lo) * g) / g;
+);
+function ir_tgt(d, kg, kl, kbias, hb) instance(tg, tgl, tb, trb, tkb) (
+  tg = lc_db(kg * d - 9) * hb; tgl = tg * (1 + kl * d); tb = kbias * d;
+  trb = ir_sat(tb); tkb = (1 + tb * tb) ^ 1.5;
+);
+function ir_glide(k) instance(tg, tgl, tb, trb, tkb, g, gl, b, rb, kb) (
+  g += (tg - g) * k; gl += (tgl - gl) * k; b += (tb - b) * k; rb += (trb - rb) * k; kb += (tkb - kb) * k;
+);
+function ir_snap() instance(tg, tgl, tb, trb, tkb, g, gl, b, rb, kb) ( g = tg; gl = tgl; b = tb; rb = trb; kb = tkb; );
+
+// ---------- SIDEBAR: gfx-lab-sidebar (sb_*) ----------
+
+// ---------- the EQ (RBJ biquads at the running rate; coefficients worked every 32 base samples) ----------
+function bq(x, b0, b1, b2, a1, a2) instance(s1, s2) local(y) ( y = b0 * x + s1; s1 = b1 * x - a1 * y + s2; s2 = b2 * x - a2 * y; y; );
+function bq_hp(f, fs) instance(b0, b1, b2, a1, a2) local(w, cw, al, n) (
+  w = 2 * $pi * min(f, 0.45 * fs) / fs; cw = cos(w); al = sin(w) / (2 * 0.70710678); n = 1 + al;
+  b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+);
+function bq_ls(f, gdb, fs) instance(b0, b1, b2, a1, a2) local(ga, w, cw, sa, n) (
+  ga = 10 ^ (gdb / 40); w = 2 * $pi * min(f, 0.45 * fs) / fs; cw = cos(w); sa = 2 * sqrt(ga) * sin(w) / 2 * sqrt(2);
+  n = (ga + 1) + (ga - 1) * cw + sa;
+  b0 = ga * ((ga + 1) - (ga - 1) * cw + sa) / n; b1 = 2 * ga * ((ga - 1) - (ga + 1) * cw) / n;
+  b2 = ga * ((ga + 1) - (ga - 1) * cw - sa) / n; a1 = -2 * ((ga - 1) + (ga + 1) * cw) / n; a2 = ((ga + 1) + (ga - 1) * cw - sa) / n;
+);
+function bq_hs(f, gdb, fs) instance(b0, b1, b2, a1, a2) local(ga, w, cw, sa, n) (
+  ga = 10 ^ (gdb / 40); w = 2 * $pi * min(f, 0.45 * fs) / fs; cw = cos(w); sa = 2 * sqrt(ga) * sin(w) / 2 * sqrt(2);
+  n = (ga + 1) - (ga - 1) * cw + sa;
+  b0 = ga * ((ga + 1) + (ga - 1) * cw + sa) / n; b1 = -2 * ga * ((ga - 1) + (ga + 1) * cw) / n;
+  b2 = ga * ((ga + 1) + (ga - 1) * cw - sa) / n; a1 = 2 * ((ga - 1) - (ga + 1) * cw) / n; a2 = ((ga + 1) - (ga - 1) * cw - sa) / n;
+);
+function bq_pk(f, gdb, q, fs) instance(b0, b1, b2, a1, a2) local(ga, w, cw, al, n) (
+  ga = 10 ^ (gdb / 40); w = 2 * $pi * min(f, 0.45 * fs) / fs; cw = cos(w); al = sin(w) / (2 * q); n = 1 + al / ga;
+  b0 = (1 + al * ga) / n; b1 = -2 * cw / n; b2 = (1 - al * ga) / n; a1 = b1; a2 = (1 - al / ga) / n;
+);
+// the glides (30 ms, at the control rate) and the coefficients
+function eq_upd(k) local(fs) (
+  fs = srate * os_f;
+  eq_lf += (eq_lft - eq_lf) * k; eq_md += (eq_mdt - eq_md) * k; eq_hf += (eq_hft - eq_hf) * k;
+  eq_mf += (eq_mft - eq_mf) * k;
+  eq_hpm < 0.0001 ? eq_hz = eq_hzt : eq_hz += (eq_hzt - eq_hz) * k;   // (while the HPF is out it jumps straight there)
+  cHP.bq_hp(exp(eq_hz), fs); cLS.bq_ls(110, eq_lf, fs); cPK.bq_pk(exp(eq_mf), eq_md, 0.9, fs); cHS.bq_hs(8800, eq_hf, fs);
+  sb_ctl(k);
+);
+function eq_run(x) local(h) (
+  h = this.h.bq(x, cHP.b0, cHP.b1, cHP.b2, cHP.a1, cHP.a2);
+  x += eq_hpm * (h - x);
+  x = this.l.bq(x, cLS.b0, cLS.b1, cLS.b2, cLS.a1, cLS.a2);
+  x = this.m.bq(x, cPK.b0, cPK.b1, cPK.b2, cPK.a1, cPK.a2);
+  this.s.bq(x, cHS.b0, cHS.b1, cHS.b2, cHS.a1, cHS.a2);
+);
+
+// ---------- the compressor: gain computer and WS9 Comp's GRAB envelope (fixed at 50 %) ----------
+function cp_gc(lv) local(ov, k2) (
+  ov = lv - cp_th; k2 = cp_kw * 0.5;
+  -(ov <= -k2 ? 0 : ov >= k2 ? ov * cp_sl : cp_sl * sqr(ov + k2) / (2 * cp_kw));
+);
+function cp_env(t) instance(gp, gf, gs) (
+  gp += (t < gp ? cp_ka : cp_kr) * (t - gp);
+  gf += (t < gf ? cp_kaf : cp_krf) * (t - gf);
+  gs += (t < gs ? cp_kas : cp_krs) * (t - gs);
+  gp + 0.5 * (min(gf, gs) - gp);
+);
+
+// one oversampled sample of the whole channel, both sides (x = after TRIM; ga / gb the VCA gains); out in lc_pl / lc_pr,
+// the compressor's detector input (after the EQ) in lc_wl / lc_wr
+function lc_os(xl, xr, ga, gb) local(a, b, sa, sb) (
+  a = iaL.ir_run(xl, iIn.g, iIn.gl, iIn.b, iIn.rb, iIn.kb, ir_kci);
+  b = iaR.ir_run(xr, iIn.g, iIn.gl, iIn.b, iIn.rb, iIn.kb, ir_kci);
+  sa = shL.sb_run(a); sb = shR.sb_run(b);
+  a += sa; b += sb;
+  a = eqL.eq_run(a) * eq_m + a * (1 - eq_m); b = eqR.eq_run(b) * eq_m + b * (1 - eq_m);
+  lc_wl = a; lc_wr = b;
+  a = obL.ir_run(a * ga * lc_lv, iOut.g, iOut.gl, iOut.b, iOut.rb, iOut.kb, ir_kco);    // LEVEL is the fader into the output iron
+  b = obR.ir_run(b * gb * lc_lv, iOut.g, iOut.gl, iOut.b, iOut.rb, iOut.kb, ir_kco);
+  lc_pl = a; lc_pr = b;
+);
+function lc_rcoefs(f) local(w) (
+  w = 2 * $pi / (srate * f); ir_kci = 1 - exp(-150 * w); ir_kco = 1 - exp(-120 * w);
+  sb_rate(srate * f);
+  eq_upd(1);
+);
+function lc_clear() (
+  uxL.os_clr(); uxR.os_clr(); dnL.os_clr(); dnR.os_clr();
+  iaL.lp = iaR.lp = obL.lp = obR.lp = 0;
+  shL.sb_clr(); shR.sb_clr();
+  eqL.h.s1 = eqL.h.s2 = eqL.l.s1 = eqL.l.s2 = eqL.m.s1 = eqL.m.s2 = eqL.s.s1 = eqL.s.s2 = 0;
+  eqR.h.s1 = eqR.h.s2 = eqR.l.s1 = eqR.l.s2 = eqR.m.s1 = eqR.m.s2 = eqR.s.s1 = eqR.s.s2 = 0;
+);
+
+// after REAPER's own bypass (the unit stopped, its buffers stale): clear everything and fade in from the dry input
+function lc_reset() (
+  lc_clear(); memset(BY_BUF, 0, 2 * BY_N);
+  eC.gp = eC.gf = eC.gs = 0; lc_msl = lc_msr = 0; lc_gp = lc_gn = 1;
+  lc_dxl = lc_dyl = lc_dxr = lc_dyr = 0; in_dxL = in_dyL = in_dxR = in_dyR = 0; sg_e = 0; vu_ms = 0;
+  lc_fi = 0;
+);
+
+// ---------- presets ----------
+#lc_pm = "Init|Dialogue Boom|Location Music|Drum Room|Vocal Presence|Acoustic Guitar|Bass DI|Hot Peaks|Open Top|Clean Desk";
+function lc_set(tr, hp, lf, md, mf, hf, cp, sp, lv) (
+  slider2 = tr; slider3 = hp; slider4 = lf; slider5 = md; slider6 = mf; slider7 = hf; slider8 = 1;
+  slider9 = cp; slider10 = sp; slider11 = 1; slider12 = lv;
+);
+function load_preset(p) local(i) (
+  //                    trim  hpf  lf    mid  freq  hf   comp spd  level
+  p == 1  ? lc_set(  0,   0,   0,    0,   3,    0,    3,   1,   0) :     // Init
+  p == 2  ? lc_set(  4,   3,  -2,    2,   4,    1,    5,   1,  -2) :     // Dialogue Boom
+  p == 3  ? lc_set(  0,   1,   0,    0,   3,  1.5,    3,   2,   0) :     // Location Music
+  p == 4  ? lc_set(  6,   2,   2,   -2,   2,    2,    6,   0,  -6) :     // Drum Room
+  p == 5  ? lc_set(  3,   3,  -1,    3,   5,    2,    5,   1,  -2) :     // Vocal Presence
+  p == 6  ? lc_set( -2,   2,  -2, -1.5,   1,  2.5,    3,   1,   2) :     // Acoustic Guitar
+  p == 7  ? lc_set(  6,   1,   3,   -2,   2,   -1,    5,   2,  -4) :     // Bass DI
+  p == 8  ? lc_set( 10,   0,   0,    0,   3,    0,    4,   0, -10) :     // Hot Peaks
+  p == 9  ? lc_set(  0,   2,  -1,    1,   6,  2.5,    2,   1,   0) :     // Open Top
+  p == 10 ? lc_set( -8,   0,   0,    0,   3,    0,    0,   1,   8) :     // Clean Desk
+  p == 11 ? ( lc_set(0, 0, 0, 0, 3, 0, 3, 1, 0); slider13 = 50; );                    // Reset all to defaults
+  i = 2; loop(11, ui_auto(i); i += 1; );
+  pr_cur = p == 11 ? 1 : p;
+);
+
+// ---------- state ----------
+function lc_srinit() (
+  lc_sr = srate;
+  lc_kd = lc_tc(1);                                   // the detector: a 1 ms mean square
+  c_kn = lc_tc(30); c_sw = lc_tc(15);
+  c_k32 = 1 - exp(-32 / (0.03 * srate));             // the EQ's glides, at the control rate
+  sg_k = lc_tc(60);                                   // the supply's sag follows the level over ~60 ms
+  vu_k = lc_tc(300);
+  lc_dcc = 1 - 2 * $pi * 5 / srate;                   // the 5 Hz DC blocker (the iron's bias)
+  lc_fis = 1 / (0.01 * srate);
+  ost_init(0);
+  lc_rcoefs(os_f); lc_clear();
+);
+os_design();
+os_f = os_tf = os_f2n(slider14); os_base = 0;
+eq_lf = eq_lft = slider4; eq_md = eq_mdt = slider5; eq_hf = eq_hft = slider7;
+eq_mf = eq_mft = log(lc_mid(slider6)); eq_hz = eq_hzt = log(110); eq_hpm = slider3 >= 0.5;
+lc_srinit();
+os_gsetup();
+in_init();
+dV.drift_init(0.8 + rand(1) * 0.4); dT.drift_init(0.8 + rand(1) * 0.4);
+drift_macro(50);
+lc_snap = 1; lc_fi = 1; lc_cr = 0;
+pdc_delay = os_lat(os_f);
+by_setup(1);
+
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility). A change of prs_sel loads that preset (0 = nothing loaded); the
+// preset bar asks through prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project
+// never reloads a preset over its settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 10 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(10, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@block
+prs_chk();
+srate != lc_sr ? lc_srinit();
+lc_now = time_precise();
+lc_tp > 0 && lc_now - lc_tp > max(0.25, 4 * samplesblock / srate) ? lc_reset();   // a gap: REAPER's bypass came off
+lc_tp = lc_now;
+in_setup(min(max(slider2, -20), 20), 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);                // the house output stage: CLIP at -0.3 dBFS
+os_tf = os_f2n(slider14); pdc_delay = os_lat(os_f);    // (ost_setup zeroes pdc_delay)
+pdc_bot_ch = 0; pdc_top_ch = 2;                        // (in_pin / out_pin: REAPER carries any other channels round)
+drift_macro(slider13);
+lc_n = samplesblock / srate;
+lc_vv = dV.drift_tick(0.03 * dm_s * lc_n); lc_vt = dT.drift_tick(0.05 * dm_s * lc_n);
+// the battery supply (18 V): wandering with DRIFT, sagging a little on loud passages; less voltage = less headroom
+lc_sag = 0.35 * min(sqrt(sg_e) / 0.5, 1);
+lc_v = max(18 - 0.35 * dm_a * (0.5 + 0.5 * lc_vv) - lc_sag, 15);
+lc_hb = (18 / lc_v) ^ 1.5;
+// the iron follows TRIM and LEVEL (JG): each is pushed by the golden ratio's 0.618 of its control's travel - at 0 dB 3 of
+// 10 (the old default), at +20 dB TRIM 9.2, at +12 dB LEVEL 6.7; turned down, the iron eases off to clean (0)
+iIn.ir_tgt(min(max(0.3 + 0.618 * min(max(slider2, -20), 20) / 20, 0), 1), 21, 0.8, 0.1, lc_hb);
+iOut.ir_tgt(min(max(0.3 + 0.618 * min(max(slider12, -24), 12) / 20, 0), 1), 19, 2, 0.25, lc_hb);
+// SIDEBAR: the ceiling's knee in the padded signal (0 VU = -18 dBFS, padded = -36 dBFS), the amount, in / out
+sb_target(14, 1, 1, 220, lc_hb);                      // SIDEBAR: automatic (JG: not on the panel) - TRIM drives it
+// the EQ
+eq_hpi = floor(min(max(slider3, 0), 4) + 0.5);
+eq_hpt = eq_hpi > 0; eq_hpi > 0 ? eq_hzt = log(lc_hpf(eq_hpi));
+eq_lft = min(max(slider4, -12), 12); eq_mdt = min(max(slider5, -12), 12); eq_hft = min(max(slider7, -12), 12);
+eq_mft = log(lc_mid(floor(min(max(slider6, 0), 7) + 0.5)));
+eq_mt = slider8 >= 0.5;
+// the compressor
+cp_k = min(max(slider9, 0), 10);
+cp_tht = -4 - 2.2 * cp_k + 0.3 * dm_a * lc_vt;                         // the control voltage wanders a little
+cp_slt = 1 - 1 / (1.5 + 0.3 * cp_k); cp_kw = 8;
+cp_am = min(cp_k, 1);
+cp_spd = floor(min(max(slider10, 0), 2) + 0.5);
+cp_att = cp_spd == 0 ? 1 : cp_spd == 1 ? 5 : 20; cp_rel = (cp_spd == 0 ? 80 : cp_spd == 1 ? 250 : 700) * (18 / lc_v);
+cp_ka = lc_tc(cp_att); cp_kr = lc_tc(cp_rel);
+cp_kaf = lc_tc(cp_att / 2.5); cp_krf = lc_tc(0.25 * cp_rel);
+cp_kas = lc_tc(10 * cp_att + 20); cp_krs = lc_tc(2.5 * cp_rel);
+cp_mt = slider11 >= 0.5;
+lc_lvt = lc_db(min(max(slider12, -24), 12));
+lc_snap ? (
+  cp_th = cp_tht; cp_sl = cp_slt; cp_mk = 0; lc_lv = lc_lvt;
+  eq_m = eq_mt; eq_hpm = eq_hpt; cp_m = cp_mt; iIn.ir_snap(); iOut.ir_snap(); lc_gp = lc_gn = 1;
+  eq_lf = eq_lft; eq_md = eq_mdt; eq_hf = eq_hft; eq_mf = eq_mft; eq_hz = eq_hzt; sb_snap(); eq_upd(1);
+);
+lc_snap = 0;
+iaL.lp = lc_tn(iaL.lp); iaR.lp = lc_tn(iaR.lp); obL.lp = lc_tn(obL.lp); obR.lp = lc_tn(obR.lp);
+lc_msl = lc_tn(lc_msl); lc_msr = lc_tn(lc_msr); sg_e = lc_tn(sg_e);
+// the panel's mailboxes
+lca_gr_d = min(lca_gr_d, lc_grm); lc_grm = 0;
+lca_cl_d = max(lca_cl_d, lc_clp); lc_clp = 0;
+lca_vu_d = vu_ms;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+by_in();
+in_process(spl0, spl1);
+lc_xl = in_l; lc_xr = in_r;
+abs(lc_xl) < 0.000000000000001 ? lc_xl = 0; abs(lc_xr) < 0.000000000000001 ? lc_xr = 0;
+// glides (no steps on a knob move, a switch or a preset change)
+iIn.ir_glide(c_kn); iOut.ir_glide(c_kn);
+sb_glide(c_kn, c_sw);
+eq_m += (eq_mt - eq_m) * c_sw; eq_hpm += (eq_hpt - eq_hpm) * c_sw; cp_m += (cp_mt - cp_m) * c_sw;
+cp_th += (cp_tht - cp_th) * c_kn; cp_sl += (cp_slt - cp_sl) * c_kn; lc_lv += (lc_lvt - lc_lv) * c_kn;
+(lc_cr -= 1) <= 0 ? ( lc_cr = 32; eq_upd(c_k32); );
+sg_e += (max(lc_xl * lc_xl, lc_xr * lc_xr) - sg_e) * sg_k;
+os_gate();
+os_chg ? ( lc_rcoefs(os_f); lc_clear(); os_hold += 2 * samplesblock; );
+// the oversampled section; the VCA's gain steps from the last sample's to this one's across the phases
+uxL.os_up(lc_xl); uxR.os_up(lc_xr);
+os_f == 1 ? (
+  lc_os(uxL.s0, uxR.s0, lc_gn, lc_gn); lc_dpl = lc_wl; lc_dpr = lc_wr; lc_yl = lc_pl; lc_yr = lc_pr;
+) : (
+  lc_dd = (lc_gn - lc_gp) / os_f;
+  lc_os(uxL.s0, uxR.s0, lc_gp + lc_dd, lc_gp + lc_dd); lc_dpl = lc_wl; lc_dpr = lc_wr; lc_a0 = lc_pl; lc_b0 = lc_pr;
+  lc_os(uxL.s1, uxR.s1, lc_gp + 2 * lc_dd, lc_gp + 2 * lc_dd); lc_a1 = lc_pl; lc_b1 = lc_pr;
+  os_f == 2 ? ( lc_yl = dnL.os_dn(lc_a0, lc_a1, 0, 0); lc_yr = dnR.os_dn(lc_b0, lc_b1, 0, 0); ) : (
+    lc_os(uxL.s2, uxR.s2, lc_gp + 3 * lc_dd, lc_gp + 3 * lc_dd); lc_a2 = lc_pl; lc_b2 = lc_pr;
+    lc_os(uxL.s3, uxR.s3, lc_gn, lc_gn); lc_a3 = lc_pl; lc_b3 = lc_pr;
+    lc_yl = dnL.os_dn(lc_a0, lc_a1, lc_a2, lc_a3); lc_yr = dnR.os_dn(lc_b0, lc_b1, lc_b2, lc_b3);
+  );
+);
+// the compressor's detector (after the EQ, its base-rate phase), linked; its gain reaches the VCA one sample later
+lc_msl += lc_kd * (lc_dpl * lc_dpl - lc_msl); lc_msr += lc_kd * (lc_dpr * lc_dpr - lc_msr);
+cp_t = cp_am * cp_gc(10 * log10(max(max(lc_msl, lc_msr), 0.00000000001)) + 3.0103);
+cp_g = eC.cp_env(cp_t);
+cp_mk += (-0.5 * cp_am * cp_gc(-12) - cp_mk) * c_kn;                  // half the reduction made up
+lc_grm = min(lc_grm, cp_m * cp_g);
+lc_gp = lc_gn; lc_gn = exp(0.115129255 * cp_m * (cp_g + cp_mk));
+// the iron's bias leaves a little DC: a 5 Hz blocker
+lc_z = lc_yl - lc_dxl + lc_dcc * lc_dyl; lc_dxl = lc_yl; lc_dyl = lc_z; lc_yl = lc_z;
+lc_z = lc_yr - lc_dxr + lc_dcc * lc_dyr; lc_dxr = lc_yr; lc_dyr = lc_z; lc_yr = lc_z;
+lc_osg = os_g * os_g * (3 - 2 * os_g);                                // the OS swap's dip (an S-curve)
+lc_yl *= lc_osg; lc_yr *= lc_osg;
+lc_yl != lc_yl ? lc_yl = 0; lc_yr != lc_yr ? lc_yr = 0;
+lc_fi < 1 ? (                                                          // fading in after a reset, from the dry input
+  lc_fi = min(lc_fi + lc_fis, 1); lc_z = lc_fi * lc_fi * (3 - 2 * lc_fi);
+  lc_a = by_d == 0 ? by_il : BY_BUF[(by_w - by_d) & (BY_N - 1)]; lc_b = by_d == 0 ? by_ir : BY_BUF[BY_N + ((by_w - by_d) & (BY_N - 1))];
+  lc_yl = lc_a + lc_z * (lc_yl - lc_a); lc_yr = lc_b + lc_z * (lc_yr - lc_b);
+);
+max(abs(lc_yl), abs(lc_yr)) > 0.89 ? lc_clp = 1;                       // the CLIP lamp: into the clipper's knee
+ost_out(lc_yl, lc_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+by_out();
+vu_ms += (0.5 * (spl0 * spl0 + spl1 * spl1) - vu_ms) * vu_k;
+
+@gfx 1080 500
+ui_begin(1080, 500);
+// =====================================================================
+// GUI - a location mixer channel's steel faceplate in cream with a brick-red header band and dark print: two plates (INPUT,
+// COMP, OUTPUT; EQ) and the METERS. the 70s desk knobs WS9 Comp has (black fluted skirts, flat coloured caps), round lamps by the section titles
+// (click = in / out), the output VU with the house glow, the GAIN REDUCTION LED row. Design space 1080 x 500.
+// Knobs: drag (SHIFT = fine), wheel, double-click = default; the name shows the value while the knob is touched.
+// =====================================================================
+// cream and brick (WS9 Comp's sister colourway, 30 Oct 2026): cream plates, a brick-red header band, dark brown print
+LVP = 0xE6DDC8; LVPS = 0xEEE7D5; LVPH = 0x8E3426; LVPW = 0x9C917B; LVI = 0x2A1E16; LVT = 0xF6EEDC; LVA = 0x8E3426;
+LVI2 = ui_mix(LVI, LVP, 0.38); LVT2 = ui_mix(LVT, LVPH, 0.38);
+// cap colours from the 70s British desk JG sent (as WS9 Comp): red, bottle green, grey, blue, yellow, orange (+ the house LF brown)
+CPR = 0x2F62A6; CRD = 0xC4222B; CSL = 0x2D5A48; CAM = 0xE07A1F; CYL = 0xF2C21B; CGY = 0xBDC0BA; CBK = 0xBDC0BA;
+CBR = 0x8A5A32; CBL = 0x2F62A6; CBL2 = 0xBDC0BA; CCR = 0xBDC0BA;
+
+sc != lv_fsc ? (
+  lv_fsc = sc;
+  lv_f10 = ui_fitfont(10, 14 * sc);     // knob labels
+  lv_f11 = ui_fitfont(11, 15 * sc);     // section titles
+  lv_f12 = ui_fitfont(12, 11 * sc);     // printed scales
+  lv_f13 = ui_fitfont(13, 14 * sc);     // lamp-key legends
+  lv_f14 = ui_fitfont(14, 27 * sc);     // the title
+  lv_f15 = ui_fitfont(15, 11.5 * sc);   // the subtitle
+);
+gfx_setfont(10, "Trebuchet MS", lv_f10, 'b'); gfx_setfont(11, "Trebuchet MS", lv_f11, 'b');
+gfx_setfont(12, "Trebuchet MS", lv_f12, 'b'); gfx_setfont(13, "Trebuchet MS", lv_f13, 'b');
+gfx_setfont(14, "Trebuchet MS", lv_f14, 'b'); gfx_setfont(15, "Trebuchet MS", lv_f15, 'b');
+
+function lv_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function lv_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function lv_ltxt(x, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = x * sc; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function lv_thick(x1, y1, x2, y2, w) ( ui_ssline(x1, y1, x2, y2, w, 0); );
+// soft drop shadow (light from the top left): 4 layers at 13 % black, (+2, +3) to (+6, +8)
+function lv_shadow(x, y, w, h) local(j) ( j = 0; loop(4, ui_cola(0x000000, 0.13); lv_r(x + 2 + j * 1.3, y + 3 + j * 1.6, w + j * 0.6, h + j * 0.6); j += 1; ); );
+// a plate: a dark seam round it, the face, a header band (32 high) with a cream rule under it
+function lv_plate(x, y, w, h) (
+  lv_shadow(x, y, w, h);
+  ui_col(LVPW); lv_r(x, y, w, h);
+  ui_col(LVPS); lv_r(x + 1, y + 1, w - 2, h - 2);
+  ui_cola(0xFFFFFF, 0.07); lv_r(x + 1, y + 1, w - 2, 1); lv_r(x + 1, y + 1, 1, h - 2);
+  ui_cola(0x000000, 0.22); lv_r(x + 1, y + h - 3, w - 2, 2); lv_r(x + w - 3, y + 1, 2, h - 2);
+  ui_col(LVPH); lv_r(x + 1, y + 1, w - 2, 32);
+  ui_cola(LVT, 0.35); lv_r(x + 1, y + 33, w - 2, 1);
+);
+function lv_title(x, y, s) ( gfx_setfont(11); ui_col(LVT); lv_ltxt(x + 14, y + 17, s); );
+// a thin inked line between two sections on one plate
+function lv_split(x, y, h) ( ui_col(LVPW); lv_r(x, y + 1, 1, h - 2); ui_cola(0xFFFFFF, 0.06); lv_r(x + 1, y + 34, 1, h - 35); );
+// a switched-off section: the face colour at about 50 % over its content
+function lv_grey(x, y, w, h) ( ui_cola(LVPS, 0.55); lv_r(x + 1, y + 34, w - 1, h - 37); );
+function lv_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+// the section title lamp: a round ring lamp (cream ring, amber centre, a soft halo when lit) left of the title;
+// clicking it switches the section in / out
+function lv_tlamp(x, y, s, idx) local(cx, cy, on, hov, j) (
+  cx = x + 22; cy = y + 17; on = slider(idx) >= 0.5;
+  hov = sqr(mouse_x - cx * sc) + sqr(mouse_y - cy * sc) <= sqr(12 * sc);
+  hov && pressed && drag_id == 0 ? ( lv_tog(idx); drag_id = -1; on = !on; );
+  on ? ( j = 0; loop(4, ui_cola(0xFFB030, 0.07); gfx_circle(cx * sc, cy * sc, (8.5 + j * 2) * sc, 1, 1); j += 1; ); );
+  ui_cola(0x000000, 0.35); gfx_circle((cx + 1) * sc, (cy + 1.5) * sc, 7.5 * sc, 1, 1);
+  ui_col(0xE8E0CB); gfx_circle(cx * sc, cy * sc, 7.5 * sc, 1, 1);
+  ui_col(0x2A2418); gfx_circle(cx * sc, cy * sc, 5.4 * sc, 1, 1);
+  ui_col(on ? 0xFFB030 : 0x5A4022); gfx_circle(cx * sc, cy * sc, 4.5 * sc, 1, 1);
+  on ? ( ui_cola(0xFFF0C8, 0.75); gfx_circle((cx - 1.3) * sc, (cy - 1.3) * sc, 1.7 * sc, 1, 1); );
+  hov ? ( ui_cola(0xFFFFFF, 0.12); gfx_circle(cx * sc, cy * sc, 7.5 * sc, 1, 1); );
+  gfx_setfont(11); ui_col(LVT); lv_ltxt(x + 38, y + 17, s);
+);
+
+function lv_hpf(i) ( i == 1 ? 33 : i == 2 ? 66 : i == 3 ? 110 : 220; );   // (the panel's own copies)
+function lv_mid(i) ( i == 0 ? 220 : i == 1 ? 440 : i == 2 ? 770 : i == 3 ? 1100 : i == 4 ? 2200 : i == 5 ? 3300 : i == 6 ? 4400 : 6600; );
+// knobs: the C2M desk knob; lv_lg = log scale, lv_step = stepped (set before; cleared after)
+lv_lg = 0; lv_step = 0;
+function lv_kn(v, lo, hi) ( lv_lg ? log(max(v, lo) / lo) / log(hi / lo) : (v - lo) / (hi - lo); );
+function lv_kv(n, lo, hi) ( lv_lg ? lo * exp(n * log(hi / lo)) : lo + n * (hi - lo); );
+// the knob (from the 70s British desk JG sent): a black fluted skirt, a flat coloured cap, a white pointer line running
+// across cap and skirt; a ring of dots round it (nd steps). Design px.
+function lv_cap(cx, cy, r, a, act, cap, nd) local(i, t, x, y, rr) (
+  x = cx * sc; y = cy * sc; rr = r * sc;
+  ui_col(LVI); i = 0;
+  loop(nd + 1, t = -0.75 * $pi + i / nd * 1.5 * $pi;
+    gfx_circle(x + sin(t) * (rr + 7 * sc), y - cos(t) * (rr + 7 * sc), (i == 0 || i == nd ? 1.5 : 1.2) * sc, 1, 1); i += 1; );
+  i = 0; loop(4, ui_cola(0x000000, 0.13); gfx_circle(x + (2 + i * 1.3) * sc, y + (3 + i * 1.6) * sc, rr + i * 0.6 * sc, 1, 1); i += 1; );
+  ui_col(0x121212); gfx_circle(x, y, rr, 1, 1);                                   // the skirt
+  i = 0; loop(30, t = i / 30 * 2 * $pi; ui_col(0x34343A);                         // its flutes
+    ui_ssline(x + sin(t) * rr * 0.74, y - cos(t) * rr * 0.74, x + sin(t) * rr * 0.95, y - cos(t) * rr * 0.95, 1.1 * sc, 0); i += 1; );
+  i = 0; loop(5, ui_cola(0x000000, 0.14 * (1 - i / 5)); gfx_circle(x, y, rr - i * 0.8 * sc, 0, 1); i += 1; );   // vignette edge
+  ui_cola(0xFFFFFF, act ? 0.22 : 0.14); ui_ssarc(x, y, rr * 0.97, -1.9, -0.1, 1 * sc);
+  ui_col(ui_mix(cap, 0x000000, 0.45)); gfx_circle(x, y, rr * 0.66, 1, 1);         // the cap
+  ui_col(cap); gfx_circle(x, y, rr * 0.62, 1, 1);
+  i = 0; loop(4, ui_cola(0x000000, 0.06 * (1 - i / 4)); gfx_circle(x, y, rr * 0.62 - i * 0.8 * sc, 0, 1); i += 1; );
+  ui_cola(0xFFFFFF, act ? 0.34 : 0.24); ui_ssarc(x, y, rr * 0.55, -1.7, -0.25, 1 * sc);
+  ui_col(((cap >> 16) & 255) * 0.3 + ((cap >> 8) & 255) * 0.59 + (cap & 255) * 0.11 > 165 ? 0x1A1A18 : 0xF7F5EE);   // dark on light caps
+  ui_ssline(x + sin(a) * rr * 0.12, y - cos(a) * rr * 0.12, x + sin(a) * rr * 0.96, y - cos(a) * rr * 0.96, (r > 24 ? 3 : 2.5) * sc, 1);
+);
+function lv_knob(cx, cy, r, idx, lo, hi, def, cap, nd) local(v, n, dx, dy, hov, did, act) (
+  did = 1700 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 6) * sc);
+  pressed && hov && drag_id == 0 ? (
+    (time_precise() - lv_lt < 0.35 && lv_lid == idx) || (mouse_cap & 4) ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; lv_lt = 0; ) : (
+      drag_id = did; lv_y = mouse_y; lv_dz = 0; lv_lt = time_precise(); lv_lid = idx; lv_n = lv_kn(v, lo, hi);
+    );
+  );
+  drag_id == did ? (
+    lv_dz += abs(lv_y - mouse_y);
+    lv_dz > 3 * sc ? (
+      lv_n = min(max(lv_n + (lv_y - mouse_y) / (((mouse_cap & 8) ? 1000 : (lv_step ? 160 : 200)) * sc), 0), 1);
+      v = lv_kv(lv_n, lo, hi); lv_step ? v = floor(v + 0.5);
+      slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+    );
+    lv_y = mouse_y;
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    lv_step ? slider(idx) = min(max(floor(v + 0.5) + sign(mouse_wheel), lo), hi) : (
+      n = min(max(lv_kn(v, lo, hi) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.03), 0), 1);
+      slider(idx) = lv_kv(n, lo, hi);
+    );
+    ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(lv_kn(v, lo, hi), 0), 1);
+  act = hov || drag_id == did;
+  lv_cap(cx, cy, r, -0.75 * $pi + n * 1.5 * $pi, act, cap, nd);
+  lv_lg = 0; lv_step = 0;
+  act;
+);
+// the name under a knob (centre cy + r + 19), the value in its place while touched
+function lv_name(cx, cy, r, act, name, val) ( gfx_setfont(10); ui_col(act ? LVA : LVI); lv_ctxt(cx, cy + r + 19, act ? val : name); );
+// printed figures round a knob: n positions, labels "a|b|c" (empty = none)
+function lv_scale(cx, cy, r, n, nr, labels) local(i, k, k0, len, c, a) (
+  len = strlen(labels); k0 = 0; i = 0; k = 0;
+  gfx_setfont(12); ui_col(LVI2);
+  loop(len + 1,
+    c = k < len ? str_getchar(labels, k) : 124;
+    c == 124 ? (
+      strcpy_substr(#lv_sl, labels, k0, k - k0);
+      a = -0.75 * $pi + i / max(n - 1, 1) * 1.5 * $pi;
+      strlen(#lv_sl) ? lv_ctxt(cx + sin(a) * (r + nr), cy - cos(a) * (r + nr), #lv_sl);
+      i += 1; k0 = k + 1;
+    );
+    k += 1;
+  );
+);
+// a lamp key (gfx-ui)
+function lv_key(x, y, w, h, lbl, on, col) ( lk_well = 0x0A0B0A; lk_font = 13; lk_font2 = 13; lk_fit(x, y, w, h, on, col, lbl); );
+function lv_rivet(x, y) ( ui_cola(0x000000, 0.35); gfx_circle((x + 1) * sc, (y + 1.5) * sc, 4 * sc, 1, 1);
+  ui_col(0x8A909C); gfx_circle(x * sc, y * sc, 4 * sc, 1, 1); ui_col(0xB6BCC6); gfx_circle((x - 0.8) * sc, (y - 0.8) * sc, 2.4 * sc, 1, 1); );
+// a status LED: 6 px round in a black ring, a small highlight and halo when lit
+function lv_led(cx, cy, col, lit) (
+  lit ? ( ui_cola(col, 0.14); gfx_circle(cx * sc, cy * sc, 10 * sc, 1, 1); ui_cola(col, 0.18); gfx_circle(cx * sc, cy * sc, 8 * sc, 1, 1); );
+  ui_col(0x07080A); gfx_circle(cx * sc, cy * sc, 7.5 * sc, 1, 1);
+  ui_col(lit ? col : ui_mix(col, 0x101216, 0.78)); gfx_circle(cx * sc, cy * sc, 5.6 * sc, 1, 1);
+  lit ? ( ui_cola(0xFFFFFF, 0.55); gfx_circle((cx - 1.6) * sc, (cy - 1.8) * sc, 1.8 * sc, 1, 1); );
+);
+
+// =====================================================================
+// Faceplate and header
+// =====================================================================
+ui_col(ui_mix(LVP, 0x000000, 0.3)); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(LVP); lv_r(0, 0, 1080, 500);
+ui_cola(0xFFFFFF, 0.06); lv_r(0, 0, 1080, 1.5); lv_r(0, 0, 1.5, 500);
+ui_cola(0x000000, 0.30); lv_r(0, 497, 1080, 3); lv_r(1077, 0, 3, 500);       // a narrow darker bottom / right edge
+lv_rivet(8, 8); lv_rivet(1071, 8); lv_rivet(8, 491); lv_rivet(1071, 491);
+ui_col(LVPH); lv_r(16, 10, 1048, 54);
+ui_cola(0x000000, 0.3); lv_r(16, 10, 1048, 1); lv_r(16, 10, 1, 54);
+ui_col(LVA); lv_r(16, 64, 1048, 2);
+// the GFX roundel and the title
+ui_col(0xF0A63A); gfx_circle(44 * sc, 37 * sc, 15 * sc, 1, 1);
+gfx_setfont(4); ui_col(0x2A1E10); ui_text(44 * sc, 31.5 * sc, "GFX");
+gfx_setfont(14); ui_col(LVT); lv_ltxt(70, 37, "WS9"); gfx_measurestr("WS9", lv_tw, lv_th);
+lv_tx = 70 + lv_tw / sc + 14;
+gfx_setfont(15); ui_col(LVT2); lv_ltxt(lv_tx, 29, "LOCATION"); lv_ltxt(lv_tx, 45, "CHANNEL");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+k_ = pk_preset(316 * sc, 20 * sc, 316 * sc, 34 * sc, pr_cur, #lc_pm);
+k_ > 0 ? prs_dirty = k_;
+by_key(756, 23, 1, 18);
+os_key(904, 26, 14, LVT2, 17);
+ui_size_picker(1002 * sc, 28 * sc);
+ui_vu_dim = slider1 >= 0.5;
+
+// =====================================================================
+// Row 1: INPUT | COMP | OUTPUT  (the SIDEBAR stage is automatic: nothing on the panel - JG, 30 Oct 2026)
+// =====================================================================
+lv_plate(16, 78, 768, 210);
+lv_split(216, 78, 210); lv_split(560, 78, 210);
+lv_k1 = 194;
+lv_title(16, 78, "INPUT");
+lv_scale(116, lv_k1, 30, 3, 19, "-20|0|+20");
+lv_a = lv_knob(116, lv_k1, 30, 2, -20, 20, 0, CGY, 4); sprintf(#lvv, "%+.1f dB", slider2); lv_name(116, lv_k1, 30, lv_a, "TRIM", #lvv);
+// COMP
+lv_scale(332, lv_k1, 28, 2, 18, "0|10");
+lv_a = lv_knob(332, lv_k1, 28, 9, 0, 10, 3, CRD, 4); sprintf(#lvv, "%.1f", slider9); lv_name(332, lv_k1, 28, lv_a, "COMP", #lvv);
+lv_scale(456, lv_k1, 20, 3, 18, "FAST|MED|SLOW");
+lv_step = 1; lv_a = lv_knob(456, lv_k1, 20, 10, 0, 2, 1, CSL, 2);
+lv_name(456, lv_k1, 24, lv_a, "SPEED", slider10 < 0.5 ? "FAST" : slider10 < 1.5 ? "MEDIUM" : "SLOW");
+slider11 < 0.5 ? lv_grey(216, 78, 344, 210);
+lv_tlamp(216, 78, "COMP", 11);
+// OUTPUT
+lv_title(560, 78, "OUTPUT");
+lv_scale(648, lv_k1, 30, 4, 19, "-24||0|+12");
+lv_a = lv_knob(648, lv_k1, 30, 12, -24, 12, 0, CGY, 6); sprintf(#lvv, "%+.1f dB", slider12); lv_name(648, lv_k1, 30, lv_a, "LEVEL", #lvv);
+lv_a = lv_knob(738, lv_k1 + 12, 14, 13, 0, 100, 50, CGY, 4); sprintf(#lvv, "%d %%", floor(slider13 + 0.5)); lv_name(738, lv_k1 + 12, 14, lv_a, "DRIFT", #lvv);
+
+// =====================================================================
+// Row 2: EQ
+// =====================================================================
+lv_plate(16, 304, 768, 180);
+lv_k2 = 398;
+lv_scale(132, lv_k2, 22, 5, 16, "OFF|33|66|110|220");
+lv_step = 1; lv_a = lv_knob(132, lv_k2, 22, 3, 0, 4, 0, CYL, 4);
+slider3 < 0.5 ? strcpy(#lvv, "OFF") : sprintf(#lvv, "%d Hz", lv_hpf(floor(slider3 + 0.5))); lv_name(132, lv_k2, 22, lv_a, "HPF", #lvv);
+lv_scale(270, lv_k2, 22, 3, 16, "-12|0|+12");
+lv_a = lv_knob(270, lv_k2, 22, 4, -12, 12, 0, CBR, 4); sprintf(#lvv, "%+.1f dB", slider4); lv_name(270, lv_k2, 22, lv_a, "LF 110", #lvv);
+lv_scale(410, lv_k2, 22, 3, 16, "-12|0|+12");
+lv_a = lv_knob(410, lv_k2, 22, 5, -12, 12, 0, CSL, 4); sprintf(#lvv, "%+.1f dB", slider5); lv_name(410, lv_k2, 22, lv_a, "MID", #lvv);
+lv_scale(510, lv_k2, 18, 8, 16, "220|||1.1k||||6.6k");
+lv_step = 1; lv_a = lv_knob(510, lv_k2, 18, 6, 0, 7, 3, CBL2, 7);
+lv_f = lv_mid(floor(slider6 + 0.5)); lv_f < 1000 ? sprintf(#lvv, "%d Hz", lv_f) : sprintf(#lvv, "%.1f kHz", lv_f / 1000);
+lv_name(510, lv_k2, 22, lv_a, "FREQ", #lvv);
+lv_scale(650, lv_k2, 22, 3, 16, "-12|0|+12");
+lv_a = lv_knob(650, lv_k2, 22, 7, -12, 12, 0, CRD, 4); sprintf(#lvv, "%+.1f dB", slider7); lv_name(650, lv_k2, 22, lv_a, "HF 8.8k", #lvv);
+slider8 < 0.5 ? lv_grey(16, 304, 768, 180);
+lv_tlamp(16, 304, "EQ", 8);
+
+// =====================================================================
+// METERS: the output VU (backlit), the GAIN REDUCTION LED row, CLIP
+// =====================================================================
+lv_plate(800, 78, 264, 406);
+lv_title(800, 78, "METERS");
+lv_vu = lca_vu_d > 0.0000000001 ? 10 * log10(2 * lca_vu_d) + 18 : -40;          // a sine at -18 dBFS = 0 VU
+vuO.ui_vu(846 * sc, 136 * sc, 172 * sc, 104 * sc, lv_vu, "OUT");
+// GAIN REDUCTION: 8 LEDs at 1, 2, 3, 4, 6, 8, 10, 14 dB (green > yellow > red)
+!lv_mi ? ( lv_gr = 0; lv_mi = 1; );
+lv_g = -lca_gr_d; lca_gr_d = 0;
+lv_gr = lv_g > lv_gr ? lv_g : max(lv_gr - 0.6, 0);
+gfx_setfont(10); ui_col(LVI); lv_ltxt(822, 300, "GAIN REDUCTION  dB");
+lv_i = 0;
+loop(8,
+  lv_d = lv_i == 0 ? 1 : lv_i == 1 ? 2 : lv_i == 2 ? 3 : lv_i == 3 ? 4 : lv_i == 4 ? 6 : lv_i == 5 ? 8 : lv_i == 6 ? 10 : 14;
+  lv_x = 838 + lv_i * 27;
+  lv_led(lv_x, 326, lv_i < 4 ? 0x3CE05A : lv_i < 6 ? 0xFFC81E : 0xFF3A2A, lv_gr >= lv_d - 0.25);
+  gfx_setfont(12); ui_col(LVI2); sprintf(#lvd, "%d", lv_d); lv_ctxt(lv_x, 346, #lvd);
+  lv_i += 1;
+);
+// CLIP: the clipper at -0.3 dBFS is working (held 0.4 s)
+lca_cl_d > 0 ? lv_ct = time_precise(); lca_cl_d = 0;
+gfx_setfont(10); ui_col(LVI); lv_ltxt(822, 410, "CLIP  -0.3 dBFS");
+lv_led(1027, 410, 0xFF3A2A, time_precise() - lv_ct < 0.4);
+
+pk_end();
+ui_end();
