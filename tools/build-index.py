@@ -226,7 +226,7 @@ def main():
                 out.append(f'    <reapack name={quoteattr(name)} type="{p["type"]}" desc={quoteattr(p["desc"])}>')
                 out.append(f'      <metadata><description><![CDATA[{p["about"]}]]></description>'
                            f'<link rel="website">{WEBSITE}</link></metadata>')
-                out.append(f'      <version name="{v["version"]}" author="JGWizrad" time="{v["time"]}">')
+                out.append(f'      <version name="{v["version"]}" author="GardenFX" time="{v["time"]}">')
                 out.append(f'        <changelog><![CDATA[{v["note"]}]]></changelog>')
                 for _, dst, is_main in p['files']:
                     url = f'https://github.com/{REPO}/raw/{commit}/' + quote(sub + dst)
