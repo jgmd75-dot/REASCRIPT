@@ -1,0 +1,544 @@
+desc:VCE 90 (v2) [e-piano module] (GFX)
+//tags: instrument synth electric piano clav autowah
+//author: GardenFX
+// by JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel and gfx-instrument (.jsfx-inc) in the same folder.
+//
+// Half-rack electric piano module in the spirit of the classic 90s EP modules.
+// Five synthesised voices (no samples):
+//   TINE    - FM tine piano: warm body plus a metallic attack "ding", bark at high velocity
+//   REED    - FM reed piano with soft-clipped bark
+//   PLUCK   - short, bright sticky-reed pluck
+//   CLAV    - plucked string with a pickup comb filter and damper mute
+//   BUZZ    - buzzy pulse-wave plucked keyboard
+// Signal chain: voices -> drive -> tone -> vibrato (stereo pan tremolo) -> chorus -> autowah -> volume.
+// Autowah: ENV follows your playing; 1/4, 1/8, 1/16 sweep in time with the project tempo.
+// Drift: pitch, vibrato rate, chorus and wah centre wander slightly.
+// Sustain pedal (CC64), pitch bend (+/- 2 semitones), all notes off (CC123).
+
+import gfx-drift.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-instrument.jsfx-inc
+
+slider1:0<0,4,1{Tine,Reed,Pluck,Clav,Buzz}>-Voice
+slider2:20<0,100,1>-Drive (%)
+slider3:55<0,100,1>-Tone (%)
+slider4:4<0.5,10,0.01>-Vibrato rate (Hz)
+slider5:30<0,100,1>-Vibrato depth (%)
+slider6:20<0,100,1>-Chorus depth (%)
+slider7:0.6<0.1,5,0.01>-Chorus rate (Hz)
+slider8:60<0,100,1>-Wah sensitivity (%)
+slider9:60<0,100,1>-Wah range (%)
+slider10:55<0,100,1>-Wah Q (%)
+slider11:60<0,100,1>-Wah mix (%)
+slider12:0<0,3,1{Env,1/4,1/8,1/16}>-Wah mode
+slider13:25<0,100,1>-Drift (%)
+slider14:0<-24,6,0.1>-Volume (dB)
+slider15:0<0,11,1{Soul Tine,Clean Tine,Suitcase,Gospel Wah,Neo Soul,Reed Bark,Reed Trem,Pluck Pop,Funk Clav,Sync Clav,Buzz 70s,Dirty Keys}>-Patch
+slider16:0<0,100,1>-Band sat (%)
+slider17:30<0,100,1>-Bias (%)
+slider18:120<40,400,1>-Sat low band (Hz)
+slider19:6000<2000,16000,10>-Sat high band (Hz)
+slider20:-0.3<-24,0,0.1>-Ceiling (dB)
+slider21:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider22:20<20,500,1>-Mono below (Hz, 20 = off)
+slider23:0<0,100,1>-Stereo width (%)
+
+in_pin:none
+out_pin:left output
+out_pin:right output
+
+@init
+#ui_man = "gfx-g-voce-90-v2";                                  // the ? pop-up links to this manual
+
+NV = 12;                                   // polyphony
+// per-voice state (memory arrays)
+v_act = 1000;  v_note = 1020; v_vel = 1040; v_held = 1060; v_sus = 1080; v_age = 1100;
+v_ph  = 1120;  v_inc  = 1140; v_env = 1160; v_att  = 1180; v_dec = 1200; v_rel = 1220;
+v_ie  = 1240;  v_idc  = 1260; v_te  = 1280; v_tdc  = 1300; v_typ = 1320; v_lp  = 1340;
+v_len = 1360;  v_wp   = 1380; v_fb  = 1400; v_fbr  = 1420; v_det = 1440;
+memset(1000, 0, 460);
+CLV = 200000; CLVSZ = 8192;                // clav delay lines, one per voice
+memset(CLV, 0, NV * CLVSZ);
+CHL = 40000; CHR = 50000; CHSZ = 8192;     // chorus delay lines
+memset(CHL, 0, CHSZ); memset(CHR, 0, CHSZ); chw = 0;
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();   // 20000..24095
+
+ins_drift_init();
+
+tp = 2 * $pi;
+agec = 0; sus_pedal = 0; bend = 1;
+atk_k = 1 - exp(-1 / (0.0015 * srate));
+envf_a = 1 - exp(-1 / (0.003 * srate)); envf_r = 1 - exp(-1 / (0.12 * srate));
+sm = 1 - exp(-1 / (0.03 * srate));
+// per-patch level trim: keeps the hottest patches out of the output clipper (measured with 8 notes at full
+// velocity, worst case held under -3 dBFS); the quieter patches are left as they are
+function patch_trim(p) (
+  p == 0 ? 0.631 :
+  p == 1 ? 0.519 :
+  p == 2 ? 0.525 :
+  p == 3 ? 0.759 :
+  p == 4 ? 0.767 :
+  p == 5 ? 0.822 :
+  p == 6 ? 0.631 :
+  p == 7 ? 0.556 :
+  p == 8 ? 0.324 :
+  p == 9 ? 0.724 :
+  p == 10 ? 0.716 :
+  1.000;
+);
+ptr_s = patch_trim(slider15);
+vlp = 0; dxp = 0; dyp = 0; tlp = 0; wenv = 0; wph = 0; vph = 0; cph = 0;
+wL1 = wL2 = wR1 = wR2 = 0;
+midi_t = 0; edited = 0;
+!ui_dflt ? ui_thm = 10; !ui_dflt ? ui_hw = 1;                    // fixed black-and-amber faceplate
+
+// ---------- patches (leave Drift and Volume alone) ----------
+function setp(v, drv, ton, vr, vd, cd, cr, ws, wr, wq, wm, wmo) (
+  slider1 = v; slider2 = drv; slider3 = ton; slider4 = vr; slider5 = vd; slider6 = cd; slider7 = cr;
+  slider8 = ws; slider9 = wr; slider10 = wq; slider11 = wm; slider12 = wmo;
+);
+function load_patch(p) (
+  p == 0  ? setp(0, 20, 55, 4,   30, 20, 0.6, 60, 60, 55, 60, 0) :   // Soul Tine
+  p == 1  ? setp(0, 5,  50, 4,   0,  0,  0.6, 50, 50, 40, 0,  0) :   // Clean Tine
+  p == 2  ? setp(0, 15, 52, 5,   60, 0,  0.6, 50, 50, 40, 0,  0) :   // Suitcase
+  p == 3  ? setp(0, 35, 60, 4,   0,  15, 0.5, 75, 70, 65, 85, 0) :   // Gospel Wah
+  p == 4  ? setp(0, 25, 45, 3.5, 20, 35, 0.4, 45, 55, 50, 35, 0) :   // Neo Soul
+  p == 5  ? setp(1, 40, 60, 6,   25, 0,  0.6, 50, 50, 40, 0,  0) :   // Reed Bark
+  p == 6  ? setp(1, 15, 55, 5.5, 55, 0,  0.6, 50, 50, 40, 0,  0) :   // Reed Trem
+  p == 7  ? setp(2, 10, 70, 4,   0,  30, 0.8, 50, 50, 40, 0,  0) :   // Pluck Pop
+  p == 8  ? setp(3, 25, 65, 4,   0,  0,  0.6, 70, 75, 70, 90, 0) :   // Funk Clav
+  p == 9  ? setp(3, 20, 60, 4,   0,  0,  0.6, 50, 70, 70, 80, 3) :   // Sync Clav
+  p == 10 ? setp(4, 20, 55, 4,   0,  40, 0.7, 50, 50, 40, 0,  0) :   // Buzz 70s
+            setp(0, 70, 50, 4,   0,  10, 0.6, 50, 65, 60, 50, 2);    // Dirty Keys
+  slider15 = p; last_patch = p; edited = 0;
+  slider_automate(16383 + 16384);          // sliders 1-12 and 15 (13, 14 unchanged but harmless)
+);
+function patch_name(p) (
+  p == 0 ? "SOUL TINE" : p == 1 ? "CLEAN TINE" : p == 2 ? "SUITCASE" : p == 3 ? "GOSPEL WAH" :
+  p == 4 ? "NEO SOUL" : p == 5 ? "REED BARK" : p == 6 ? "REED TREM" : p == 7 ? "PLUCK POP" :
+  p == 8 ? "FUNK CLAV" : p == 9 ? "SYNC CLAV" : p == 10 ? "BUZZ 70S" : "DIRTY KEYS";
+);
+
+// ---------- voices ----------
+function blep(t, dt) (
+  t < dt ? ( t /= dt; 2 * t - t * t - 1; ) : t > 1 - dt ? ( t = (t - 1) / dt; t * t + 2 * t + 1; ) : 0;
+);
+
+function note_on(n, vel) local(i, k, best, ba, f, ks, typ, dec, rel, len, bl, br, nz, base) (
+  best = -1;
+  i = 0; loop(NV, v_act[i] && v_note[i] == n && best < 0 ? best = i; i += 1; );      // retrigger same key
+  i = 0; loop(NV, !v_act[i] && best < 0 ? best = i; i += 1; );                        // free voice
+  best < 0 ? ( ba = 1000000000000; i = 0; loop(NV, v_age[i] < ba ? ( ba = v_age[i]; best = i; ); i += 1; ); );  // oldest
+  i = best;
+  typ = voice;
+  f = 440 * 2 ^ ((n - 69) / 12);
+  ks = 2 ^ (-(n - 60) / 30);               // higher notes decay faster
+  vel = (vel / 127) ^ 0.8;
+  v_act[i] = 1; v_note[i] = n; v_vel[i] = vel; v_held[i] = 1; v_sus[i] = 0;
+  agec += 1; v_age[i] = agec; v_typ[i] = typ;
+  v_det[i] = ins_note_detune();                          // per-note tuning offset, up to +/-6 cents
+  v_inc[i] = f / srate; v_ph[i] = 0;
+  v_att[i] = 0; v_env[i] = 1; v_lp[i] = 0;
+  typ == 0 ? ( dec = 4.5; rel = 0.18; v_ie[i] = 1.8 * vel; v_idc[i] = 0.5;  v_te[i] = 0.6 * vel; v_tdc[i] = 0.08; ) :
+  typ == 1 ? ( dec = 3.0; rel = 0.12; v_ie[i] = 2.5 * vel; v_idc[i] = 0.3;  v_te[i] = 0;         v_tdc[i] = 0.05; ) :
+  typ == 2 ? ( dec = 1.6; rel = 0.06; v_ie[i] = 1.5 * vel; v_idc[i] = 0.15; v_te[i] = 0.4 * vel; v_tdc[i] = 0.03; ) :
+  typ == 3 ? ( dec = 30;  rel = 0.05; v_ie[i] = 0;         v_idc[i] = 0.1;  v_te[i] = 0;         v_tdc[i] = 0.05; ) :
+             ( dec = 1.8; rel = 0.08; v_ie[i] = 0.9 * vel; v_idc[i] = 0.4;  v_te[i] = 0;         v_tdc[i] = 0.05; );
+  v_dec[i] = exp(-1 / (dec * ks * srate));
+  v_rel[i] = exp(-1 / (rel * srate));
+  v_idc[i] = exp(-1 / (v_idc[i] * ks * srate));
+  v_tdc[i] = exp(-1 / (v_tdc[i] * srate));
+  typ == 3 ? (
+    // clav: fill the string with a velocity-filtered noise burst
+    len = min(srate / f, CLVSZ - 4); v_len[i] = len;
+    base = CLV + i * CLVSZ; memset(base, 0, CLVSZ);
+    br = 0.25 + 0.7 * vel; bl = 0;
+    k = 0; loop(floor(len) + 2, nz = rand(2) - 1; bl += (nz - bl) * br; base[k] = bl * (0.6 + 0.6 * vel); k += 1; );
+    v_wp[i] = floor(len) + 2;
+    v_fb[i]  = 10 ^ (-3 / (3.0 * ks * f));     // ~3 s ring while held
+    v_fbr[i] = 10 ^ (-3 / (0.06 * f));         // damper: dies in ~60 ms
+  );
+  ins_midi_hit();
+);
+
+function note_off(n) local(i) (
+  i = 0;
+  loop(NV,
+    v_act[i] && v_held[i] && v_note[i] == n ? ( v_held[i] = 0; sus_pedal ? v_sus[i] = 1; );
+    i += 1;
+  );
+);
+
+function all_off() local(i) ( i = 0; loop(NV, v_held[i] = 0; v_sus[i] = 0; i += 1; ); );
+
+// ---------- parameters ----------
+function update() (
+  voice = slider1;
+  // gentle drive: gain rises with the square of the knob, so 10-30% stays almost transparent
+  // (unity gain at low levels, only the peaks round off); a touch of bias adds even harmonics
+  // headroom drv_h shrinks as the knob goes up, so low settings leave even loud chords untouched
+  drv = slider2 / 100; drv_g = 1 + 6 * drv * drv; drv_b = 0.05 * drv; drv_h = 2.5 - 1.7 * drv;
+  t1 = exp(2 * (drv_g * 0.15 / drv_h + drv_b)); t2 = exp(2 * drv_b);
+  drv_n = 0.15 / ((t1 - 1) / (t1 + 1) - (t2 - 1) / (t2 + 1));   // level match at a 0.15 peak
+  tone_f = 1500 * 2 ^ (slider3 / 100 * 3.1);
+  vib_r = slider4; vib_d = slider5 / 100;
+  ch_d = slider6 / 100; ch_r = slider7;
+  w_sens = slider8 / 100; w_rng = slider9 / 100; w_q = 0.7 + (slider10 / 100) ^ 1.5 * 7; w_comp = 1 / (0.5 + 0.5 * sqrt(w_q)); w_mix = slider11 / 100;
+  w_mode = slider12;
+  drift = slider13 / 100;
+  vol_t = 10 ^ (slider14 / 20);
+  ins_output_setup(16); ins_stereo_setup(22);   // output stage: CLIP, always on
+);
+
+// ---------- GUI helpers ----------
+AMB = 0xE8A33A; INKC = 0xD8D4CC;
+
+// LED-cap button (as the GUARD button, larger): returns 1 when clicked
+function capbtn(x, y, w, h, on) local(hit, bx, by, kt) (
+  hit = pressed && drag_id == 0 && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+  hit ? drag_id = -1;
+  bx = x + w * 0.5; by = y + h * 0.24; kt = y + h * 0.46;
+  ui_keyshadow(x, y, w, h, 2 * sc);
+  ui_col(0x0E0E10); ui_rrs(x, y, w, h, 2 * sc);
+  ui_col(0x232326); gfx_rect(x + 1 * sc, y + 1 * sc, w - 2 * sc, kt - y - 1 * sc);
+  ui_cola(0xFFFFFF, 0.1); gfx_line(x + 2 * sc, y + 1 * sc, x + w - 3 * sc, y + 1 * sc);
+  ui_col(0x313136); gfx_rect(x + 1 * sc, kt, w - 2 * sc, 1 * sc);
+  ui_col(0x1A1A1D); gfx_rect(x + 4 * sc, kt + 4 * sc, w - 8 * sc, y + h - kt - 8 * sc);
+  ui_cola(0xFFFFFF, 0.07); gfx_line(x + 4 * sc, kt + 4 * sc, x + w - 5 * sc, kt + 4 * sc);
+  ui_cola(0x000000, 0.5);  gfx_line(x + 4 * sc, y + h - 4 * sc, x + w - 5 * sc, y + h - 4 * sc);
+  ui_col(0x060607); gfx_circle(bx, by, 5.5 * sc, 1, 1);
+  on ? (
+    ui_cola(AMB, 0.22); gfx_circle(bx, by, 8.5 * sc, 1, 1);
+    ui_col(AMB); gfx_circle(bx, by, 4.4 * sc, 1, 1);
+    ui_cola(0xFFFFFF, 0.75); gfx_circle(bx - 1.2 * sc, by - 1.3 * sc, 1.3 * sc, 1, 1);
+  ) : (
+    ui_col(0x3A250C); gfx_circle(bx, by, 4.4 * sc, 1, 1);
+    ui_cola(0xFFFFFF, 0.18); gfx_circle(bx - 1.2 * sc, by - 1.3 * sc, 1.1 * sc, 1, 1);
+  );
+  hit;
+);
+// small flat push button: returns 1 when clicked
+function pbtn(x, y, w, h) local(hit) (
+  hit = pressed && drag_id == 0 && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h;
+  hit ? drag_id = -1;
+  ui_keyshadow(x, y, w, h, 2 * sc);
+  ui_col(0x2C2D31); ui_rrs(x, y, w, h, 2 * sc);
+  ui_col(mdown && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h ? 0x2A2B2F : 0x37383D);
+  ui_rrect(x + 2 * sc, y + 2 * sc, w - 4 * sc, h - 5 * sc, 1.5 * sc);
+  hit;
+);
+function screw(x, y) local(rr) (
+  rr = 4.5 * sc;
+  ui_cola(0x000000, 0.4); gfx_circle(x + 1, y + 1.5, rr, 1, 1);
+  ui_col(0x55585E); gfx_circle(x, y, rr, 1, 1);
+  ui_col(0x6E7178); gfx_circle(x - rr * 0.2, y - rr * 0.2, rr * 0.6, 1, 1);
+  ui_col(0x222326); gfx_line(x - rr * 0.7, y, x + rr * 0.7, y, 1);
+);
+function divider(x) (
+  ui_cola(0x000000, 0.5); gfx_line(x, 44 * sc, x, 256 * sc);
+  ui_cola(0xFFFFFF, 0.06); gfx_line(x + 1, 44 * sc, x + 1, 256 * sc);
+);
+function stitle(cx, s) ( gfx_setfont(4); ui_col(AMB); ui_text(cx, 50 * sc, s); );
+
+update();
+vol_s = vol_t;
+last_patch = -1;
+ui_dflt = 1;   // theme defaults above apply once: @init re-runs (playback start, device reset) must not undo the saved theme
+
+@slider
+last_patch < 0 ? ( last_patch = slider15; ) : ( slider15 != last_patch ? load_patch(slider15); );
+update();
+
+@block
+update();
+// MIDI in
+while (midirecv(mofs, m1, m2, m3)) (
+  st = m1 & 0xF0;
+  st == 0x90 && m3 > 0 ? note_on(m2, m3) :
+  st == 0x80 || (st == 0x90 && m3 == 0) ? note_off(m2) :
+  st == 0xB0 && m2 == 64 ? (
+    sus_pedal = m3 >= 64;
+    !sus_pedal ? ( i = 0; loop(NV, v_sus[i] = 0; i += 1; ); );
+  ) :
+  st == 0xB0 && (m2 == 123 || m2 == 120) ? all_off() :
+  st == 0xE0 ? bend = ins_bend(m2, m3, 2);
+  midisend(mofs, m1, m2, m3);
+);
+// transport stop: release whatever is still held (as an all-notes-off would; a safety net if the stop's note-offs go missing)
+gfx_pst = play_state == 1 || play_state == 5;
+gfx_pst_prev && !gfx_pst ? ( all_off(); );
+gfx_pst_prev = gfx_pst;
+// drift (block rate)
+ins_drift_block(drift, samplesblock);                   // GFX instrument drift
+pmul = bend * ins_pitch;                                // pitch wander, up to +/-20 cents
+// tone wanders like a filter cutoff, up to +/-0.45 octave
+tone_c = 1 - exp(-tp * min(tone_f * 2 ^ ins_tone, srate * 0.45) / srate);
+vib_inc = vib_r * (1 + 0.15 * ins_fx) / srate;
+ch_inc  = ch_r  * (1 + 2 * ins_aux) / srate;            // own drift source, up to +/-30%
+// wah tempo sync
+w_mult = w_mode == 1 ? 1 : w_mode == 2 ? 2 : 4;
+w_inc = tempo / 60 * w_mult / srate;
+w_mode > 0 && (play_state & 1) ? wph = (beat_position * w_mult) - floor(beat_position * w_mult);
+
+@sample
+// ---------- voices ----------
+xs = 0;
+i = 0;
+loop(NV,
+  v_act[i] ? (
+    v_att[i] += (1 - v_att[i]) * atk_k;
+    v_held[i] || v_sus[i] ? ( v_env[i] *= v_dec[i]; ) : ( v_env[i] *= v_rel[i]; );
+    amp = v_env[i] * v_att[i];
+    v_ie[i] *= v_idc[i]; v_te[i] *= v_tdc[i];
+    dt = v_inc[i] * pmul * v_det[i];
+    ph = v_ph[i] + dt; ph -= floor(ph); v_ph[i] = ph;
+    vel = v_vel[i]; typ = v_typ[i];
+    typ == 0 ? (                                     // tine
+      y = sin(tp * ph + (0.35 + v_ie[i]) * sin(tp * ph));
+      y += 0.18 * vel * y * y;
+      y += v_te[i] * sin(tp * ph + 1.5 * sin(tp * 14 * ph));
+    ) : typ == 1 ? (                                 // reed
+      y = sin(tp * ph + (0.6 + v_ie[i]) * sin(tp * ph)) * (1 + 1.5 * vel);
+      y = 1.3 * y / (1 + abs(y));
+    ) : typ == 2 ? (                                 // pluck
+      y = sin(tp * ph + (0.2 + v_ie[i]) * sin(tp * ph)) + v_te[i] * sin(tp * 3 * ph);
+    ) : typ == 3 ? (                                 // clav: plucked string + pickup comb
+      base = CLV + i * CLVSZ;
+      len = min(v_len[i] / (pmul * v_det[i]), CLVSZ - 4);
+      rp = v_wp[i] - len; rp < 0 ? rp += CLVSZ;
+      ri = floor(rp); fr = rp - ri; r2 = ri + 1; r2 >= CLVSZ ? r2 -= CLVSZ;
+      ys = base[ri] * (1 - fr) + base[r2] * fr;
+      nw = (v_held[i] || v_sus[i] ? v_fb[i] : v_fbr[i]) * (0.55 * ys + 0.45 * v_lp[i]);
+      v_lp[i] = ys;
+      base[v_wp[i]] = nw;
+      v_wp[i] += 1; v_wp[i] >= CLVSZ ? v_wp[i] = 0;
+      pr = ri - floor(len * 0.18); pr < 0 ? pr += CLVSZ;
+      y = 3.5 * (ys - base[pr]);
+    ) : (                                            // buzz: band-limited pulse, closing filter
+      p2 = ph + 0.3; p2 -= floor(p2);
+      y = (2 * ph - 1 - blep(ph, dt)) - (2 * p2 - 1 - blep(p2, dt));
+      v_lp[i] += (y - v_lp[i]) * (0.04 + 0.5 * v_ie[i]);
+      y = 0.8 * v_lp[i];
+    );
+    xs += y * amp * (0.55 + 0.45 * vel);
+    !(v_held[i] || v_sus[i]) && v_env[i] < 0.0003 ? v_act[i] = 0;
+    v_env[i] < 0.00003 ? v_act[i] = 0;
+  );
+  i += 1;
+);
+x = xs * 0.2;
+
+// ---------- drive (gentle, slightly asymmetric soft clip) + DC block ----------
+drv > 0.001 ? (
+  e1 = exp(2 * min(max(drv_g * x / drv_h + drv_b, -20), 20)); e2 = exp(2 * drv_b);
+  x = ((e1 - 1) / (e1 + 1) - (e2 - 1) / (e2 + 1)) * drv_n;
+);
+dy = x - dxp + 0.995 * dyp; dxp = x; dyp = dy; x = dy;
+
+// ---------- tone ----------
+tlp += (x - tlp) * tone_c; x = tlp;
+
+// ---------- vibrato: stereo pan tremolo ----------
+vph += vib_inc; vph -= floor(vph);
+vs = sin(tp * vph);
+xL = x * (1 - vib_d * 0.5 * (1 - vs));
+xR = x * (1 - vib_d * 0.5 * (1 + vs));
+
+// ---------- chorus ----------
+CHL[chw] = xL; CHR[chw] = xR;
+cph += ch_inc; cph -= floor(cph);
+ch_d > 0.001 ? (
+  dl = (0.007 + 0.004 * ch_d * (0.5 + 0.5 * sin(tp * cph))) * srate;
+  dr = (0.007 + 0.004 * ch_d * (0.5 + 0.5 * cos(tp * cph))) * srate;
+  rp = chw - dl; rp < 0 ? rp += CHSZ; ri = floor(rp); fr = rp - ri; r2 = ri + 1; r2 >= CHSZ ? r2 -= CHSZ;
+  cwL = CHL[ri] * (1 - fr) + CHL[r2] * fr;
+  rp = chw - dr; rp < 0 ? rp += CHSZ; ri = floor(rp); fr = rp - ri; r2 = ri + 1; r2 >= CHSZ ? r2 -= CHSZ;
+  cwR = CHR[ri] * (1 - fr) + CHR[r2] * fr;
+  xL = xL * (1 - 0.35 * ch_d) + cwR * 0.8 * ch_d;
+  xR = xR * (1 - 0.35 * ch_d) + cwL * 0.8 * ch_d;
+);
+chw += 1; chw >= CHSZ ? chw = 0;
+
+// ---------- autowah ----------
+w_mix > 0.001 ? (
+  a_in = 0.5 * abs(xL + xR);
+  wenv += (a_in - wenv) * (a_in > wenv ? envf_a : envf_r);
+  w_mode == 0 ? (
+    ctl = min(wenv * (1 + w_sens * 40), 1) ^ 0.6;
+  ) : (
+    wph += w_inc; wph -= floor(wph);
+    ctl = 0.5 - 0.5 * cos(tp * wph);
+    ctl *= 0.4 + 0.6 * w_sens;
+  );
+  ctl = min(max(ctl + 0.15 * ins_fx, 0), 1);
+  fc = min(250 * (2 ^ (1 + w_rng * 4)) ^ ctl, srate * 0.45);
+  g = tan($pi * fc / srate); k = 1 / w_q;
+  a1 = 1 / (1 + g * (g + k)); a2 = g * a1; a3 = g * a2;
+  v3 = xL - wL2; v1 = a1 * wL1 + a2 * v3; v2 = wL2 + a2 * wL1 + a3 * v3;
+  wL1 = 2 * v1 - wL1; wL2 = 2 * v2 - wL2; yL = (v2 + 0.5 * v1) * w_comp;
+  v3 = xR - wR2; v1 = a1 * wR1 + a2 * v3; v2 = wR2 + a2 * wR1 + a3 * v3;
+  wR1 = 2 * v1 - wR1; wR2 = 2 * v2 - wR2; yR = (v2 + 0.5 * v1) * w_comp;
+  xL = xL * (1 - w_mix) + yL * w_mix;
+  xR = xR * (1 - w_mix) + yR * w_mix;
+);
+
+// ---------- volume + output stage (soft clip at -0.3 dB) ----------
+vol_s += (vol_t - vol_s) * sm;
+ptr_s = patch_trim(slider15);                    // follows the patch at once (a patch change is a discrete event)
+oL = ostL.ost_band((xL) * ptr_s) * vol_s;
+oR = ostR.ost_band((xR) * ptr_s) * vol_s;
+ins_stereo(oL, oR); ost_out(ins_sl, ins_sr);           // mono-maker / widener, then the output stage
+spl0 = ost_l;
+spl1 = ost_r;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, edited);
+
+@gfx 780 416
+// version tag (JG, 29 Oct 2026): v1 = Legacy, v2 = Stable, v3 = the next graduation; a small dim tag just after the
+// panel title. ver_tag_at draws it at x with its baseline at yb, fs px high, in col (or the current colour if col < 0),
+// at 55 %; ver_tag puts it after text just drawn (dx, dy: extra offset in that text's heights). Font, colour and
+// gfx_x / gfx_y are left as they were.
+function ver_tag_at(s, slot, x, yb, fs, col) local(x0, y0, r, g, b, a, f) (
+  x0 = gfx_x; y0 = gfx_y; r = gfx_r; g = gfx_g; b = gfx_b; a = gfx_a; f = gfx_getfont();
+  col >= 0 ? ( gfx_r = (col >> 16) / 255; gfx_g = ((col >> 8) & 255) / 255; gfx_b = (col & 255) / 255; gfx_a = 1; );
+  gfx_setfont(slot, "Trebuchet MS", max(10, fs), 'b');
+  gfx_x = x; gfx_y = yb - 0.8 * gfx_texth; gfx_a *= 0.55; gfx_drawstr(s);
+  gfx_r = r; gfx_g = g; gfx_b = b; gfx_a = a; gfx_x = x0; gfx_y = y0; gfx_setfont(f + 1);
+);
+function ver_tag(s, slot, dx, dy) local(th) (
+  th = gfx_texth;
+  ver_tag_at(s, slot, gfx_x + (0.3 + dx) * th, gfx_y + (0.8 + dy) * th, 0.5 * th, -1);
+);
+ui_thm = 10; ui_hw = 1;
+ui_begin(780, 416);
+
+// ---------- faceplate ----------
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0x000000, 0.5); fh = show_out ? 392 : 272;
+ui_rrect(14 * sc, 18 * sc, 756 * sc, fh * sc, 6 * sc);
+ui_col(0x3A3B40); ui_rrect(12 * sc, 14 * sc, 756 * sc, fh * sc, 6 * sc);
+gfx_gradrect(13 * sc, 15 * sc, 754 * sc, (fh - 2) * sc, 0.165, 0.169, 0.184, 1, 0, 0, 0, 0, -0.075 / ((fh - 2) * sc), -0.075 / ((fh - 2) * sc), -0.075 / ((fh - 2) * sc), 0);
+ui_cola(0xFFFFFF, 0.12); gfx_line(18 * sc, 16 * sc, 762 * sc, 16 * sc);
+screw(26 * sc, 28 * sc); screw(754 * sc, 28 * sc); screw(26 * sc, fh * sc); screw(754 * sc, fh * sc);
+
+// brand
+ui_col(AMB); gfx_circle(60 * sc, 60 * sc, 16 * sc, 1, 1);
+gfx_setfont(2); ui_col(0x1A1206); ui_text(60 * sc, 53 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 22 * sc, 'b'); ui_col(INKC); gfx_x = 86 * sc; gfx_y = 44 * sc; gfx_drawstr("VCE 90"); ver_tag("v2", 16, 0, 0);
+gfx_setfont(4); ui_cola(INKC, 0.6); gfx_x = 87 * sc; gfx_y = 68 * sc; gfx_drawstr("ELECTRIC PIANO MODULE");
+
+// LCD
+ui_col(0x050505); ui_rrect(44 * sc, 88 * sc, 150 * sc, 54 * sc, 4 * sc);
+gfx_gradrect(48 * sc, 92 * sc, 142 * sc, 46 * sc, 0.17, 0.10, 0.02, 1, 0, 0, 0, 0, -0.06 / (46 * sc), -0.04 / (46 * sc), -0.01 / (46 * sc), 0);
+gfx_setfont(7, "Courier New", 14 * sc, 'b'); ui_col(AMB);
+sprintf(#l1, edited ? "P%02d*%s" : "P%02d %s", slider15 + 1, patch_name(slider15));
+gfx_x = 54 * sc; gfx_y = 99 * sc; gfx_drawstr(#l1);
+gfx_setfont(8, "Courier New", 10 * sc, 'b'); ui_cola(AMB, 0.75);
+drag_id >= 2 && drag_id <= 14 ? (
+  drag_id == 2  ? sprintf(#l2, "DRIVE      %3.0f%%", slider2) :
+  drag_id == 3  ? sprintf(#l2, "TONE       %3.0f%%", slider3) :
+  drag_id == 4  ? sprintf(#l2, "VIB RATE %5.2fHz", slider4) :
+  drag_id == 5  ? sprintf(#l2, "VIB DEPTH  %3.0f%%", slider5) :
+  drag_id == 6  ? sprintf(#l2, "CHO DEPTH  %3.0f%%", slider6) :
+  drag_id == 7  ? sprintf(#l2, "CHO RATE %5.2fHz", slider7) :
+  drag_id == 8  ? sprintf(#l2, "WAH SENS   %3.0f%%", slider8) :
+  drag_id == 9  ? sprintf(#l2, "WAH RANGE  %3.0f%%", slider9) :
+  drag_id == 10 ? sprintf(#l2, "WAH Q      %3.0f%%", slider10) :
+  drag_id == 11 ? sprintf(#l2, "WAH MIX    %3.0f%%", slider11) :
+  drag_id == 13 ? sprintf(#l2, "DRIFT      %3.0f%%", slider13) :
+                  sprintf(#l2, "VOLUME  %5.1fdB", slider14);
+) : (
+  sprintf(#l2, "WAH:%s DRV:%02d", slider12 == 0 ? "ENV " : slider12 == 1 ? "1/4 " : slider12 == 2 ? "1/8 " : "1/16", min(slider2, 99));
+);
+gfx_x = 54 * sc; gfx_y = 121 * sc; gfx_drawstr(#l2);
+
+// click the display: the full patch list
+pressed && drag_id == 0 && mouse_x >= 44 * sc && mouse_x < 194 * sc && mouse_y >= 88 * sc && mouse_y < 142 * sc ? (
+  drag_id = -1; #pm = "";
+  strcat(#pm, ">Tines|"); slider15 == 0 ? strcat(#pm, "!"); strcat(#pm, "Soul Tine|");
+  strcat(#pm, ""); slider15 == 1 ? strcat(#pm, "!"); strcat(#pm, "Clean Tine|");
+  strcat(#pm, ""); slider15 == 2 ? strcat(#pm, "!"); strcat(#pm, "Suitcase|");
+  strcat(#pm, ""); slider15 == 3 ? strcat(#pm, "!"); strcat(#pm, "Gospel Wah|");
+  strcat(#pm, "<"); slider15 == 4 ? strcat(#pm, "!"); strcat(#pm, "Neo Soul|");
+  strcat(#pm, ">Reeds|"); slider15 == 5 ? strcat(#pm, "!"); strcat(#pm, "Reed Bark|");
+  strcat(#pm, "<"); slider15 == 6 ? strcat(#pm, "!"); strcat(#pm, "Reed Trem|");
+  strcat(#pm, ">Others|"); slider15 == 7 ? strcat(#pm, "!"); strcat(#pm, "Pluck Pop|");
+  strcat(#pm, ""); slider15 == 8 ? strcat(#pm, "!"); strcat(#pm, "Funk Clav|");
+  strcat(#pm, ""); slider15 == 9 ? strcat(#pm, "!"); strcat(#pm, "Sync Clav|");
+  strcat(#pm, ""); slider15 == 10 ? strcat(#pm, "!"); strcat(#pm, "Buzz 70s|");
+  strcat(#pm, "<"); slider15 == 11 ? strcat(#pm, "!"); strcat(#pm, "Dirty Keys");
+  gfx_x = 44 * sc; gfx_y = 142 * sc; gsel = gfx_showmenu(#pm); gsel > 0 ? load_patch(gsel - 1);
+);
+ui_col(AMB); gfx_triangle(180 * sc, 130 * sc, 188 * sc, 130 * sc, 184 * sc, 135 * sc);   // the list cue
+
+// patch up / down
+pbtn(202 * sc, 88 * sc, 38 * sc, 24 * sc) ? load_patch(slider15 >= 11 ? 0 : slider15 + 1);
+pbtn(202 * sc, 118 * sc, 38 * sc, 24 * sc) ? load_patch(slider15 <= 0 ? 11 : slider15 - 1);
+ui_col(INKC);
+gfx_line(215 * sc, 103 * sc, 221 * sc, 97 * sc, 1); gfx_line(221 * sc, 97 * sc, 227 * sc, 103 * sc, 1);
+gfx_line(215 * sc, 127 * sc, 221 * sc, 133 * sc, 1); gfx_line(221 * sc, 133 * sc, 227 * sc, 127 * sc, 1);
+gfx_setfont(4); ui_cola(INKC, 0.6); ui_text(221 * sc, 146 * sc, "PATCH");
+
+// voice selectors (LED caps)
+gv = 0;
+loop(5,
+  capbtn((44 + gv * 40) * sc, 166 * sc, 36 * sc, 50 * sc, slider1 == gv) ? (
+    slider1 = gv; slider_automate(1); edited = 1;
+  );
+  gfx_setfont(4); ui_col(INKC);
+  ui_text((62 + gv * 40) * sc, 224 * sc, gv == 0 ? "TINE" : gv == 1 ? "REED" : gv == 2 ? "PLUCK" : gv == 3 ? "CLAV" : "BUZZ");
+  gv += 1;
+);
+
+// ---------- effect sections ----------
+C_INK = INKC;
+ui_section(2);
+divider(262 * sc); stitle(307 * sc, "DRIVE");
+ui_knob(307 * sc, 104 * sc, 2, 0, 100, 20, 0, "DRIVE", "%.0f%%");
+ui_knob(307 * sc, 196 * sc, 3, 0, 100, 55, 0, "TONE", "%.0f%%");
+divider(352 * sc); stitle(397 * sc, "VIBRATO");
+ui_knob(397 * sc, 104 * sc, 4, 0.5, 10, 4, 1, "RATE", "%.2f Hz");
+ui_knob(397 * sc, 196 * sc, 5, 0, 100, 30, 0, "DEPTH", "%.0f%%");
+divider(442 * sc); stitle(487 * sc, "CHORUS");
+ui_knob(487 * sc, 104 * sc, 6, 0, 100, 20, 0, "DEPTH", "%.0f%%");
+ui_knob(487 * sc, 196 * sc, 7, 0.1, 5, 0.6, 1, "RATE", "%.2f Hz");
+divider(532 * sc); stitle(602 * sc, "AUTOWAH");
+ui_knob(567 * sc, 104 * sc, 8, 0, 100, 60, 0, "SENS", "%.0f%%");
+ui_knob(637 * sc, 104 * sc, 9, 0, 100, 60, 0, "RANGE", "%.0f%%");
+ui_knob(567 * sc, 196 * sc, 10, 0, 100, 55, 0, "Q", "%.0f%%");
+ui_knob(637 * sc, 196 * sc, 11, 0, 100, 60, 0, "MIX", "%.0f%%");
+pbtn(580 * sc, 244 * sc, 44 * sc, 18 * sc) ? ( slider12 = (slider12 >= 3 ? 0 : slider12 + 1); slider_automate(2048); edited = 1; );
+gfx_setfont(4); ui_col(AMB);
+ui_text(602 * sc, 247 * sc, slider12 == 0 ? "ENV" : slider12 == 1 ? "1/4" : slider12 == 2 ? "1/8" : "1/16");
+divider(672 * sc); stitle(720 * sc, "MASTER");
+ui_knob(720 * sc, 104 * sc, 13, 0, 100, 25, 0, "DRIFT", "%.0f%%");
+ui_knob(720 * sc, 196 * sc, 14, -24, 6, 0, 0, "VOLUME", "%.1f dB");
+drag_id >= 2 && drag_id <= 12 ? ( edited = 1; );
+
+// MIDI activity LED
+lit = ins_midi_lit();
+lit ? ( ui_cola(0x3ADF6A, 0.25); gfx_circle(744 * sc, 252 * sc, 5.5 * sc, 1, 1); ui_col(0x3ADF6A); )
+    : ui_col(0x123A1C);
+gfx_circle(744 * sc, 252 * sc, 2.8 * sc, 1, 1);
+gfx_setfont(4); ui_cola(INKC, 0.7); gfx_x = 712 * sc; gfx_y = 246 * sc; gfx_drawstr("MIDI");
+
+// size picker (top right, small)
+ui_size_picker(676 * sc, 20 * sc);
+
+// ---------- output stage: OUTPUT button folds the panel out below the module ----------
+capbtn(566 * sc, 19 * sc, 24 * sc, 20 * sc, show_out) ? show_out = !show_out;
+gfx_setfont(4); ui_col(INKC); gfx_x = 596 * sc; gfx_y = 24 * sc; gfx_drawstr("OUTPUT");
+show_out ? (
+  ui_cola(0x000000, 0.5); gfx_line(26 * sc, 278 * sc, 754 * sc, 278 * sc);
+  ui_cola(0xFFFFFF, 0.06); gfx_line(26 * sc, 279 * sc, 754 * sc, 279 * sc);
+  ins_stereo_box(150, 296, 22, 0x1E1F23, INKC);
+  ins_output_tray(330, 296, 16, 0x1E1F23, INKC, 0xFF3A2A);
+);
+
+ui_end();

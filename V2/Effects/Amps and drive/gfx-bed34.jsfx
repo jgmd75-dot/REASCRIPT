@@ -1,0 +1,687 @@
+desc:BED34 [practice amp] (GFX)
+//tags: guitar amp practice amp solid state fuzz clean speaker cabinet broken speaker modular
+//author: GardenFX
+// by JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-input, gfx-output, gfx-drift, gfx-ui, gfx-panel, gfx-dyn and gfx-clip (.jsfx-inc) in the same folder.
+//
+// BED34. Three little practice amps from the 80s and 90s bedroom, in the spirit of the classics (the sound is designed
+// from scratch), modular: pick the AMP and the SPEAKER separately, and mix and match.
+//
+//   AMP      APE 20    a raw 20 W solid-state amp: op-amp diode clipping into a second stage, the top pushed into the
+//                      clipper and the mids scooped after it - a fizzy, punky fuzz. Its own three-knob panel: DRIVE (OFF =
+//                      clean .. 10), VOLUME and EQ (one tilt, -5 dark .. +5 bright).
+//            SPRITE 10 a little 10 W amp with two inputs: NORMAL (clean and snappy) and OVERDRIVE (18 dB hotter, into
+//                      diode clipping: a bright, crunchy break-up); VOLUME, MASTER VOL, BASS, MIDDLE, TREBLE.
+//            TENOR 20  a warm 20 W amp with a mid-forward voice: two softer stages, smooth and round when pushed. Its full
+//                      panel: channel A (VOLUME: clean) or B (GAIN: drive), a pull-style MID BOOST (+6 dB at 700 Hz into
+//                      the preamp), a PARAMETRIC EQ (LEVEL -12 .. +12 dB, Q 0.5 .. 4, FREQUENCY 100 Hz .. 2 kHz), PRESENCE
+//                      (0 .. +12 dB above 2.5 kHz, in the power amp) and a spring REVERB.
+//            GAIN 0 - 10, BASS / MID / TREBLE 0 - 10 (5 = the amp's own voice, +/- 12 dB each), MASTER 0 - 10: the
+//            volume into the small solid-state power amp, which clips (and its supply sags) when it is turned up.
+//   SPEAKER  6.5" (tight and boxy, no real bass), 8" (the APE's: barky, a hard 2.4 kHz edge), 10" (the
+//            TENOR's: rounder, a fuller low end). Each an open-back cabinet: its low-end bump, presence and roll-off.
+//   BROKEN SPEAKER  a torn cone: it rattles and buzzes as it moves (more on the low notes and hard hits), with a ragged,
+//            notchy response and a weak low end.
+//   OUTPUT   -12 .. +12 dB. The house output stage: CLIP (ceiling -0.3 dBFS).
+//   Changing the AMP or the SPEAKER runs the new one alongside the old for 40 ms, then crossfades over 25 ms; BROKEN
+//   SPEAKER fades (10 ms): no click. Linked stereo (a mono guitar comes out the same on both sides).
+//   DRIFT    (0 - 100 %, 50 % = standard, 0 = none): the supply sags on hard chords (the power amp clips sooner and
+//            breathes) and wanders; the speaker's paper cone loosens as it works (its bass resonance drops a little).
+//   VFD / MATRIX  the panel's look (VFD charcoal and amber; MATRIX black tolex and silver). The look only.
+//   PRESETS  12 (Init + 11) plus Reset all to defaults. A preset sets the amp, the speaker, the knobs and BROKEN SPEAKER;
+//            OUTPUT, DRIFT and the look are left alone (Reset all restores them too).
+
+slider1:0<0,2,1{APE 20,SPRITE 10,TENOR 20}>-Amp
+slider2:1<0,2,1{6.5 inch,8 inch,10 inch}>-Speaker
+slider3:5<0,10,0.1>-Gain
+slider4:5<0,10,0.1>-Bass
+slider5:5<0,10,0.1>-Mid
+slider6:5<0,10,0.1>-Treble
+slider7:5<0,10,0.1>-Master
+slider8:0<0,1,1{Off,On}>-Broken speaker
+slider9:0<-12,12,0.1>-Output (dB)
+slider10:50<0,100,1>-Drift (%)
+slider11:0<0,1,1{VFD,Matrix}>-Look
+slider12:1<0,1,1{A (clean),B (drive)}>-TENOR channel
+slider13:5<0,10,0.1>-TENOR volume (A)
+slider14:0<0,1,1{Off,On}>-TENOR mid boost
+slider15:0<-12,12,0.1>-TENOR parametric level (dB)
+slider16:1<0.5,4,0.01>-TENOR parametric Q
+slider17:500<100,2000,1>-TENOR parametric frequency (Hz)
+slider18:0<0,10,0.1>-TENOR presence
+slider19:0<0,10,0.1>-TENOR reverb
+slider20:0<-5,5,0.1>-APE EQ (tilt)
+slider21:0<0,1,1{Normal,Overdrive}>-SPRITE input
+slider22:prs_sel=0<0,12,1{No preset,Init,Punk Fizz,Ape Crunch,Bedroom Clean,Sprite Crunch,Tenor Blues,Tenor Lead,Mix and Match,Tiny Box,Broken Fuzz,Broken Blues,Garage Wreck}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-drift.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-clip.jsfx-inc
+
+@init
+#ui_man = "gfx-bed34";                                // the ? pop-up links to this manual
+ext_noinit = 1;
+clp_aa = 1; clp_pf_on = 1; clp_kt_on = 0;             // gfx-clip: ADAA clippers with the drive-tracking pre-filter
+
+function bd_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function bd_op(f) ( 1 - exp(-2 * $pi * min(f, 0.49 * srate) / srate); );
+function bd_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
+function bd_sm(g) ( g * g * (3 - 2 * g); );
+
+// ---------- biquads: coefficients at o (b0 b1 b2 a1 a2), states at s (2) ----------
+function bd_w(f) ( 2 * $pi * min(max(f, 5), 0.45 * srate) / srate; );
+function bd_pk(o, f, gdb, q) local(A, w, cw, al, n) (
+  A = 10 ^ (gdb / 40); w = bd_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al / A;
+  o[0] = (1 + al * A) / n; o[1] = -2 * cw / n; o[2] = (1 - al * A) / n; o[3] = -2 * cw / n; o[4] = (1 - al / A) / n;
+);
+function bd_lsh(o, f, gdb) local(A, w, cw, al, s, a0) (
+  A = 10 ^ (gdb / 40); w = bd_w(f); cw = cos(w); al = sin(w) / 1.41421356; s = 2 * sqrt(A) * al;
+  a0 = (A + 1) + (A - 1) * cw + s;
+  o[0] = A * ((A + 1) - (A - 1) * cw + s) / a0; o[1] = 2 * A * ((A - 1) - (A + 1) * cw) / a0; o[2] = A * ((A + 1) - (A - 1) * cw - s) / a0;
+  o[3] = -2 * ((A - 1) + (A + 1) * cw) / a0; o[4] = ((A + 1) + (A - 1) * cw - s) / a0;
+);
+function bd_hsh(o, f, gdb) local(A, w, cw, al, s, a0) (
+  A = 10 ^ (gdb / 40); w = bd_w(f); cw = cos(w); al = sin(w) / 1.41421356; s = 2 * sqrt(A) * al;
+  a0 = (A + 1) - (A - 1) * cw + s;
+  o[0] = A * ((A + 1) + (A - 1) * cw + s) / a0; o[1] = -2 * A * ((A - 1) + (A + 1) * cw) / a0; o[2] = A * ((A + 1) + (A - 1) * cw - s) / a0;
+  o[3] = 2 * ((A - 1) - (A + 1) * cw) / a0; o[4] = ((A + 1) - (A - 1) * cw - s) / a0;
+);
+function bd_hp(o, f, q) local(w, cw, al, n) (
+  w = bd_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al;
+  o[0] = (1 + cw) * 0.5 / n; o[1] = -(1 + cw) / n; o[2] = o[0]; o[3] = -2 * cw / n; o[4] = (1 - al) / n;
+);
+function bd_lp(o, f, q) local(w, cw, al, n) (
+  w = bd_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al;
+  o[0] = (1 - cw) * 0.5 / n; o[1] = (1 - cw) / n; o[2] = o[0]; o[3] = -2 * cw / n; o[4] = (1 - al) / n;
+);
+function bd_bpf(o, f, q) local(w, cw, al, n) (
+  w = bd_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al;
+  o[0] = al / n; o[1] = 0; o[2] = -al / n; o[3] = -2 * cw / n; o[4] = (1 - al) / n;
+);
+function bd_bq(x, o, s) local(y) ( y = o[0] * x + s[0]; s[0] = o[1] * x - o[3] * y + s[1]; s[1] = o[2] * x - o[4] * y; y; );
+
+// ---------- one chain set's coefficients at o (by amp a, speaker k): 12 biquads ----------
+//   0 coupling HP  5 pre-emphasis  10 BASS  15 MID  20 TREBLE  25 the amp's voicing
+//   30 speaker HP  35 its bump  40 its presence  45 / 50 its roll-off (two LPs)  55 its dip
+function bd_coef(o, a, k) local(bb, mm, tt) (
+  bb = (bd_bs - 5) * 2.4; mm = (bd_md - 5) * 2.4; tt = (bd_tr - 5) * 2.4;
+  a == 0 ? ( bb = -1.6 * bd_tl; mm = 0; tt = 1.6 * bd_tl; );         // APE: one EQ, a tilt
+  bd_hp(o, 70, 0.7);
+  a == 0 ? ( bd_hsh(o + 5, 1000, 6); bd_lsh(o + 10, 400, bb); bd_pk(o + 15, 600, mm, 0.9); bd_hsh(o + 20, 1200, tt); bd_pk(o + 25, 500, -5, 0.8); ) :
+  a == 1 ? ( bd_hsh(o + 5, 2000, 4); bd_lsh(o + 10, 250, bb); bd_pk(o + 15, 650, mm, 0.9); bd_hsh(o + 20, 3000, tt); bd_pk(o + 25, 1600, 2, 0.8); ) :
+           ( bd_pk(o + 5, 800, 4, 0.7); bd_lsh(o + 10, 220, bb); bd_pk(o + 15, 700, mm, 0.8); bd_hsh(o + 20, 2200, tt); bd_pk(o + 25, 1200, 2, 0.7);
+             bd_pk(o + 60, bd_pf, bd_pl, bd_pq); bd_hsh(o + 65, 2500, bd_pr * 1.2); bd_bpf(o + 70, 700, 0.9); );
+  k == 0 ? ( bd_hp(o + 30, 185, 1); bd_pk(o + 35, 235 * bd_cone, 6, 2); bd_pk(o + 40, 1300, 5, 1.2); bd_lp(o + 45, 3500, 0.8); bd_lp(o + 50, 3500, 0.7); bd_pk(o + 55, 600, -3, 1.2); ) :   // 6.5": boxy, nasal, no lows
+  k == 1 ? ( bd_hp(o + 30, 115, 0.9); bd_pk(o + 35, 150 * bd_cone, 4, 1.6); bd_pk(o + 40, 2400, 5, 1.4); bd_lp(o + 45, 4800, 0.7); bd_lp(o + 50, 4800, 0.7); bd_pk(o + 55, 800, -3, 1); ) :      // 8": barky, an edge
+           ( bd_hp(o + 30, 70, 0.8); bd_pk(o + 35, 95 * bd_cone, 5, 1.3); bd_pk(o + 40, 1600, 2, 0.9); bd_lp(o + 45, 5800, 0.7); bd_lp(o + 50, 5800, 0.7); bd_pk(o + 55, 1100, -2, 1); );     // 10": round and full
+);
+
+// =====================================================================
+// ONE CHAIN SET: coupling, pre-emphasis, GAIN into the amp's clippers, its voicing and tone stack, MASTER into the power
+// amp, the speaker. Coefficients at cf, states at st (both sides); reads / writes bd_a / bd_b
+// =====================================================================
+function set_cfg(n) instance(cf, amp, spk, r1, bi) (
+  amp == 0 ? ( this.c1a.clp_set(2, 0.5, 0.42, 0); this.c1b.clp_set(2, 0.5, 0.42, 0); this.c1a.clp_knee(0.08); this.c1b.clp_knee(0.08);
+               this.c2a.clp_set(1, 0.9, 0.9, 0); this.c2b.clp_set(1, 0.9, 0.9, 0); bd_b1 = 0.02; ) :
+  amp == 1 ? ( this.c1a.clp_set(2, 0.7, 0.66, 0); this.c1b.clp_set(2, 0.7, 0.66, 0); this.c1a.clp_knee(0.15); this.c1b.clp_knee(0.15);
+               this.c2a.clp_set(1, 1, 1, 0); this.c2b.clp_set(1, 1, 1, 0); bd_b1 = 0.01; ) :
+             ( this.c1a.clp_set(1, 1, 0.8, 0); this.c1b.clp_set(1, 1, 0.8, 0); this.c2a.clp_set(1, 0.8, 0.8, 0); this.c2b.clp_set(1, 0.8, 0.8, 0); bd_b1 = 0.1; );
+  this.c1a.clp_pf_cfg(0.45 * srate, amp == 1 ? 9000 : 7000, -1.5, 150); this.c1b.clp_pf_cfg(0.45 * srate, amp == 1 ? 9000 : 7000, -1.5, 150);
+  this.c1a.clp_pf_block(bd_gn / 10, srate, n); this.c1b.clp_pf_block(bd_gn / 10, srate, n);
+  this.pa.clp_set(1, bd_rail, bd_rail * 0.95, 0); this.pb.clp_set(1, bd_rail, bd_rail * 0.95, 0);
+  bi = bd_b1; r1 = this.c1a.clp_crv(bi);
+  bd_coef(cf, amp, spk);
+);
+function set_run() instance(cf, st, amp, r1, bi, ok) local(a, b, g1, gm) (
+  a = bd_bq(bd_bq(bd_a, cf, st), cf + 5, st + 2); b = bd_bq(bd_bq(bd_b, cf, st + 32), cf + 5, st + 34);
+  amp == 2 ? ( a += bd_mbs * bd_bq(a, cf + 70, st + 24); b += bd_mbs * bd_bq(b, cf + 70, st + 56); );   // TENOR: the mid boost (+6 dB at 700 Hz)
+  g1 = amp == 0 ? bd_gape : amp == 1 ? bd_gspk : bd_gten;              // the preamp's gain (glided; TENOR: its channel's)
+  a = this.c1a.clp_pf_run(a * g1); b = this.c1b.clp_pf_run(b * g1);
+  a = this.c1a.clp_run(a + bi) - r1; b = this.c1b.clp_run(b + bi) - r1;
+  a = this.c2a.clp_run(a * 2) * 0.5; b = this.c2b.clp_run(b * 2) * 0.5;
+  a = bd_bq(bd_bq(bd_bq(bd_bq(a, cf + 25, st + 4), cf + 10, st + 6), cf + 15, st + 8), cf + 20, st + 10);
+  b = bd_bq(bd_bq(bd_bq(bd_bq(b, cf + 25, st + 36), cf + 10, st + 38), cf + 15, st + 40), cf + 20, st + 42);
+  amp == 2 ? ( a = bd_bq(a, cf + 60, st + 26); b = bd_bq(b, cf + 60, st + 58); );   // TENOR: the parametric
+  gm = bd_ms;                                                           // MASTER into the power amp
+  a = this.pa.clp_run(a * gm) / bd_msc; b = this.pb.clp_run(b * gm) / bd_msc;
+  bd_pw = max(bd_pw, max(abs(a), abs(b)) * bd_msc);
+  amp == 2 ? ( a = bd_bq(a, cf + 65, st + 28); b = bd_bq(b, cf + 65, st + 60); );   // TENOR: presence
+  a = bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(a, cf + 30, st + 12), cf + 35, st + 14), cf + 40, st + 16), cf + 45, st + 18), cf + 50, st + 20), cf + 55, st + 22);
+  b = bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(bd_bq(b, cf + 30, st + 44), cf + 35, st + 46), cf + 40, st + 48), cf + 45, st + 50), cf + 50, st + 52), cf + 55, st + 54);
+  ok = amp == 0 ? bd_ka : amp == 1 ? bd_ks : bd_kt;
+  bd_a = a * ok; bd_b = b * ok;
+);
+function set_reset() instance(st, bi) (
+  memset(st, 0, 64); this.c1a.clp_reset(); this.c1b.clp_reset(); this.c2a.clp_reset(); this.c2b.clp_reset();
+  this.pa.clp_reset(); this.pb.clp_reset(); this.c1a.clp_pf_reset(); this.c1b.clp_pf_reset();
+  this.c1a.x1 = this.c1b.x1 = bi; this.c1a.ad1 = this.c1b.ad1 = this.c1a.clp_ad(bi);
+);
+function set_tidy() instance(st) local(i) (
+  i = 0; loop(64, st[i] = bd_tn(st[i]); i += 1; );
+  this.c1a.clp_tidy(); this.c1b.clp_tidy(); this.c2a.clp_tidy(); this.c2b.clp_tidy(); this.pa.clp_tidy(); this.pb.clp_tidy();
+);
+
+// ---------- BROKEN SPEAKER: a torn cone's ragged response and its rattle (states at BKS) ----------
+BKC = 200; BKS = 260;                                  // coefficients: 0 notch, 5 peak, 10 low shelf, 15 the rattle's HP
+bd_pk(BKC, 1400, -10, 4); bd_pk(BKC + 5, 3200, 4, 2); bd_lsh(BKC + 10, 180, -6); bd_hp(BKC + 15, 900, 0.7);
+function bk_run() local(a, b, ea, eb, ra, rb, oa, ob) (
+  a = bd_bq(bd_bq(bd_bq(bd_a, BKC, BKS), BKC + 5, BKS + 2), BKC + 10, BKS + 4);
+  b = bd_bq(bd_bq(bd_bq(bd_b, BKC, BKS + 6), BKC + 5, BKS + 8), BKC + 10, BKS + 10);
+  bk_ea += bk_kx * (bd_a * 3 - bk_ea); bk_eb += bk_kx * (bd_b * 3 - bk_eb);   // the cone's excursion (the lows)
+  oa = max(abs(bk_ea) - 0.18, 0); ob = max(abs(bk_eb) - 0.18, 0);
+  ra = (bk_ea > 0 ? oa : -oa) * 1.6 + (rand(2) - 1) * oa * 0.9;              // it slaps and buzzes past its limit
+  rb = (bk_eb > 0 ? ob : -ob) * 1.6 + (rand(2) - 1) * ob * 0.9;
+  ra = bd_bq(ra, BKC + 15, BKS + 12); rb = bd_bq(rb, BKC + 15, BKS + 14);
+  a += ra * 0.7; b += rb * 0.7;
+  bd_a += bd_eK * (a - bd_a); bd_b += bd_eK * (b - bd_b);
+);
+function bk_tidy() local(i) ( i = 0; loop(16, BKS[i] = bd_tn(BKS[i]); i += 1; ); bk_ea = bd_tn(bk_ea); bk_eb = bd_tn(bk_eb); );
+
+// ---------- the TENOR's spring reverb (shared, after the speaker; its send fades with the TENOR) ----------
+RVA = 20000; RVB = 24200; RVN1 = 1601; RVN2 = 1987;  // two damped feedback lines (about 33 and 41 ms)
+function rv_run(x) local(i, v, y1, y2, s) (
+  v = x; i = 0;                                       // the spring's dispersion: a chain of first-order all-passes
+  loop(6, y1 = -0.62 * v + RVD[i]; RVD[i] = v + 0.62 * y1; v = y1; i += 1; );
+  y1 = RVA[rv_p1]; y2 = RVB[rv_p2];
+  rv_l1 += 0.45 * (y1 - rv_l1); rv_l2 += 0.45 * (y2 - rv_l2);   // the damping
+  RVA[rv_p1] = v + 0.72 * rv_l2; RVB[rv_p2] = v + 0.70 * rv_l1;
+  rv_p1 = (rv_p1 + 1) % rv_n1; rv_p2 = (rv_p2 + 1) % rv_n2;
+  s = y1 + y2; rv_h += rv_kh * (s - rv_h);
+  s - rv_h;                                           // (a 300 Hz high-pass: no boom)
+);
+RVD = 30000;
+
+// ---------- presets ----------
+#bd_pm = "Init|Punk Fizz|Ape Crunch|Bedroom Clean|Sprite Crunch|Tenor Blues|Tenor Lead|Mix and Match|Tiny Box|Broken Fuzz|Broken Blues|Garage Wreck";
+function bd_set(a, k, g, bs, md, tr, ms, br) ( slider1 = a; slider2 = k; slider3 = g; slider4 = bs; slider5 = md; slider6 = tr; slider7 = ms; slider8 = br;
+  slider12 = 1; slider13 = 5; slider14 = 0; slider15 = 0; slider16 = 1; slider17 = 500; slider18 = 0; slider19 = 0; slider20 = 0; slider21 = 0; );
+function bd_ten(ch, vol, mb, pl, pq, pf, pr, rv) ( slider12 = ch; slider13 = vol; slider14 = mb; slider15 = pl; slider16 = pq; slider17 = pf; slider18 = pr; slider19 = rv; );
+function load_preset(p) local(i) (
+  //                amp spk gain bass mid treb mstr broken
+  p == 1  ? bd_set(0, 1, 5, 5, 5, 5, 5, 0) :     // Init
+  p == 2  ? ( bd_set(0, 1, 9, 6, 3, 6, 6, 0); slider20 = 2; ) :     // Punk Fizz
+  p == 3  ? bd_set(0, 2, 4, 5, 6, 5, 6, 0) :     // Ape Crunch
+  p == 4  ? bd_set(1, 0, 2, 6, 5, 6, 4, 0) :     // Bedroom Clean
+  p == 5  ? ( bd_set(1, 1, 5, 5, 6, 6, 7, 0); slider21 = 1; ) :     // Sprite Crunch
+  p == 6  ? ( bd_set(2, 2, 5, 6, 6, 5, 6, 0); bd_ten(1, 5, 1, 2, 1, 700, 3, 3); ) :     // Tenor Blues
+  p == 7  ? ( bd_set(2, 2, 8.5, 5, 7, 6, 6, 0); bd_ten(1, 5, 1, 3, 1.5, 900, 4, 2.5); ) : // Tenor Lead
+  p == 8  ? bd_set(0, 2, 7, 6, 5, 4, 5, 0) :     // Mix and Match
+  p == 9  ? ( bd_set(2, 0, 6, 4, 7, 5, 7, 0); bd_ten(0, 6, 0, -3, 0.8, 300, 5, 2); ) :  // Tiny Box
+  p == 10 ? ( bd_set(0, 1, 8, 7, 4, 5, 6, 1); slider20 = -2; ) :    // Broken Fuzz
+  p == 11 ? ( bd_set(2, 2, 5, 7, 6, 4, 6, 1); bd_ten(1, 5, 1, 0, 1, 500, 2, 4); ) :     // Broken Blues
+  p == 12 ? ( bd_set(1, 0, 10, 8, 6, 7, 9, 1); slider21 = 1; ) :     // Garage Wreck
+  p == 13 ? ( bd_set(0, 1, 5, 5, 5, 5, 5, 0); slider9 = 0; slider10 = 50; slider11 = 0; );   // Reset all to defaults
+  i = 1; loop(21, ui_auto(i); i += 1; );
+  pr_cur = p == 13 ? 1 : p;
+);
+
+// ---------- state ----------
+function bd_srinit() (
+  bd_sr = srate;
+  bd_fst = 1 / (0.01 * srate); bd_xst = 1 / (0.025 * srate);
+  bd_gsm = 1 - exp(-1 / (0.015 * srate));
+  bd_ksa = bd_tc(40); bd_ksr = bd_tc(500);            // the supply: sag / recovery
+  bd_kh = bd_tc(3000); bd_kc = bd_tc(8000);           // the cone: loosens / recovers
+  bk_kx = bd_op(250); rv_kh = bd_op(300); rv_n1 = min(floor(0.0333 * srate), 4000); rv_n2 = min(floor(0.0414 * srate), 4000);
+  bd_pk(BKC, 1400, -10, 4); bd_pk(BKC + 5, 3200, 4, 2); bd_lsh(BKC + 10, 180, -6); bd_hp(BKC + 15, 900, 0.7);
+  ost_init(0);
+);
+bd_srinit();
+in_init();
+dS.drift_init(0.8 + rand(0.4)); dC.drift_init(0.8 + rand(0.4));
+drift_macro(50);
+BKA = 1.1; BKN = 1.25; BKO = 0.46; BKT = 0.96;              // (the amps' output trims)
+sA.cf = 1000; sA.st = 1200; sB.cf = 1100; sB.st = 1300;
+memset(RVA, 0, 4100); memset(RVB, 0, 4100); memset(RVD, 0, 8);
+bd_cone = 1; bd_rail = 1;
+sA.set_reset(); sB.set_reset();
+bd_cur = 0; bd_cfgC = bd_cfgN = floor(slider1 + 0.5) + 3 * floor(slider2 + 0.5); bd_xf = 0;
+bd_snap = 1;
+
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
+// state never reloads a preset over the saved settings.
+// the @slider work, also run after a preset swap in @block (PRESET parameter)
+function prs_sl() (
+  0
+);
+function prs_chk() local(k) (
+  prs_dirty > 0 ? ( prs_pk = prs_dirty; prs_dirty = 0; prs_q = 1; ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( prs_pk = prs_sel; prs_q = 0; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+  // PRESET parameter: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+  prs_pk > 0 ? (
+    prs_g <= 0 ? (
+      k = prs_pk; prs_pk = 0; load_preset(k); prs_sl();
+      prs_q ? ( k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
+      prs_gs = 1 / (0.030 * srate);
+    ) : prs_gs = -1 / (0.005 * srate);
+  );
+);
+prs_ok = 0; prs_dirty = 0; prs_pk = 0; prs_g = 1; prs_gs = 0;
+
+@slider
+prs_chk();
+prs_sl();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@block
+prs_chk();
+srate != bd_sr ? bd_srinit();
+in_setup(0, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);                // the house output stage: CLIP (an amp)
+drift_macro(slider10);
+bd_n = samplesblock / srate;
+bd_vs = dS.drift_tick(0.04 * dm_s * bd_n); bd_vc = dC.drift_tick(0.04 * dm_s * bd_n);
+// AMP / SPEAKER: a change starts the crossfade into the other set (warmed up first)
+bd_ct = floor(min(max(slider1, 0), 2) + 0.5) + 3 * floor(min(max(slider2, 0), 2) + 0.5);
+bd_xf <= 0 && bd_ct != bd_cfgC ? (
+  bd_snap ? bd_cfgC = bd_ct : ( bd_cfgN = bd_ct; bd_xf = 0.000001; bd_wu = floor(0.04 * srate); bd_cur ? sA.set_reset() : sB.set_reset(); );
+);
+// each set plays its own configuration
+bd_ca = bd_cur ? (bd_xf > 0 ? bd_cfgN : bd_cfgC) : bd_cfgC; bd_cb = bd_cur ? bd_cfgC : (bd_xf > 0 ? bd_cfgN : bd_cfgC);
+sA.amp = bd_ca % 3; sA.spk = floor(bd_ca / 3); sB.amp = bd_cb % 3; sB.spk = floor(bd_cb / 3);
+bd_gl = bd_snap ? 1 : 1 - exp(-samplesblock / (0.03 * srate));
+bd_gn += (min(max(slider3, 0), 10) - bd_gn) * bd_gl;
+bd_bs += (min(max(slider4, 0), 10) - bd_bs) * bd_gl; bd_md += (min(max(slider5, 0), 10) - bd_md) * bd_gl; bd_tr += (min(max(slider6, 0), 10) - bd_tr) * bd_gl;
+bd_mt += (min(max(slider7, 0), 10) - bd_mt) * bd_gl;
+bd_pl += (min(max(slider15, -12), 12) - bd_pl) * bd_gl; bd_pq += (min(max(slider16, 0.5), 4) - bd_pq) * bd_gl;
+bd_pfl += (log(min(max(slider17, 100), 2000)) - bd_pfl) * bd_gl; bd_pf = exp(bd_pfl);
+bd_pr += (min(max(slider18, 0), 10) - bd_pr) * bd_gl; bd_mbt = slider14 >= 0.5;
+bd_tl += (min(max(slider20, -5), 5) - bd_tl) * bd_gl;
+bd_vo += (min(max(slider13, 0), 10) - bd_vo) * bd_gl;
+bd_rvt = sqr(min(max(slider19, 0), 10) / 10) * 0.6;
+// each amp's preamp gain (into the clipper, x 0.5), on curved tapers so the drive builds gradually
+bd_ga_db = 34 * (bd_gn / 10) ^ 1.6;                                          // APE: 0 .. +34 dB, curved (OFF is clean)
+bd_gs_db = slider21 >= 0.5 ? 10 + 24 * (bd_gn / 10) ^ 1.6 : 22 * (bd_gn / 10) ^ 1.3;   // SPRITE: NORMAL / OVERDRIVE
+bd_gt_db = 30 * (bd_gn / 10) ^ 1.5;                                          // TENOR B
+bd_gat = 10 ^ (bd_ga_db / 20) * 0.5; bd_gst = 10 ^ (bd_gs_db / 20) * 0.5;
+// the output trims: each amp at its middle setting about level; GAIN raises the level at half its rate
+bd_kat = BKA * 10 ^ (-0.5 * (bd_ga_db - 11.2) / 20); bd_kst = (slider21 >= 0.5 ? BKO : BKN) * 10 ^ (-0.5 * (bd_gs_db - (slider21 >= 0.5 ? 17.9 : 8.9)) / 20);
+bd_ktt = slider12 >= 0.5 ? BKT * 10 ^ (-0.5 * (bd_gt_db - 10.6) / 20) : 2.45 * 10 ^ (-0.5 * (2 * bd_vo - 10) / 20);
+bd_gtt = slider12 >= 0.5 ? 10 ^ (bd_gt_db / 20) * 0.5 : 10 ^ ((-8 + 2 * bd_vo) / 20) * 0.5;   // TENOR: B (GAIN) or A (VOLUME)
+// MASTER: -24 .. +12 dB into the power amp; the output follows it at half the rate (louder, and gritty when up)
+bd_mst = 10 ^ ((-24 + 3.6 * bd_mt) / 20); bd_msc = sqrt(bd_mst);
+// DRIFT: the supply (its rail: wander and sag) and the cone (it loosens with what it has played)
+bd_rail = 1 - 0.03 * dm_a * (0.5 + 0.5 * bd_vs) - 0.18 * dm_a * bd_sag;
+bd_cone = 1 - 0.09 * dm_a * bd_heat + 0.01 * dm_a * bd_vc;
+sA.set_cfg(samplesblock); sB.set_cfg(samplesblock);
+bd_tK = slider8 >= 0.5;
+bd_outt = 10 ^ (min(max(slider9, -12), 12) / 20);
+bd_rvon = bd_cfgC % 3 == 2;                            // (the reverb's send: the TENOR playing)
+bd_snap ? ( bd_ka = bd_kat; bd_ks = bd_kst; bd_kt = bd_ktt; bd_mbs = bd_mbt; bd_rv = bd_rvt; bd_eR = bd_rvon; bd_gape = bd_gat; bd_gspk = bd_gst; bd_gten = bd_gtt; bd_ms = bd_mst; bd_outs = bd_outt; bd_gK = bd_tK; sA.set_reset(); sB.set_reset(); );
+bd_snap = 0;
+sA.set_tidy(); sB.set_tidy(); bk_tidy(); rv_l1 = bd_tn(rv_l1); rv_l2 = bd_tn(rv_l2); rv_h = bd_tn(rv_h); bd_sag = bd_tn(bd_sag); bd_heat = bd_tn(bd_heat);
+// the panel's mailboxes
+bda_ol = max(bda_ol, bd_ol); bda_or = max(bda_or, bd_or); bd_ol = bd_or = 0; bda_ex = max(bda_ex, bd_exm); bd_exm = 0;
+bda_pw = max(bda_pw, bd_pw); bd_pw = 0;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+in_process(spl0, spl1);
+bd_xl = in_l; bd_xr = in_r;
+abs(bd_xl) < 0.000000000000001 ? bd_xl = 0; abs(bd_xr) < 0.000000000000001 ? bd_xr = 0;
+bd_gK != bd_tK ? ( bd_gK = bd_tK ? min(bd_gK + bd_fst, 1) : max(bd_gK - bd_fst, 0); );
+bd_eK = bd_sm(bd_gK);
+bd_xf > 0 ? ( bd_wu > 0 ? bd_wu -= 1 : ( bd_xf += bd_xst; bd_xf >= 1 ? ( bd_xf = 0; bd_cur = 1 - bd_cur; bd_cfgC = bd_cfgN; ); ); );
+bd_ex = bd_sm(bd_xf);
+bd_gape += (bd_gat - bd_gape) * bd_gsm; bd_gspk += (bd_gst - bd_gspk) * bd_gsm; bd_gten += (bd_gtt - bd_gten) * bd_gsm;
+bd_ms += (bd_mst - bd_ms) * bd_gsm; bd_outs += (bd_outt - bd_outs) * bd_gsm; bd_mbs += (bd_mbt - bd_mbs) * bd_gsm;
+bd_ka += (bd_kat - bd_ka) * bd_gsm; bd_ks += (bd_kst - bd_ks) * bd_gsm; bd_kt += (bd_ktt - bd_kt) * bd_gsm;
+// the amp and its speaker (the playing set; the incoming one alongside while a change crossfades)
+bd_a = bd_xl; bd_b = bd_xr;
+bd_cur ? sB.set_run() : sA.set_run();
+bd_yl = bd_a; bd_yr = bd_b;
+bd_xf > 0 ? ( bd_a = bd_xl; bd_b = bd_xr; bd_cur ? sA.set_run() : sB.set_run(); bd_yl += bd_ex * (bd_a - bd_yl); bd_yr += bd_ex * (bd_b - bd_yr); );
+// the supply sags with what the power amp delivers; the cone loosens with what it has played
+bd_d = max(abs(bd_yl), abs(bd_yr)); bd_sag += (bd_d > bd_sag ? bd_ksa : bd_ksr) * (min(bd_d, 1) - bd_sag);
+bd_heat += (bd_d > bd_heat ? bd_kh : bd_kc) * (min(bd_d, 1) - bd_heat);
+// the TENOR's spring reverb (mono, the same both sides), faded with the TENOR
+bd_eR += ((bd_xf > 0 ? bd_cfgN % 3 == 2 : bd_rvon) - bd_eR) * bd_gsm; bd_rv += (bd_rvt - bd_rv) * bd_gsm;
+bd_rv * bd_eR > 0.0001 ? ( bd_rw = rv_run((bd_yl + bd_yr) * 0.5) * bd_rv * bd_eR; bd_yl += bd_rw; bd_yr += bd_rw; );
+// BROKEN SPEAKER
+bd_a = bd_yl; bd_b = bd_yr;
+bd_gK > 0 ? bk_run();
+bd_exm = max(bd_exm, max(abs(bk_ea), abs(bk_eb)));
+bd_yl = bd_a * bd_outs; bd_yr = bd_b * bd_outs;
+bd_yl != bd_yl ? bd_yl = 0; bd_yr != bd_yr ? bd_yr = 0;
+ost_out(bd_yl, bd_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+bd_ol = max(bd_ol, abs(spl0)); bd_or = max(bd_or, abs(spl1));
+prs_gs != 0 ? ( prs_g += prs_gs; prs_g <= 0 ? ( prs_g = 0; prs_gs = 0; ) : prs_g >= 1 ? ( prs_g = 1; prs_gs = 0; ); );
+prs_g < 1 ? ( prs_w = prs_g * prs_g * (3 - 2 * prs_g); spl0 *= prs_w; spl1 *= prs_w; );   // PRESET parameter duck: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
+
+@gfx 1080 430
+// version tag (JG, 29 Oct 2026): v1 = Legacy, v2 = Stable, v3 = the next graduation; a small dim tag just after the
+// panel title. ver_tag_at draws it at x with its baseline at yb, fs px high, in col (or the current colour if col < 0),
+// at 55 %; ver_tag puts it after text just drawn (dx, dy: extra offset in that text's heights). Font, colour and
+// gfx_x / gfx_y are left as they were.
+function ver_tag_at(s, slot, x, yb, fs, col) local(x0, y0, r, g, b, a, f) (
+  x0 = gfx_x; y0 = gfx_y; r = gfx_r; g = gfx_g; b = gfx_b; a = gfx_a; f = gfx_getfont();
+  col >= 0 ? ( gfx_r = (col >> 16) / 255; gfx_g = ((col >> 8) & 255) / 255; gfx_b = (col & 255) / 255; gfx_a = 1; );
+  gfx_setfont(slot, "Trebuchet MS", max(10, fs), 'b');
+  gfx_x = x; gfx_y = yb - 0.8 * gfx_texth; gfx_a *= 0.55; gfx_drawstr(s);
+  gfx_r = r; gfx_g = g; gfx_b = b; gfx_a = a; gfx_x = x0; gfx_y = y0; gfx_setfont(f + 1);
+);
+function ver_tag(s, slot, dx, dy) local(th) (
+  th = gfx_texth;
+  ver_tag_at(s, slot, gfx_x + (0.3 + dx) * th, gfx_y + (0.8 + dy) * th, 0.5 * th, -1);
+);
+ui_begin(1080, 430);
+// =====================================================================
+// GUI - in the 34 series manner (KRT81): sharp-cornered sections, bakelite knobs, a speaker you can see (and, with
+// BROKEN SPEAKER, see torn). The controls section shows the chosen amp's own panel: APE its three, the SPRITE its two inputs and five knobs, the
+// TENOR its full panel in its own cap colours (green levels, lilac tone, yellow parametric, red presence and reverb).
+// Two looks: VFD (charcoal and amber) and MATRIX (black tolex and silver). Design space 1080 x 430.
+// =====================================================================
+dv_mx = 0;                                  // one look (VFD); slider11 kept so old projects load
+!dv_mx ? (                                                // VFD: charcoal and amber
+  KRP = 0x2E2F31; KRF = 0x202123; KRI = 0xF5E6CC; KRA = 0xF2A33A; KRW = 0x121314; KRM = 0x55575A;
+  KRC = 0xF2A33A; KRPT = 0x2A1806; KRCN = 0xF2A33A; KRGH = 0x342A1E; KRAMB = 0xFFD24A; KRRED = 0xFF3B1F; KRKT = 0x2A1806;
+) : (                                                     // MATRIX: black tolex and silver
+  KRP = 0x1B1B1C; KRF = 0x111112; KRI = 0xD5D8DC; KRA = 0xC9CDD2; KRW = 0x0A0A0B; KRM = 0x4A4C4F;
+  KRC = 0xC9CDD2; KRPT = 0x111112; KRCN = 0xC9CDD2; KRGH = 0x26272A; KRAMB = 0xD4A373; KRRED = 0xBC3908; KRKT = 0x111112;
+);
+KRH = ui_mix(KRP, 0x000000, 0.35); KRI2 = ui_mix(KRI, KRF, 0.35);
+KCGR = 0x5CC895; KCLI = 0x8C8FCC; KCYE = 0xF0D06A; KCRE = 0xEE603C;   // the TENOR's caps
+
+gfx_setfont(6,  "Trebuchet MS", 27 * sc, 'b');
+gfx_setfont(10, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(11, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(12, "Trebuchet MS", 13 * sc, 'b');
+gfx_setfont(13, "Trebuchet MS", 12 * sc, 'b');
+gfx_setfont(14, "Trebuchet MS", 15 * sc, 'b');
+gfx_setfont(15, "Trebuchet MS", 12 * sc, 'b');     // lamp key legends
+
+function kr_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+function kr_txt(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function kr_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function kr_rtxt(rx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = rx * sc - tw; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function kr_lbl(x, y, s) ( gfx_setfont(11); ui_col(KRI2); kr_txt(x, y, s); );
+function kr_hov(x, y, w, h) ( mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc; );
+function kr_thick(x1, y1, x2, y2, w) local(dx, dy, l, nx, ny, k) (       // (drawn here: works with any system files)
+  dx = x2 - x1; dy = y2 - y1; l = max(sqrt(dx * dx + dy * dy), 0.001); nx = -dy / l; ny = dx / l;
+  k = -0.5 * w; loop(floor(w * 2.5) + 1, gfx_line(x1 + nx * k, y1 + ny * k, x2 + nx * k, y2 + ny * k, 1); k += 0.4; );
+);
+// panel keys: house lamp keys (gfx-ui). kr_kc = the key's lamp colour (set before the call; cleared after;
+// none = the face's accent colour)
+function kr_key(x, y, w, h, lbl, on) local(c) (
+  c = kr_kc ? kr_kc : KRA; kr_kc = 0;
+  lk_well = 0x0A0A0B; lk_font = 15; lk_font2 = 15;
+  lk_fit(x, y, w, h, on, c, lbl);
+);
+// a key that isn't live: an unlit lamp key, dimmed
+function kr_dim(x, y, w, h, lbl) local(c) (
+  c = kr_kc ? kr_kc : KRA; kr_kc = 0;
+  lk_well = 0x0A0A0B; lk_font = 15; lk_font2 = 15; lk_inert = 1;
+  lk_fit(x, y, w, h, 0, c, lbl);
+  ui_cola(KRF, 0.55); kr_r(x, y, w, h); 0;
+);
+function kr_sect(x, y, w, h, name) (
+  ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRF); kr_r(x + 1, y + 1, w - 2, h - 2);
+  strlen(name) ? kr_lbl(x + 9, y + 6, name);
+);
+function kr_scale(cx, cy, r, n, nr, labels, minor) local(i, k, k0, len, c, a, ca, sa, m) (
+  len = strlen(labels); k0 = 0; i = 0; k = 0;
+  minor > 0 ? (
+    m = 0; ui_col(KRI2);
+    loop((n - 1) * minor + 1,
+      a = -0.75 * $pi + m / ((n - 1) * minor) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      gfx_line((cx + ca * (r + 4)) * sc, (cy + sa * (r + 4)) * sc, (cx + ca * (r + 6)) * sc, (cy + sa * (r + 6)) * sc, 1);
+      m += 1;
+    );
+  );
+  gfx_setfont(10);
+  loop(len + 1,
+    c = k < len ? str_getchar(labels, k) : 124;
+    c == 124 ? (
+      strcpy_substr(#krv_sl, labels, k0, k - k0);
+      a = -0.75 * $pi + i / max(n - 1, 1) * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+      ui_col(KRI);
+      gfx_line((cx + ca * (r + 3)) * sc, (cy + sa * (r + 3)) * sc, (cx + ca * (r + 7)) * sc, (cy + sa * (r + 7)) * sc, 1);
+      strlen(#krv_sl) ? kr_ctxt(cx + ca * (r + nr), cy + sa * (r + nr), #krv_sl);
+      i += 1; k0 = k + 1;
+    );
+    k += 1;
+  );
+);
+function kr_bake(cx, cy, r, a) local(i, t, ca, sa, k) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.55); gfx_circle(cx + 2.5 * sc, cy + 4.5 * sc, r * 1.02, 1, 1);
+  ui_col(0x0A0A0A); gfx_circle(cx, cy, r + 1 * sc, 1, 1);
+  ui_col(0x191817); gfx_circle(cx, cy, r, 1, 1);
+  i = 0;
+  loop(16,
+    t = i / 16 * 2 * $pi; k = 0.5 + 0.5 * cos(t + 0.8);
+    ui_col(ui_mix(0x0D0C0B, 0x48443F, k * 0.8)); gfx_circle(cx + sin(t) * r * 0.86, cy - cos(t) * r * 0.86, r * 0.15, 1, 1);
+    ui_col(0x0D0C0B); gfx_circle(cx + sin(t + 0.196) * r * 0.9, cy - cos(t + 0.196) * r * 0.9, r * 0.075, 1, 1);
+    i += 1;
+  );
+  ui_col(0x090808); gfx_circle(cx, cy, r * 0.70 + 1 * sc, 1, 1);
+  ui_col(0x22201E); gfx_circle(cx, cy, r * 0.70, 1, 1);
+  ui_cola(0xFFFFFF, 0.08); gfx_circle(cx, cy, r * 0.70, 0, 1);
+  ui_col(0x060606); kr_thick(cx + ca * r * 0.18, cy + sa * r * 0.18, cx + ca * r * 0.98, cy + sa * r * 0.98, 4.2 * sc);
+  ui_col(KRA); kr_thick(cx + ca * r * 0.22, cy + sa * r * 0.22, cx + ca * r * 0.95, cy + sa * r * 0.95, 2.5 * sc);
+);
+function kr_scap(cx, cy, r, a, cap) local(ca, sa, k, pc) (
+  ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.5); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+  ui_col(0x121212); gfx_circle(cx, cy, r, 1, 1);
+  ui_cola(0xFFFFFF, 0.12); gfx_circle(cx, cy, r, 0, 1);
+  k = r * 0.74;
+  ui_col(cap); gfx_circle(cx, cy, k, 1, 1);
+  ui_col(ui_mix(cap, 0x000000, 0.35)); gfx_circle(cx, cy, k, 0, 1);
+  pc = (cap & 255) + ((cap >> 8) & 255) + ((cap >> 16) & 255) > 380 ? KRPT : 0xF4F0E6;
+  ui_col(pc); kr_thick(cx + ca * k * 0.2, cy + sa * k * 0.2, cx + ca * r * 0.94, cy + sa * r * 0.94, 2.6 * sc);
+);
+krv_small = 0; krv_lg = 0; krv_step = 0; krv_cap = 0;
+function kr_kn(v, lo, hi) ( krv_lg ? log(max(v, lo) / lo) / log(hi / lo) : (v - lo) / (hi - lo); );
+function kr_kv(n, lo, hi) ( krv_lg ? lo * exp(n * log(hi / lo)) : lo + n * (hi - lo); );
+function kr_knob(cx, cy, r, idx, lo, hi, def) local(v, n, dx, dy, hov, did) (
+  did = 1700 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 5) * sc);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - krv_lt < 0.35 && krv_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; krv_lt = 0; ) : (
+      drag_id = did; krv_y = mouse_y; krv_lt = time_precise(); krv_lid = idx; krv_n = kr_kn(v, lo, hi);
+    );
+  );
+  drag_id == did ? (
+    krv_n = min(max(krv_n + (krv_y - mouse_y) / (((mouse_cap & 8) ? 1200 : (krv_step ? 160 : 240)) * sc), 0), 1); krv_y = mouse_y;
+    v = kr_kv(krv_n, lo, hi); krv_step ? v = floor(v + 0.5);
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    krv_step ? slider(idx) = min(max(floor(v + 0.5) + sign(mouse_wheel), lo), hi) : (
+      n = min(max(kr_kn(v, lo, hi) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.025), 0), 1);
+      slider(idx) = kr_kv(n, lo, hi);
+    );
+    ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(kr_kn(v, lo, hi), 0), 1);
+  krv_small ? kr_scap(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi, krv_cap ? krv_cap : KRC) : kr_bake(cx * sc, cy * sc, r * sc, -0.75 * $pi + n * 1.5 * $pi);
+  hov || drag_id == did ? ( ui_cola(0xFFFFFF, 0.07); gfx_circle(cx * sc, cy * sc, (r + 2) * sc, 1, 1); );
+  hov || drag_id == did;
+);
+function kr_name(cx, cy, act, name, val) ( gfx_setfont(14); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy, act ? val : name); );
+// a small knob with a tick ring (or n step ticks) and its name; the value while touched
+function kr_small(cx, cy, r, idx, lo, hi, def, nt, name, val) local(i, t, act) (
+  ui_cola(KRI, 0.85); i = 0;
+  loop(nt, t = -0.75 * $pi + i / (nt - 1) * 1.5 * $pi;
+    gfx_line((cx + sin(t) * (r + 4)) * sc, (cy - cos(t) * (r + 4)) * sc, (cx + sin(t) * (r + 8)) * sc, (cy - cos(t) * (r + 8)) * sc, 1); i += 1; );
+  krv_small = 1; act = kr_knob(cx, cy, r, idx, lo, hi, def); krv_small = 0;
+  strlen(name) ? ( gfx_setfont(11); ui_col(act ? KRA : KRI); kr_ctxt(cx, cy + r + 15, act ? val : name); );
+  act;
+);
+function kr_cell(x, y, w, h, lit, zone) local(c) (
+  c = zone == 2 ? KRRED : zone == 1 ? KRAMB : KRCN;
+  lit ? ( ui_cola(c, 0.16); kr_r(x - 0.5, y - 1, w + 1, h + 2); ui_col(c); kr_r(x, y, w, h); ui_cola(0xFFFFFF, 0.22); kr_r(x, y, w, 1.5); )
+      : ( ui_col(KRGH); kr_r(x, y, w, h); ui_cola(0x000000, 0.25); kr_r(x, y + h - 1, w, 1); );
+);
+function kr_hbar(x, y, w, h, v) local(n, i, sw, d) (
+  n = 32; sw = w / n; i = 0;
+  loop(n, d = -48 + (i + 0.5) / n * 48; kr_cell(x + i * sw + 0.5, y, sw - 2, h, v >= d, d > -3 ? 2 : d > -12 ? 1 : 0); i += 1; );
+);
+function kr_grbar(x, y, w, h, gr) local(n, i, sw, d) (                     // gain reduction: 0 .. -24 dB, from the left
+  n = 24; sw = w / n; i = 0;
+  loop(n, d = -(i + 0.5); kr_cell(x + i * sw + 0.5, y, sw - 2, h, gr <= d, 1); i += 1; );
+);
+function kr_window(x, y, w, h) ( ui_col(0x040404); kr_r(x, y, w, h); ui_col(KRW); kr_r(x + 1, y + 1, w - 2, h - 2); );
+function kr_db(v) ( sprintf(#krd, "%+.1f dB", v); #krd; );
+function kr_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+function dv_n(v) ( sprintf(#dvn, "%.1f", v); #dvn; );
+// a TENOR knob: a small capped knob in its colour, the name above, the value while touched
+function dv_tk(cx, cy, idx, lo, hi, def, cap, name, val) local(a) (
+  krv_cap = cap; a = kr_small(cx, cy, 17, idx, lo, hi, def, 11, "", val); krv_cap = 0;
+  gfx_setfont(11); ui_col(a ? KRA : KRI); kr_ctxt(cx, cy - 33, name);
+  a ? ( gfx_setfont(11); ui_col(KRA); kr_ctxt(cx, cy + 32, val); );
+);
+
+// =====================================================================
+// Faceplate and header
+// =====================================================================
+ui_col(ui_mix(KRP, 0x000000, 0.35)); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_cola(0xFFFFFF, 0.08); kr_r(0, 0, 1080, 1.5); kr_r(0, 0, 1.5, 430);
+ui_cola(0x000000, 0.35); kr_r(0, 428.5, 1080, 1.5); kr_r(1078.5, 0, 1.5, 430);
+ui_col(KRP); kr_r(12, 12, 1056, 406);
+dv_mx ? ( dv_i = 0; loop(100, dv_j = 0; loop(260, ((dv_i + dv_j) & 3) == 0 ? ( ui_cola(0xFFFFFF, 0.025); kr_r(14 + dv_j * 4, 14 + dv_i * 4, 2, 2); ); dv_j += 1; ); dv_i += 1; ); );   // (tolex)
+ui_cola(0x000000, 0.30); kr_r(12, 12, 1056, 1.5); kr_r(12, 12, 1.5, 406);
+ui_cola(0xFFFFFF, 0.07); kr_r(12, 416.5, 1056, 1.5); kr_r(1066.5, 12, 1.5, 406);
+ui_col(KRH); kr_r(13.5, 13.5, 1053, 50.5);
+ui_col(KRA); kr_r(13.5, 64, 1053, 2);
+ui_col(KRA); gfx_circle(45 * sc, 39 * sc, 16 * sc, 1, 1);
+gfx_setfont(4); ui_col(KRKT); ui_text(45 * sc, 33.5 * sc, "GFX");
+gfx_setfont(6); ui_col(KRI); kr_txt(72, 24, "BED34"); gfx_measurestr("BED34", dv_tw, dv_th); ver_tag("v2", 16, 4.1, 0);
+dv_tx = 72 + dv_tw / sc + 14;
+gfx_setfont(11); ui_col(KRI2); kr_txt(dv_tx, 25, "PRACTICE AMPS"); kr_txt(dv_tx, 40, "AMP + SPEAKER");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+k_ = pk_preset(318 * sc, 22 * sc, 290 * sc, 34 * sc, pr_cur, #bd_pm);
+k_ > 0 ? prs_dirty = k_;
+ui_size_picker(1000 * sc, 30 * sc);
+
+// ---------- AMP ----------
+kr_sect(22, 72, 170, 338, "AMP");
+dv_am = floor(min(max(slider1, 0), 2) + 0.5);
+kr_kc = LK_YEL; kr_key(36, 104, 142, 34, "APE 20", dv_am == 0) ? ( slider1 = 0; ui_auto(1); );
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(107, 150, "RAW SOLID-STATE FUZZ");
+kr_kc = LK_YEL; kr_key(36, 180, 142, 34, "SPRITE 10", dv_am == 1) ? ( slider1 = 1; ui_auto(1); );
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(107, 226, "NORMAL / OVERDRIVE");
+kr_kc = LK_YEL; kr_key(36, 256, 142, 34, "TENOR 20", dv_am == 2) ? ( slider1 = 2; ui_auto(1); );
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(107, 302, "WARM, FULL PANEL");
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(107, 372, "ANY AMP INTO");
+kr_ctxt(107, 386, "ANY SPEAKER");
+
+// ---------- CONTROLS: the chosen amp's panel ----------
+kr_sect(198, 72, 562, 338, dv_am == 0 ? "APE 20" : dv_am == 1 ? "SPRITE 10" : "TENOR 20");
+dv_am == 0 ? (
+  ui_col(0xC8231B); kr_r(206, 312, 546, 4); ui_col(0xF2C230); kr_r(206, 318, 546, 3);      // the stripe
+  kr_scale(300, 212, 34, 3, 18, "OFF||10", 4);
+  dv_a = kr_knob(300, 212, 34, 3, 0, 10, 5); kr_name(300, 274, dv_a, "DRIVE", slider3 < 0.05 ? "OFF" : dv_n(slider3));
+  kr_scale(479, 212, 34, 3, 18, "0|5|10", 4);
+  dv_a = kr_knob(479, 212, 34, 7, 0, 10, 5); kr_name(479, 274, dv_a, "VOLUME", dv_n(slider7));
+  kr_scale(658, 212, 34, 3, 18, "-5|0|+5", 4);
+  dv_a = kr_knob(658, 212, 34, 20, -5, 5, 0); sprintf(#dvt, "%+.1f", slider20); kr_name(658, 274, dv_a, "EQ", #dvt);
+  gfx_setfont(10); ui_col(KRI2); kr_ctxt(658, 292, "DARK  -  BRIGHT");
+  gfx_setfont(11); ui_col(KRI2); kr_ctxt(479, 360, "OFF IS CLEAN - THEN A FIZZY, PUNKY FUZZ");
+) : dv_am == 1 ? (
+  ui_col(0xEDEDE8); kr_r(206, 100, 546, 4);                                                   // the white stripe
+  gfx_setfont(11); ui_col(KRI); kr_ctxt(270, 136, "INPUT");
+  dv_ka = KRA; dv_kk = KRKT; KRA = 0xEDEDE8; KRKT = 0x1A1A1A;                                  // (white keys on this panel)
+  kr_kc = LK_RED; kr_key(214, 156, 112, 28, "OVERDRIVE", slider21 >= 0.5) ? ( slider21 = 1; ui_auto(21); );
+  kr_kc = LK_RED; kr_key(214, 192, 112, 28, "NORMAL", slider21 < 0.5) ? ( slider21 = 0; ui_auto(21); );
+  KRA = dv_ka; KRKT = dv_kk;
+  dv_tk(378, 190, 3, 0, 10, 5, 0xEDEDE8, "VOLUME", dv_n(slider3));
+  dv_tk(466, 190, 7, 0, 10, 5, 0xEDEDE8, "MASTER VOL", dv_n(slider7));
+  dv_tk(556, 190, 4, 0, 10, 5, 0xEDEDE8, "BASS", dv_n(slider4));
+  dv_tk(626, 190, 5, 0, 10, 5, 0xEDEDE8, "MIDDLE", dv_n(slider5));
+  dv_tk(696, 190, 6, 0, 10, 5, 0xEDEDE8, "TREBLE", dv_n(slider6));
+  ui_col(0xEDEDE8); kr_r(522, 246, 208, 1.5); kr_r(522, 246, 1.5, 10); kr_r(728.5, 246, 1.5, 10);
+  gfx_setfont(10); ui_col(0xEDEDE8); kr_ctxt(626, 262, "EQUALIZER");
+  gfx_setfont(11); ui_col(KRI2); kr_ctxt(479, 360, slider21 >= 0.5 ? "OVERDRIVE INPUT - A BRIGHT, CRUNCHY BREAK-UP" : "NORMAL INPUT - CLEAN AND SNAPPY");
+) : (
+  // the TENOR: row 1 A / B, VOLUME, GAIN, MASTER VOL (green), TREBLE, MIDDLE, BASS (lilac)
+  kr_kc = LK_WHT; kr_key(212, 112, 50, 24, slider12 >= 0.5 ? "B" : "A", 1) ? kr_tog(12);
+  gfx_setfont(10); ui_col(KRI2); kr_ctxt(237, 148, "A / B");
+  ui_col(slider12 < 0.5 ? KRA : KRI2); kr_ctxt(310, 98, "A");
+  ui_col(slider12 >= 0.5 ? KRA : KRI2); kr_ctxt(380, 98, "B");
+  dv_tk(310, 150, 13, 0, 10, 5, KCGR, "VOLUME", dv_n(slider13));
+  dv_tk(380, 150, 3, 0, 10, 5, KCGR, "GAIN", dv_n(slider3));
+  dv_tk(450, 150, 7, 0, 10, 5, KCGR, "MASTER VOL", dv_n(slider7));
+  dv_tk(540, 150, 6, 0, 10, 5, KCLI, "TREBLE", dv_n(slider6));
+  dv_tk(610, 150, 5, 0, 10, 5, KCLI, "MIDDLE", dv_n(slider5));
+  dv_tk(680, 150, 4, 0, 10, 5, KCLI, "BASS", dv_n(slider4));
+  kr_kc = LK_WHT; kr_key(212, 268, 92, 24, "MID BOOST", slider14 >= 0.5) ? kr_tog(14);
+  ui_col(ui_mix(KRF, KRP, 0.6)); kr_r(210, 212, 538, 1);
+  // row 2: the PARAMETRIC EQ (yellow), PRESENCE and REVERB (red)
+  dv_tk(380, 280, 15, -12, 12, 0, KCYE, "LEVEL", kr_db(slider15));
+  krv_lg = 1; sprintf(#dvq, "Q %.2f", slider16); dv_tk(450, 280, 16, 0.5, 4, 1, KCYE, "Q", #dvq);
+  sprintf(#dvf, slider17 >= 1000 ? "%.1f kHz" : "%d Hz", slider17 >= 1000 ? slider17 / 1000 : floor(slider17 + 0.5)); dv_tk(520, 280, 17, 100, 2000, 500, KCYE, "FREQUENCY", #dvf); krv_lg = 0;
+  gfx_setfont(10); ui_col(KRI2); kr_ctxt(450, 336, "PARAMETRIC EQ"); ui_col(KCYE); kr_r(360, 328, 30, 1); kr_r(510, 328, 30, 1);
+  dv_tk(610, 280, 18, 0, 10, 0, KCRE, "PRESENCE", dv_n(slider18));
+  dv_tk(680, 280, 19, 0, 10, 0, KCRE, "REVERB", dv_n(slider19));
+);
+
+// ---------- SPEAKER: the cone, the size, BROKEN ----------
+kr_sect(766, 72, 186, 338, "SPEAKER");
+dv_sp = floor(min(max(slider2, 0), 2) + 0.5);
+dv_r = dv_sp == 0 ? 44 : dv_sp == 1 ? 54 : 64; dv_cx = 859; dv_cy = 180;
+dv_ex = min(bda_ex * 3, 1); bda_ex = 0; dv_exs += (dv_ex - dv_exs) * 0.5;
+ui_col(0x050505); gfx_circle(dv_cx * sc, dv_cy * sc, (dv_r + 6) * sc, 1, 1);
+ui_col(ui_mix(KRM, 0x000000, 0.4)); gfx_circle(dv_cx * sc, dv_cy * sc, (dv_r + 4) * sc, 1, 1);
+ui_col(0x1A1816); gfx_circle(dv_cx * sc, dv_cy * sc, (dv_r) * sc, 1, 1);
+dv_i = 0; loop(6, ui_cola(0xFFFFFF, 0.025 + dv_i * 0.008); gfx_circle(dv_cx * sc, dv_cy * sc, (dv_r * (1 - dv_i * 0.13)) * sc, 0, 1); dv_i += 1; );
+ui_col(0x0E0D0C); gfx_circle(dv_cx * sc, dv_cy * sc, (dv_r * 0.3 + dv_exs * 3) * sc, 1, 1);         // the dust cap moves
+ui_cola(0xFFFFFF, 0.12); gfx_circle((dv_cx - 3) * sc, (dv_cy - 3) * sc, (dv_r * 0.12) * sc, 1, 1);
+slider8 >= 0.5 ? (                                                                                  // the tear
+  ui_col(KRRED);
+  kr_thick((dv_cx + dv_r * 0.32) * sc, (dv_cy - dv_r * 0.18) * sc, (dv_cx + dv_r * 0.55) * sc, (dv_cy - dv_r * 0.38) * sc, 1.6 * sc);
+  kr_thick((dv_cx + dv_r * 0.55) * sc, (dv_cy - dv_r * 0.38) * sc, (dv_cx + dv_r * 0.62) * sc, (dv_cy - dv_r * 0.62) * sc, 1.6 * sc);
+  kr_thick((dv_cx + dv_r * 0.55) * sc, (dv_cy - dv_r * 0.38) * sc, (dv_cx + dv_r * 0.82) * sc, (dv_cy - dv_r * 0.34) * sc, 1.6 * sc);
+  kr_thick((dv_cx - dv_r * 0.36) * sc, (dv_cy + dv_r * 0.25) * sc, (dv_cx - dv_r * 0.7) * sc, (dv_cy + dv_r * 0.45) * sc, 1.6 * sc);
+);
+kr_kc = LK_BLU; kr_key(776, 270, 52, 28, "6.5\"", dv_sp == 0) ? ( slider2 = 0; ui_auto(2); );
+kr_kc = LK_BLU; kr_key(833, 270, 52, 28, "8\"", dv_sp == 1) ? ( slider2 = 1; ui_auto(2); );
+kr_kc = LK_BLU; kr_key(890, 270, 52, 28, "10\"", dv_sp == 2) ? ( slider2 = 2; ui_auto(2); );
+dv_hov = kr_hov(776, 316, 166, 44);
+dv_hov && pressed && drag_id == 0 ? ( drag_id = -1; kr_tog(8); );
+ui_col(0x050505); kr_r(776, 316, 166, 44);
+ui_col(slider8 >= 0.5 ? KRRED : (dv_hov ? ui_mix(KRP, 0xFFFFFF, 0.14) : ui_mix(KRP, 0xFFFFFF, 0.07))); kr_r(777, 317, 164, 42);
+slider8 >= 0.5 ? ( ui_cola(KRRED, 0.3); kr_r(774, 314, 170, 48); );
+gfx_setfont(14); ui_col(slider8 >= 0.5 ? 0x1A0606 : KRI); kr_ctxt(859, 338, "BROKEN SPEAKER");
+gfx_setfont(10); ui_col(KRI2); kr_ctxt(859, 378, dv_sp == 0 ? "6.5\" OPEN BACK - BOXY" : dv_sp == 1 ? "8\" OPEN BACK - BARKY" : "10\" OPEN BACK - ROUND");
+
+// ---------- OUTPUT ----------
+kr_sect(958, 72, 100, 338, "OUTPUT");
+kr_scale(1008, 160, 26, 3, 15, "-12|0|+12", 4);
+dv_a = kr_knob(1008, 160, 26, 9, -12, 12, 0); kr_name(1008, 210, dv_a, "LEVEL", kr_db(slider9));
+sprintf(#dvv, "%d%%", floor(slider10 + 0.5)); kr_small(1008, 262, 15, 10, 0, 100, 50, 11, "DRIFT", #dvv);
+function kr_fall(v, pk) ( pk = pk > 0.0000001 ? 20 * log10(pk) : -90; pk > v ? pk : max(v - 0.6, -90); );
+dv_ml = kr_fall(dv_ml, bda_ol); dv_mr = kr_fall(dv_mr, bda_or); bda_ol = bda_or = 0;
+kr_window(980, 312, 56, 84);
+dv_i = 0;
+loop(12, dv_d = -48 + (dv_i + 0.5) / 12 * 48; dv_y = 390 - (dv_i + 1) * 6.4;
+  kr_cell(988, dv_y, 18, 4.6, dv_ml >= dv_d, dv_d > -3 ? 2 : dv_d > -12 ? 1 : 0); kr_cell(1010, dv_y, 18, 4.6, dv_mr >= dv_d, dv_d > -3 ? 2 : dv_d > -12 ? 1 : 0); dv_i += 1; );
+
+pk_end();
+ui_end();
