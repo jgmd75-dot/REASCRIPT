@@ -29,10 +29,6 @@ from urllib.parse import quote
 REPO = 'jgmd75-dot/REASCRIPT'
 TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAB = '--lab' in sys.argv
-INDEX_NAME = 'GFX Lab' if LAB else 'GFX'
-CAT = 'Lab' if LAB else 'Stable'
-SUB = 'Lab/' if LAB else ''          # where this repository's files live inside the git repo
-HERE = os.path.join(TOP, SUB) if LAB else TOP
 WEBSITE = 'https://www.gardenfx.uk/'
 
 
@@ -44,27 +40,120 @@ def sha(path):
     return hashlib.sha256(open(path, 'rb').read()).hexdigest()
 
 
-def folders():
-    """file -> install subfolder: the same folders as the website's download ZIPs (JG, 28 Oct 2026: screen-reader users
-    browse by category). Read from the website checkout (--site PATH, default ../website next to this repo):
-    the Stable's categories from stable.js, the Lab's groups from lab/index.html."""
+def load_site(n):
+    """A module from the website checkout's tools/ (--site PATH, default ../website next to this repo)."""
     import importlib.util
-    site = sys.argv[sys.argv.index('--site') + 1] if '--site' in sys.argv else os.path.join(os.path.dirname(TOP), 'website')
-    def load(n):
-        spec = importlib.util.spec_from_file_location(n.replace('-', '_'), os.path.join(site, 'tools', n + '.py'))
-        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
-    if not os.path.isdir(os.path.join(site, 'tools')):
-        sys.exit(f'No website checkout at {site} (pass --site PATH): the install folders come from it.')
+    site = SITE
+    spec = importlib.util.spec_from_file_location(n.replace('-', '_'), os.path.join(site, 'tools', n + '.py'))
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
+
+
+SITE = sys.argv[sys.argv.index('--site') + 1] if '--site' in sys.argv else os.path.join(os.path.dirname(TOP), 'website')
+
+
+def head_of(path):
+    return open(path, encoding='utf-8', errors='replace').read(4000)
+
+
+def effect_pkg(path, f, dest, cat, sysname, lab=False):
+    """One plug-in's package: its desc and about text from the file's header."""
+    head = head_of(path)
+    m = re.search(r'^desc:\s*(.+)$', head, re.M)
+    desc = m.group(1).strip() if m else f
+    m = re.search(r'^//\s*Requires (.+?)\(\.jsfx-inc\)', head, re.M)
+    req = m.group(1).strip() if m else ''
+    about = f'{desc}. Part of GFX (Garden FX) by JGWizrad: free donationware, gardenfx.uk.'
+    if lab:
+        about += ' A Lab plug-in: experimental, may change between versions.'
+    if req:
+        about += f' Needs the {sysname} package ({req.rstrip()}).'
+    return dict(type='effect', category=cat, desc=desc, about=about, files=[(path, dest, False)])
+
+
+def parts(src, tracked):
+    """The ReaPack repositories to build: [(sub, index name, category, packages, sysname, description)].
+    Stable (JG, 30 Oct 2026: "Split: GFX V3 / V2 extras / V1"): three repositories, ticked on or off in Manage
+    repositories, so a sync never brings back a version you removed:
+      GFX     (index.xml)    - the V3 range (stable.js), the system files, the scripts and Pulse's patterns
+      GFX V2  (V2/index.xml) - the V2 units that aren't in V3 as they are: the earlier versions kept as -v2 files
+                               and the units that left the range (stable-v2.js); the rest of V2 is the same file in V3
+      GFX V1  (V1/index.xml) - the legacy units (the site's legacy/files)
+    V2 and V1 plug-ins import the GFX system files (install them from the GFX repository)."""
+    if not os.path.isdir(os.path.join(SITE, 'tools')):
+        sys.exit(f'No website checkout at {SITE} (pass --site PATH): the install folders come from it.')
+    incs = sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx-inc'))
+    units = sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx'))
     if LAB:
-        m = load('build-lab-zip')
-        return {f: g for g, items in m.groups() for _, _, f in items}, m.SYS_DIR, 'Other'
-    m = load('sync-plugins')
+        m = load_site('build-lab-zip')
+        fold = {f: g for g, items in m.groups() for _, _, f in items}
+        sysname = 'GFX Lab system files'
+        pk = {f: effect_pkg(os.path.join(src, f), f, f'Effects/{fold.get(f, "Other")}/{f}', 'Lab', sysname, True)
+              for f in units}
+        pk[sysname] = dict(
+            type='effect', category='Lab', desc=f'{sysname} (install this first: every GFX Lab plug-in needs them)',
+            about='The shared engine and panel files (.jsfx-inc) that every GFX Lab plug-in imports. Install once.',
+            files=[(os.path.join(src, f), f'Effects/{m.SYS_DIR}/{f}', False) for f in incs])
+        add_scripts(pk, src, tracked)
+        return [('Lab/', 'GFX Lab', 'Lab', pk, sysname,
+                 'GFX Lab: the experimental GFX plug-ins for REAPER by JGWizrad - new ideas built in the open; they '
+                 'change often. Install "GFX Lab system files" first, then any Lab plug-ins you like. gardenfx.uk/lab')]
+
+    m = load_site('sync-plugins')
     cats, plugs = m.site_data()
-    fold = {f + '.jsfx': cats[c] for f, (_, c) in plugs.items()}
-    v2dir = getattr(m, 'V2_DIR', None)   # v3.0: the kept earlier versions (<name>-v2.jsfx) in their own folder, as in the ZIP
-    if v2dir:
-        fold.update({f: v2dir for f in os.listdir(os.path.abspath(sys.argv[1])) if f.endswith('-v2.jsfx')})
-    return fold, m.SYS_DIR, m.LEGACY_DIR
+    cats2, plugs2 = m.site_data(v2=True)
+    sysname = 'GFX system files'
+    v3, v2, v1 = {}, {}, {}
+    for f in units:
+        n = f[:-5]
+        if n in plugs:
+            v3[f] = effect_pkg(os.path.join(src, f), f, f'Effects/{cats[plugs[n][1]]}/{f}', 'Stable', sysname)
+        elif n.endswith('-v2') and n[:-3] in plugs2:
+            v2[f] = effect_pkg(os.path.join(src, f), f, f'Effects/{cats2[plugs2[n[:-3]][1]]}/{f}', 'V2', sysname)
+        elif n in plugs2:
+            v2[f] = effect_pkg(os.path.join(src, f), f, f'Effects/{cats2[plugs2[n][1]]}/{f}', 'V2', sysname)
+        else:
+            v1[f] = None                       # a legacy unit kept in the Stable (Optimiser): from legacy/files below
+    leg = os.path.join(SITE, 'legacy', 'files')
+    for f in sorted(os.listdir(leg)):
+        if f.endswith('.jsfx'):
+            v1[f] = effect_pkg(os.path.join(leg, f), f, f'Effects/{f}', 'V1', sysname)
+    missing = [f for f, p in v1.items() if p is None]
+    if missing:
+        sys.exit(f'Not in the V3 or V2 range and not in the site\'s legacy/files: {", ".join(missing)}')
+    v3[sysname] = dict(
+        type='effect', category='Stable', desc=f'{sysname} (install this first: every GFX plug-in needs them)',
+        about='The shared engine and panel files (.jsfx-inc) that every GFX plug-in imports - the V2 and V1 '
+              'repositories\' plug-ins too. Install once.',
+        files=[(os.path.join(src, f), f'Effects/{m.SYS_DIR}/{f}', False) for f in incs])
+    add_scripts(v3, src, tracked)
+    pats = sorted(t for t in tracked if t.startswith('Data/gfx-drum-patterns/'))
+    if pats:
+        v3['GFX Pulse patterns'] = dict(
+            type='data', category='Data', desc='GFX Pulse drum patterns',
+            about='Pattern files for the Pulse drum machine (installed into REAPER\'s Data/gfx-drum-patterns).',
+            files=[(os.path.join(src, f), f, False) for f in pats])
+    need = ' They need the "GFX system files" package from the GFX repository (index.xml): add that repository too.'
+    return [('', 'GFX', 'Stable', v3, sysname,
+             'GFX (Garden FX) V3: free JSFX plug-ins and ReaScripts for REAPER by JGWizrad - the current range. '
+             'Install "GFX system files" first, then any plug-ins you like. Earlier versions are in the separate '
+             'GFX V2 and GFX V1 repositories. gardenfx.uk'),
+            ('V2/', 'GFX V2', 'V2', v2, sysname,
+             'GFX V2: the GFX 2.0 units that changed or left the range in V3 - the earlier versions (-v2 files) and '
+             'the units V3 dropped - so projects made with them still open. Everything else in V2 is the same file '
+             'as in V3.' + need + ' gardenfx.uk'),
+            ('V1/', 'GFX V1', 'V1', v1, sysname,
+             'GFX V1: the legacy GFX units (the site\'s V1 page), so projects made with them still open.' + need +
+             ' gardenfx.uk')]
+
+
+def add_scripts(pk, src, tracked):
+    for f in sorted(t for t in tracked if t.endswith('.lua') and not t.startswith('dev/')):
+        base = os.path.basename(f)
+        head = open(os.path.join(src, f), encoding='utf-8', errors='replace').read(3000)
+        m = re.search(r'@description\s+(.+)$', head, re.M)
+        desc = m.group(1).strip() if m else base[:-4]
+        pk[base] = dict(type='script', category='Scripts', desc=desc,
+                        about=f'{desc}. A GFX ReaScript (Actions list).', files=[(os.path.join(src, f), f'Scripts/{base}', True)])
 
 
 def main():
@@ -73,122 +162,91 @@ def main():
     src = os.path.abspath(sys.argv[1])
     msg = sys.argv[sys.argv.index('--message') + 1] if '--message' in sys.argv else 'Update from GFX-II'
     tracked = git('ls-files', cwd=src).split('\n')
-    sysname = 'GFX Lab system files' if LAB else 'GFX system files'
+    plan = parts(src, tracked)
 
-    # ---------- 1. the packages, from the Stable checkout ----------
-    pk = {}   # name -> dict(type, category, desc, files: [(src, dest, main)], about)
-    fold, sysdir, other = folders()
-    incs = sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx-inc'))
-    for f in sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx')):
-        head = open(os.path.join(src, f), encoding='utf-8', errors='replace').read(4000)
-        m = re.search(r'^desc:\s*(.+)$', head, re.M)
-        desc = m.group(1).strip() if m else f
-        m = re.search(r'^//\s*Requires (.+?)\(\.jsfx-inc\)', head, re.M)
-        req = m.group(1).strip() if m else ''
-        about = f'{desc}. Part of GFX (Garden FX) by JGWizrad: free donationware, gardenfx.uk.'
-        if LAB:
-            about += ' A Lab plug-in: experimental, may change between versions.'
-        if req:
-            about += f' Needs the {sysname} package ({req.rstrip()}).'
-        pk[f] = dict(type='effect', category=CAT, desc=desc, about=about,
-                     files=[(f, f'Effects/{fold.get(f, other)}/{f}', False)])
-    pk[sysname] = dict(
-        type='effect', category=CAT, desc=f'{sysname} (install this first: every GFX{" Lab" if LAB else ""} plug-in needs them)',
-        about=f'The shared engine and panel files (.jsfx-inc) that every GFX{" Lab" if LAB else ""} plug-in imports. Install once.',
-        files=[(f, f'Effects/{sysdir}/{f}', False) for f in incs])
-    for f in sorted(t for t in tracked if t.endswith('.lua') and not t.startswith('dev/')):
-        base = os.path.basename(f)
-        head = open(os.path.join(src, f), encoding='utf-8', errors='replace').read(3000)
-        m = re.search(r'@description\s+(.+)$', head, re.M)
-        desc = m.group(1).strip() if m else base[:-4]
-        pk[base] = dict(type='script', category='Scripts', desc=desc,
-                        about=f'{desc}. A GFX ReaScript (Actions list).', files=[(f, f'Scripts/{base}', True)])
-    pats = [] if LAB else sorted(t for t in tracked if t.startswith('Data/gfx-drum-patterns/'))
-    if pats:
-        pk['GFX Pulse patterns'] = dict(
-            type='data', category='Data', desc='GFX Pulse drum patterns',
-            about='Pattern files for the Pulse drum machine (installed into REAPER\'s Data/gfx-drum-patterns).',
-            files=[(f, f, False) for f in pats])
-
-    # ---------- 2. copy and version ----------
-    for d in ('Effects', 'Scripts', 'Data'):
-        shutil.rmtree(os.path.join(HERE, d), ignore_errors=True)
-    for p in pk.values():
-        for s, dst, _ in p['files']:
-            os.makedirs(os.path.dirname(os.path.join(HERE, dst)), exist_ok=True)
-            shutil.copy2(os.path.join(src, s), os.path.join(HERE, dst))
-    vpath = os.path.join(HERE, 'versions.json')
-    old = json.load(open(vpath)) if os.path.exists(vpath) else {}
-    new, changed = {}, []
-    for name, p in pk.items():
-        # an effect's install path counts too: a plug-in moved to another folder is a new version (ReaPack moves it)
-        h = hashlib.sha256(''.join((d if p['type'] == 'effect' else '') + sha(os.path.join(HERE, d))
-                                   for _, d, _ in p['files']).encode()).hexdigest()
-        o = old.get(name)
-        if o and o['hash'] == h:
-            new[name] = o
-        else:
-            if o:
-                a, b, c = map(int, o['version'].split('.'))
-                ver = f'{a}.{b}.{c + 1}'
+    # ---------- copy and version, each repository in its own folder ----------
+    news, report = [], []
+    for sub, iname, cat, pk, sysname, about in plan:
+        here = os.path.join(TOP, sub)
+        for d in ('Effects', 'Scripts', 'Data'):
+            shutil.rmtree(os.path.join(here, d), ignore_errors=True)
+        for p in pk.values():
+            for s, dst, _ in p['files']:
+                os.makedirs(os.path.dirname(os.path.join(here, dst)), exist_ok=True)
+                shutil.copy2(s, os.path.join(here, dst))
+        vpath = os.path.join(here, 'versions.json')
+        old = json.load(open(vpath)) if os.path.exists(vpath) else {}
+        new, changed = {}, []
+        for name, p in pk.items():
+            # an effect's install path counts too: a plug-in moved to another folder is a new version (ReaPack moves it)
+            h = hashlib.sha256(''.join((d if p['type'] == 'effect' else '') + sha(os.path.join(here, d))
+                                       for _, d, _ in p['files']).encode()).hexdigest()
+            o = old.get(name)
+            if o and o['hash'] == h:
+                new[name] = o
             else:
-                ver = '1.0.0'
-            new[name] = dict(hash=h, version=ver, time=datetime.datetime.now(datetime.timezone.utc)
-                             .strftime('%Y-%m-%dT%H:%M:%SZ'), note=msg if o else 'First release on ReaPack.')
-            changed.append(f'{name} {ver}')
-    gone = sorted(set(old) - set(new))
-    if not changed and not gone and os.path.exists(os.path.join(HERE, 'index.xml')):
+                if o:
+                    a, b, c = map(int, o['version'].split('.'))
+                    ver = f'{a}.{b}.{c + 1}'
+                else:
+                    ver = '1.0.0'
+                new[name] = dict(hash=h, version=ver, time=datetime.datetime.now(datetime.timezone.utc)
+                                 .strftime('%Y-%m-%dT%H:%M:%SZ'), note=msg if o else 'First release on ReaPack.')
+                changed.append(f'{name} {ver}')
+        gone = sorted(set(old) - set(new))
+        fresh = changed or gone or not os.path.exists(os.path.join(here, 'index.xml'))
+        news.append((new, fresh))
+        if fresh:
+            json.dump(new, open(vpath, 'w'), indent=1, sort_keys=True)
+        report.append(f'{iname}: {len(changed)} package(s) new or updated' + (f', {len(gone)} removed' if gone else ''))
+        report += ['   ' + c for c in changed[:20]]
+        git('add', '-A', *(sub + d for d in ('Effects', 'Scripts', 'Data', 'versions.json') if os.path.exists(os.path.join(here, d))))
+    if not any(f for _, f in news):
         print('Nothing changed.')
         return
-    json.dump(new, open(vpath, 'w'), indent=1, sort_keys=True)
-    git('add', '-A', *(SUB + d for d in ('Effects', 'Scripts', 'Data', 'versions.json') if os.path.exists(os.path.join(HERE, d))))
     if git('status', '--porcelain'):
         git('commit', '-q', '-m', f'Files: {msg}')
     commit = git('rev-parse', 'HEAD')
 
-    # ---------- 3. the index, pinned to that commit ----------
-    cats = {}
-    for name, p in pk.items():
-        cats.setdefault(p['category'], []).append(name)
-    out = ['<?xml version="1.0" encoding="utf-8"?>',
-           f'<index version="1" name={quoteattr(INDEX_NAME)} commit="{commit}">']
-    for cat in (CAT, 'Scripts', 'Data'):
-        if cat not in cats:
+    # ---------- the indexes, pinned to that commit ----------
+    for (sub, iname, cat0, pk, sysname, about), (new, fresh) in zip(plan, news):
+        if not fresh:
             continue
-        out.append(f'  <category name={quoteattr(cat)}>')
-        for name in sorted(cats[cat], key=lambda n: (n != sysname, n.lower())):
-            p, v = pk[name], new[name]
-            out.append(f'    <reapack name={quoteattr(name)} type="{p["type"]}" desc={quoteattr(p["desc"])}>')
-            out.append(f'      <metadata><description><![CDATA[{p["about"]}]]></description>'
-                       f'<link rel="website">{WEBSITE}</link></metadata>')
-            out.append(f'      <version name="{v["version"]}" author="JGWizrad" time="{v["time"]}">')
-            out.append(f'        <changelog><![CDATA[{v["note"]}]]></changelog>')
-            for _, dst, is_main in p['files']:
-                url = f'https://github.com/{REPO}/raw/{commit}/' + quote(SUB + dst)
-                file_attr = dst.split('/', 1)[1]            # path inside the package's install folder
-                main = ' main="main"' if is_main else ''
-                out.append(f'        <source file={quoteattr(file_attr)}{main}>{escape(url)}</source>')
-            out.append('      </version>')
-            out.append('    </reapack>')
-        out.append('  </category>')
-    out.append('  <metadata>')
-    if LAB:
-        out.append('    <description><![CDATA[GFX Lab: the experimental GFX plug-ins for REAPER by JGWizrad - new ideas built in '
-                   'the open; they change often. Install "GFX Lab system files" first, then any Lab plug-ins you like. '
-                   'gardenfx.uk/lab]]></description>')
-    else:
-        out.append('    <description><![CDATA[GFX (Garden FX): free JSFX plug-ins and ReaScripts for REAPER by JGWizrad. '
-                   'Install "GFX system files" first, then any plug-ins you like. gardenfx.uk]]></description>')
-    out.append(f'    <link rel="website">{WEBSITE}</link>')
-    out.append('    <link rel="donation">https://ko-fi.com/jgwizrad</link>')
-    out.append('  </metadata>')
-    out.append('</index>')
-    open(os.path.join(HERE, 'index.xml'), 'w').write('\n'.join(out) + '\n')
-    git('add', SUB + 'index.xml')
+        cats = {}
+        for name, p in pk.items():
+            cats.setdefault(p['category'], []).append(name)
+        out = ['<?xml version="1.0" encoding="utf-8"?>',
+               f'<index version="1" name={quoteattr(iname)} commit="{commit}">']
+        for cat in (cat0, 'Scripts', 'Data'):
+            if cat not in cats:
+                continue
+            out.append(f'  <category name={quoteattr(cat)}>')
+            for name in sorted(cats[cat], key=lambda n: (n != sysname, n.lower())):
+                p, v = pk[name], new[name]
+                out.append(f'    <reapack name={quoteattr(name)} type="{p["type"]}" desc={quoteattr(p["desc"])}>')
+                out.append(f'      <metadata><description><![CDATA[{p["about"]}]]></description>'
+                           f'<link rel="website">{WEBSITE}</link></metadata>')
+                out.append(f'      <version name="{v["version"]}" author="JGWizrad" time="{v["time"]}">')
+                out.append(f'        <changelog><![CDATA[{v["note"]}]]></changelog>')
+                for _, dst, is_main in p['files']:
+                    url = f'https://github.com/{REPO}/raw/{commit}/' + quote(sub + dst)
+                    file_attr = dst.split('/', 1)[1]            # path inside the package's install folder
+                    main = ' main="main"' if is_main else ''
+                    out.append(f'        <source file={quoteattr(file_attr)}{main}>{escape(url)}</source>')
+                out.append('      </version>')
+                out.append('    </reapack>')
+            out.append('  </category>')
+        out.append('  <metadata>')
+        out.append(f'    <description><![CDATA[{about}]]></description>')
+        out.append(f'    <link rel="website">{WEBSITE}</link>')
+        out.append('    <link rel="donation">https://ko-fi.com/jgwizrad</link>')
+        out.append('  </metadata>')
+        out.append('</index>')
+        open(os.path.join(TOP, sub, 'index.xml'), 'w').write('\n'.join(out) + '\n')
+        git('add', sub + 'index.xml')
     git('commit', '-q', '-m', f'Index: {msg}')
-    print(f'{len(changed)} package(s) new or updated' + (f', {len(gone)} removed' if gone else '') + f'; files at {commit[:7]}')
-    for c in changed[:20]:
-        print('  ', c)
+    print(f'Files at {commit[:7]}')
+    print('\n'.join(report))
 
 
 if __name__ == '__main__':

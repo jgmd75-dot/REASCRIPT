@@ -18,6 +18,11 @@ This repo is the public ReaPack repository for the GFX Stable range. John adds
   under Effects, and an old project finds a plug-in that moved (JG tested both). The folders come from the website
   checkout: pass `--site PATH/TO/WEBSITE` (default `../website`). Keep every effect package in the one ReaPack
   category: the folder is in each file's path, so a move is an ordinary update (ReaPack removes the old file).
+- **Versions (JG, 30 Oct 2026):** the Stable build writes three ReaPack repositories so users tick each version on
+  or off: **GFX** (`index.xml`, the V3 range = stable.js, plus system files, scripts, Pulse patterns), **GFX V2**
+  (`V2/index.xml`, category "V2": the `-v2` files and the units in stable-v2.js but not in V3 - the rest of V2 is the
+  same file as V3) and **GFX V1** (`V1/index.xml`, category "V1": the website's `legacy/files`). V2 / V1 use the
+  main repo's "GFX system files" package. A Stable file in neither range nor legacy/files stops the build.
 - **The Lab** is a second, separate ReaPack repository in the same git repo: `Lab/index.xml` (index "GFX Lab",
   category "Lab"), files under `Lab/Effects/`, versions in `Lab/versions.json`. Rebuild it with
   `python3 tools/build-index.py PATH/TO/LAB --lab --message "what changed"` after a Lab plug-in arrives, changes or
