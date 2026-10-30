@@ -1,0 +1,57 @@
+desc:GFX Lab Sidebar - high-headroom peak saturation (include)
+//author: JGWizrad / Garden FX (GFX)
+//
+// gfx-lab-sidebar - the WS9 series' HEADROOM stage (JGWizrad's design, 30 Oct 2026; first in WS9 Channel).
+// The signal is padded 18 dB inside the stage; only the peaks that still reach the stage's ceiling are saturated; what
+// the saturation adds (the "sidebar") is lifted back 18 dB and folded into the clean, full-level signal. The clean
+// signal is never squashed below the ceiling; the peaks gain harmonics.
+//
+// The curve: below the knee (a little lower on the positive side, for some 2nd harmonic) nothing happens; above it
+// the excess goes through x / sqrt(1 + x^2) scaled to the knee, so the join is smooth (slope 1, no bend at the first
+// point) and the curve tends to twice the knee. The sidebar = the curve minus the padded signal (zero below the knee),
+// x 1 / pad, DC-blocked (5 Hz), high-passed by TONE (one pole) and smoothed (one-pole low-pass, 15 kHz). It comes out
+// on the same sample as the input: add it to that sample and the two stay in time and in phase.
+// Run it inside the unit's oversampled section (gfx-lab-os) - it makes harmonics.
+//
+// API (all rates are the RUNNING rate, srate x os_f)
+//   sb_rate(fs)                         @init, on a sample-rate change and on os_chg: the rate's coefficients
+//   sb_target(hr_db, amt, on, tone, hb) @block: HEADROOM in dB above 0 VU (-18 dBFS; 6 - 24 typical), the amount
+//                                       (1 = what a stage with that headroom would add = plain saturation at the
+//                                       ceiling, 2 = twice that), on (0 / 1), TONE in Hz (22 - 2200), hb = supply
+//                                       headroom factor (1 = nominal; > 1 = a sagging supply, the knee comes down)
+//   sb_snap()                           after the first sb_target: no glide in
+//   sb_glide(kk, ks)                    @sample (base rate): glides the knee (kk, ~30 ms) and the amount / on (ks, ~15 ms)
+//   sb_ctl(k)                           every 32 base samples: glides TONE and works its coefficient
+//   u.sb_run(x)                         one running-rate sample in -> the sidebar to add (already x the amount);
+//                                       sb_pk holds the largest |sidebar| since the unit last cleared it (for a meter)
+//   u.sb_clr()                          clear the state (after a factor change, after REAPER's bypass)
+// Variables: sb_ (this file's prefix).
+
+@init
+SB_PAD = 0.12589254117941673; SB_RST = 1 / SB_PAD;      // -18 dB in, +18 dB back
+function sb_sat(x) ( x / sqrt(1 + x * x); );
+function sb_rate(fs) local(w) (
+  sb_fs = fs; w = 2 * $pi / fs;
+  sb_dcc = 1 - 5 * w; sb_lpk = 1 - exp(-15000 * w); sb_ha = exp(-exp(sb_fz) * w);
+);
+function sb_target(hr_db, amt, on, tone, hb) (
+  sb_tt = exp((-36 + hr_db) * 0.11512925464970228) / max(hb, 0.1);   // the knee in the padded signal (0 VU = -36 dBFS there)
+  sb_gt = max(amt, 0) * (on >= 0.5);
+  sb_fzt = log(min(max(tone, 22), 2200));
+);
+function sb_snap() ( sb_t = sb_tt; sb_g = sb_gt; sb_fz = sb_fzt; sb_ha = exp(-2 * $pi * exp(sb_fz) / sb_fs); );
+function sb_glide(kk, ks) ( sb_t += (sb_tt - sb_t) * kk; sb_g += (sb_gt - sb_g) * ks; sb_tp = sb_t * 0.88; sb_tn = sb_t * 1.12; );
+function sb_ctl(k) ( sb_fz += (sb_fzt - sb_fz) * k; sb_ha = exp(-2 * $pi * exp(sb_fz) / sb_fs); );
+function sb_run(x) instance(dx, dy, hx, hy, lp) local(p, a, t, d) (
+  p = x * SB_PAD; a = abs(p);
+  t = p >= 0 ? sb_tp : sb_tn;
+  d = a > t ? ( (t + t * sb_sat((a - t) / t)) * (p >= 0 ? 1 : -1) - p ) : 0;
+  d *= SB_RST;
+  dy = d - dx + sb_dcc * dy; dx = d;
+  hy = sb_ha * (hy + dy - hx); hx = dy;
+  lp += (hy - lp) * sb_lpk;
+  abs(lp) < 0.000000000001 ? lp = 0;
+  d = lp * sb_g; sb_pk = max(sb_pk, abs(d));
+  d;
+);
+function sb_clr() instance(dx, dy, hx, hy, lp) ( dx = dy = hx = hy = lp = 0; );
