@@ -2,7 +2,7 @@ desc:Motra [analogue poly synth] (GFX)
 //tags: instrument synth poly mono analogue sequencer unison bass pad
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-drift, gfx-voice, gfx-output, gfx-ui, gfx-panel, gfx-instrument, gfx-dyn and gfx-faceplate
+// Requires gfx-drift, gfx-voice, gfx-output, gfx-ui, gfx-panel, gfx-instrument, gfx-dyn, gfx-faceplate
 // (.jsfx-inc) in the same folder.
 //
 // MOTRA. A straightforward analogue-style synth built for three things: big fat detuned basses and pads,
@@ -11,19 +11,27 @@ desc:Motra [analogue poly synth] (GFX)
 // VOICE      two DCOs (SAW, TRI, PULSE with PW; DCO 2 can be off) with their MIX, a SUB square an octave or two
 //            below DCO 1, and NOISE.
 // STACK      every note plays 1 - 4 voices, DETUNEd apart and SPREAD across the stereo field (MONO or POLY).
-// FILTER     a four-stage low-pass with resonance up to self-oscillation, 2-POLE or 4-POLE; DRIVE into it,
-//            ENV amount, KEY tracking and VELocity.
+// FILTER     a four-stage ladder with resonance up to self-oscillation, read five ways from its stages:
+//            2-POLE LP, 4-POLE LP, BAND, HIGH and NOTCH (mixes of the stage outputs, in the spirit of the
+//            mid-80s modular polys that tapped their ladders); DRIVE into it, ENV amount, KEY tracking and VELocity.
 // ENVELOPES  FILTER and AMP, attack - decay - sustain - release; AMP velocity.
 // MOTION     two LFOs (free or tempo-synced; to pitch, cutoff, PW or pan) and the SEQUENCER: four tracks of
 //            sixteen steps - PITCH (semitones), CUTOFF, LEVEL and one assignable (PW, resonance, drive, pan or
 //            noise), each with its depth. It runs while a key is held (in time with the project while it plays),
 //            RETRIG restarts the envelopes on every step.
+// STEP LANES (new in the Lab copy) two more rows under the four tracks: FILTER sets the filter type step by
+//            step and STACK the number of stacked voices step by step (each step can also follow the panel).
+//            A type change glides the stage mix over 10 ms (the ladder keeps running: nothing restarts, so it
+//            never clicks); a stack change fades the stacked voices in or out over 6 ms and re-spreads the
+//            others across the stereo field. A note takes as many voices as the STACK lane's biggest step.
+//            While a note rings out after the key is let go, the last step's type and stack stay.
 // MODES      MONO (legato, last note, GLIDE) or POLY (up to eight voices: four notes at STACK 2, two at STACK 4).
 //            A voice taken for a new note fades out first (4 ms): no clicks, nothing bumps into anything.
 // ASSIGN     four knobs on the top row, each set to any parameter (click its name).
 // DRIFT      every voice's DCOs wander on their own and every voice sits at its own tuning and cutoff, on top of
 //            the GFX instrument drift.
 // MIDI       note on / off (sample accurate), pitch bend, CC1 mod wheel (adds LFO 1), CC64 sustain, CC123.
+// OUTPUT     a 5 Hz DC blocker (Lab copy), then the house output stage (band SAT, CLIP always on). Latency: none.
 
 import gfx-drift.jsfx-inc
 import gfx-voice.jsfx-inc
@@ -50,7 +58,7 @@ slider13:12<0,50,0.1>-Stack detune (cents)
 slider14:60<0,100,1>-Stack spread (%)
 slider15:2500<20,16000,1>-Cutoff (Hz)
 slider16:20<0,100,0.1>-Resonance (%)
-slider17:1<0,1,1{2-pole,4-pole}>-Filter poles
+slider17:1<0,4,1{2-pole low-pass,4-pole low-pass,Band-pass,High-pass,Notch}>-Filter type
 slider18:25<0,100,1>-Drive (%)
 slider19:45<-100,100,1>-Filter env amount (%)
 slider20:40<0,100,1>-Key track (%)
@@ -96,9 +104,8 @@ slider59:30<0,100,1>-Bias (%)
 slider60:120<40,400,1>-Sat low band (Hz)
 slider61:6000<2000,16000,10>-Sat high band (Hz)
 slider62:-0.3<-24,0,0.1>-Ceiling (dB)
-slider63:1<0,1,1{Off,Clip}>-(unused, was output stage)
-slider64:0<0,1000000,1>-(edit counter)
-slider65:prs_sel=0<0,16,1{No preset,Init,Fat Bass,Sub Bass,Stack Pad,Wide Strings,Seq Bass,Seq Motion,Acid Line,Pluck,Brass Stack,Drone,Wobble,Glide Lead,Dark Pad,Saw Stab,Bell Steps}>-Preset
+slider63:0<0,1000000,1>-(edit counter)
+slider64:prs_sel=0<0,19,1{No preset,Init,Fat Bass,Sub Bass,Stack Pad,Wide Strings,Seq Bass,Seq Motion,Acid Line,Pluck,Brass Stack,Drone,Wobble,Glide Lead,Dark Pad,Saw Stab,Bell Steps,Type Steps,Stack Steps,Shape Shifter}>-Preset
 
 in_pin:none
 out_pin:left output
@@ -111,6 +118,7 @@ ext_noinit = 1;
 // ---------- memory ----------
 NPP = 49;                                           // sound parameters (sliders 1 - 49), what ASSIGN can pick
 SEQ = 100000;                                       // 4 tracks x 16 steps (0..1)
+FTL = SEQ + 64; STL = SEQ + 80;                     // the step lanes: filter type (0 = panel, 1..5), stack (0 = panel, 1..4)
 PLO = 101000; PHI = 101100; PDEF = 101200; PLG = 101300; PST = 101400;   // range, default, log, stepped
 VB = 110000; VS = 128; NVX = 8;                     // voices: 8 slots x 128
 QO = 112000; QT = 112400; QN = 112800; QV = 113200; // MIDI event queue (400)
@@ -125,7 +133,7 @@ prm(1, 0, 2, 0, 0, 1, "DCO 1 WAVE"); prm(2, -24, 24, 0, 0, 1, "DCO 1 FREQ"); prm
 prm(4, 0, 3, 1, 0, 1, "DCO 2 WAVE"); prm(5, -24, 24, 0, 0, 1, "DCO 2 FREQ"); prm(6, -50, 50, 7, 0, 0, "DCO 2 FINE"); prm(7, 2, 98, 50, 0, 0, "DCO 2 PW");
 prm(8, 0, 100, 50, 0, 0, "DCO MIX"); prm(9, 0, 100, 0, 0, 0, "SUB"); prm(10, 0, 1, 0, 0, 1, "SUB OCTAVE"); prm(11, 0, 100, 0, 0, 0, "NOISE");
 prm(12, 0, 3, 0, 0, 1, "STACK"); prm(13, 0, 50, 12, 0, 0, "DETUNE"); prm(14, 0, 100, 60, 0, 0, "SPREAD");
-prm(15, 20, 16000, 2500, 1, 0, "CUTOFF"); prm(16, 0, 100, 20, 0, 0, "RESONANCE"); prm(17, 0, 1, 1, 0, 1, "POLES"); prm(18, 0, 100, 25, 0, 0, "DRIVE");
+prm(15, 20, 16000, 2500, 1, 0, "CUTOFF"); prm(16, 0, 100, 20, 0, 0, "RESONANCE"); prm(17, 0, 4, 1, 0, 1, "FILTER TYPE"); prm(18, 0, 100, 25, 0, 0, "DRIVE");
 prm(19, -100, 100, 45, 0, 0, "FILTER ENV"); prm(20, 0, 100, 40, 0, 0, "KEY TRACK"); prm(21, 0, 100, 30, 0, 0, "FILTER VEL");
 prm(22, 0.5, 10000, 2, 1, 0, "F.ENV ATTACK"); prm(23, 2, 10000, 400, 1, 0, "F.ENV DECAY"); prm(24, 0, 100, 30, 0, 0, "F.ENV SUSTAIN"); prm(25, 2, 10000, 300, 1, 0, "F.ENV RELEASE");
 prm(26, 0.5, 10000, 2, 1, 0, "AMP ATTACK"); prm(27, 2, 10000, 300, 1, 0, "AMP DECAY"); prm(28, 0, 100, 90, 0, 0, "AMP SUSTAIN"); prm(29, 2, 10000, 300, 1, 0, "AMP RELEASE");
@@ -136,10 +144,11 @@ prm(43, 0, 1, 0, 0, 1, "SEQUENCER"); prm(44, 0, 5, 1, 0, 1, "SEQ RATE"); prm(45,
 prm(47, 0, 100, 60, 0, 0, "SEQ CUTOFF"); prm(48, 0, 100, 100, 0, 0, "SEQ LEVEL"); prm(49, 0, 100, 50, 0, 0, "SEQ 4 DEPTH");
 prm(50, 0, 12, 2, 0, 1, "BEND RANGE"); prm(51, -24, 6, 0, 0, 0, "VOLUME"); prm(52, 0, 100, 30, 0, 0, "DRIFT"); prm(53, 0, 16, 0, 0, 1, "MIDI CHANNEL");
 
-function seq_default() local(i) ( i = 0; loop(64, SEQ[i] = i < 16 ? 0 : i < 32 ? (i & 15) / 15 * 0.6 : i < 48 ? 1 : 0.5; i += 1; ); );
+function seq_default() local(i) ( i = 0; loop(64, SEQ[i] = i < 16 ? 0 : i < 32 ? (i & 15) / 15 * 0.6 : i < 48 ? 1 : 0.5; i += 1; ); memset(FTL, 0, 32); );
 seq_default();
 
-// ---------- presets: "slider:value" changes from Init, and the sequence (pitch in semitones 0..24, the rest 0..99) ----------
+// ---------- presets: "slider:value" changes from Init, and the sequence (pitch in semitones 0..24, the rest 0..99;
+// then, if given, the FILTER lane 0..5 and the STACK lane 0..4, 0 = follow the panel) ----------
 function mt_nums(s, dst) local(i, n, c, len, acc, neg, fr, scl, inn) (
   n = 0; i = 0; inn = 0; len = strlen(s);
   loop(len + 1,
@@ -158,7 +167,7 @@ function mt_nums(s, dst) local(i, n, c, len, acc, neg, fr, scl, inn) (
   );
   n;
 );
-#mt_pm = "Init|Fat Bass|Sub Bass|Stack Pad|Wide Strings|Seq Bass|Seq Motion|Acid Line|Pluck|Brass Stack|Drone|Wobble|Glide Lead|Dark Pad|Saw Stab|Bell Steps";
+#mt_pm = "Init|Fat Bass|Sub Bass|Stack Pad|Wide Strings|Seq Bass|Seq Motion|Acid Line|Pluck|Brass Stack|Drone|Wobble|Glide Lead|Dark Pad|Saw Stab|Bell Steps|Type Steps|Stack Steps|Shape Shifter";
 function mt_pstr(p) (
   p == 2  ? "32:0 12:2 13:14 14:40 1:0 4:3 7:35 9:60 15:380 16:22 18:55 19:55 23:320 24:20 25:150 26:1 27:500 28:85 29:120 20:30" :
   p == 3  ? "32:0 12:1 13:8 14:20 1:2 3:50 4:2 9:85 10:0 15:240 16:10 18:60 19:30 23:450 24:30 28:100 29:140 31:30" :
@@ -175,6 +184,9 @@ function mt_pstr(p) (
   p == 14 ? "12:3 13:18 14:100 1:2 3:30 4:2 6:-7 15:500 16:30 17:1 18:25 19:30 22:1800 23:3000 24:50 25:3000 26:1600 28:100 29:3000 38:0.2 40:1 41:25 51:-3" :
   p == 15 ? "12:2 13:12 14:70 1:0 4:1 5:7 6:3 15:800 16:30 18:45 19:80 21:50 22:0.5 23:260 24:0 25:200 26:0.5 27:400 28:0 29:300" :
   p == 16 ? "12:1 13:5 14:60 1:1 4:2 5:19 6:3 8:45 15:2600 16:30 20:100 19:30 22:0.5 23:900 24:0 25:900 26:0.5 27:1200 28:0 29:1100 43:1 44:2 45:1 47:30 48:60" :
+  p == 17 ? "12:1 13:10 14:70 1:0 4:1 6:6 15:1400 16:50 18:30 19:15 23:600 24:60 25:500 26:4 28:100 29:600 43:1 44:1 45:0 47:25 48:20 51:-2" :
+  p == 18 ? "32:0 12:3 13:18 14:80 1:0 4:1 6:5 9:40 15:420 16:30 18:50 19:45 23:260 24:20 25:150 26:0.5 27:300 28:85 29:120 43:1 44:1 45:1 47:50 48:100" :
+  p == 19 ? "32:0 12:1 13:12 14:70 1:0 4:3 7:35 9:50 15:600 16:55 18:55 19:50 21:40 22:0.5 23:220 24:15 25:130 26:0.5 27:260 28:75 29:120 43:1 44:1 45:1 46:0 47:60 48:100 49:40" :
   "";
 );
 function mt_sstr(p) (
@@ -182,24 +194,31 @@ function mt_sstr(p) (
   p == 7  ? "0 7 12 7 0 7 15 7 0 7 12 7 0 5 10 12  10 30 50 70 90 70 50 30 10 30 50 70 90 70 50 30  99 70 99 70 99 70 99 70 99 70 99 70 99 70 99 70  0 20 40 60 80 99 80 60 40 20 0 20 40 60 80 99" :
   p == 8  ? "0 0 12 0 3 0 15 0 0 0 12 10 0 7 0 12  10 50 90 20 60 30 99 40 10 70 20 80 30 99 50 20  99 60 99 60 99 99 60 99 60 99 60 99 99 60 99 70  50 50 50 50 50 50 50 50 50 50 50 50 50 50 50 50" :
   p == 16 ? "0 12 7 19 12 24 19 12 0 12 7 19 14 24 19 7  40 50 60 70 40 50 60 70 40 50 60 70 40 50 60 70  99 60 80 60 99 60 80 60 99 60 80 60 99 60 80 60  50 50 50 50 50 50 50 50 50 50 50 50 50 50 50 50" :
+  // (the Lab presets add the FILTER lane, then the STACK lane)
+  p == 17 ? "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0  40 50 60 70 40 50 60 70 40 50 60 70 40 50 60 70  99 80 90 80 99 80 90 80 99 80 90 80 99 80 90 80  50 50 50 50 50 50 50 50 50 50 50 50 50 50 50 50  2 3 4 3 2 5 4 3 2 3 4 3 1 5 4 3  0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0" :
+  p == 18 ? "0 0 12 0 0 0 7 0 0 0 12 0 0 10 12 7  20 40 70 30 20 40 80 30 20 40 70 30 20 60 90 50  99 70 90 70 99 70 90 70 99 70 90 70 99 80 99 80  50 50 50 50 50 50 50 50 50 50 50 50 50 50 50 50  0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0  1 1 2 1 1 1 3 1 1 1 2 1 1 4 4 2" :
+  p == 19 ? "0 0 12 0 3 0 0 7 0 0 12 0 10 0 7 12  30 50 80 40 30 60 90 40 30 50 80 40 60 30 90 50  99 70 99 70 99 70 99 80 99 70 99 70 99 80 99 80  20 40 60 80 20 40 60 80 20 40 60 80 20 40 60 80  0 0 3 0 4 0 3 1 0 0 3 0 5 0 4 3  1 0 0 3 1 0 4 0 1 0 0 3 1 0 4 4" :
   "";
 );
-function mt_dirty() ( slider64 = (slider64 + 1) % 1000000; ui_auto(64); );
-function mt_dirty_au() ( slider64 = (slider64 + 1) % 1000000; ui_auto(64); );
+function mt_dirty() ( slider63 = (slider63 + 1) % 1000000; ui_auto(63); );
+function mt_dirty_au() ( slider63 = (slider63 + 1) % 1000000; ui_auto(63); );
 function load_preset(p) local(n, i) (
   i = 1; loop(49, i != 32 || p > 1 ? slider(i) = PDEF[i]; i += 1; );   // (Init leaves MODE as it is)
   n = mt_nums(mt_pstr(p), PTMP);
   i = 0; loop(floor(n / 2), PTMP[i * 2] >= 1 && PTMP[i * 2] <= 49 ? slider(PTMP[i * 2]) = PTMP[i * 2 + 1]; i += 1; );
   slider51 = PDEF[51]; i = 0; loop(floor(n / 2), PTMP[i * 2] == 51 ? slider51 = PTMP[i * 2 + 1]; i += 1; );
   n = mt_nums(mt_sstr(p), PTMP);
-  n > 0 ? ( i = 0; loop(64, SEQ[i] = i < n ? PTMP[i] / (i < 16 ? 24 : 99) : 0; i += 1; ); ) : seq_default();
+  n > 0 ? ( i = 0; loop(64, SEQ[i] = i < n ? PTMP[i] / (i < 16 ? 24 : 99) : 0; i += 1; );
+            i = 0; loop(32, FTL[i] = 64 + i < n ? PTMP[64 + i] : 0; i += 1; ); ) : seq_default();
   i = 1; loop(51, ui_auto(i); i += 1; );
   pr_cur = p; mt_dirty_au();
 );
 
 // ---------- the filter: four TPT one-poles with global resonance, the input stage saturating (one voice) ----------
-// p[40..43] stage states; g = tan(pi fc / fs2); k = 0..~4.3; two = 2-pole tap (inside the same loop: it still sings)
-function mt_flt(p, x, g, k, two) local(ga, ga2, ga4, sa, u, v, y1, y2, y3, y4, h) (
+// p[40..43] stage states; g = tan(pi fc / fs2); k = 0..~4.3. The output is a mix of the input stage and the four
+// stage outputs (fm_a .. fm_e, gliding, shared by the voices), with a resonance make-up (1 + fm_k k): the 2-pole
+// low-pass taps stage 2 inside the same loop, so every type still sings.
+function mt_flt(p, x, g, k) local(ga, ga2, ga4, sa, u, v, y1, y2, y3, y4, h) (
   h = 1 / (1 + g); ga = g * h; ga2 = ga * ga; ga4 = ga2 * ga2;
   sa = ga2 * ga * p[40] * h + ga2 * p[41] * h + ga * p[42] * h + p[43] * h;
   u = (x - k * sa) / (1 + k * ga4);
@@ -208,8 +227,17 @@ function mt_flt(p, x, g, k, two) local(ga, ga2, ga4, sa, u, v, y1, y2, y3, y4, h
   v = (y1 - p[41]) * ga; y2 = v + p[41]; p[41] = y2 + v;
   v = (y2 - p[42]) * ga; y3 = v + p[42]; p[42] = y3 + v;
   v = (y3 - p[43]) * ga; y4 = v + p[43]; p[43] = y4 + v;
-  two ? y2 * (1 + 0.15 * k) : y4 * (1 + 0.3 * k);
+  (fm_a * u + fm_b * y1 + fm_c * y2 + fm_d * y3 + fm_e * y4) * (1 + fm_k * k);
 );
+// the stage mix of each type: 2-pole LP, 4-pole LP, band-pass, high-pass, notch
+function ft_set(t) (
+  t < 0.5 ? ( ft_a = 0; ft_b = 0; ft_c = 1; ft_d = 0; ft_e = 0; ft_k = 0.15; ) :
+  t < 1.5 ? ( ft_a = 0; ft_b = 0; ft_c = 0; ft_d = 0; ft_e = 1; ft_k = 0.3; ) :
+  t < 2.5 ? ( ft_a = 0; ft_b = 2; ft_c = -2; ft_d = 0; ft_e = 0; ft_k = 0.15; ) :
+  t < 3.5 ? ( ft_a = 1; ft_b = -2; ft_c = 1; ft_d = 0; ft_e = 0; ft_k = 0; ) :
+            ( ft_a = 1; ft_b = -2; ft_c = 2; ft_d = 0; ft_e = 0; ft_k = 0.08; );
+);
+function ft_snap() ( fm_a = ft_a; fm_b = ft_b; fm_c = ft_c; fm_d = ft_d; fm_e = ft_e; fm_k = ft_k; );
 
 // half-band decimator (39 taps, equiripple, > 63 dB stop band): ring[(w - j) & 63], newest 2x sample at j = 0
 function mt_hb(b, w) (
@@ -234,6 +262,8 @@ function mt_hb(b, w) (
 //   28 g   29 step   30 k   31 step   32 amp   33 step   34 / 35 pan gains L / R
 //   37 / 38 filter env (stage, level)   39 / 44 amp env (stage, level)   40..43 filter stages
 //   45..47 drift wander (DCO 1, DCO 2, cutoff)   48..50 its targets   51 its timer   52..54 the voice's own offsets
+//   15 its copy in the stack (0..3)   55 its stack level (0..1: the STACK lane fades copies in and out)
+//   (5, the stack position, now glides to where the copy sits in the stack sounding now; 10 holds the waiting copy)
 
 function v_ptr(i) ( VB + i * VS; );
 
@@ -247,11 +277,15 @@ function mt_env(st_, lv_, a, d, s, r, n) (
 );
 
 // one voice's control tick (every 16 samples)
-function mt_tick(p, n) local(e1, e2, base, p1, p2, f, oct, fc, g, kk, amp, t, pw1, pw2, pan, NR) (
+function mt_tick(p, n) local(e1, e2, base, p1, p2, f, oct, fc, g, kk, amp, t, pw1, pw2, pan, NR, on, ps) (
   e1 = mt_env(p[37], p[38], slider22, slider23, slider24 * 0.01, slider25, n); p[37] = mt_es; p[38] = e1;
   e2 = mt_env(p[39], p[44], slider26, slider27, slider28 * 0.01, slider29, n); p[39] = mt_es; p[44] = e2;
   p[39] == 0 && p[7] <= 0 ? p[0] = 0;                 // the amp envelope has finished: the voice is free
   p[12] += (p[13] - p[12]) * glide_k;
+  // the stack sounding now (the STACK lane): copies past it fade out where they stand, the rest re-spread
+  on = p[15] < stk_act;
+  ps = stk_act > 1 ? 2 * min(p[15], stk_act - 1) / (stk_act - 1) - 1 : 0;
+  p[6] ? ( p[55] = on; p[5] = ps; ) : ( p[55] += (on - p[55]) * stk_k; on ? p[5] += (ps - p[5]) * stk_pk; );
   // drift wander: a new target every 1.5 - 4 s, glided to
   p[51] -= n; p[51] <= 0 ? ( p[51] = (1.5 + 2.5 * rand(1)) * srate / max(dm_s, 0.3); p[48] = rand(2) - 1; p[49] = rand(2) - 1; p[50] = rand(2) - 1; );
   t = n / (1.2 * srate); p[45] += (p[48] * 9 - p[45]) * t; p[46] += (p[49] * 9 - p[46]) * t; p[47] += (p[50] * 0.12 - p[47]) * t;
@@ -271,7 +305,7 @@ function mt_tick(p, n) local(e1, e2, base, p1, p2, f, oct, fc, g, kk, amp, t, pw
   g = tan($pi * min(fc, 0.45 * 2 * srate) / (2 * srate)); p[29] = (g - p[28]) / NR; p[6] ? ( p[28] = g; p[29] = 0; );
   kk = min(fl_rs * 0.01 + sq_res, 1) * 4.3; p[31] = (kk - p[30]) / NR; p[6] ? ( p[30] = kk; p[31] = 0; );
   // amp (a voice fading out for a new note is handled per sample)
-  amp = e2 * (1 - slider30 * 0.01 + slider30 * 0.01 * p[4]) * sq_lvl * stk_g;
+  amp = e2 * (1 - slider30 * 0.01 + slider30 * 0.01 * p[4]) * sq_lvl * stk_gs * p[55];
   p[7] <= 0 ? p[33] = (amp - p[32]) / NR;
   pan = min(max(p[5] * stk_spr + lfo_pan + sq_pan, -1), 1);
   p[34] = sqrt(0.5 * (1 - pan)); p[35] = sqrt(0.5 * (1 + pan));
@@ -279,36 +313,33 @@ function mt_tick(p, n) local(e1, e2, base, p1, p2, f, oct, fc, g, kk, amp, t, pw
 );
 
 // start a voice now (it is silent: fresh, or faded out)
-function v_go(p, n, vel, cp) (
+function v_go(p, n, vel, c) (
   p[16] = rand(1); p[17] = rand(1); p[18] = p[16] * 0.5;
   p[40] = p[41] = p[42] = p[43] = 0; p[32] = 0; p[33] = 0;
-  p[1] = n; p[13] = n; p[2] = 1; p[4] = vel / 127; p[5] = cp; p[6] = 1; p[7] = 0;
+  p[1] = n; p[13] = n; p[2] = 1; p[4] = vel / 127; p[15] = c; p[6] = 1; p[7] = 0;
   p[12] = mono_mode && glide_k < 1 && last_note >= 0 ? last_note : n;
   p[14] = (rand(2) - 1) * 6 * dr_amt;
   p[37] = 1; p[38] = 0; p[39] = 1; p[44] = 0;
   p[0] = 1; vage += 1; p[3] = vage;
 );
 // put a note on voice i: straight away when it is silent, else after a 4 ms fade
-function v_note(i, n, vel, cp) local(p) (
+function v_note(i, n, vel, c) local(p) (
   p = v_ptr(i);
   p[0] && p[32] > 0.0005 ? (
-    p[7] = floor(0.004 * srate); p[8] = n; p[9] = vel; p[10] = cp; p[11] = 1;
+    p[7] = floor(0.004 * srate); p[8] = n; p[9] = vel; p[10] = c; p[11] = 1;
     p[1] = n; p[2] = 1; vage += 1; p[3] = vage;
-  ) : v_go(p, n, vel, cp);
+  ) : v_go(p, n, vel, c);
 );
 // retrigger the envelopes (RETRIG on a sequencer step), from where they stand
 function v_retrig(p) ( p[37] = 1; p[39] = 1; );
 function v_release(p) ( p[2] = 0; p[11] = 0; p[37] > 0 ? p[37] = 3; p[39] > 0 ? p[39] = 3; );
 
-// the position of stack copy c across the stack: -1 .. 1
-function stk_pos(c) ( stk_n > 1 ? 2 * c / (stk_n - 1) - 1 : 0; );
-
 // ---------- notes ----------
 function mono_play(n, vel, retrig) local(i, p) (
   i = 0;
-  loop(stk_n,
+  loop(stk_al,
     p = v_ptr(i);
-    retrig || !p[0] || p[7] > 0 ? v_note(i, n, vel, stk_pos(i)) : ( p[13] = n; p[1] = n; p[2] = 1; );
+    retrig || !p[0] || p[7] > 0 ? v_note(i, n, vel, i) : ( p[13] = n; p[1] = n; p[2] = 1; );
     i += 1;
   );
   last_note = n;
@@ -321,12 +352,12 @@ function note_on(n, vel) local(c, i, b, ba, p, had) (
     mono_play(n, vel, !had);
   ) : (
     c = 0;
-    loop(stk_n,
+    loop(stk_al,
       // a free voice first, else the one released longest ago, else the oldest
       b = -1; i = 0; loop(NVX, p = v_ptr(i); b < 0 && !p[0] ? b = i; i += 1; );
       b < 0 ? ( ba = 0; i = 0; loop(NVX, p = v_ptr(i); !p[2] && (b < 0 || p[3] < ba) ? ( b = i; ba = p[3]; ); i += 1; ); );
       b < 0 ? ( ba = 0; i = 0; loop(NVX, p = v_ptr(i); b < 0 || p[3] < ba ? ( b = i; ba = p[3]; ); i += 1; ); );
-      v_note(b, n, vel, stk_pos(c));
+      v_note(b, n, vel, c);
       c += 1;
     );
   );
@@ -357,7 +388,10 @@ function update() (
   mono_mode = slider32 < 0.5;
   stk_n = floor(slider12 + 0.5) + 1;
   stk_det = slider13 * 0.5; stk_spr = slider14 * 0.01;
-  stk_g = (mono_mode ? 0.62 : 0.34) / sqrt(stk_n);           // (POLY: several notes sum)
+  // a note takes as many voices as the STACK lane's biggest step (while the sequencer is on)
+  stk_al = stk_n;
+  slider43 >= 0.5 ? ( stk_al = 0; stl_i = 0; loop(16, stk_al = max(stk_al, STL[stl_i] > 0.5 ? min(floor(STL[stl_i] + 0.5), 4) : stk_n); stl_i += 1; ); );
+  stk_m = mono_mode ? 0.62 : 0.34;                           // (POLY: several notes sum)
   glide_k = slider31 > 0 ? 1 - exp(-4.6 * 16 / (slider31 * 0.001 * srate)) : 1;
   chan = slider53;
   vol_t = 10 ^ (slider51 / 20);
@@ -369,13 +403,16 @@ ins_drift_init();
 fl_ok = 0;
 ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
 gi = 0; loop(NVX, p_ = v_ptr(gi); p_[52] = (rand(2) - 1) * 5; p_[53] = (rand(2) - 1) * 5; p_[54] = (rand(2) - 1) * 0.08; p_[51] = rand(1) * srate; gi += 1; );
-sm = 1 - exp(-1 / (0.03 * srate)); sagc = 1 - exp(-1 / (0.15 * srate));
+sm = 1 - exp(-1 / (0.03 * srate)); dc_r = 1 - 2 * $pi * 5 / srate; dcxl = dcyl = dcxr = dcyr = 0; sagc = 1 - exp(-1 / (0.15 * srate));
 qcount = 0; vage = 0; pedal = 0; hcount = 0; mhold = 0; hw = 0; sag = 0; sage = 0; last_note = -1; ctl = 0;
 sq_run = 0; sq_ph = 0; sq_step = -1; mw = 0; bend_st = 0;
 sq_pitch = 0; sq_cut = 0; sq_lvl = 1; sq_pw = sq_res = sq_drv = sq_pan = sq_nz = 0;
 lfo_pitch = lfo_cut = lfo_pw = lfo_pan = 0; lf1 = lf2 = 0; ls1 = ls2 = 0;
 !ui_dflt ? ( ui_sz = 2; pr_cur = 1; mt_page = 0; );   // a new instance opens Large, on Init, on the sequencer page
-update(); last_mono = mono_mode; last_stk = stk_n;
+update(); last_mono = mono_mode; last_stk = stk_al;
+// the step lanes: what sounds now (type, stack), the stack gain and the glides (type 10 ms, stack 6 ms, spread 20 ms)
+sq_ft = slider17; sq_sn = stk_n; stk_act = stk_n; stk_gs = stk_m / sqrt(stk_n); ft_set(sq_ft); ft_snap();
+ft_g = 1 - exp(-1 / (0.010 * srate)); stk_k = 1 - exp(-16 / (0.006 * srate)); stk_pk = 1 - exp(-16 / (0.020 * srate));
 vol_s = vol_t;
 ui_dflt = 1;
 
@@ -389,14 +426,14 @@ update();
 );
 function prs_chk() local(k) (
   prs_dirty > 0 ? ( prs_pk = prs_dirty; prs_dirty = 0; prs_q = 1; ) : prs_ok ? (
-    prs_sel = max(0, min(16, prs_sel | 0));
+    prs_sel = max(0, min(19, prs_sel | 0));
     prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( prs_pk = prs_sel; prs_q = 0; ); );
   ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
   // PRESET parameter: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
   prs_pk > 0 ? (
     prs_g <= 0 ? (
       k = prs_pk; prs_pk = 0; load_preset(k); prs_sl();
-      prs_q ? ( k <= 16 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
+      prs_q ? ( k <= 19 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
       prs_gs = 1 / (0.030 * srate);
     ) : prs_gs = -1 / (0.005 * srate);
   );
@@ -414,7 +451,7 @@ update();
 fl_lc = log(slider15);
 fl_k = 1 - exp(-1 / (0.015 * srate));
 !fl_ok ? ( fl_c1 = fl_c2 = fl_lc; fl_rs = slider16; fl_ev = slider19; fl_ok = 1; );
-mono_mode != last_mono || stk_n != last_stk ? ( all_off(); last_mono = mono_mode; last_stk = stk_n; );
+mono_mode != last_mono || stk_al != last_stk ? ( all_off(); last_mono = mono_mode; last_stk = stk_al; );
 
 qcount = 0;
 while (midirecv(mofs, m1, m2, m3)) (
@@ -465,6 +502,9 @@ while (qi < qcount && (QO[qi] <= spos || spos >= samplesblock - 1)) (   // (an e
 spos += 1;
 // CUTOFF, RESO and ENV glide per sample, so a turned knob or automation sweeps smoothly (never in steps)
 fl_c1 += (fl_lc - fl_c1) * fl_k; fl_c2 += (fl_c1 - fl_c2) * fl_k; fl_rs += (slider16 - fl_rs) * fl_k; fl_ev += (slider19 - fl_ev) * fl_k;
+// the filter type glides per sample (the stage mix), so a step that changes type never clicks
+fm_a += (ft_a - fm_a) * ft_g; fm_b += (ft_b - fm_b) * ft_g; fm_c += (ft_c - fm_c) * ft_g;
+fm_d += (ft_d - fm_d) * ft_g; fm_e += (ft_e - fm_e) * ft_g; fm_k += (ft_k - fm_k) * ft_g;
 
 // ---------- control rate (every 16 samples): the LFOs and the sequencer, shared by the voices ----------
 (ctl -= 1) <= 0 ? (
@@ -479,7 +519,7 @@ fl_c1 += (fl_lc - fl_c1) * fl_k; fl_c2 += (fl_c1 - fl_c2) * fl_k; fl_rs += (slid
   d_ = slider35; d_ < 0.5 ? lfo_pitch += a1_ * a1_ * a1_ * 12 + a1_ * 0.3 : d_ < 1.5 ? lfo_cut += a1_ * 4 : d_ < 2.5 ? lfo_pw += a1_ * 0.45 : lfo_pan += a1_;
   d_ = slider40; d_ < 0.5 ? lfo_pitch += a2_ * a2_ * a2_ * 12 + a2_ * 0.3 : d_ < 1.5 ? lfo_cut += a2_ * 4 : d_ < 2.5 ? lfo_pw += a2_ * 0.45 : lfo_pan += a2_;
   // the sequencer: runs while a key is held
-  any_key = 0; vi_ = 0; loop(NVX, vp_ = v_ptr(vi_); vp_[2] ? any_key = 1; vi_ += 1; );
+  any_key = 0; snd_ = 0; vi_ = 0; loop(NVX, vp_ = v_ptr(vi_); vp_[2] ? any_key = 1; vp_[0] ? snd_ = max(snd_, vp_[32]); vi_ += 1; );
   run_ = slider43 >= 0.5 && any_key;
   run_ && !sq_run ? ( sq_ph = (play_state & 1) ? beat_position * sq_spb : 0; sq_step = -1; );
   sq_run = run_;
@@ -499,13 +539,23 @@ fl_c1 += (fl_lc - fl_c1) * fl_k; fl_c2 += (fl_c1 - fl_c2) * fl_k; fl_rs += (slid
     sq_drv = d_ >= 1.5 && d_ < 2.5 ? v4_ : 0;
     sq_pan = d_ >= 2.5 && d_ < 3.5 ? v4_ * 2 - slider49 * 0.01 : 0;
     sq_nz = d_ >= 3.5 ? v4_ : 0;
+    // the step lanes (0 = follow the panel)
+    sq_ft = FTL[sq_step] > 0.5 ? floor(FTL[sq_step] + 0.5) - 1 : slider17;
+    sq_sn = STL[sq_step] > 0.5 ? floor(STL[sq_step] + 0.5) : stk_n;
   ) : (
     sq_step = -1; sq_pitch = 0; sq_cut = 0; sq_lvl = 1; sq_pw = sq_res = sq_drv = sq_pan = sq_nz = 0;
+    // (a note ringing out keeps the last step's filter type and stack; back to the panel once all is quiet)
+    snd_ < 0.0005 || slider43 < 0.5 ? ( sq_ft = slider17; sq_sn = stk_n; );
   );
+  // the filter type and the stack sounding now; with nothing sounding they jump straight there
+  ft_set(sq_ft);
+  stk_act = min(max(sq_sn, 1), stk_al);
+  stk_gs += (stk_m / sqrt(stk_act) - stk_gs) * stk_k;
+  snd_ < 0.0005 ? ( ft_snap(); stk_gs = stk_m / sqrt(stk_act); );
   // the mixer (shared)
   mx2_ = slider8 * 0.01; lv1 = 1 - mx2_; lv2 = slider4 > 0.5 ? mx2_ : 0;
   lvs = slider9 * 0.01; lvn = min(slider11 * 0.01 + sq_nz, 1); w1 = floor(slider1 + 0.5); w2 = floor(slider4 + 0.5);
-  sdiv = slider10 < 0.5 ? 0.5 : 0.25; two = slider17 < 0.5;
+  sdiv = slider10 < 0.5 ? 0.5 : 0.25;
   drv = (1 + 5 * min(slider18 * 0.01 + sq_drv, 1)) * (1 + sag * 0.35);
   vi_ = 0; loop(NVX, vp_ = v_ptr(vi_); vp_[0] ? mt_tick(vp_, 16); vi_ += 1; );
 );
@@ -519,8 +569,9 @@ loop(NVX,
       p[32] *= 1 - 1 / p[7]; p[33] = 0; p[7] -= 1;
       p[7] <= 0 ? ( v_go(p, p[8], p[9], p[10]); p[2] = p[11]; mt_tick(p, 16); );
     );
-    k = 0;
-    loop(2,
+    // a stack copy the STACK lane has faded out rests (silent, its filter cleared) until it is wanted again
+    p[55] < 0.0005 && p[15] >= stk_act && p[7] <= 0 ? ( p[40] = p[41] = p[42] = p[43] = 0; k = 2; ) : k = 0;
+    loop(2 - k,
       p[20] += p[22]; p[21] += p[23]; p[24] += p[26]; p[25] += p[27];
       p[28] += p[29]; p[30] += p[31]; p[32] += p[33];
       // DCO 1 and the sub
@@ -537,7 +588,7 @@ loop(NVX,
            ( p2_ = ph + 1 - p[25]; p2_ -= floor(p2_); 0.8 * ((2 * ph - 1 - vo_blep(ph, i2)) - (2 * p2_ - 1 - vo_blep(p2_, i2))); );
       x = o1 * lv1 + o2 * lv2 + 0.5 * s1 * lvs;
       lvn > 0.0001 ? x += (rand(2) - 1) * lvn;
-      y = mt_flt(p, x * 0.55 * drv, p[28], p[30], two) * p[32];
+      y = mt_flt(p, x * 0.55 * drv, p[28], p[30]) * p[32];
       k == 0 ? ( L0 += y * p[34]; R0 += y * p[35]; ) : ( L1 += y * p[34]; R1 += y * p[35]; );
       k += 1;
     );
@@ -549,17 +600,20 @@ HBL[hw] = L0; HBR[hw] = R0; hw = (hw + 1) & 63;
 HBL[hw] = L1; HBR[hw] = R1;
 oL = mt_hb(HBL, hw); oR = mt_hb(HBR, hw);
 hw = (hw + 1) & 63;
+// 5 Hz DC blocker (pulse waves at uneven widths and the driven ladder carry some DC)
+dcx = oL; oL = oL - dcxl + dc_r * dcyl; dcxl = dcx; dcyl = oL;
+dcx = oR; oR = oR - dcxr + dc_r * dcyr; dcxr = dcx; dcyr = oR;
 mt_pre = max(mt_pre, max(abs(oL), abs(oR)));          // (the level before the output stage)
 sage += (min(abs(oL) + abs(oR), 2) - sage) * sagc;
 vol_s += (vol_t - vol_s) * sm;
 oL = ostL.ost_band(oL) * vol_s; oR = ostR.ost_band(oR) * vol_s;
 ost_out(oL, oR);
 spl0 = ost_l; spl1 = ost_r;
-mt_pk = max(mt_pk, max(abs(spl0), abs(spl1)));
+mt_pk_d = max(mt_pk_d, max(abs(spl0), abs(spl1)));
 prs_gs != 0 ? ( prs_g += prs_gs; prs_g <= 0 ? ( prs_g = 0; prs_gs = 0; ) : prs_g >= 1 ? ( prs_g = 1; prs_gs = 0; ); );
 prs_g < 1 ? ( prs_w = prs_g * prs_g * (3 - 2 * prs_g); spl0 *= prs_w; spl1 *= prs_w; );   // PRESET parameter duck: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
 
-@gfx 960 616
+@gfx 960 680
 // version tag (JG, 29 Oct 2026): v1 = Legacy, v2 = Stable, v3 = the next graduation; a small dim tag just after the
 // panel title. ver_tag_at draws it at x with its baseline at yb, fs px high, in col (or the current colour if col < 0),
 // at 55 %; ver_tag puts it after text just drawn (dx, dy: extra offset in that text's heights). Font, colour and
@@ -576,14 +630,15 @@ function ver_tag(s, slot, dx, dy) local(th) (
   ver_tag_at(s, slot, gfx_x + (0.3 + dx) * th, gfx_y + (0.8 + dy) * th, 0.5 * th, -1);
 );
 // =====================================================================
-// GUI - design space 1200 x 770 at qs = 0.8 x sc. A starship hull in the spirit of the 70s sci-fi paperback
+// GUI - design space 1200 x 850 at qs = 0.8 x sc. A starship hull in the spirit of the 70s sci-fi paperback
 // paintings: off-white plating with seams and rivets, bold livery blocks (orange, teal, red, hazard yellow),
 // hazard stripes and a stencilled hull code; the name rail is an airbrushed deep-space sky.
 // Top: the performance controls (CUTOFF, RESONANCE, ATTACK, DECAY / RELEASE, four ASSIGN knobs, the voice
-// lights, MODE and STACK). Below: the SEQUENCER page, or every parameter behind EDIT.
+// lights, MODE and STACK). Below: the SEQUENCER page (four tracks and the FILTER / STACK step lanes), or every
+// parameter behind EDIT.
 // Bottom: the PLAY strip. Knob values show on hover / drag (house style).
 // =====================================================================
-ui_begin(960, 616);
+ui_begin(960, 680);
 qs = sc * 0.8;
 gfx_setfont(8, "Trebuchet MS", 13 * qs, 'b');        // small print, labels
 gfx_setfont(9, "Arial Black", 15 * qs);               // section titles (stencil livery)
@@ -596,7 +651,7 @@ gfx_setfont(14, "Trebuchet MS", 15 * qs, 'b');        // labels and info, the la
 HULL = 0xE7E1D2; HULL2 = 0xD8D1BF; SEAM = 0xB9B19C; INK = 0x1B1B1C; INK2 = 0x5A564C;
 ORG = 0xE8692A; TEAL = 0x1F6F78; RED = 0xC8352B; YEL = 0xF2C230; NAVY = 0x0E1A33;
 
-function R(x, y, w, h) ( gfx_rect(x * qs, y * qs, max(1, w * qs), max(1, h * qs)); );
+function RCT(x, y, w, h) ( gfx_rect(x * qs, y * qs, max(1, w * qs), max(1, h * qs)); );
 function RR(x, y, w, h, r) ( rd_rr(x * qs, y * qs, w * qs, h * qs, r * qs); );
 function TX(x, y, t) ( gfx_x = x * qs; gfx_y = y * qs; gfx_drawstr(t); );
 function TC(cx, y, t) local(w, h) ( gfx_measurestr(t, w, h); gfx_x = cx * qs - w * 0.5; gfx_y = y * qs; gfx_drawstr(t); );
@@ -614,7 +669,7 @@ function fval(i) local(v) (
   i == 4 ? ( v < 0.5 ? "OFF" : v < 1.5 ? "SAW" : v < 2.5 ? "TRI" : "PULSE"; ) :
   i == 10 ? ( v < 0.5 ? "-1 OCT" : "-2 OCT"; ) :
   i == 12 ? sprintf(#fv, "%d", v + 1) :
-  i == 17 ? ( v < 0.5 ? "2-POLE" : "4-POLE"; ) :
+  i == 17 ? iname("2-POLE LP|4-POLE LP|BAND-PASS|HIGH-PASS|NOTCH", v) :
   i == 32 ? ( v < 0.5 ? "MONO" : "POLY"; ) :
   i == 34 || i == 39 ? ( v < 0.5 ? "TRIANGLE" : v < 1.5 ? "SAW" : v < 2.5 ? "SQUARE" : "RANDOM"; ) :
   i == 35 || i == 40 ? ( v < 0.5 ? "PITCH" : v < 1.5 ? "CUTOFF" : v < 2.5 ? "PW" : "PAN"; ) :
@@ -669,7 +724,7 @@ function sect(x, y, w, h, col, title) (
   ui_cola(0x000000, 0.18); RR(x + 1, y + 2, w, h, 6);
   ui_col(SEAM); RR(x, y, w, h, 6);
   ui_col(HULL2); RR(x + 1.5, y + 1.5, w - 3, h - 3, 5);
-  ui_col(col); RR(x + 1.5, y + 1.5, w - 3, 24, 5); R(x + 1.5, y + 14, w - 3, 11.5);
+  ui_col(col); RR(x + 1.5, y + 1.5, w - 3, 24, 5); RCT(x + 1.5, y + 14, w - 3, 11.5);
   gfx_setfont(9); ui_col(col == YEL ? INK : 0xFFFFFF); TX(x + 12, y + 4, title);
   rivet(x + w - 9, y + h - 9); rivet(x + 9, y + h - 9);
 );
@@ -691,21 +746,21 @@ ui_cola(0xE8A060, 0.9); gfx_circle(1012 * qs, 40 * qs, 20 * qs, 1, 1);
 ui_cola(0x6A2E1A, 0.55); gfx_circle(1019 * qs, 46 * qs, 19 * qs, 1, 1);
 ui_cola(0xF6D9A8, 0.7); gfx_line(978 * qs, 47 * qs, 1048 * qs, 31 * qs, 1); gfx_line(978 * qs, 48 * qs, 1048 * qs, 32 * qs, 1);
 // the livery band, hazard stripes, the hull code
-ui_col(ORG); R(0, 58, 1200, 16);
+ui_col(ORG); RCT(0, 58, 1200, 16);
 mg_i = 0; loop(16, ui_col(mg_i & 1 ? INK : YEL); gfx_triangle((mg_i * 16) * qs, 74 * qs, (mg_i * 16 + 16) * qs, 74 * qs, (mg_i * 16 + 32) * qs, 58 * qs, (mg_i * 16 + 16) * qs, 58 * qs); mg_i += 1; );
-ui_col(TEAL); R(1110, 58, 90, 16);
-ui_cola(0x000000, 0.25); R(0, 74, 1200, 2);
-gfx_setfont(13); ui_col(INK); TX(300, 59, "UNIT  MT-04       STACK  1 - 4       SEQUENCER  4 x 16       CASCADE  2 / 4 POLE");
+ui_col(TEAL); RCT(1110, 58, 90, 16);
+ui_cola(0x000000, 0.25); RCT(0, 74, 1200, 2);
+gfx_setfont(13); ui_col(INK); TX(300, 59, "UNIT  MT-04       STACK  1 - 4       SEQUENCER  6 x 16       LADDER  5 TYPES");
 gfx_setfont(13); ui_col(0xFFFFFF); TX(1122, 59, "MT-04");
 // hull seams
-ui_col(SEAM); R(0, 241, 1200, 1); R(0, 695, 1200, 1);
+ui_col(SEAM); RCT(0, 241, 1200, 1); RCT(0, 775, 1200, 1);
 
 // ---- the name rail ----
 ui_col(0xF1E9D2); gfx_circle(34 * qs, 29 * qs, 17 * qs, 1, 1);
 gfx_setfont(13); ui_col(NAVY); ui_keytext(34 * qs, 29 * qs, "GFX");
 gfx_setfont(10); ui_col(0xF4EEDD); TX(62, 2, "MOTRA");
 gfx_measurestr("MOTRA", mg_tw, mg_th);
-gfx_setfont(13); ui_cola(0xF4EEDD, 0.85); TX(66 + mg_tw / qs, 14, "STACKED ANALOGUE SYNTH"); TX(66 + mg_tw / qs, 30, "MONO  -  POLY  -  SEQUENCER"); ver_tag_at("v2", 16, gfx_x + 0.45 * gfx_texth, gfx_y + 0.8 * gfx_texth, gfx_texth, -1);
+gfx_setfont(13); ui_cola(0xF4EEDD, 0.85); TX(66 + mg_tw / qs, 14, "STACKED ANALOGUE SYNTH"); ver_tag_at("v3", 16, gfx_x + 0.45 * gfx_texth, gfx_y + 0.8 * gfx_texth, gfx_texth, -1); TX(66 + mg_tw / qs, 30, "MONO  -  POLY  -  SEQUENCER");
 pk_pextra = "";
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
 mg_k = pk_preset(470 * qs, 13 * qs, 380 * qs, 32 * qs, pr_cur, #mt_pm);
@@ -762,12 +817,12 @@ gfx_setfont(14); ui_col(INK2); TX(978, mg_y + 70, "STACK  -  VOICES PER NOTE");
 mg_kfs = 14;
 mg_i = 0; loop(4, sprintf(#pk, "%d", mg_i + 1); key(978 + mg_i * 49, mg_y + 90, 43, 24, floor(slider12 + 0.5) == mg_i, ORG, #pk) ? setv(12, mg_i); mg_i += 1; );
 mg_kfs = 0;
-gfx_setfont(14); ui_cola(INK, 0.65); TX(978, mg_y + 122, slider32 < 0.5 ? "LEGATO, LAST NOTE" : sprintf(#pv, "%d NOTES AT A TIME", floor(8 / (floor(slider12 + 0.5) + 1))));
+gfx_setfont(14); ui_cola(INK, 0.65); TX(978, mg_y + 122, slider32 < 0.5 ? "LEGATO, LAST NOTE" : sprintf(#pv, "%d NOTES AT A TIME", floor(8 / max(stk_al, 1))));
 
 // ---------------------------------------------------------------------
 !mt_page ? (
   // ---- SEQUENCER: four tracks of sixteen steps (drag across the bars to draw; the value shows while drawing) ----
-  sect(14, 250, 1172, 438, TEAL, "SEQUENCER");
+  sect(14, 250, 1172, 518, TEAL, "SEQUENCER");
   key(560, 254, 70, 18, slider43 < 0.5, YEL, "OFF") ? setv(43, 0);
   key(636, 254, 70, 18, slider43 >= 0.5, YEL, "ON") ? setv(43, 1);
   key(730, 254, 90, 18, slider45 >= 0.5, ORG, "RETRIG") ? tog(45);
@@ -779,32 +834,32 @@ gfx_setfont(14); ui_cola(INK, 0.65); TX(978, mg_y + 122, slider32 < 0.5 ? "LEGAT
   mg_i = 0; loop(16, rd_led((mg_bx + mg_i * mg_bw + mg_bw * 0.5) * 0.8, 290 * 0.8, 3.5 * 0.8, mg_i == mg_st, ORG); mg_i += 1; );
   mg_tr = 0;
   loop(4,
-    mg_ty = 304 + mg_tr * 96; mg_col = mg_tr == 0 ? ORG : mg_tr == 1 ? TEAL : mg_tr == 2 ? RED : 0xC79A10;
+    mg_ty = 304 + mg_tr * 88; mg_col = mg_tr == 0 ? ORG : mg_tr == 1 ? TEAL : mg_tr == 2 ? RED : 0xC79A10;
     mg_pit = mg_tr == 0;
-    ui_col(mg_col); RR(28, mg_ty, 8, 80, 2);
+    ui_col(mg_col); RR(28, mg_ty, 8, 72, 2);
     gfx_setfont(9); ui_col(INK); TX(46, mg_ty + 2, mg_tr == 0 ? "PITCH" : mg_tr == 1 ? "CUTOFF" : mg_tr == 2 ? "LEVEL" : "SEQ 4");
-    mg_tr == 0 ? ( gfx_setfont(13); ui_col(INK2); TX(46, mg_ty + 30, "SEMITONES 0 - 24"); TX(46, mg_ty + 46, "ON TOP OF THE KEY"); ) : (
-      mg_tr == 3 ? ( mbox(46, mg_ty + 28, 96, 20, fval(46)) ? mlist(46, "PW|Resonance|Drive|Pan|Noise", 46, mg_ty + 48); );
-      knob(46 + mg_tr, 172, mg_ty + 48, 15, mg_col, "");
-      gfx_setfont(13); ui_col(INK2); TX(46, mg_ty + 58, "DEPTH");
+    mg_tr == 0 ? ( gfx_setfont(13); ui_col(INK2); TX(46, mg_ty + 28, "SEMITONES 0 - 24"); TX(46, mg_ty + 44, "ON TOP OF THE KEY"); ) : (
+      mg_tr == 3 ? ( mbox(46, mg_ty + 26, 96, 20, fval(46)) ? mlist(46, "PW|Resonance|Drive|Pan|Noise", 46, mg_ty + 46); );
+      knob(46 + mg_tr, 172, mg_ty + 42, 15, mg_col, "");
+      gfx_setfont(13); ui_col(INK2); TX(46, mg_ty + 54, "DEPTH");
     );
     // the bars
     mg_q = SEQ + mg_tr * 16;
-    ui_col(0x16181B); RR(mg_bx - 4, mg_ty - 2, 16 * mg_bw + 6, 84, 4);
+    ui_col(0x16181B); RR(mg_bx - 4, mg_ty - 2, 16 * mg_bw + 6, 76, 4);
     mg_i = 0;
     loop(16,
       mg_x = mg_bx + mg_i * mg_bw;
-      ui_cola(0xFFFFFF, (mg_i & 3) == 0 ? 0.05 : 0.025); R(mg_x + 2, mg_ty + 2, mg_bw - 6, 76);
+      ui_cola(0xFFFFFF, (mg_i & 3) == 0 ? 0.05 : 0.025); RCT(mg_x + 2, mg_ty + 2, mg_bw - 6, 68);
       mg_v = mg_q[mg_i]; mg_pit ? mg_v = floor(mg_v * 24 + 0.5) / 24;
-      ui_col(mg_i == mg_st ? ui_mix(mg_col, 0xFFFFFF, 0.35) : mg_col); R(mg_x + 2, mg_ty + 2 + 76 * (1 - mg_v), mg_bw - 6, max(1.5, 76 * mg_v));
-      mg_pit && mg_v > 0 ? ( gfx_setfont(13); ui_col(0xF1E9D2); sprintf(#sn, "%d", floor(mg_v * 24 + 0.5)); TC(mg_x + mg_bw * 0.5 - 2, mg_ty + 64, #sn); );
+      ui_col(mg_i == mg_st ? ui_mix(mg_col, 0xFFFFFF, 0.35) : mg_col); RCT(mg_x + 2, mg_ty + 2 + 68 * (1 - mg_v), mg_bw - 6, max(1.5, 68 * mg_v));
+      mg_pit && mg_v > 0 ? ( gfx_setfont(13); ui_col(0xF1E9D2); sprintf(#sn, "%d", floor(mg_v * 24 + 0.5)); TC(mg_x + mg_bw * 0.5 - 2, mg_ty + 56, #sn); );
       mg_i += 1;
     );
     // drawing: press in the bars, drag across
-    pressed && drag_id == 0 && inbox(mg_bx, mg_ty, 16 * mg_bw, 80) ? ( drag_id = 3000 + mg_tr; );
+    pressed && drag_id == 0 && inbox(mg_bx, mg_ty, 16 * mg_bw, 72) ? ( drag_id = 3000 + mg_tr; );
     drag_id == 3000 + mg_tr ? (
       mg_i = min(max(floor((mouse_x / qs - mg_bx) / mg_bw), 0), 15);
-      mg_v = min(max(1 - (mouse_y / qs - mg_ty - 2) / 76, 0), 1);
+      mg_v = min(max(1 - (mouse_y / qs - mg_ty - 2) / 68, 0), 1);
       mg_pit ? mg_v = floor(mg_v * 24 + 0.5) / 24;
       mg_q[mg_i] = mg_v; mg_sdirty = 1;
       mg_pit ? sprintf(#sv, "STEP %d   +%d st", mg_i + 1, floor(mg_v * 24 + 0.5)) : sprintf(#sv, "STEP %d   %d", mg_i + 1, floor(mg_v * 100 + 0.5));
@@ -813,60 +868,90 @@ gfx_setfont(14); ui_cola(INK, 0.65); TX(978, mg_y + 122, slider32 < 0.5 ? "LEGAT
     );
     mg_tr += 1;
   );
+  // ---- the step lanes: FILTER (type per step) and STACK (voices per step); a dim step follows the panel ----
+  mg_ln = 0;
+  loop(2,
+    mg_ty = 660 + mg_ln * 54; mg_col = mg_ln == 0 ? ORG : TEAL; mg_q = mg_ln == 0 ? FTL : STL;
+    ui_col(mg_col); RR(28, mg_ty, 8, 40, 2);
+    gfx_setfont(9); ui_col(INK); TX(46, mg_ty, mg_ln == 0 ? "FILTER" : "STACK");
+    gfx_setfont(13); ui_col(INK2); TX(46, mg_ty + 24, mg_ln == 0 ? "TYPE PER STEP" : "VOICES PER STEP");
+    ui_col(0x16181B); RR(mg_bx - 4, mg_ty - 2, 16 * mg_bw + 6, 44, 4);
+    mg_i = 0;
+    loop(16,
+      mg_x = mg_bx + mg_i * mg_bw; mg_v = floor(mg_q[mg_i] + 0.5);
+      mg_hv = inbox(mg_x + 2, mg_ty + 2, mg_bw - 6, 36);
+      mg_v > 0 ? ( ui_col(mg_i == mg_st ? ui_mix(mg_col, 0xFFFFFF, 0.35) : mg_col); RCT(mg_x + 2, mg_ty + 2, mg_bw - 6, 36); ) :
+                 ( ui_cola(0xFFFFFF, mg_i == mg_st ? 0.16 : (mg_i & 3) == 0 ? 0.06 : 0.035); RCT(mg_x + 2, mg_ty + 2, mg_bw - 6, 36); );
+      mg_hv ? ( ui_cola(0xFFFFFF, 0.5); gfx_rect((mg_x + 2) * qs, (mg_ty + 2) * qs, (mg_bw - 6) * qs, 36 * qs, 0); );
+      mg_ln == 0 ? ( pk_pitem("LP2|LP4|BAND|HIGH|NOTCH", (mg_v > 0 ? mg_v - 1 : floor(slider17 + 0.5)) + 1, #lt); ) :
+                   sprintf(#lt, "%d", mg_v > 0 ? mg_v : floor(slider12 + 0.5) + 1);
+      gfx_setfont(14); gfx_measurestr(#lt, mg_tw, mg_th); mg_tw > (mg_bw - 8) * qs ? gfx_setfont(13);
+      ui_col(mg_v > 0 ? (mg_col == ORG ? INK : 0xFFFFFF) : 0x8A8A86); TC(mg_x + mg_bw * 0.5 - 1, mg_ty + 12, #lt);
+      hitbox(mg_x + 2, mg_ty + 2, mg_bw - 6, 36) ? (
+        mg_ln == 0 ? sprintf(#ml, "%sPanel (%s)|%sLP 2-pole|%sLP 4-pole|%sBand-pass|%sHigh-pass|%sNotch||All steps follow the panel",
+                       mg_v == 0 ? "!" : "", fval(17), mg_v == 1 ? "!" : "", mg_v == 2 ? "!" : "", mg_v == 3 ? "!" : "", mg_v == 4 ? "!" : "", mg_v == 5 ? "!" : "")
+                   : sprintf(#ml, "%sPanel (%d)|%s1 voice|%s2 voices|%s3 voices|%s4 voices||All steps follow the panel",
+                       mg_v == 0 ? "!" : "", floor(slider12 + 0.5) + 1, mg_v == 1 ? "!" : "", mg_v == 2 ? "!" : "", mg_v == 3 ? "!" : "", mg_v == 4 ? "!" : "");
+        gfx_x = (mg_x + 2) * qs; gfx_y = (mg_ty + 40) * qs; mg_k = gfx_showmenu(#ml);
+        mg_k > 0 ? ( mg_k == (mg_ln == 0 ? 7 : 6) ? memset(mg_q, 0, 16) : mg_q[mg_i] = mg_k - 1; mt_dirty(); );
+      );
+      mg_i += 1;
+    );
+    mg_ln += 1;
+  );
   !mdown && mg_sdirty ? ( mt_dirty(); mg_sdirty = 0; );
 ) : (
   // ---- EDITOR: every parameter ----
   // row 1: DCO 1 | DCO 2 | MIXER | STACK | FILTER
-  mg_y = 250; mg_ky = mg_y + 92;
-  sect(14, mg_y, 190, 148, TEAL, "DCO 1");
+  mg_y = 250; mg_ky = mg_y + 98;
+  sect(14, mg_y, 190, 160, TEAL, "DCO 1");
   mbox(26, mg_y + 32, 90, 20, fval(1)) ? mlist(1, "Saw|Tri|Pulse", 26, mg_y + 52);
   knob(2, 58, mg_ky, 17, TEAL, "FREQ"); knob(3, 150, mg_ky, 17, TEAL, "PW");
-  sect(212, mg_y, 250, 148, TEAL, "DCO 2");
+  sect(212, mg_y, 250, 160, TEAL, "DCO 2");
   mbox(224, mg_y + 32, 90, 20, fval(4)) ? mlist(4, "Off|Saw|Tri|Pulse", 224, mg_y + 52);
   knob(5, 250, mg_ky, 17, TEAL, "FREQ"); knob(6, 310, mg_ky, 17, TEAL, "FINE"); knob(7, 370, mg_ky, 17, TEAL, "PW");
   knob(8, 430, mg_ky, 15, 0xC79A10, "MIX");
-  sect(470, mg_y, 196, 148, YEL, "SUB  /  NOISE");
+  sect(470, mg_y, 196, 160, YEL, "SUB  /  NOISE");
   key(484, mg_y + 32, 44, 20, slider10 >= 0.5, YEL, slider10 >= 0.5 ? "-2" : "-1") ? tog(10);
   gfx_setfont(14); ui_col(INK2); TX(536, mg_y + 35, "SUB OCTAVE");
   knob(9, 532, mg_ky, 17, 0xC79A10, "SUB"); knob(11, 604, mg_ky, 17, 0xC79A10, "NOISE");
-  sect(674, mg_y, 200, 148, ORG, "STACK");
+  sect(674, mg_y, 200, 160, ORG, "STACK");
   knob(13, 710, mg_ky - 10, 16, ORG, "DETUNE"); knob(14, 772, mg_ky - 10, 16, ORG, "SPREAD"); knob(31, 834, mg_ky - 10, 16, ORG, "GLIDE");
   gfx_setfont(14); ui_col(INK2); TX(690, mg_y + 33, "VOICES: TOP ROW");
-  sect(882, mg_y, 304, 148, ORG, "FILTER");
-  key(1060, mg_y + 32, 54, 20, slider17 < 0.5, YEL, "2-POLE") ? setv(17, 0);
-  key(1118, mg_y + 32, 54, 20, slider17 >= 0.5, YEL, "4-POLE") ? setv(17, 1);
+  sect(882, mg_y, 304, 160, ORG, "FILTER");
+  mbox(1050, mg_y + 32, 124, 20, fval(17)) ? mlist(17, "2-pole low-pass|4-pole low-pass|Band-pass|High-pass|Notch", 1050, mg_y + 52);
   knob(18, 920, mg_ky, 15, ORG, "DRIVE"); knob(19, 996, mg_ky, 15, ORG, "ENV AMT"); knob(20, 1072, mg_ky, 15, ORG, "KEY"); knob(21, 1148, mg_ky, 15, ORG, "VEL");
   gfx_setfont(14); ui_col(INK2); TX(898, mg_y + 33, "CUTOFF / RES:"); TX(898, mg_y + 50, "TOP ROW");
   // row 2: the envelopes
-  mg_y = 404;
-  sect(14, mg_y, 580, 140, ORG, "FILTER ENVELOPE");
-  knob(22, 86, mg_y + 76, 19, ORG, "ATTACK"); knob(23, 231, mg_y + 76, 19, ORG, "DECAY"); knob(24, 376, mg_y + 76, 19, ORG, "SUSTAIN"); knob(25, 521, mg_y + 76, 19, ORG, "RELEASE");
-  sect(602, mg_y, 584, 140, RED, "AMP ENVELOPE");
-  knob(26, 660, mg_y + 76, 19, RED, "ATTACK"); knob(27, 777, mg_y + 76, 19, RED, "DECAY"); knob(28, 894, mg_y + 76, 19, RED, "SUSTAIN"); knob(29, 1011, mg_y + 76, 19, RED, "RELEASE");
-  knob(30, 1128, mg_y + 78, 17, RED, "VELOCITY");
+  mg_y = 420;
+  sect(14, mg_y, 580, 156, ORG, "FILTER ENVELOPE");
+  knob(22, 86, mg_y + 84, 19, ORG, "ATTACK"); knob(23, 231, mg_y + 84, 19, ORG, "DECAY"); knob(24, 376, mg_y + 84, 19, ORG, "SUSTAIN"); knob(25, 521, mg_y + 84, 19, ORG, "RELEASE");
+  sect(602, mg_y, 584, 156, RED, "AMP ENVELOPE");
+  knob(26, 660, mg_y + 84, 19, RED, "ATTACK"); knob(27, 777, mg_y + 84, 19, RED, "DECAY"); knob(28, 894, mg_y + 84, 19, RED, "SUSTAIN"); knob(29, 1011, mg_y + 84, 19, RED, "RELEASE");
+  knob(30, 1128, mg_y + 86, 17, RED, "VELOCITY");
   // row 3: the LFOs
-  mg_y = 550; mg_l = 0;
+  mg_y = 586; mg_l = 0;
   loop(2,
     mg_x = 14 + mg_l * 590; mg_b = 33 + mg_l * 5;
-    sect(mg_x, mg_y, 582, 138, TEAL, mg_l == 0 ? "LFO 1  -  MOD WHEEL ADDS" : "LFO 2");
+    sect(mg_x, mg_y, 582, 182, TEAL, mg_l == 0 ? "LFO 1  -  MOD WHEEL ADDS" : "LFO 2");
     mg_b2 = mg_b;
-    knob(mg_b, mg_x + 60, mg_y + 74, 18, TEAL, "RATE");
-    slider(mg_b + 4) > 0.5 ? ( ui_cola(HULL2, 0.6); gfx_circle((mg_x + 60) * qs, (mg_y + 74) * qs, 24 * qs, 1, 1); );
-    gfx_setfont(14); ui_col(INK2); TX(mg_x + 128, mg_y + 38, "SYNC");
-    mbox(mg_x + 128, mg_y + 56, 92, 20, fval(mg_b + 4)) ? mlist(mg_b + 4, "Free|1 bar|1/2|1/4|1/8|1/16|1/8 triplet", mg_x + 128, mg_y + 76);
-    gfx_setfont(14); ui_col(INK2); TX(mg_x + 236, mg_y + 38, "SHAPE");
-    mbox(mg_x + 236, mg_y + 56, 100, 20, fval(mg_b + 1)) ? mlist(mg_b + 1, "Triangle|Saw|Square|Random", mg_x + 236, mg_y + 76);
-    gfx_setfont(14); ui_col(INK2); TX(mg_x + 352, mg_y + 38, "TO");
-    mbox(mg_x + 352, mg_y + 56, 100, 20, fval(mg_b + 2)) ? mlist(mg_b + 2, "Pitch|Cutoff|PW|Pan", mg_x + 352, mg_y + 76);
-    knob(mg_b + 3, mg_x + 512, mg_y + 74, 18, TEAL, "AMOUNT");
+    knob(mg_b, mg_x + 60, mg_y + 100, 18, TEAL, "RATE");
+    slider(mg_b + 4) > 0.5 ? ( ui_cola(HULL2, 0.6); gfx_circle((mg_x + 60) * qs, (mg_y + 100) * qs, 24 * qs, 1, 1); );
+    gfx_setfont(14); ui_col(INK2); TX(mg_x + 128, mg_y + 60, "SYNC");
+    mbox(mg_x + 128, mg_y + 78, 92, 20, fval(mg_b + 4)) ? mlist(mg_b + 4, "Free|1 bar|1/2|1/4|1/8|1/16|1/8 triplet", mg_x + 128, mg_y + 100);
+    gfx_setfont(14); ui_col(INK2); TX(mg_x + 236, mg_y + 60, "SHAPE");
+    mbox(mg_x + 236, mg_y + 78, 100, 20, fval(mg_b + 1)) ? mlist(mg_b + 1, "Triangle|Saw|Square|Random", mg_x + 236, mg_y + 100);
+    gfx_setfont(14); ui_col(INK2); TX(mg_x + 352, mg_y + 60, "TO");
+    mbox(mg_x + 352, mg_y + 78, 100, 20, fval(mg_b + 2)) ? mlist(mg_b + 2, "Pitch|Cutoff|PW|Pan", mg_x + 352, mg_y + 100);
+    knob(mg_b + 3, mg_x + 512, mg_y + 100, 18, TEAL, "AMOUNT");
     mg_l += 1;
   );
 );
 
 // ---------------------------------------------------------------------
 // PLAY strip
-mg_y = 700;
-ui_col(HULL2); R(0, mg_y, 1200, 70); ui_col(SEAM); R(0, mg_y, 1200, 1);
+mg_y = 780;
+ui_col(HULL2); RCT(0, mg_y, 1200, 70); ui_col(SEAM); RCT(0, mg_y, 1200, 1);
 mg_i = 0; loop(10, rivet(8 + mg_i * 132, mg_y + 8); mg_i += 1; );
 gfx_setfont(9); ui_col(INK); TX(20, mg_y + 22, "PLAY");
 gfx_setfont(14); ui_col(INK2); TX(110, mg_y + 10, "MIDI CH");
@@ -876,8 +961,8 @@ knob(50, 250, mg_y + 28, 14, YEL, ""); gfx_setfont(14); ui_col(INK2); TC(250, mg
 knob(52, 330, mg_y + 28, 14, ORG, ""); gfx_setfont(14); ui_col(INK2); TC(330, mg_y + 49, "DRIFT");
 knob(51, 410, mg_y + 28, 14, ORG, ""); gfx_setfont(14); ui_col(INK2); TC(410, mg_y + 49, "VOLUME");
 ins_io(470 * 0.8, (mg_y + 14) * 0.8, 58, INK);
-mgL.ui_ledm(760 * qs, (mg_y + 22) * qs, 400 * qs, 8 * qs, mt_pk); mgR.ui_ledm(760 * qs, (mg_y + 36) * qs, 400 * qs, 8 * qs, mt_pk);
-mt_pk *= 0.85;
+mgL.ui_ledm(760 * qs, (mg_y + 22) * qs, 400 * qs, 8 * qs, mt_pk_d); mgR.ui_ledm(760 * qs, (mg_y + 36) * qs, 400 * qs, 8 * qs, mt_pk_d);
+mt_pk_d *= 0.85;
 gfx_setfont(13); ui_col(INK2); TX(712, mg_y + 26, "OUTPUT");
 
 pk_end();

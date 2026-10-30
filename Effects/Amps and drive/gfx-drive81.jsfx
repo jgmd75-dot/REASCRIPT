@@ -2,7 +2,11 @@ desc:Drive81 [studio drive] (GFX)
 //tags: drive saturation distortion overdrive clipper console transformer studio parallel eq
 //author: JGWizrad / Garden FX (GFX)
 //
-// Requires gfx-drift, gfx-output, gfx-ui, gfx-panel, gfx-dyn and gfx-faceplate (.jsfx-inc) in the same folder.
+// Requires gfx-drift, gfx-output, gfx-power, gfx-ui, gfx-panel, gfx-dyn, gfx-faceplate and gfx-os
+// (.jsfx-inc) in the same folder.
+//
+// LAB: the Stable Drive81 with optional oversampling - the OS key in the header cycles 1x / 2x / 4x (2x = the
+// Stable unit, which always ran at 2x). Every rate-dependent coefficient follows the running rate.
 //
 // DRIVE81. An eight-circuit studio drive: two half-rack units bolted side by side by a central mounting bracket
 // (the 81 family). Studio and broadcast saturation for tracks and busses, not stompbox fuzz.
@@ -32,7 +36,7 @@ desc:Drive81 [studio drive] (GFX)
 //                           round zero that grows as the rail drops: the decay sputters out, gate-like.
 //
 // SIGNAL FLOW
-//   input -> INPUT trim -> 2x oversampling (linear-phase Kaiser half-bands, 63 taps up and down) -> the two units in
+//   input -> INPUT trim -> oversampling (OS: 1x / 2x / 4x, gfx-os linear-phase half-bands) -> the two units in
 //   series (ORDER: DRIVE81 -> JDM-81 or JDM-81 -> DRIVE81) -> back to 1x -> OUTPUT -> the house output stage
 //   (band SAT, soft clip always on).
 //   Each unit: DRIVE (0 .. +30 dB into the circuit) -> the selected CIRCUIT -> DC blocker (5 Hz) -> level matched
@@ -41,11 +45,15 @@ desc:Drive81 [studio drive] (GFX)
 //   unit's own input (inside the oversampled domain, so the dry and the wet line up sample for sample) -> OUTPUT
 //   -> 3-band EQ (LOW shelf 100 Hz, MID bell 200 Hz - 8 kHz, Q 0.9, HIGH shelf 10 kHz, +/-15 dB; post-circuit,
 //   on the unit's output) -> the ON key (10 ms fade). Changing CIRCUIT crossfades the two circuits (15 ms).
-//   Latency: 31 samples (the oversampling; reported).
+//   Latency: 0 / 31 / 37 samples at 1x / 2x / 4x (the oversampling; reported). Changing OS dips the output for
+//   5 ms, swaps at the silent point and comes back once the new latency has come through.
 // DRIFT (0 - 100 %, 50 % = standard): component tolerance. The bias points and clip thresholds of every circuit
 //   wander slowly (bias +/-0.03, threshold +/-3 %), the EQ frequencies wander (+/-2 %), and the left and right
 //   channels never quite match (fixed tolerances: threshold +/-1 %, bias +/-0.012, redrawn per instance).
 //   0 % = ideal components.
+// MAINS / EQUATOR PROXIMITY (in the ? pop-up, gfx-power): OFF / UK / US mains hum (very faint), supply sag and
+//   ripple into the circuits; and the warm-up: a cold box is a little duller, lower and grittier, and settles as it
+//   warms (by 5 min at FAR). Default OFF + NEAR = as before.
 // METERS: each unit's display shows the selected circuit and VU bars for the unit's input and output
 //   (Meter81 calibration: a sine peaking at -18 dBFS reads 0 VU; 300 ms needle ballistics).
 // GUI: drag a knob (SHIFT = fine, double-click = default, wheel); values show while a knob is touched; the CIRCUIT
@@ -77,6 +85,8 @@ import gfx-ui.jsfx-inc
 import gfx-panel.jsfx-inc
 import gfx-dyn.jsfx-inc
 import gfx-faceplate.jsfx-inc
+import gfx-os.jsfx-inc
+import gfx-power.jsfx-inc
 
 slider1:1<0,1,1{Off,On}>-Drive81 on
 slider2:1<0,1,1{VFD,Matrix}>-Mode
@@ -108,7 +118,7 @@ slider27:120<40,400,1>-Sat low band (Hz)
 slider28:6000<2000,16000,10>-Sat high band (Hz)
 slider29:-0.3<-24,0,0.1>-Ceiling (dB)
 slider30:1<0,1,1{Off,Clip}>-(unused, was output stage)
-slider31:0<0,1,1>-(unused, was label language)
+slider31:1<0,2,1{1x,2x,4x}>-Oversampling
 slider32:prs_sel=0<0,12,1{No preset,Init,Bus Warmth,Germanium Glue,Line Driver Snare,Matrix Bass,Console Vocal,Broadcast Slam Drums,Dissonant Synth,Starved Kick,Parallel Crunch,TKY-Berlin Chain,Full Melt}>-Preset
 
 in_pin:left input
@@ -119,13 +129,12 @@ out_pin:right output
 @init
 gdc_r = 1 - 2 * $pi / srate;                            // input DC blocker, 1 Hz (first order)
 gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
-#ui_man = "gfx-drive81";                               // the ? pop-up links to this manual
+#ui_man = "gfx-drive81";
 ext_noinit = 1;
 
 // ---------- memory ----------
 nextmem = 0;
 function alloc(n) local(p) ( p = nextmem; nextmem += n; memset(p, 0, n); p; );
-dq_H1 = alloc(64);                                      // the half-band kernel
 dq_EQ = alloc(32);                                      // EQ biquads: unit A bands 0-2, unit B bands 3-5 (5 each)
 dq_MKT = alloc(192);                                    // the level-matching tables: 2 modes x 8 circuits x 11 DRIVE points
 dq_VPA = alloc(8); dq_VPB = alloc(8);                   // each unit's emphasis (with its DRIVE shelf)
@@ -133,64 +142,8 @@ dq_VC = alloc(40);                                      // the voicing biquads: 
 dq_eg = alloc(8);                                       // EQ gains as they glide (A low, mid, high, B low, mid, high)                                      // the level-matching table: 8 circuits x 11 DRIVE points
 dq_ostm = alloc(4096);
 
-// ---------- oversampling: linear-phase half-bands (Kaiser windowed), polyphase ----------
-function dq_bi0(x) local(s, t, k) ( s = 1; t = 1; k = 1; loop(30, t *= sqr(x / (2 * k)); s += t; k += 1; ); s; );
-function dq_hbdesign(h, n, beta) local(c, t, k, w, x, se, i0) (
-  c = (n - 1) / 2; i0 = dq_bi0(beta); t = 0;
-  loop(n,
-    k = t - c; x = 2 * t / (n - 1) - 1;
-    w = dq_bi0(beta * sqrt(max(0, 1 - x * x))) / i0;
-    h[t] = k == 0 ? 0.5 : sin($pi * k / 2) / ($pi * k) * w;
-    t += 1;
-  );
-  se = 0; t = 0; loop((n + 1) / 2, se += h[2 * t]; t += 1; );
-  t = 0; loop((n + 1) / 2, h[2 * t] *= 0.5 / se; t += 1; );      // each polyphase branch: unity at DC
-);
-// The kernels are symmetric, so each pair of taps shares one multiply. The delay lines are shift registers in
-// instance variables and the taps sit in globals (dq_hu0-15 up, dq_hd0-15 down), written out in full: no memory
-// reads in the loop, which in EEL cost far more than the multiplies.
-// up 2x: one sample in -> o0, o1 (the odd branch of a half-band is a pure delay); a0..a31 the last 32 inputs
-function dq_up(x) instance(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
-                           a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31,
-                           o0, o1) (
-  a31 = a30; a30 = a29; a29 = a28; a28 = a27; a27 = a26; a26 = a25; a25 = a24; a24 = a23; a23 = a22; a22 = a21;
-  a21 = a20; a20 = a19; a19 = a18; a18 = a17; a17 = a16; a16 = a15; a15 = a14; a14 = a13; a13 = a12; a12 = a11;
-  a11 = a10; a10 = a9; a9 = a8; a8 = a7; a7 = a6; a6 = a5; a5 = a4; a4 = a3; a3 = a2; a2 = a1;
-  a1 = a0; a0 = x;
-  o0 = dq_hu0 * (a0 + a31) + dq_hu1 * (a1 + a30) + dq_hu2 * (a2 + a29) + dq_hu3 * (a3 + a28)
-    + dq_hu4 * (a4 + a27) + dq_hu5 * (a5 + a26) + dq_hu6 * (a6 + a25) + dq_hu7 * (a7 + a24)
-    + dq_hu8 * (a8 + a23) + dq_hu9 * (a9 + a22) + dq_hu10 * (a10 + a21) + dq_hu11 * (a11 + a20)
-    + dq_hu12 * (a12 + a19) + dq_hu13 * (a13 + a18) + dq_hu14 * (a14 + a17) + dq_hu15 * (a15 + a16);
-  o1 = a15;
-);
-// down 2x: two samples in -> one out (on the even phase, x0, like the input); b0..b31 the last 32 even samples,
-// c1..c16 the odd ones from 1 to 16 pairs back
-function dq_dn(x0, x1) instance(b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
-                                b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31,
-                                c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16) local(y) (
-  b31 = b30; b30 = b29; b29 = b28; b28 = b27; b27 = b26; b26 = b25; b25 = b24; b24 = b23; b23 = b22; b22 = b21;
-  b21 = b20; b20 = b19; b19 = b18; b18 = b17; b17 = b16; b16 = b15; b15 = b14; b14 = b13; b13 = b12; b12 = b11;
-  b11 = b10; b10 = b9; b9 = b8; b8 = b7; b7 = b6; b6 = b5; b5 = b4; b4 = b3; b3 = b2; b2 = b1;
-  b1 = b0; b0 = x0;
-  y = dq_hd0 * (b0 + b31) + dq_hd1 * (b1 + b30) + dq_hd2 * (b2 + b29) + dq_hd3 * (b3 + b28)
-    + dq_hd4 * (b4 + b27) + dq_hd5 * (b5 + b26) + dq_hd6 * (b6 + b25) + dq_hd7 * (b7 + b24)
-    + dq_hd8 * (b8 + b23) + dq_hd9 * (b9 + b22) + dq_hd10 * (b10 + b21) + dq_hd11 * (b11 + b20)
-    + dq_hd12 * (b12 + b19) + dq_hd13 * (b13 + b18) + dq_hd14 * (b14 + b17) + dq_hd15 * (b15 + b16)
-    + 0.5 * c16;
-  c16 = c15; c15 = c14; c14 = c13; c13 = c12; c12 = c11; c11 = c10; c10 = c9; c9 = c8; c8 = c7; c7 = c6;
-  c6 = c5; c5 = c4; c4 = c3; c3 = c2; c2 = c1; c1 = x1;
-  y;
-);
-dq_hbdesign(dq_H1, 63, 8);
-dq_hu0 = 2 * dq_H1[0]; dq_hu1 = 2 * dq_H1[2]; dq_hu2 = 2 * dq_H1[4]; dq_hu3 = 2 * dq_H1[6];
-dq_hu4 = 2 * dq_H1[8]; dq_hu5 = 2 * dq_H1[10]; dq_hu6 = 2 * dq_H1[12]; dq_hu7 = 2 * dq_H1[14];
-dq_hu8 = 2 * dq_H1[16]; dq_hu9 = 2 * dq_H1[18]; dq_hu10 = 2 * dq_H1[20]; dq_hu11 = 2 * dq_H1[22];
-dq_hu12 = 2 * dq_H1[24]; dq_hu13 = 2 * dq_H1[26]; dq_hu14 = 2 * dq_H1[28]; dq_hu15 = 2 * dq_H1[30];
-dq_hd0 = dq_H1[0]; dq_hd1 = dq_H1[2]; dq_hd2 = dq_H1[4]; dq_hd3 = dq_H1[6];
-dq_hd4 = dq_H1[8]; dq_hd5 = dq_H1[10]; dq_hd6 = dq_H1[12]; dq_hd7 = dq_H1[14];
-dq_hd8 = dq_H1[16]; dq_hd9 = dq_H1[18]; dq_hd10 = dq_H1[20]; dq_hd11 = dq_H1[22];
-dq_hd12 = dq_H1[24]; dq_hd13 = dq_H1[26]; dq_hd14 = dq_H1[28]; dq_hd15 = dq_H1[30];
-dq_LAT = 31;                                            // the up / down pair's latency at 1x (measured)
+// ---------- oversampling: gfx-os (OS key: 1x / 2x / 4x) ----------
+os_design(); os_base = 0; os_f = os_tf = os_f2n(slider31);
 
 // ---------- curves ----------
 // tanh (Pade 3/2), exact 1 with zero slope at +/-3: smooth and cheap
@@ -638,7 +591,8 @@ function dq_update() local(t) (
   dq_tog = 10 ^ (slider24 / 20);
   ost_setup(slider25 / 100, slider26 / 100, slider27, slider28, slider29, 1);   // output stage: CLIP, always on
   pdc_bot_ch = 0; pdc_top_ch = 2;
-  pdc_delay = dq_LAT;
+  os_tf = os_f2n(slider31);                             // OS: the factor asked for (os_gate swaps it in)
+  pdc_delay = os_base + os_lat(os_f);
 );
 
 // ---------- presets ----------
@@ -676,7 +630,7 @@ function load_preset(p) (
 // everything that depends on the sample rate (run again from @block if the rate changes)
 function dq_k(f) ( 1 - exp(-2 * $pi * min(f, 0.45 * dq_fso) / dq_fso); );
 function dq_srinit() local(K, w1, w2) (
-  dq_sr = srate; dq_fso = 2 * srate;
+  dq_sr = srate; dq_fso = os_f * srate;                 // the running (oversampled) rate
   dq_k10 = dq_k(10); dq_k15 = dq_k(15); dq_k120 = dq_k(120); dq_k150 = dq_k(150); dq_k700 = dq_k(700);
   dq_k2500 = dq_k(2500);  dq_k11k = dq_k(11000); dq_k13k = dq_k(13000);
   dq_k14k = dq_k(14000); dq_k17k = dq_k(17000); dq_k18k = dq_k(18000); dq_k20k = dq_k(20000);
@@ -701,13 +655,14 @@ function dq_srinit() local(K, w1, w2) (
   dq_vset(dq_md); dqAL.dq_vclr(); dqAR.dq_vclr(); dqBL.dq_vclr(); dqBR.dq_vclr();
   ost_init(dq_ostm);
 );
-dq_srinit();
+dq_srinit(); os_gsetup();
+pwr_init();  pwr_wu_loss = 1;  pwr_wu_drv = 2;  pwr_wu_lp = 7000;  pwr_bloom = 0.2;   // mains + warm-up
 // fixed tolerances (left / right never quite match), redrawn per instance
 dq_sbAL = rand(2) - 1; dq_sbAR = rand(2) - 1; dq_sgAL = rand(2) - 1; dq_sgAR = rand(2) - 1;
 dq_sbBL = rand(2) - 1; dq_sbBR = rand(2) - 1; dq_sgBL = rand(2) - 1; dq_sgBR = rand(2) - 1;
-dfbAL.drift_init(0.8 + rand(0.4)); dfbAR.drift_init(0.8 + rand(0.4)); dfgAL.drift_init(0.8 + rand(0.4)); dfgAR.drift_init(0.8 + rand(0.4));
-dfbBL.drift_init(0.8 + rand(0.4)); dfbBR.drift_init(0.8 + rand(0.4)); dfgBL.drift_init(0.8 + rand(0.4)); dfgBR.drift_init(0.8 + rand(0.4));
-dfeA.drift_init(0.7 + rand(0.4)); dfeB.drift_init(0.7 + rand(0.4));
+dfbAL.drift_init(0.8 + rand(1) * 0.4); dfbAR.drift_init(0.8 + rand(1) * 0.4); dfgAL.drift_init(0.8 + rand(1) * 0.4); dfgAR.drift_init(0.8 + rand(1) * 0.4);
+dfbBL.drift_init(0.8 + rand(1) * 0.4); dfbBR.drift_init(0.8 + rand(1) * 0.4); dfgBL.drift_init(0.8 + rand(1) * 0.4); dfgBR.drift_init(0.8 + rand(1) * 0.4);
+dfeA.drift_init(0.7 + rand(1) * 0.4); dfeB.drift_init(0.7 + rand(1) * 0.4);
 dqoL.ost_ch_init(); dqoR.ost_ch_init();
 dq_update();
 dq_md = dq_tmd; dq_vset(dq_md);
@@ -722,7 +677,7 @@ dq_vy0 = dq_vy1 = dq_vy2 = dq_vy3 = 0; dq_vv0 = dq_vv1 = dq_vv2 = dq_vv3 = 0;
 dq_iA = dq_xA = dq_iB = dq_xB = 0; dq_pkA = dq_pkB = 0;
 dq_zdA = dq_zdB = dq_zkA = dq_zkB = -1;     // the drive gains and makeups: worked out on the first sample
 dqAL.cvb = dqAR.cvb = dqBL.cvb = dqBR.cvb = 1000000;   // the curves' constants too (with DRIFT at 0 they were never set: silence)
-dqa_pkA = dqa_pkB = 0;
+dqa_pkA_d = dqa_pkB_d = 0;
 
 ui_thm = 5; ui_hw = 1;                                  // house keycaps for the preset bar and size picker
 !ui_dflt ? ( ui_sz = 2; pr_cur = 1; );                  // new instances open in Large, on Init
@@ -750,8 +705,9 @@ dq_update();
 
 @block
 prs_chk();
-srate != dq_sr ? dq_srinit();
+srate != dq_sr ? ( dq_srinit(); os_gsetup(); );
 dq_update();                                            // knobs moved on the panel do not run @slider
+pwr_block(1);                                           // MAINS: sag, ripple, hum; the warm-up
 // circuit changes: crossfade from the old circuit to the new one (its state cleared first)
 dq_tcA != dq_ciA && dq_kA >= 1 ? ( dq_prA = dq_ciA; dq_ciA = dq_tcA; dq_kA = 0; dqAL.dq_flush(dq_ciA); dqAR.dq_flush(dq_ciA); );
 dq_tcB != dq_ciB && dq_kB >= 1 ? ( dq_prB = dq_ciB; dq_ciB = dq_tcB; dq_kB = 0; dqBL.dq_flush(dq_ciB); dqBR.dq_flush(dq_ciB); );
@@ -807,17 +763,19 @@ dq_vy0 = dq_tiny(dq_vy0); dq_vy1 = dq_tiny(dq_vy1); dq_vy2 = dq_tiny(dq_vy2); dq
 dq_vv0 = dq_tiny(dq_vv0); dq_vv1 = dq_tiny(dq_vv1); dq_vv2 = dq_tiny(dq_vv2); dq_vv3 = dq_tiny(dq_vv3);
 // the panel's meters (mailboxes: the audio thread writes, the panel reads)
 dqa_vu0 = dq_vy0; dqa_vu1 = dq_vy1; dqa_vu2 = dq_vy2; dqa_vu3 = dq_vy3;
-dqa_pkA = max(dqa_pkA, dq_pkA); dq_pkA = 0; dqa_pkB = max(dqa_pkB, dq_pkB); dq_pkB = 0;
+dqa_pkA_d = max(dqa_pkA_d, dq_pkA); dq_pkA = 0; dqa_pkB_d = max(dqa_pkB_d, dq_pkB); dq_pkB = 0;
 
 @serialize
 file_var(0, ui_sz);
 file_var(0, pr_cur);
+pwr_ser();
 file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
 
 @sample
 // ---------- input DC blocker, 1 Hz: no offset reaches the nonlinear stages ----------
 gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
 gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+pwr_in(spl0, spl1); spl0 = pwr_l; spl1 = pwr_r;          // mains hum + sag, warm-up drive (OFF + NEAR: untouched)
 // ---------- glides ----------
 dq_in += (dq_tin - dq_in) * dq_sm;
 dq_og += (dq_tog - dq_og) * dq_sm;
@@ -883,24 +841,41 @@ function dq_unitB(l, r) local(yl, yr) (
   dq_ph0 ? ( dq_iB = max(abs(l), abs(r)); dq_xB = max(abs(yl), abs(yr)); );
   dq_ol = yl; dq_or = yr;
 );
-// one unit over both phases: (dq_p0l, dq_p0r) and (dq_p1l, dq_p1r) in, the same out
+// one unit over all the running phases: (dq_p0l, dq_p0r) .. (dq_p3l, dq_p3r) in, the same out
 function dq_bothA() (
   dq_loadA();
   dq_ph0 = 1; dq_unitA(dq_p0l, dq_p0r); dq_p0l = dq_ol; dq_p0r = dq_or;
-  dq_ph0 = 0; dq_unitA(dq_p1l, dq_p1r); dq_p1l = dq_ol; dq_p1r = dq_or;
+  dq_ph0 = 0;
+  os_f > 1 ? ( dq_unitA(dq_p1l, dq_p1r); dq_p1l = dq_ol; dq_p1r = dq_or;
+    os_f > 2 ? ( dq_unitA(dq_p2l, dq_p2r); dq_p2l = dq_ol; dq_p2r = dq_or; dq_unitA(dq_p3l, dq_p3r); dq_p3l = dq_ol; dq_p3r = dq_or; );
+  );
 );
 function dq_bothB() (
   dq_loadB();
   dq_ph0 = 1; dq_unitB(dq_p0l, dq_p0r); dq_p0l = dq_ol; dq_p0r = dq_or;
-  dq_ph0 = 0; dq_unitB(dq_p1l, dq_p1r); dq_p1l = dq_ol; dq_p1r = dq_or;
+  dq_ph0 = 0;
+  os_f > 1 ? ( dq_unitB(dq_p1l, dq_p1r); dq_p1l = dq_ol; dq_p1r = dq_or;
+    os_f > 2 ? ( dq_unitB(dq_p2l, dq_p2r); dq_p2l = dq_ol; dq_p2r = dq_or; dq_unitB(dq_p3l, dq_p3r); dq_p3l = dq_ol; dq_p3r = dq_or; );
+  );
 );
 
-// ---------- 2x: up, the units, down ----------
+// ---------- OS: a factor change swaps in at the silent point (os_gate) - everything rate-dependent follows ----------
+os_gate();
+os_chg ? (
+  dq_srinit();
+  dqAL.dq_flush(dq_ciA); dqAR.dq_flush(dq_ciA); dqBL.dq_flush(dq_ciB); dqBR.dq_flush(dq_ciB);
+  dqAL.dq_flush(dq_prA); dqAR.dq_flush(dq_prA); dqBL.dq_flush(dq_prB); dqBR.dq_flush(dq_prB);
+  eAL0.dq_bqz(); eAR0.dq_bqz(); eAL1.dq_bqz(); eAR1.dq_bqz(); eAL2.dq_bqz(); eAR2.dq_bqz();
+  eBL0.dq_bqz(); eBR0.dq_bqz(); eBL1.dq_bqz(); eBR1.dq_bqz(); eBL2.dq_bqz(); eBR2.dq_bqz();
+  dqu1L.os_clr(); dqu1R.os_clr(); dqd1L.os_clr(); dqd1R.os_clr();
+);
+// ---------- up, the units, down ----------
 dq_xl = spl0 * dq_in; dq_xr = spl1 * dq_in;
-dqu1L.dq_up(dq_xl); dqu1R.dq_up(dq_xr);
-dq_p0l = dqu1L.o0; dq_p0r = dqu1R.o0; dq_p1l = dqu1L.o1; dq_p1r = dqu1R.o1;
+dqu1L.os_up(dq_xl); dqu1R.os_up(dq_xr);
+dq_p0l = dqu1L.s0; dq_p0r = dqu1R.s0; dq_p1l = dqu1L.s1; dq_p1r = dqu1R.s1;
+dq_p2l = dqu1L.s2; dq_p2r = dqu1R.s2; dq_p3l = dqu1L.s3; dq_p3r = dqu1R.s3;
 dq_ord ? ( dq_bothB(); dq_bothA(); ) : ( dq_bothA(); dq_bothB(); );
-dq_yl = dqd1L.dq_dn(dq_p0l, dq_p1l); dq_yr = dqd1R.dq_dn(dq_p0r, dq_p1r);
+dq_yl = dqd1L.os_dn(dq_p0l, dq_p1l, dq_p2l, dq_p3l); dq_yr = dqd1R.os_dn(dq_p0r, dq_p1r, dq_p2r, dq_p3r);
 
 // ---------- meters: VU needles for each unit's input and output ----------
 dq_vv0 += (dq_vw * dq_vw * (dq_iA * 1.5707963 - dq_vy0) - 2 * dq_vz * dq_vw * dq_vv0) * dq_vdt; dq_vy0 += dq_vv0 * dq_vdt;
@@ -913,11 +888,13 @@ dq_pkA = max(dq_pkA, dq_xA); dq_pkB = max(dq_pkB, dq_xB);
 dq_tord != dq_ord || dq_tmd != dq_md ? ( dq_od = max(dq_od - dq_odc, 0); dq_od == 0 ? (
     dq_ord = dq_tord;
     dq_tmd != dq_md ? ( dq_md = dq_tmd; dq_vset(dq_md); dqAL.dq_vclr(); dqAR.dq_vclr(); dqBL.dq_vclr(); dqBR.dq_vclr(); );
-    dq_oh = dq_LAT + 8; ); ) :
+    dq_oh = os_lat(os_f) + 8; ); ) :
   dq_oh > 0 ? dq_oh -= 1 : dq_od < 1 ? dq_od = min(dq_od + dq_odc, 1);   // (held silent until the swap has come through)
 dq_od < 1 ? ( dq_yl *= dq_od; dq_yr *= dq_od; );
+os_g < 1 ? ( dq_yl *= os_g; dq_yr *= os_g; );
 
 // ---------- OUTPUT and the house output stage ----------
+pwr_out(dq_yl, dq_yr); dq_yl = pwr_l; dq_yr = pwr_r;      // the warm-up's gain and tone, ripple
 dq_yl = dqoL.ost_band(dq_yl) * dq_og;
 dq_yr = dqoR.ost_band(dq_yr) * dq_og;
 ost_out(dq_yl, dq_yr);
@@ -1326,15 +1303,17 @@ ui_cola(0xFFFFFF, 0.06); dv_r(0, 0, 1100, 1);
 ui_col(0x111213); dv_r(0, 54, 1100, 2);
 ui_col(KHI_); gfx_circle(31 * sc, 27 * sc, 16 * sc, 1, 1);
 gfx_setfont(4); ui_col(KH); ui_text(31 * sc, 21.5 * sc, "GFX");
-gfx_setfont(6); ui_col(KHI_); dv_txt(58, 12, "DRIVE81"); ver_tag("v2", 9, 0.05, 0);
+gfx_setfont(6); ui_col(KHI_); dv_txt(58, 12, "DRIVE81"); ver_tag("v3", 9, 0, 0);
 gfx_setfont(11); ui_col(0xA99999); dv_txt(196, 14, dv_de ? "ACHT SCHALTUNGEN" : "EIGHT-CIRCUIT"); dv_txt(196, 29, dv_de ? "STUDIO-VERZERRER" : "STUDIO DRIVE RACK");
 pk_pextra = "Reset all to defaults";                    // the house preset bar: PRESETS, prev / next, LCD
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
-dv_k = pk_preset(380 * sc, 10 * sc, 470 * sc, 34 * sc, pr_cur,
+dv_k = pk_preset(380 * sc, 10 * sc, 416 * sc, 34 * sc, pr_cur,
   "Init|Bus Warmth|Germanium Glue|Line Driver Snare|Matrix Bass|Console Vocal|Broadcast Slam Drums|Dissonant Synth|Starved Kick|Parallel Crunch|TKY-Berlin Chain|Full Melt");
 dv_k > 0 ? ( prs_dirty = dv_k; pr_cur = dv_k > 12 ? 1 : dv_k; );
 // MODE: two lit keys in the mode's own dress (VFD = the Japanese voicing, English; MATRIX = the European, German)
 dv_style(0, slider2 >= 0.5);
+// OS: a square lamp key, each click cycles 1x (grey) -> 2x (amber) -> 4x (red); "OS" printed beside it
+os_key(832, 16, 31, 0xA99999, 7);
 dv_key(862, 15, 70, 24, "VFD", slider2 < 0.5) ? ( slider2 = 0; ui_auto(2); );
 dv_key(936, 15, 82, 24, "MATRIX", slider2 >= 0.5) ? ( slider2 = 1; ui_auto(2); );
 dv_de = 0;   // English labels in both modes
@@ -1344,8 +1323,8 @@ ui_size_picker(1032 * sc, 18 * sc);
 dv_now = time_precise();
 function dv_vu(y) ( 20 * log10(max(y, 0.000001)) + 18; );
 dv_v0 = dv_vu(dqa_vu0); dv_v1 = dv_vu(dqa_vu1); dv_v2 = dv_vu(dqa_vu2); dv_v3 = dv_vu(dqa_vu3);
-dqa_pkA >= 1 ? dv_ckA = dv_now; dqa_pkA = 0;
-dqa_pkB >= 1 ? dv_ckB = dv_now; dqa_pkB = 0;
+dqa_pkA_d >= 1 ? dv_ckA = dv_now; dqa_pkA_d = 0;
+dqa_pkB_d >= 1 ? dv_ckB = dv_now; dqa_pkB_d = 0;
 
 // The two units trade places with the ORDER key: the first in the chain sits on the left
 dv_xa = slider21 >= 0.5 ? 600 : 8; dv_xb = 608 - dv_xa;
@@ -1390,4 +1369,8 @@ sprintf(#dvv, "%.0f %%", slider25);
 dv_ticks(574, 262, 13); dv_knob(574, 262, 13, 25, 0, 0, 100, 0, 0xD8B040, dv_de ? "SÄTT." : "SAT", #dvv, 27);
 
 pk_end();
-ui_end();
+// the ? pop-up (ui_end, opened out): credits and links, then MAINS / EQUATOR PROXIMITY under them
+ui_help_xh = 192;
+ui_name_keys(); ui_help();
+ui_help_open ? ( mouse_x = ui_mx; mouse_y = ui_my;  pwr_panel(ui_help_cx + 30 * ui_help_s, ui_help_cy + 118 * ui_help_s, ui_help_s, 17, ui_help_clk, ui_mw); );
+prev_down = mdown; mouse_wheel = 0;

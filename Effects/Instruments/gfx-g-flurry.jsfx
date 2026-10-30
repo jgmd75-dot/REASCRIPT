@@ -19,7 +19,13 @@ desc:Flurry [synth] (GFX)
 //     -> DISTORTION (PRE)  ->  FILTER 1: 4-pole ladder (zero-delay feedback, saturating input = the "juicy" drive,
 //        self-oscillates; LP 24 / LP 12 / BP / HP 24 from the stage taps)  ->  FILTER 2: 12 dB state-variable
 //        (LP / HP / BP / notch, cutoff = filter 1's + OFFSET; SERIAL or PARALLEL)  ->  DISTORTION (POST)  ->  AMP
-//   voices -> CHORUS -> DELAY (house engine; stereo / ping-pong, sync) -> SPACE (house reverb, fed by the delay)
+//   STRINGS (the Lab rework): beside each voice, a string-machine section - one divider chain per note (16', 8', 4'
+//           registers from one phase, so they stay locked), its own slow ATTACK and RELEASE, summed, then a 110 Hz
+//           low cut, TONE (low-pass 1.1 - 11 kHz) and the ENSEMBLE: three copies of the strings, each swept by a slow
+//           (0.6 Hz) and a fast (6.1 Hz) sine 120 degrees apart, spread left / centre / right (AMOUNT, SPEED).
+//           BLEND sets synth against strings: 0 = the synth alone (as the Stable Flurry, bit for bit), 0.5 = both at
+//           full level, 1 = the strings alone. The strings ignore velocity, as the string machines did.
+//   synth voices + strings -> CHORUS -> DELAY (house engine; stereo / ping-pong, sync) -> SPACE (house reverb, fed by the delay)
 //   -> EQ (low / high shelf) -> DC blocker -> house output stage
 //
 // LFO: a sine to PWM, CUTOFF and PITCH. RATE in Hz (0.02 - 20), or with SYNC a note value at the project tempo
@@ -27,7 +33,9 @@ desc:Flurry [synth] (GFX)
 //
 // DRIFT (0 - 100 %, 50 % = standard): each voice's pitch wanders slowly on its own (up to +/-20 cents) with a small
 //   random offset per note (+/-6 cents), and its pulse width wanders a little (+/-0.08). 0 % = none, 100 % = twice
-//   the standard amount, a little faster.
+//   the standard amount, a little faster. The STRINGS run on their own supply: as it wanders, the whole divider chain
+//   drifts in tune together (+/-4 cents at 50 %) and the ensemble's clock stretches and shrinks its delays (+/-5 %),
+//   so the sweep breathes. Its notes keep in tune with each other, as on a divide-down string machine.
 //
 // GAIN STAGING: at filter DRIVE 0 dB the ladder's saturating input runs nearly linear; DRIVE pushes it into the
 //   growl. DISTORTION is OFF in Init; its curves are anti-aliased (first-order antiderivative, the clip kit's
@@ -37,13 +45,14 @@ desc:Flurry [synth] (GFX)
 //   (Shift = fine), double-click or Ctrl-click = default; drag the filter display for cutoff / resonance.
 // MIDI: 8 voices (VOICES menu: 1 = mono), sustain pedal, pitch bend +/-2 st, mod wheel = more vibrato,
 //   all-notes-off (CC 120 / 123); notes are released when the transport stops. MIDI passes through.
-// PRESETS: 12, from the house preset bar (click the display for the list).
+// PRESETS: 15, from the house preset bar (click the display for the list) or the hidden Preset parameter; the last
+//   three (String Machine, Hyper Strings, Brass and Strings) use the STRINGS.
 // Latency: 0 samples.
 //
 // TWEAK points are marked TWEAK: the ladder's mode taps, resonance range, bass compensation, the distortion curves,
 // the hyper-saw detune table, the chorus.
 //
-// STATUS: Stable v2.0 (from the Lab, Oct 2026). v0.4 (house naming and anatomy; DRIFT; size picker; wheel; VOICES menu).
+// STATUS: Lab v3.0 dev (Oct 2026): the Stable v2.0 Flurry plus the STRINGS and ENSEMBLE row (panel 1100 x 856).
 
 import gfx-drift.jsfx-inc
 import gfx-output.jsfx-inc
@@ -107,7 +116,16 @@ slider50:npoly=8<1,8,1>-Voices
 slider51:drift=50<0,100,1>-Drift (%)
 slider52:lfo_sync=0<0,1,1{Free,Sync}>-LFO sync
 slider53:lfo_div=5<0,13,1{4 bars,2 bars,1 bar,1/2,1/2 dotted,1/4,1/4 dotted,1/4 triplet,1/8,1/8 dotted,1/8 triplet,1/16,1/16 triplet,1/32}>-LFO note value
-slider54:prs_sel=0<0,12,1{No preset,Init,Super Lead,Wide Pad,Juicy Bass,Reso Pluck,PWM Strings,Classic Brass,Rave Hoover,Tube Keys,Ice Drone,Acid Line,Digital Grit}>-Preset
+slider54:str_bal=0<0,1,0.001>-Strings blend (synth > strings)
+slider55:str_16=0<0,1,1{Off,On}>-Strings 16'
+slider56:str_8=1<0,1,1{Off,On}>-Strings 8'
+slider57:str_4=1<0,1,1{Off,On}>-Strings 4'
+slider58:str_att=450<1,5000,0.1:log>-Strings attack (ms)
+slider59:str_rel=1200<1,10000,1:log>-Strings release (ms)
+slider60:str_tone=0.5<0,1,0.001>-Strings tone
+slider61:ens_amt=0.7<0,1,0.001>-Ensemble amount
+slider62:ens_spd=0.5<0,1,0.001>-Ensemble speed
+slider63:prs_sel=0<0,15,1{No preset,Init,Super Lead,Wide Pad,Juicy Bass,Reso Pluck,PWM Strings,Classic Brass,Rave Hoover,Tube Keys,Ice Drone,Acid Line,Digital Grit,String Machine,Hyper Strings,Brass and Strings}>-Preset
 
 @init
 #ui_man = "gfx-g-flurry";
@@ -117,7 +135,7 @@ ui_dflt = 1;
 CR = 16;                          // control rate: every 16 samples
 
 // ---------- memory map (2000 - 3200 belong to gfx-bverb's tables) ----------
-NV = 8;  VS = 64;  VOX = 0;       // voice records: VOX + v * VS
+NV = 8;  VS = 80;  VOX = 0;       // voice records: VOX + v * VS
 U_MEM = 1024;                     // osc 1 copies: U_MEM + v * 20 + u * 2 (phase, increment)
 UT = 1900;                        // copies: detune ratio [0..8], gain left [10..18], gain right [20..28]
 HOFF = 1940;                      // the hyper-saw detune table [0..8]
@@ -140,6 +158,8 @@ F_DL = 45;  F_DR = 49;                                             // distortion
 F_NEW = 53;                                                        // fresh voice: coefficients land at once
 F_DV = 54;  F_DT = 55;  F_DTM = 56;  F_NDT = 57;                   // drift, pitch: value, target, timer, per-note offset
 F_WV = 58;  F_WT = 59;  F_WTM = 60;                                // drift, pulse width: value, target, timer
+F_SEN = 61;  F_SST = 62;  F_SV = 63;  F_SS = 64;                   // STRINGS: env level + stage, value + per-sample step
+F_SP = 65;  F_SI = 66;                                             // STRINGS: the 16' divider phase, its increment
 
 memset(VOX, 0, NV * VS);  memset(U_MEM, 0, NV * 20);
 // TWEAK: hyper-saw detune table, centre first, then pairs spreading out (outermost = +-1 x the spread)
@@ -150,6 +170,10 @@ HOFF[5] = -0.66;  HOFF[6] = 0.66;  HOFF[7] = -1;  HOFF[8] = 1;
 bv_alloc(FX_MEM);
 bd_alloc(BV_END);
 CH_N = ceil(0.03 * srate) + 4;  CH_L = BD_END;  CH_R = CH_L + CH_N;  memset(CH_L, 0, 2 * CH_N);
+EN_N = ceil(0.03 * srate) + 4;  EN_B = CH_R + CH_N;  memset(EN_B, 0, EN_N);    // STRINGS: the ensemble's line (mono in)
+en_w = 0;  ens_sc = 1;  ens_ss = 0;  ens_fc = 1;  ens_fs = 0;
+str_rs = 90217;  str_pm = 1;  en_on = 0;                   // STRINGS' own random numbers (the synth's rand() stream is left as it was)
+sy_s = 1;  st_s = 0;  ea_s = ens_amt;  r16_s = 0;  r8_s = 0;  r4_s = 0;  tn_s = 0.5;  sv_v = 0;  sv_t = 0;  sv_tm = 0;
 ch_w = 0;  ch_c = 1;  ch_s = 0;
 ost_init(0);  ostL.ost_ch_init();  ostR.ost_ch_init();                 // house output stage (CLIP)
 k = 0;  loop(8, RVM[k] = rand(1);  k += 1; );
@@ -163,6 +187,7 @@ function saw_bl(p, d) local(s, t) (
   s;
 );
 function env_coef(ms) ( exp(-6.9 * CR / max(1, ms * 0.001 * srate)); );   // one tick of a ~ms fall to -60 dB
+function s_rnd() ( str_rs = (str_rs * 16807) % 2147483647;  str_rs / 2147483647; );   // 0 .. 1, STRINGS only
 
 // ---------- DISTORTION: one side of a unit curve (v >= 0) and its antiderivative ----------
 // TWEAK: the soft curve is the clip kit's cubic t - 4/27 t^3 (unity slope at 0, flat from 1.5); hard clamps at 1
@@ -214,12 +239,13 @@ function v_freq(b) local(f, inc, p, u) (
   p = U_MEM + (b - VOX) / VS * 20;  u = 0;
   loop(nst, p[1] = min(inc * UT[u], 0.45);  p += 2;  u += 1; );
   b[F_I2] = min(inc * o2_rat, 0.45);  b[F_IS] = inc * 0.5;
+  b[F_SI] = 440 * 2 ^ ((b[F_NOTE] - 69 + bend + lfo_v * vib_c * 0.01) / 12) * str_pm * 0.5 / srate;   // STRINGS: 16' divider
   b[F_PW] = max(0.03, min(0.97, pw_base + lfo_v * pwm * 0.45 + b[F_WV] * 0.08 * dm_a));                  // DRIFT: +/-0.08 at 50 %
 );
 function v_start(b, note, vel) local(p, u) (
   b[F_ON] = 1;  b[F_NOTE] = note;  b[F_VEL] = vel;  b[F_GATE] = 1;  b[F_SUS] = 0;
   age_n += 1;  b[F_AGE] = age_n;
-  b[F_AST] = 1;  b[F_FST] = 1;                                     // attack (levels carry on: no click)
+  b[F_AST] = 1;  b[F_FST] = 1;  b[F_SST] = 1;                      // attack (levels carry on: no click)
   b[F_GAIN] = 1 - vsens + vsens * vel / 127;
   b[F_FVEL] = 1 - 0.5 * vsens + 0.5 * vsens * vel / 127;
   b[F_FADE] = 1;  b[F_STEAL] = 0;  b[F_AS] = 0;  b[F_GS] = 0;  b[F_A1S] = 0;  b[F_A2S] = 0;  b[F_A3S] = 0;
@@ -231,6 +257,7 @@ function v_start(b, note, vel) local(p, u) (
     p = U_MEM + (b - VOX) / VS * 20;  u = 0;
     loop(9, p[0] = (hyper && u > 0) ? rand(1) : 0;  p += 2;  u += 1; );   // hyper saws start free-running
   );
+  b[F_SV] < 0.00001 && b[F_SEN] < 0.00001 ? ( b[F_SEN] = 0;  b[F_SV] = 0;  b[F_SS] = 0;  b[F_SP] = s_rnd(); );   // STRINGS: dividers free-run
   b[F_NDT] = (rand(2) - 1) * 0.06 * dm_a;                          // DRIFT: a per-note offset, +/-6 cents at 50 %
   v_freq(b);                                                       // sound at once, before the next tick
 );
@@ -239,13 +266,13 @@ function v_alloc(note, vel) local(v, b, best, bq, q) (
   best = 0;  bq = 1000000000;  v = 0;
   loop(max(1, npoly),
     b = VOX + v * VS;
-    q = !b[F_ON] ? -1 : (!b[F_GATE] && !b[F_SUS]) ? b[F_AEN] : 2 + b[F_AGE];
+    q = !b[F_ON] ? -1 : (!b[F_GATE] && !b[F_SUS]) ? ( str_on ? max(b[F_AEN], b[F_SEN]) : b[F_AEN] ) : 2 + b[F_AGE];
     b[F_ON] && b[F_NOTE] == note && !b[F_STEAL] ? q = -2;          // same note again: reuse its voice
     q < bq ? ( bq = q;  best = v; );
     v += 1;
   );
   b = VOX + best * VS;
-  (b[F_ON] && b[F_AV] > 0.0005 && b[F_NOTE] != note) ? (
+  (b[F_ON] && (b[F_AV] > 0.0005 || (str_on && b[F_SV] > 0.0005)) && b[F_NOTE] != note) ? (
     b[F_STEAL] = 1;  b[F_PEND] = note;  b[F_PVEL] = vel;
   ) : v_start(b, note, vel);
 );
@@ -255,7 +282,7 @@ function v_release(note) local(v, b) (
     b = VOX + v * VS;
     b[F_ON] && b[F_GATE] && b[F_NOTE] == note ? (
       sustain ? b[F_SUS] = 1;
-      b[F_GATE] = 0;  b[F_AST] = 4;  b[F_FST] = 4;
+      b[F_GATE] = 0;  b[F_AST] = 4;  b[F_FST] = 4;  b[F_SST] = 4;
     );
     b[F_STEAL] && b[F_PEND] == note ? b[F_PEND] = -1;              // released before it started
     v += 1;
@@ -267,7 +294,7 @@ function v_pedal_up() local(v, b) (
 );
 function v_all_off() local(v, b) (
   v = 0;
-  loop(NV, b = VOX + v * VS;  b[F_ON] ? ( b[F_GATE] = 0;  b[F_SUS] = 0;  b[F_AST] = 4;  b[F_FST] = 4; );  v += 1; );
+  loop(NV, b = VOX + v * VS;  b[F_ON] ? ( b[F_GATE] = 0;  b[F_SUS] = 0;  b[F_AST] = 4;  b[F_FST] = 4;  b[F_SST] = 4; );  v += 1; );
 );
 function midi_event(i) local(st, d1, d2, c) (
   st = MQ[i * 4 + 1] & 0xF0;  d1 = MQ[i * 4 + 2];  d2 = MQ[i * 4 + 3];
@@ -293,14 +320,16 @@ function env_tick(lv, stg, a_inc, d_c, s_lv, r_c) (
 // ---------- control tick for one voice ----------
 function v_tick(b) local(fc, g, t, a) (
   // a held pedal keeps a released note sounding at sustain
-  b[F_SUS] && !b[F_GATE] && b[F_AST] == 4 ? ( b[F_AST] = 2;  b[F_FST] = 2; );
-  !b[F_SUS] && !b[F_GATE] && b[F_AST] != 4 ? ( b[F_AST] = 4;  b[F_FST] = 4; );
+  b[F_SUS] && !b[F_GATE] && b[F_AST] == 4 ? ( b[F_AST] = 2;  b[F_FST] = 2;  b[F_SST] = 2; );
+  !b[F_SUS] && !b[F_GATE] && b[F_AST] != 4 ? ( b[F_AST] = 4;  b[F_FST] = 4;  b[F_SST] = 4; );
   b[F_AEN] = env_tick(b[F_AEN], b[F_AST], a_ainc, a_dc, a_sl, a_rc);  b[F_AST] = env_out_stg;
   b[F_FEN] = env_tick(b[F_FEN], b[F_FST], f_ainc, f_dc, f_sl, f_rc);  b[F_FST] = env_out_stg;
+  b[F_SEN] = env_tick(b[F_SEN], b[F_SST], s_ainc, 1, 1, s_rc);  b[F_SST] = env_out_stg;   // STRINGS: attack, hold, release
+  b[F_SS] = (b[F_SEN] - b[F_SV]) / CR;
   // DRIFT: each voice's own slow wander (a new target every 1.5 - 4 s, smoothed), pitch and pulse width apart
-  b[F_DTM] -= CR / srate * dm_s;  b[F_DTM] <= 0 ? ( b[F_DT] = rand(2) - 1;  b[F_DTM] = 1.5 + rand(2.5); );
+  b[F_DTM] -= CR / srate * dm_s;  b[F_DTM] <= 0 ? ( b[F_DT] = rand(2) - 1;  b[F_DTM] = 1.5 + rand(1) * 2.5; );
   b[F_DV] += (b[F_DT] - b[F_DV]) * dr_c;
-  b[F_WTM] -= CR / srate * dm_s;  b[F_WTM] <= 0 ? ( b[F_WT] = rand(2) - 1;  b[F_WTM] = 1.5 + rand(2.5); );
+  b[F_WTM] -= CR / srate * dm_s;  b[F_WTM] <= 0 ? ( b[F_WT] = rand(2) - 1;  b[F_WTM] = 1.5 + rand(1) * 2.5; );
   b[F_WV] += (b[F_WT] - b[F_WV]) * dr_c;
   v_freq(b);
   // cutoff in octaves: the knob + key tracking + envelope (+/-6 oct, velocity-scaled) + LFO
@@ -318,13 +347,15 @@ function v_tick(b) local(fc, g, t, a) (
   a = b[F_AEN] * b[F_GAIN];
   b[F_AS] = (a - b[F_AV]) / CR;
   // finished: released and silent
-  b[F_AST] == 4 && b[F_AEN] < 0.0001 && b[F_AV] < 0.0001 && !b[F_STEAL] ? (
-    b[F_ON] = 0;  b[F_AEN] = 0;  b[F_FEN] = 0;  b[F_AV] = 0;  b[F_AS] = 0;
+  b[F_AST] == 4 && b[F_AEN] < 0.0001 && b[F_AV] < 0.0001 && !b[F_STEAL] &&
+  (!str_on || (b[F_SEN] < 0.0001 && b[F_SV] < 0.0001)) ? (
+    b[F_ON] = 0;  b[F_AEN] = 0;  b[F_FEN] = 0;  b[F_AV] = 0;  b[F_AS] = 0;  b[F_SEN] = 0;  b[F_SV] = 0;  b[F_SS] = 0;
   );
 );
 
 // ---------- one voice, one sample ----------
 function v_run(b) local(p, u, ph, d, s, q, ol, or_, mono, xl, xr, yl, yr, w) (
+ syn_live ? (
   // OSC 1: the copies, each with its own pan
   p = U_MEM + (b - VOX) / VS * 20;  ol = or_ = 0;  u = 0;
   hyper ? (
@@ -381,6 +412,17 @@ function v_run(b) local(p, u, ph, d, s, q, ol, or_, mono, xl, xr, yl, yr, w) (
   b[F_AV] += b[F_AS];
   w = b[F_AV] * b[F_FADE];
   mixL += yl * w;  mixR += yr * w;
+ ) : b[F_AV] += b[F_AS];
+  // STRINGS: a divide-down chain from one 16' phase (8' and 4' are its octaves, locked), summed mono
+  b[F_SV] += b[F_SS];
+  str_live ? (
+    d = b[F_SI];  ph = b[F_SP] + d;  ph >= 1 ? ph -= 1;  b[F_SP] = ph;
+    s = 0;
+    r16_s > 0.00001 ? s += r16_s * saw_bl(ph, d);
+    r8_s > 0.00001 ? ( q = 2 * ph;  q -= floor(q);  s += r8_s * saw_bl(q, min(2 * d, 0.45)); );
+    r4_s > 0.00001 ? ( q = 4 * ph;  q -= floor(q);  s += r4_s * saw_bl(q, min(4 * d, 0.45)); );
+    strM += s * b[F_SV] * b[F_FADE];
+  );
   b[F_STEAL] ? (
     b[F_FADE] -= fade_step;
     b[F_FADE] <= 0 ? (
@@ -432,6 +474,14 @@ function update_params() local(j, d, n, f, ss, mc, wd, pn, nrm, w, t) (
   a_ainc = CR / max(1, ae_a * 0.001 * srate);  a_dc = env_coef(ae_d);  a_sl = ae_s / 100;  a_rc = env_coef(ae_r);
   f_ainc = CR / max(1, fe_a * 0.001 * srate);  f_dc = env_coef(fe_d);  f_sl = fe_s / 100;  f_rc = env_coef(fe_r);
   fade_step = 1 / (0.003 * srate);
+  s_ainc = CR / max(1, str_att * 0.001 * srate);  s_rc = env_coef(str_rel);       // STRINGS envelope
+  str_on = str_bal > 0.0005;
+  syn_gt = min(1, 2 * (1 - str_bal));  str_gt = min(1, 2 * str_bal);               // BLEND: 0 synth .. 0.5 both .. 1 strings
+  // TWEAK: register levels (16' a little softer, 4' softer still), summed against each other
+  r16_t = str_16 >= 0.5 ? 0.8 : 0;  r8_t = str_8 >= 0.5 ? 1 : 0;  r4_t = str_4 >= 0.5 ? 0.7 : 0;
+  t = 1 / max(1, sqrt(r16_t * r16_t + r8_t * r8_t + r4_t * r4_t));  r16_t *= t;  r8_t *= t;  r4_t *= t;
+  ens_mul = 2 ^ ((ens_spd - 0.5) * 2);                                               // SPEED 0.5x .. 2x
+  str_hc = 1 - exp(-2 * $pi * 110 / srate);                                          // the string bus's low cut, 110 Hz
   drift_macro(drift);                                              // dm_a: amount 0 - 2 (50 % = 1), dm_s: speed 0.5 - 1.5
   dr_c = 1 - exp(-CR * dm_s / (1.2 * srate));                      // drift smoothing (~1.2 s)
   dc_r = 1 - 2 * $pi * 5 / srate;                                  // DC blockers: 5 Hz
@@ -505,7 +555,10 @@ function sl_auto(idx) (
   idx == 42 ? slider_automate(dl_pp) : idx == 43 ? slider_automate(sp_size) : idx == 44 ? slider_automate(sp_decay) :
   idx == 45 ? slider_automate(sp_damp) : idx == 46 ? slider_automate(sp_mix) : idx == 47 ? slider_automate(eq_lo) :
   idx == 48 ? slider_automate(eq_hi) : idx == 49 ? slider_automate(vol) : idx == 50 ? slider_automate(npoly) :
-  idx == 51 ? slider_automate(drift) : idx == 52 ? slider_automate(lfo_sync) : idx == 53 ? slider_automate(lfo_div);
+  idx == 51 ? slider_automate(drift) : idx == 52 ? slider_automate(lfo_sync) : idx == 53 ? slider_automate(lfo_div) :
+  idx == 54 ? slider_automate(str_bal) : idx == 55 ? slider_automate(str_16) : idx == 56 ? slider_automate(str_8) :
+  idx == 57 ? slider_automate(str_4) : idx == 58 ? slider_automate(str_att) : idx == 59 ? slider_automate(str_rel) :
+  idx == 60 ? slider_automate(str_tone) : idx == 61 ? slider_automate(ens_amt) : idx == 62 ? slider_automate(ens_spd);
 );
 function sl_auto_au(idx) (
   idx == 33 ? slider_automate(lfo_hz) : idx == 34 ? slider_automate(lfo_cut) : idx == 35 ? slider_automate(lfo_pit) :
@@ -514,7 +567,10 @@ function sl_auto_au(idx) (
   idx == 42 ? slider_automate(dl_pp) : idx == 43 ? slider_automate(sp_size) : idx == 44 ? slider_automate(sp_decay) :
   idx == 45 ? slider_automate(sp_damp) : idx == 46 ? slider_automate(sp_mix) : idx == 47 ? slider_automate(eq_lo) :
   idx == 48 ? slider_automate(eq_hi) : idx == 49 ? slider_automate(vol) : idx == 50 ? slider_automate(npoly) :
-  idx == 51 ? slider_automate(drift) : idx == 52 ? slider_automate(lfo_sync) : idx == 53 ? slider_automate(lfo_div);
+  idx == 51 ? slider_automate(drift) : idx == 52 ? slider_automate(lfo_sync) : idx == 53 ? slider_automate(lfo_div) :
+  idx == 54 ? slider_automate(str_bal) : idx == 55 ? slider_automate(str_16) : idx == 56 ? slider_automate(str_8) :
+  idx == 57 ? slider_automate(str_4) : idx == 58 ? slider_automate(str_att) : idx == 59 ? slider_automate(str_rel) :
+  idx == 60 ? slider_automate(str_tone) : idx == 61 ? slider_automate(ens_amt) : idx == 62 ? slider_automate(ens_spd);
 );
 function param_touched(idx) (
   idx <= 32 ? slider_automate(2 ^ (idx - 1)) : sl_auto(idx);
@@ -532,6 +588,7 @@ function p_init() (
   pv(30, 0); pv(31, 12); pv(32, 1); pv(33, 0.8); pv(34, 0); pv(35, 0); pv(52, 0); pv(53, 5); pv(36, 0.25);
   pv(37, 1); pv(38, 350); pv(39, 4); pv(40, 0.4); pv(41, 0.2); pv(42, 1);
   pv(43, 0.6); pv(44, 2.8); pv(45, 0.45); pv(46, 0.2); pv(47, 0); pv(48, 0); pv(49, 0); pv(50, 8); pv(51, 50);
+  pv(54, 0); pv(55, 0); pv(56, 1); pv(57, 1); pv(58, 450); pv(59, 1200); pv(60, 0.5); pv(61, 0.7); pv(62, 0.5);
 );
 function load_preset(p) local(i) (
   p_init();
@@ -582,8 +639,22 @@ function load_preset(p) local(i) (
     pv(30, 1); pv(31, 8); pv(36, 0); pv(39, 8); pv(40, 0.3); pv(41, 0.2); pv(46, 0); pv(50, 1); ) :
   p == 12 ? (                                                                                  // Digital Grit
     pv(1, 0); pv(2, 0.85); pv(3, 0.3); pv(4, 0.4); pv(8, 0.2); pv(11, 3); pv(12, 160); pv(13, 0.2); pv(15, 0.2);
-    pv(30, 5); pv(31, 18); pv(32, 0); pv(33, 3); pv(36, 0.2); pv(46, 0.15); ) : 0;
-  i = 1;  loop(53, param_touched_au(i);  i += 1; );
+    pv(30, 5); pv(31, 18); pv(32, 0); pv(33, 3); pv(36, 0.2); pv(46, 0.15); ) :
+  p == 13 ? (                                                                                  // String Machine
+    pv(54, 1); pv(56, 1); pv(57, 1); pv(58, 350); pv(59, 1400); pv(60, 0.55); pv(61, 0.85); pv(62, 0.5);
+    pv(36, 0); pv(41, 0); pv(43, 0.8); pv(44, 3.5); pv(45, 0.5); pv(46, 0.3); pv(49, -2); ) :
+  p == 14 ? (                                                                                  // Hyper Strings
+    pv(2, 0.8); pv(3, 0.6); pv(8, 0.25); pv(9, 0); pv(12, 1400); pv(13, 0.15); pv(15, 0.2); pv(16, 0.3);
+    pv(21, 600); pv(22, 2500); pv(23, 50); pv(24, 2000); pv(25, 500); pv(26, 3000); pv(27, 85); pv(28, 2000);
+    pv(54, 0.5); pv(55, 1); pv(56, 1); pv(57, 0); pv(58, 700); pv(59, 2000); pv(60, 0.4); pv(61, 0.7);
+    pv(36, 0.2); pv(41, 0.1); pv(43, 0.85); pv(44, 5); pv(45, 0.5); pv(46, 0.35); pv(49, -3); ) :
+  p == 15 ? (                                                                                  // Brass and Strings
+    pv(1, 0); pv(2, 0); pv(3, 0.2); pv(6, 0); pv(7, 6); pv(8, 0.5); pv(9, 0); pv(12, 700); pv(13, 0.2);
+    pv(15, 0.5); pv(21, 60); pv(22, 600); pv(23, 45); pv(24, 300); pv(25, 20); pv(26, 500); pv(27, 85); pv(28, 400);
+    pv(30, 1); pv(31, 6); pv(33, 5); pv(35, 4); pv(36, 0.15); pv(41, 0);
+    pv(54, 0.45); pv(56, 1); pv(57, 1); pv(58, 250); pv(59, 900); pv(60, 0.65); pv(61, 0.75);
+    pv(43, 0.5); pv(44, 2.2); pv(45, 0.5); pv(46, 0.2); pv(49, -4); ) : 0;
+  i = 1;  loop(62, param_touched_au(i);  i += 1; );
 );
 
 // PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
@@ -596,14 +667,14 @@ update_params();
 );
 function prs_chk() local(k) (
   prs_dirty > 0 ? ( prs_pk = prs_dirty; prs_dirty = 0; prs_q = 1; ) : prs_ok ? (
-    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_sel = max(0, min(15, prs_sel | 0));
     prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( prs_pk = prs_sel; prs_q = 0; ); );
   ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
   // PRESET parameter: the swap ducks 5 ms, loads at silence (at the top of a block) and comes back over 30 ms
   prs_pk > 0 ? (
     prs_g <= 0 ? (
       k = prs_pk; prs_pk = 0; load_preset(k); prs_sl();
-      prs_q ? ( k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
+      prs_q ? ( k <= 15 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
       prs_gs = 1 / (0.030 * srate);
     ) : prs_gs = -1 / (0.005 * srate);
   );
@@ -636,6 +707,27 @@ drv_s += (10 ^ (fdrive / 20) - drv_s) * kb;
 f_in = 0.35 * drv_s * (1 + lcomp * kres);
 f_out = 1 / (0.35 * sqrt(drv_s));
 vib_c = lfo_pit + modw * 50;
+// STRINGS: the blend and the registers glide per sample (15 ms); TONE per block (30 ms)
+sm_k = 1 - exp(-1 / (0.015 * srate));
+syn_live = syn_gt > 0 || sy_s > 0.00001;
+str_live = str_gt > 0 || st_s > 0.00001;
+str_live ? (
+  tn_s += (str_tone - tn_s) * min(1, samplesblock / (0.03 * srate));
+  st_f = min(1100 * 10 ^ tn_s, 0.45 * srate);  st_g = tan($pi * st_f / srate);         // LP 1.1 - 11 kHz
+  st_k = 1.3;  st_a1 = 1 / (1 + st_g * (st_g + st_k));  st_a2 = st_g * st_a1;  st_a3 = st_g * st_a2;
+  // DRIFT = the string section's supply: one slow wander for its whole divider chain (tuning, +/-4 cents at 50 %)
+  // and the ensemble's clock (the delays stretch +/-5 %, the sweep speeds follow)
+  sv_tm -= samplesblock / srate * dm_s;  sv_tm <= 0 ? ( sv_t = s_rnd() * 2 - 1;  sv_tm = 2 + s_rnd() * 3; );
+  sv_v += (sv_t - sv_v) * (1 - exp(-samplesblock * dm_s / (1.5 * srate)));
+  str_pm = 2 ^ (sv_v * 0.04 * dm_a / 12);
+  en_clk = 1 + sv_v * 0.05 * dm_a;
+  t = 2 * $pi * 0.6 * ens_mul / en_clk / srate;  ens_cs = cos(t);  ens_sn = sin(t);      // slow sweep 0.6 Hz
+  t = 2 * $pi * 6.1 * ens_mul / en_clk / srate;  ens_cf = cos(t);  ens_sf = sin(t);      // fast shimmer 6.1 Hz
+  en_base = 0.0062 * srate * en_clk;  en_sd = 0.0021 * srate * en_clk;  en_fd = 0.00028 * srate * en_clk;
+  !en_on ? ( memset(EN_B, 0, EN_N);  st_z1 = st_z2 = st_h = 0; );
+  en_on = 1;
+) : ( en_on = 0;  str_pm = 1; );
+ens_disp = atan2(ens_ss, ens_sc);
 ost_setup(0, 0.3, 120, 6000, -0.3, 1);                             // house output stage: CLIP, always on, -0.3 dBFS
 outpk_disp = max(outpk_disp, outpk);  outpk = 0;                   // OUT meter hand-off
 ost_clipped ? ( clip_d = 1;  ost_clipped = 0; );
@@ -669,11 +761,45 @@ cr_n <= 0 ? (
 );
 cr_n -= 1;
 
+// STRINGS: the blend and the registers glide (15 ms)
+sy_s += (syn_gt - sy_s) * sm_k;  st_s += (str_gt - st_s) * sm_k;
+r16_s += (r16_t - r16_s) * sm_k;  r8_s += (r8_t - r8_s) * sm_k;  r4_s += (r4_t - r4_s) * sm_k;
+
 // voices
-mixL = 0;  mixR = 0;  vb = VOX;
+mixL = 0;  mixR = 0;  strM = 0;  vb = VOX;
 loop(NV, vb[F_ON] ? v_run(vb);  vb += VS; );
 
-yl = mixL * out_g;  yr = mixR * out_g;
+yl = mixL * sy_s * out_g;  yr = mixR * sy_s * out_g;
+// ---------- STRINGS bus: low cut 110 Hz, TONE low-pass, then the ensemble (three swept taps, 120 degrees apart) ----------
+en_on ? (
+  st_h += (strM - st_h) * str_hc;  st_x = strM - st_h;
+  st_v3 = st_x - st_z2;  st_v1 = st_a1 * st_z1 + st_a2 * st_v3;  st_v2 = st_z2 + st_a2 * st_z1 + st_a3 * st_v3;
+  st_z1 = 2 * st_v1 - st_z1;  st_z2 = 2 * st_v2 - st_z2;  st_x = st_v2;
+  EN_B[en_w] = st_x;
+  // two sine pairs turning (slow sweep, fast shimmer); each tap reads them 120 degrees apart
+  e_t = ens_sc * ens_cs - ens_ss * ens_sn;  ens_ss = ens_ss * ens_cs + ens_sc * ens_sn;  ens_sc = e_t;
+  e_t = ens_fc * ens_cf - ens_fs * ens_sf;  ens_fs = ens_fs * ens_cf + ens_fc * ens_sf;  ens_fc = e_t;
+  e_k = 0;  e_l = 0;  e_r = 0;
+  loop(3,
+    e_a = e_k == 0 ? 1 : -0.5;  e_b = e_k == 0 ? 0 : e_k == 1 ? 0.8660254 : -0.8660254;    // cos / sin of k x 120 degrees
+    e_p = en_w - (en_base + en_sd * (ens_ss * e_a + ens_sc * e_b) + en_fd * (ens_fs * e_a + ens_fc * e_b));
+    e_p < 0 ? e_p += EN_N;
+    e_i = floor(e_p);  e_f = e_p - e_i;  e_j = e_i + 1;  e_j >= EN_N ? e_j = 0;
+    e_v = EN_B[e_i] + (EN_B[e_j] - EN_B[e_i]) * e_f;
+    e_k == 0 ? e_l += e_v : e_k == 1 ? ( e_l += 0.5 * e_v;  e_r += 0.5 * e_v; ) : e_r += e_v;
+    e_k += 1;
+  );
+  en_w += 1;  en_w >= EN_N ? (
+    en_w = 0;
+    e_t = 1 / sqrt(ens_sc * ens_sc + ens_ss * ens_ss);  ens_sc *= e_t;  ens_ss *= e_t;
+    e_t = 1 / sqrt(ens_fc * ens_fc + ens_fs * ens_fs);  ens_fc *= e_t;  ens_fs *= e_t;
+  );
+  // TWEAK: the wet pair against the dry line (AMOUNT), the bus level against one synth note
+  e_g = st_s * out_g * 0.65;
+  ea_s += (ens_amt - ea_s) * sm_k;
+  yl += (st_x * (1 - ea_s) + e_l * 0.85 * ea_s) * e_g;
+  yr += (st_x * (1 - ea_s) + e_r * 0.85 * ea_s) * e_g;
+);
 // DC blocker at the start of the master chain (5 Hz): nothing below it reaches the FX
 dc_xl = yl - dc_pl + dc_r * dc_xl;  dc_pl = yl;  yl = dc_xl;
 dc_xr = yr - dc_pr + dc_r * dc_xr;  dc_pr = yr;  yr = dc_xr;
@@ -733,7 +859,7 @@ file_var(0, pr_cur);
 file_var(0, ui_sz);
 file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
 
-@gfx 1100 700
+@gfx 1100 856
 // version tag (JG, 29 Oct 2026): v1 = Legacy, v2 = Stable, v3 = the next graduation; a small dim tag just after the
 // panel title. ver_tag_at draws it at x with its baseline at yb, fs px high, in col (or the current colour if col < 0),
 // at 55 %; ver_tag puts it after text just drawn (dx, dy: extra offset in that text's heights). Font, colour and
@@ -849,6 +975,9 @@ function fmtv(v, fmt) (
   fmt == 17 ? sprintf(#kv, "%.1f s", v) :
   fmt == 18 ? ( osc_mode >= 0.5 ? sprintf(#kv, "%.1f saws", 1 + 8 * v) : sprintf(#kv, "shape %d %%", v * 100 + 0.5); ) :
   fmt == 19 ? sprintf(#kv, "%d c", v) :
+  fmt == 21 ? ( v < 0.0005 ? strcpy(#kv, "synth") : v > 0.9995 ? strcpy(#kv, "strings") : sprintf(#kv, "%d / %d", min(1, 2 * (1 - v)) * 100 + 0.5, min(1, 2 * v) * 100 + 0.5); ) :
+  fmt == 22 ? ( v = 1100 * 10 ^ v;  v < 1000 ? sprintf(#kv, "%d Hz", v) : sprintf(#kv, "%.1f kHz", v / 1000); ) :
+  fmt == 23 ? sprintf(#kv, "%.2fx", 2 ^ ((v - 0.5) * 2)) :
   fmt == 20 ? ( v = floor(v + 0.5);  strcpy(#kv, v == 0 ? "4 bars" : v == 1 ? "2 bars" : v == 2 ? "1 bar" : v == 3 ? "1/2" : v == 4 ? "1/2 dotted" :
     v == 5 ? "1/4" : v == 6 ? "1/4 dotted" : v == 7 ? "1/4 triplet" : v == 8 ? "1/8" : v == 9 ? "1/8 dotted" : v == 10 ? "1/8 triplet" :
     v == 11 ? "1/16" : v == 12 ? "1/16 triplet" : "1/32"); ) :
@@ -1099,14 +1228,14 @@ function g_resp(f, fc1, fc2) local(r, t, pr, pim, p2r, p2i, p3r, p3i, p4r, p4i, 
 );
 
 // ---------- presets (GUI thread only) ----------
-PRESET_MENU = "Init|Super Lead|Wide Pad|Juicy Bass|Reso Pluck|PWM Strings|Classic Brass|Rave Hoover|Tube Keys|Ice Drone|Acid Line|Digital Grit";
+PRESET_MENU = "Init|Super Lead|Wide Pad|Juicy Bass|Reso Pluck|PWM Strings|Classic Brass|Rave Hoover|Tube Keys|Ice Drone|Acid Line|Digital Grit|String Machine|Hyper Strings|Brass and Strings";
 
 // ---------- frame setup ----------
 g_ret = gfx_ext_retina > 1 ? gfx_ext_retina : 1;
 g_want = ui_sz == 1 ? 0.85 : ui_sz == 2 ? 1.3 : 1;                          // S / M / L
-sc = g_ret * max(min(g_want, min(gfx_w / (1100 * g_ret), gfx_h / (700 * g_ret))), 0.5);
+sc = g_ret * max(min(g_want, min(gfx_w / (1100 * g_ret), gfx_h / (856 * g_ret))), 0.5);
 ox = (gfx_w - 1100 * sc) * 0.5;
-oy = (gfx_h - 700 * sc) * 0.5;
+oy = (gfx_h - 856 * sc) * 0.5;
 lmb = mouse_cap & 1;
 click = lmb && !last_lmb;
 klog = 0;  kstep = 0;  kdim = 0;  fcap = C_ICE;
@@ -1128,11 +1257,11 @@ col(C_PANEL, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
 sb_sc != sc ? sb_build();
 gfx_a = 1;  gfx_x = px(0);  gfx_y = py(0);  gfx_blit(120, 1, 0);                  // the winter-night top bar
 col(C_ICE, 1);  u_rect(0, 58, 1100, 2);
-col(shade(C_PANEL, 0.78), 1);  u_rect(0, 697, 1100, 3);  u_rect(1097, 0, 3, 700);
-rivet(8, 8);  rivet(1092, 8);  rivet(8, 692);  rivet(1092, 692);
+col(shade(C_PANEL, 0.78), 1);  u_rect(0, 853, 1100, 3);  u_rect(1097, 0, 3, 856);
+rivet(8, 8);  rivet(1092, 8);  rivet(8, 848);  rivet(1092, 848);
 gfx_setfont(1);  col(0x7CD4FF, 0.18);
 g_j = 0;  loop(8, text_l(px(24) + ps(2) * cos(g_j * $pi / 4), py(23) + ps(2) * sin(g_j * $pi / 4), "FLURRY");  g_j += 1; );
-col(0xF4FAFF, 1);  text_l(px(24), py(23), "FLURRY"); ver_tag("v2", 16, 0, 0);
+col(0xF4FAFF, 1);  text_l(px(24), py(23), "FLURRY"); ver_tag("v3", 16, 0, 0);
 gfx_setfont(10);  col(0xA9DCFF, 1);  text_l(px(26), py(47), "HYPER-SAW SYNTHESIZER");
 // voice lamps on a light inset panel
 col(0x000000, 0.35);  lk_rr(287, 15, 202, 30, 6);
@@ -1155,13 +1284,13 @@ gfx_setfont(4);  col(0xFFB89A, 1);  text_l(px(970), py(29), "GFX");
 
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
 pb_k = preset_bar(500, 12, 34, 250, pr_cur, PRESET_MENU);
-pb_k > 0 ? ( prs_dirty = pb_k;  pr_cur = pb_k > 12 ? 1 : pb_k; );
+pb_k > 0 ? ( prs_dirty = pb_k;  pr_cur = pb_k > 15 ? 1 : pb_k; );
 
 // ---------- layout (design units, 1100 x 700) ----------
 // One spacing system throughout (8-pt grid): 16 outer margin, 16 gutters, 16 padding inside a section; each section has
 // a 32-high header band (title and header keys share its centre line, y + 20) and content starts 16 below it (y + 48).
-// Rows sized to their content: 256 / 140 / 180 from y 76 (row tops 76, 348, 504). Knob labels in a row share one line.
-// Columns: row 1 and 3 share x 16 / 368 / 764 (row 3 splits the first into CHORUS + DELAY); row 2 adds the LFO at 864.
+// Rows sized to their content: 256 / 140 / 140 / 180 from y 76 (row tops 76, 348, 504, 660). Knob labels in a row share one line.
+// Columns: rows 1 and 4 share x 16 / 368 / 764 (row 4 splits the first into CHORUS + DELAY); row 2 adds the LFO at 864; row 3 = STRINGS + ENSEMBLE.
 
 // ---------- OSC 1 ----------
 section(16, 76, 336, 256, C_SEC1, "OSC 1");
@@ -1300,34 +1429,91 @@ lfo_sync >= 0.5 ? ( kstep = 1;  kn(911, 420, 18, 53, 0, 13, 5, C_ICE, 0xFFFFFF, 
 kn(974, 422, 16, 34, 0, 4, 0, C_CAPW, C_INK, "CUTOFF", 13, 0);
 kn(1037, 422, 16, 35, 0, 100, 0, C_CAPW, C_INK, "PITCH", 19, 0);
 
+// ---------- STRINGS (the Lab rework): a string-machine section beside the synth ----------
+section(16, 504, 732, 140, C_SEC3, "STRINGS");
+g_j = 0;
+loop(3,
+  g_on = g_j == 0 ? str_16 >= 0.5 : g_j == 1 ? str_8 >= 0.5 : str_4 >= 0.5;
+  lk_key(564 + g_j * 56, 512, 50, 24, g_on, LK_SKY, g_j == 0 ? "16'" : g_j == 1 ? "8'" : "4'") ?
+    ( slider(55 + g_j) = g_on ? 0 : 1;  param_touched(55 + g_j); );
+  g_j += 1;
+);
+kn(72, 576, 20, 54, 0, 1, 0, C_ICE, 0xFFFFFF, "BLEND", 21, 1);
+g_sd = str_bal < 0.0005;
+klog = 1;  kdim = g_sd;  kn(152, 580, 16, 58, 1, 5000, 450, C_CAPW, C_INK, "ATTACK", 3, 0);
+klog = 1;  kdim = g_sd;  kn(224, 580, 16, 59, 1, 10000, 1200, C_CAPW, C_INK, "RELEASE", 3, 0);
+kdim = g_sd;  kn(296, 580, 16, 60, 0, 1, 0.5, C_CAPW, C_INK, "TONE", 22, 0);
+// the display: the registers and the blend on the text line, the strings' envelope below it (y 574 .. 620)
+lcd_box(344, 548, 388, 80);
+strcpy(#sr, "");
+str_16 >= 0.5 ? strcat(#sr, "16' ");  str_8 >= 0.5 ? strcat(#sr, "8' ");  str_4 >= 0.5 ? strcat(#sr, "4' ");
+strlen(#sr) == 0 ? strcpy(#sr, "NO REGISTER ");
+g_sd ? strcat(#sr, "  SYNTH ONLY") : str_bal > 0.9995 ? strcat(#sr, "  STRINGS ONLY") :
+  ( sprintf(#st, "  SYNTH %d  STRINGS %d", min(1, 2 * (1 - str_bal)) * 100 + 0.5, min(1, 2 * str_bal) * 100 + 0.5);  strcat(#sr, #st); );
+gfx_setfont(7);  col(C_LCDTX, g_sd ? 0.45 : 0.9);  text_l(px(356), py(562), #sr);
+// attack ramp, hold, release fall (widths on a log time scale)
+g_wa = 12 + 110 * log(max(1, str_att)) / log(5000);
+g_wr = 12 + 150 * log(max(1, str_rel)) / log(10000);
+g_x0 = 356;  g_yb = 620;  g_yt = 578;  g_xh = g_x0 + g_wa + 70;
+col(C_LCDTX, 0.15);  u_rect(g_x0, g_yb, 364, 1);
+g_j = 0;
+loop(ceil(g_wa + 70 + g_wr) + 1,
+  g_xx = g_x0 + g_j;
+  g_v = g_xx < g_x0 + g_wa ? g_j / g_wa : g_xx < g_xh ? 1 : exp(-6.9 * (g_xx - g_xh) / g_wr);
+  g_yy = py(g_yb - g_v * (g_yb - g_yt));  g_xx = px(g_xx);
+  col(C_LCDTX, g_sd ? 0.05 : 0.12);  gfx_rect(floor(g_xx), g_yy, max(1, ceil(ps(1))), py(g_yb) - g_yy, 1);
+  col(C_LCDTX, g_sd ? 0.35 : 1);  g_j > 0 ? gfx_line(g_xp, g_yp, g_xx, g_yy, 1);
+  g_xp = g_xx;  g_yp = g_yy;  g_j += 1;
+);
+
+// ---------- ENSEMBLE: three swept copies of the strings, spread left / centre / right ----------
+section(764, 504, 320, 140, C_SEC1, "ENSEMBLE");
+lcd_box(780, 548, 140, 80);
+sprintf(#en, "%.2f Hz", 0.6 * 2 ^ ((ens_spd - 0.5) * 2));
+gfx_setfont(7);  col(C_LCDTX, g_sd ? 0.45 : 0.9);  text_l(px(792), py(562), #en);
+g_j = 0;
+loop(3,
+  col(g_j == 0 ? 0x7CD4FF : g_j == 1 ? 0xE8F6FF : 0xFF8AC0, g_sd ? 0.3 : 0.95);
+  g_k = 0;
+  loop(61,
+    g_xx = px(792 + g_k * 2);
+    g_yy = py(598 + (8 + 12 * ens_amt) * sin(g_k / 60 * 2 * $pi + ens_disp + g_j * 2 * $pi / 3));
+    g_k > 0 ? gfx_line(g_xp, g_yp, g_xx, g_yy, 1);
+    g_xp = g_xx;  g_yp = g_yy;  g_k += 1;
+  );
+  g_j += 1;
+);
+kdim = g_sd;  kn(970, 578, 18, 61, 0, 1, 0.7, C_ICE, 0xFFFFFF, "AMOUNT", 1, 0);
+kdim = g_sd;  kn(1040, 580, 16, 62, 0, 1, 0.5, C_CAPW, C_INK, "SPEED", 23, 0);
+
 // ---------- CHORUS ----------
-section(16, 504, 120, 180, C_SEC3, "CHORUS");
-kn(76, 619, 24, 36, 0, 1, 0.25, C_ICE, 0xFFFFFF, "MIX", 1, 1);
+section(16, 660, 120, 180, C_SEC3, "CHORUS");
+kn(76, 775, 24, 36, 0, 1, 0.25, C_ICE, 0xFFFFFF, "MIX", 1, 1);
 
 // ---------- DELAY ----------
-section(152, 504, 316, 180, C_SEC1, "DELAY");
-lk_key(332, 512, 56, 24, dl_sync >= 0.5, LK_SKY, "SYNC") ? ( slider(37) = dl_sync >= 0.5 ? 0 : 1;  param_touched(37); );
-lk_key(396, 512, 56, 24, dl_pp >= 0.5, LK_YEL, "PING") ? ( slider(42) = dl_pp >= 0.5 ? 0 : 1;  param_touched(42); );
+section(152, 660, 316, 180, C_SEC1, "DELAY");
+lk_key(332, 668, 56, 24, dl_sync >= 0.5, LK_SKY, "SYNC") ? ( slider(37) = dl_sync >= 0.5 ? 0 : 1;  param_touched(37); );
+lk_key(396, 668, 56, 24, dl_pp >= 0.5, LK_YEL, "PING") ? ( slider(42) = dl_pp >= 0.5 ? 0 : 1;  param_touched(42); );
 dl_sync >= 0.5 ? strcpy(#dl, bd_divname(floor(dl_div + 0.5))) : ( dl_ms < 1000 ? sprintf(#dl, "%d ms", dl_ms) : sprintf(#dl, "%.2f s", dl_ms / 1000); );
 strcat(#dl, dl_pp >= 0.5 ? "   PING-PONG" : "   STEREO");
-lcd(168, 548, 284, 30, 7, #dl);
-dl_sync >= 0.5 ? ( kstep = 1;  kn(215, 623, 22, 39, 0, 13, 4, C_ICE, 0xFFFFFF, "TIME", 16, 1); )
-               : ( klog = 1;  kn(215, 623, 22, 38, 10, 2000, 350, C_ICE, 0xFFFFFF, "TIME", 3, 1); );
-kn(310, 627, 16, 40, 0, 0.95, 0.4, C_CAPW, C_INK, "FDBK", 1, 0);
-kn(405, 627, 16, 41, 0, 1, 0.2, C_ICE, 0xFFFFFF, "MIX", 1, 0);
+lcd(168, 704, 284, 30, 7, #dl);
+dl_sync >= 0.5 ? ( kstep = 1;  kn(215, 779, 22, 39, 0, 13, 4, C_ICE, 0xFFFFFF, "TIME", 16, 1); )
+               : ( klog = 1;  kn(215, 779, 22, 38, 10, 2000, 350, C_ICE, 0xFFFFFF, "TIME", 3, 1); );
+kn(310, 783, 16, 40, 0, 0.95, 0.4, C_CAPW, C_INK, "FDBK", 1, 0);
+kn(405, 783, 16, 41, 0, 1, 0.2, C_ICE, 0xFFFFFF, "MIX", 1, 0);
 
 // ---------- SPACE ----------
-section(484, 504, 264, 180, C_SEC2, "SPACE");
+section(484, 660, 264, 180, C_SEC2, "SPACE");
 #sn = sp_size < 0.25 ? "ROOM" : sp_size < 0.5 ? "CHAMBER" : sp_size < 0.8 ? "HALL" : "CATHEDRAL";
 sprintf(#sl, "%s   %.1f s", #sn, sp_decay);
-lcd(500, 548, 232, 30, 7, #sl);
-kn(529, 627, 16, 43, 0, 1, 0.6, C_CAPW, C_INK, "SIZE", 1, 0);
-klog = 1;  kn(587, 627, 16, 44, 0.2, 12, 2.8, C_CAPW, C_INK, "DECAY", 17, 0);
-kn(645, 627, 16, 45, 0, 1, 0.45, C_CAPW, C_INK, "DAMP", 1, 0);
-kn(703, 627, 16, 46, 0, 1, 0.2, C_ICE, 0xFFFFFF, "MIX", 1, 0);
+lcd(500, 704, 232, 30, 7, #sl);
+kn(529, 783, 16, 43, 0, 1, 0.6, C_CAPW, C_INK, "SIZE", 1, 0);
+klog = 1;  kn(587, 783, 16, 44, 0.2, 12, 2.8, C_CAPW, C_INK, "DECAY", 17, 0);
+kn(645, 783, 16, 45, 0, 1, 0.45, C_CAPW, C_INK, "DAMP", 1, 0);
+kn(703, 783, 16, 46, 0, 1, 0.2, C_ICE, 0xFFFFFF, "MIX", 1, 0);
 
 // ---------- MASTER ----------
-section(764, 504, 320, 180, C_SEC3, "MASTER");
+section(764, 660, 320, 180, C_SEC3, "MASTER");
 // OUT meter, -48 .. 0 dB, with a floating peak hold (1.5 s, then it falls); its figure in the display, the CLIP lamp above
 u_db = out_m > 0.000001 ? 8.685889638065035 * log(out_m) : -120;
 u_now = time_precise();
@@ -1337,37 +1523,37 @@ u_db >= pk_db || u_now - pk_t > 1.5 ? (
 pk_last = u_now;
 pk_db > -48 ? sprintf(#pk, "%.1f dB", min(pk_db, 0)) : strcpy(#pk, "-inf");
 sprintf(#ms, "PLAYING %d/%d   PEAK %s", voices_disp, npoly, #pk);
-lcd(780, 548, 248, 30, 7, #ms);
+lcd(780, 704, 248, 30, 7, #ms);
 clip_d ? ( clip_t = u_now;  clip_d = 0; );
 u_on = u_now - clip_t < 0.4;
-col(u_on ? 0xFF4A30 : 0x5A2620, 1);  gfx_circle(px(1054), py(524), ps(4), 1, 1);
-u_on ? ( col(0xFF4A30, 0.3);  gfx_circle(px(1054), py(524), ps(7), 1, 1); );
-col(0x141815, 1);  u_rect(1044, 548, 20, 102);
+col(u_on ? 0xFF4A30 : 0x5A2620, 1);  gfx_circle(px(1054), py(680), ps(4), 1, 1);
+u_on ? ( col(0xFF4A30, 0.3);  gfx_circle(px(1054), py(680), ps(7), 1, 1); );
+col(0x141815, 1);  u_rect(1044, 704, 20, 102);
 g_j = 0;
 loop(24,
   u_d = -48 + (g_j + 1) * 2;
   col(u_d > -1 ? 0xE0503A : u_d > -6 ? 0x2E7BE0 : 0x2FB6D4, u_db >= u_d - 2 ? 1 : 0.14);
-  u_rect(1047, 647 - (g_j + 1) * 96 / 24 + 1, 14, 96 / 24 - 1.2);
+  u_rect(1047, 803 - (g_j + 1) * 96 / 24 + 1, 14, 96 / 24 - 1.2);
   g_j += 1;
 );
 pk_db > -48 ? (
-  u_y = 647 - (min(pk_db, 0) + 48) / 48 * 96;
+  u_y = 803 - (min(pk_db, 0) + 48) / 48 * 96;
   col(0xFFFFFF, 0.95);  u_rect(1046, u_y - 1, 16, 2);
 );
-gfx_setfont(6);  col(C_INK, 1);  text_c(px(1054), py(663), "OUT");
-kn(802, 627, 16, 47, -12, 12, 0, C_CAPW, C_INK, "LOW", 7, 0);
-kn(856, 627, 16, 48, -12, 12, 0, C_CAPW, C_INK, "HIGH", 7, 0);
-kn(910, 627, 16, 29, 0, 1, 0.5, C_CAPW, C_INK, "VELO", 1, 0);
-kn(964, 628, 15, 51, 0, 100, 50, C_CAPW, C_INK, "DRIFT", 4, 0);
+gfx_setfont(6);  col(C_INK, 1);  text_c(px(1054), py(819), "OUT");
+kn(802, 783, 16, 47, -12, 12, 0, C_CAPW, C_INK, "LOW", 7, 0);
+kn(856, 783, 16, 48, -12, 12, 0, C_CAPW, C_INK, "HIGH", 7, 0);
+kn(910, 783, 16, 29, 0, 1, 0.5, C_CAPW, C_INK, "VELO", 1, 0);
+kn(964, 784, 15, 51, 0, 100, 50, C_CAPW, C_INK, "DRIFT", 4, 0);
 // VOICES: a menu in the header (1 = mono)
 sprintf(#vk, npoly < 1.5 ? "MONO" : "%d VOICES", npoly);
-lk_key(916, 512, 96, 24, 1, LK_SKY, #vk) ? (
+lk_key(916, 668, 96, 24, 1, LK_SKY, #vk) ? (
   strcpy(#vm, "");  g_j = 1;
   loop(8, g_j == floor(npoly + 0.5) ? strcat(#vm, "!");  g_j == 1 ? strcat(#vm, "1 (mono)") : ( sprintf(#vt, "%d", g_j);  strcat(#vm, #vt); );  g_j < 8 ? strcat(#vm, "|");  g_j += 1; );
-  gfx_x = px(916);  gfx_y = py(540);  g_j = gfx_showmenu(#vm);
+  gfx_x = px(916);  gfx_y = py(696);  g_j = gfx_showmenu(#vm);
   g_j > 0 ? ( slider(50) = g_j;  param_touched(50); );
 );
-kn(1012, 625, 18, 49, -24, 6, 0, C_ICE, 0xFFFFFF, "VOL", 7, 0);
+kn(1012, 781, 18, 49, -24, 6, 0, C_ICE, 0xFFFFFF, "VOL", 7, 0);
 
 // ---------- S / M / L / ? (size picker and credits), house layout: four 13 x 18 keys on a 14 pitch ----------
 g_j = 0;

@@ -1,8 +1,21 @@
 desc:C2E [eq] (GFX)
+//tags: equalizer eq console mid-side dynamic
 //author: JGWizrad / Garden FX (GFX)
+// Requires gfx-bypass (.jsfx-inc) in the same folder.
 //
 // C2E — a 70s British broadcast-console channel EQ: C2M's partner module, from the same desk.
 // Reference (comments only): the M-series console's input / EQ module.
+// LAB HYBRID (Oct 2026): what the desk never had -
+//   M / S PER BAND: each band works on the whole stereo signal (STEREO), on the middle only (MID)
+//     or on the sides only (SIDE), chosen from a menu on its lamp key (cream / amber / blue).
+//   TWO DYNAMIC BANDS: HMF (tracks) and LMF (mix buss) each have DYN and one DEPTH dial (-15 .. +15 dB,
+//     left = cut when loud, right = lift when loud). One dial sets both, in the spirit of a classic
+//     soft-knee "easy" compressor: the further from centre, the lower the threshold (-20 dBFS ->
+//     -44 dBFS at full turn) AND the bigger the move (= DEPTH dB). With DYN lit, the band's level is
+//     watched at its own frequency; past the threshold the band moves on top of its GAIN (all of
+//     DEPTH about 10 dB over, soft knee), 3 ms
+//     attack, 120 ms release. An amber light shows how far it has moved.
+//   With everything on STEREO and DYN off, it sounds as the Stable C2E (nulls below -140 dB).
 //
 // Signal path (stereo, both sides set alike), each stage its own block below:
 //   1. INPUT   TRIM (+/-20 dB) into the console's input stage: the input transformer (lows saturate
@@ -18,15 +31,19 @@ desc:C2E [eq] (GFX)
 //              The bells are proportional-Q, like British broadcast desks: broad and gentle for small
 //              moves, tighter as the boost or cut grows. Shelves are a gentle Q of 0.6.
 //   4. OUTPUT  the output transformer (a softly rounded top). Mix tool: no clip stage.
-// IRON: both transformers in / out. DRIFT = power supply + iron: the supply rail wanders (the
+// IRON: both transformers in / out.
+// DRIFT (0 - 10, 3 = standard) = power supply + iron: the supply rail wanders (the
 //   input stage's headroom breathes, with a tiny level wander), and each side's transformer core
 //   wanders on its own.
 // Smoothing: every control glides (gains in dB, frequencies in octaves) and the filters are
 //   zero-delay state-variable designs, which stay clean while they move: no zipper noise.
+// BYPASS (top bar, the house BYPASS keycap; its top lights amber when bypassed): a 15 ms crossfade to the
+//   untouched input (no latency, so no delay needed).
 // Calibration: 0 dBu = -18 dBFS. Tweak points are marked TWEAK.
 //
-// STATUS: Stable v2.0 (from the Lab, Oct 2026). v0.1.
-// v2.0.1 (27 Oct 2026): bug fix - no click when a filter leaves / reaches OFF or a band swaps SHELF / BELL.
+// STATUS: Lab v0.1 (Hybrid rework of the Stable C2E v2.0).
+
+import gfx-bypass.jsfx-inc
 
 in_pin:left input
 in_pin:right input
@@ -51,9 +68,21 @@ slider15:lf_f=100<47,470,1>-LF frequency (Hz)
 slider16:lf_bell=0<0,1,1{Shelf,Bell}>-LF shape
 slider17:iron=1<0,1,1{Off,On}>-Iron
 slider18:drift=3<0,10,0.1>-Drift (supply + iron)
-slider19:prs_sel=0<0,11,1{No preset,Init,Vocal: Presence,Vocal: Warm Broadcast,Kick: Thump + Click,Snare: Crack,Acoustic Guitar,Bass: Round,Electric Guitar: Tame,Overheads: Air,Telephone,Desk Colour Only}>-Preset
+slider19:hf_ms=0<0,2,1{Stereo,Mid,Side}>-HF works on
+slider20:hmf_ms=0<0,2,1{Stereo,Mid,Side}>-HMF works on
+slider21:lmf_ms=0<0,2,1{Stereo,Mid,Side}>-LMF works on
+slider22:lf_ms=0<0,2,1{Stereo,Mid,Side}>-LF works on
+slider23:hmf_dyn=0<0,1,1{Off,On}>-HMF dynamic
+slider24:hmf_amt=-6<-15,15,0.1>-HMF dynamic depth (dB)
+slider25:lmf_dyn=0<0,1,1{Off,On}>-LMF dynamic
+slider26:lmf_amt=-6<-15,15,0.1>-LMF dynamic depth (dB)
+slider27:prs_sel=0<0,11,1{No preset,Init,Vocal: Presence,Vocal: Warm Broadcast,Kick: Thump + Click,Snare: Crack,Acoustic Guitar,Bass: Round,Electric Guitar: Tame,Overheads: Air,Telephone,Desk Colour Only}>-Preset
+slider28:bypass=0<0,1,1{Off,On}>-Bypass
+slider29:out_db=0<-20,20,0.1>-Output (dB)
 
 @init
+by_setup(28);                              // the BYPASS key
+#ui_man = "gfx-c2e";
 ext_noinit = 1;
 pr_cur = 1;
 first_run = 1;
@@ -121,17 +150,48 @@ function eq_t(x) instance(a1, a2, a3, m0, m1, m2, ic1, ic2) local(v1, v2, v3) (
   m0 * x + m1 * v1 + m2 * v2;
 );
 // the high half (HF, HMF) and the low half (LMF, LF), both sides (work on el / er)
+// (Lab: the EQ and filters run on mid / side - el / fl = mid, er / fr = side; the same filter on both
+//  is the same as on left and right, so STEREO sounds as before)
 function eq_high() ( el = HMFL.eq_t(HFL.eq_t(el));  er = HMFR.eq_t(HFR.eq_t(er)); );
 function eq_low()  ( el = LFL.eq_t(LMFL.eq_t(el));  er = LFR.eq_t(LMFR.eq_t(er)); );
 // the filters, both sides (work on fl / fr)
 function filters() (
-  // v2.0.1: the filters always run (their state stays current) and fade in / out over 10 ms when a
-  // dial leaves or reaches OFF - switching them in cold clicked on some preset changes
+  // Lab: the filters always run (their state stays current) and fade in / out over 10 ms when a
+  // dial leaves or reaches OFF - the Stable switched them in cold, which clicked on some presets
   hp_s += (hpf_on - hp_s) * xs_c;  lp_s += (lpf_on - lp_s) * xs_c;
   HPL.svf_t(fl);  HPR.svf_t(fr);
   hp_s >= 0.99999 ? ( fl = HPL.hp;  fr = HPR.hp; ) : hp_s > 0.00001 ? ( fl += (HPL.hp - fl) * hp_s;  fr += (HPR.hp - fr) * hp_s; );
   LPL.svf_t(fl);  LPR.svf_t(fr);
   lp_s >= 0.99999 ? ( fl = LPL.lp;  fr = LPR.lp; ) : lp_s > 0.00001 ? ( fl += (LPL.lp - fl) * lp_s;  fr += (LPR.lp - fr) * lp_s; );
+);
+
+// =====================================================================
+// 3b. DYNAMIC BANDS (Lab): a band-pass detector at the band's frequency (Q 1, unity at the centre)
+// on the part of the signal the band works on, a peak envelope, and a soft-kneed amount 0 .. 1
+// =====================================================================
+DYN_FULL = 10;  DYN_KNEE = 6;            // TWEAK: dB over threshold for the full DEPTH; knee width
+DYN_T0 = -20;  DYN_TS = 1.6;             // TWEAK: threshold (dBFS) = DYN_T0 - DYN_TS x |DEPTH|
+function det_c(fc) instance(a1, a2, a3) local(g) (
+  g = tan($pi * min(fc, 0.45 * srate) / srate);
+  a1 = 1 / (1 + g * (g + 1));  a2 = g * a1;  a3 = g * a2;
+);
+function det_t(x) instance(a1, a2, a3, ic1, ic2) local(v1, v2, v3) (
+  v3 = x - ic2;  v1 = a1 * ic1 + a2 * v3;  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;  ic2 = 2 * v2 - ic2;
+  v1;                                      // band-pass, k = 1: unity at the centre
+);
+// one dynamic band: m / s in, envelope kept in env
+function dyn_det(m, s, ms) instance(DM, DS, env) local(a, b, lv) (
+  a = DM.det_t(m);  b = DS.det_t(s);
+  lv = ms == 1 ? abs(a) : ms == 2 ? abs(b) : max(abs(a + b), abs(a - b));
+  env += (lv - env) * (lv > env ? dy_att : dy_rel);
+);
+function dyn_c(fc) instance(DM, DS) ( DM.det_c(fc);  DS.det_c(fc); );
+// amount 0 .. 1 from the envelope (control rate)
+function dyn_amt(thr) instance(env) local(o, k) (
+  o = 8.685889638065035 * log(max(env, 0.00000001)) - thr;  k = DYN_KNEE * 0.5;
+  o = o < -k ? 0 : o > k ? o : sqr(o + k) / (2 * DYN_KNEE);
+  min(1, o / DYN_FULL);
 );
 
 // =====================================================================
@@ -148,25 +208,35 @@ function walk(dt) instance(v, tg, tm) (
 
 // ---------- parameters: targets on a change; smoothed values glide at control rate ----------
 function update_params() (
-  t_trim = db2g(trim);  t_pol = phase >= 0.5 ? -1 : 1;
+  t_trim = db2g(trim);  t_out = db2g(out_db);  t_pol = phase >= 0.5 ? -1 : 1;
   t_hpf = log(max(hpf, 20));  t_lpf = log(min(lpf, 20000));
   hpf_on = hpf > 20.5;  lpf_on = lpf < 19990;
   t_fin = filt_in >= 0.5;  t_eqin = eq_in >= 0.5;
   t_hfg = hf_g;   t_hff = log(hf_f);   t_hmfg = hmf_g;  t_hmff = log(hmf_f);
   t_lmfg = lmf_g; t_lmff = log(lmf_f); t_lfg = lf_g;    t_lff = log(lf_f);
   t_xw = iron >= 0.5;  dr = drift / 10;
+  // Lab: which part each stage works on (0 stereo, 1 mid, 2 side) -> a mid and a side share
+  t_fm = t_fs = t_fin;
+  hfm = hf_ms != 2;  hfs = hf_ms != 1;  hmm = hmf_ms != 2;  hms = hmf_ms != 1;
+  lmm = lmf_ms != 2;  lms = lmf_ms != 1;  lfm = lf_ms != 2;  lfs = lf_ms != 1;
+  t_hdy = hmf_dyn >= 0.5;  t_ldy = lmf_dyn >= 0.5;
+  dy_att = cms(3);  dy_rel = cms(120);
+  dk_c = CR / (0.005 * srate);             // shape-swap duck: 5 ms down, 5 ms up
+  dg_c = 1 - exp(-CR / (0.005 * srate));  // the moving gain glides ~5 ms between control ticks
   xf_c = 1 - exp(-2 * $pi * 150 / srate);
   ho_c = 1 - exp(-2 * $pi * min(16000, srate * 0.45) / srate);
   sm_c = 1 - exp(-CR / (0.03 * srate));    // control glide: ~30 ms
-  xs_c = cms(10);
-  dk_c = CR / (0.005 * srate);             // shape-swap duck: 5 ms down, 5 ms up                           // per-sample crossfades (polarity, in / out keys)
+  xs_c = cms(10);                           // per-sample crossfades (polarity, in / out keys)
   op_d = (ts(OP_B + 0.0001) - ts(OP_B - 0.0001)) / 0.0002;
   first_run ? (
-    trim_s = t_trim;  pol_s = t_pol;  s_hpf = t_hpf;  s_lpf = t_lpf;  fin_s = t_fin;  eqin_s = t_eqin;
+    trim_s = t_trim;  out_s = t_out;  pol_s = t_pol;  s_hpf = t_hpf;  s_lpf = t_lpf;  fin_s = t_fin;  eqin_s = t_eqin;
     s_hfg = t_hfg;  s_hff = t_hff;  s_hmfg = t_hmfg;  s_hmff = t_hmff;
     s_lmfg = t_lmfg;  s_lmff = t_lmff;  s_lfg = t_lfg;  s_lff = t_lff;  xw_s = t_xw;
-    XFL.ik = XFR.ik = XF_K;  first_run = 0;
+    fm_s = t_fm;  fs_s = t_fs;
+    m_hfm = hfm;  m_hfs = hfs;  m_hmm = hmm;  m_hms = hms;  m_lmm = lmm;  m_lms = lms;  m_lfm = lfm;  m_lfs = lfs;
+    hdy_s = t_hdy;  ldy_s = t_ldy;
     hp_s = hpf_on;  lp_s = lpf_on;  hf_k = hf_bell >= 0.5 ? 0 : 2;  lf_k = lf_bell >= 0.5 ? 0 : 1;  hf_w = lf_w = 1;
+    XFL.ik = XFR.ik = XF_K;  first_run = 0;
   );
 );
 // every CR samples: glide the controls, then rebuild the coefficients (both sides alike)
@@ -178,16 +248,28 @@ function control_tick() local(hs, ls, hg, lg) (
   s_lfg += (t_lfg - s_lfg) * sm_c;   s_lff += (t_lff - s_lff) * sm_c;
   HPL.svf_c(exp(s_hpf));  HPR.svf_c(exp(s_hpf));
   LPL.svf_c(exp(s_lpf));  LPR.svf_c(exp(s_lpf));
-  // v2.0.1: a SHELF / BELL change ducks that band to flat (~5 ms), swaps the shape, and brings it back
-  // (swapping the shape under a live filter clicked)
+  // Lab: a SHELF / BELL change ducks that band to flat (~5 ms), swaps the shape, and brings it back
+  // (the Stable swapped the shape under a live filter, which clicked)
   hs = hf_bell >= 0.5 ? 0 : 2;  ls = lf_bell >= 0.5 ? 0 : 1;
   hs != hf_k ? ( hf_w = max(0, hf_w - dk_c);  hf_w <= 0 ? hf_k = hs; ) : hf_w = min(1, hf_w + dk_c);
   ls != lf_k ? ( lf_w = max(0, lf_w - dk_c);  lf_w <= 0 ? lf_k = ls; ) : lf_w = min(1, lf_w + dk_c);
-  hs = hf_k;  ls = lf_k;  hg = s_hfg * hf_w;  lg = s_lfg * lf_w;
-  HFL.eq_c(hs, exp(s_hff), hg, hs ? SHELF_Q : pq(hg));          HFR.eq_c(hs, exp(s_hff), hg, hs ? SHELF_Q : pq(hg));
-  HMFL.eq_c(0, exp(s_hmff), s_hmfg, pq(s_hmfg));                HMFR.eq_c(0, exp(s_hmff), s_hmfg, pq(s_hmfg));
-  LMFL.eq_c(0, exp(s_lmff), s_lmfg, pq(s_lmfg));                LMFR.eq_c(0, exp(s_lmff), s_lmfg, pq(s_lmfg));
-  LFL.eq_c(ls, exp(s_lff), lg, ls ? SHELF_Q : pq(lg));          LFR.eq_c(ls, exp(s_lff), lg, ls ? SHELF_Q : pq(lg));
+  hs = hf_k;  ls = lf_k;
+  // Lab: each band's mid and side gains glide on their own (a menu change glides like a knob);
+  // the dynamic bands add their moving gain on top
+  hdy_s += (t_hdy - hdy_s) * sm_c;  ldy_s += (t_ldy - ldy_s) * sm_c;
+  hdy_s > 0.0001 ? ( HMFD.dyn_c(exp(s_hmff));  hg = hmf_amt * HMFD.dyn_amt(DYN_T0 - DYN_TS * abs(hmf_amt)) * hdy_s; ) : ( hg = 0;  HMFD.env = 0; );
+  ldy_s > 0.0001 ? ( LMFD.dyn_c(exp(s_lmff));  lg = lmf_amt * LMFD.dyn_amt(DYN_T0 - DYN_TS * abs(lmf_amt)) * ldy_s; ) : ( lg = 0;  LMFD.env = 0; );
+  hmf_dg += (hg - hmf_dg) * dg_c;  lmf_dg += (lg - lmf_dg) * dg_c;
+  m_hfm += (hfm - m_hfm) * sm_c;  m_hfs += (hfs - m_hfs) * sm_c;  m_hmm += (hmm - m_hmm) * sm_c;  m_hms += (hms - m_hms) * sm_c;
+  m_lmm += (lmm - m_lmm) * sm_c;  m_lms += (lms - m_lms) * sm_c;  m_lfm += (lfm - m_lfm) * sm_c;  m_lfs += (lfs - m_lfs) * sm_c;
+  s_hfm = s_hfg * m_hfm * hf_w;  s_hfs = s_hfg * m_hfs * hf_w;
+  s_hmm = (s_hmfg + hmf_dg) * m_hmm;  s_hms = (s_hmfg + hmf_dg) * m_hms;
+  s_lmm = (s_lmfg + lmf_dg) * m_lmm;  s_lms = (s_lmfg + lmf_dg) * m_lms;
+  s_lfm = s_lfg * m_lfm * lf_w;  s_lfs = s_lfg * m_lfs * lf_w;
+  HFL.eq_c(hs, exp(s_hff), s_hfm, hs ? SHELF_Q : pq(s_hfm));    HFR.eq_c(hs, exp(s_hff), s_hfs, hs ? SHELF_Q : pq(s_hfs));
+  HMFL.eq_c(0, exp(s_hmff), s_hmm, pq(s_hmm));                  HMFR.eq_c(0, exp(s_hmff), s_hms, pq(s_hms));
+  LMFL.eq_c(0, exp(s_lmff), s_lmm, pq(s_lmm));                  LMFR.eq_c(0, exp(s_lmff), s_lms, pq(s_lms));
+  LFL.eq_c(ls, exp(s_lff), s_lfm, ls ? SHELF_Q : pq(s_lfm));    LFR.eq_c(ls, exp(s_lff), s_lfs, ls ? SHELF_Q : pq(s_lfs));
 );
 
 // (moved here from @gfx: the PRESET parameter loads presets on the audio side)
@@ -195,7 +277,10 @@ function set_pr(trm, ph, hp, lp, fi, ei, hg, hf, hb, hmg, hmf, lmg, lmf, lg, lff
   slider(1) = trm;  slider(2) = ph;  slider(3) = hp;  slider(4) = lp;  slider(5) = fi;  slider(6) = ei;
   slider(7) = hg;  slider(8) = hf;  slider(9) = hb;  slider(10) = hmg;  slider(11) = hmf;
   slider(12) = lmg;  slider(13) = lmf;  slider(14) = lg;  slider(15) = lff;  slider(16) = lb;
-  slider(17) = irn;  slider(18) = dft;
+  slider(17) = irn;  slider(18) = dft;  slider(29) = 0;
+  // Lab: presets start on stereo with the dynamics off
+  slider(19) = slider(20) = slider(21) = slider(22) = 0;
+  slider(23) = 0;  slider(24) = -6;  slider(25) = 0;  slider(26) = -6;
 );
 function load_preset(p) (
   //                TRIM PH HPF  LPF    F  EQ  HF   HFf   HB  HMF  HMFf  LMF  LMFf  LF   LFf  LB IRON DRIFT
@@ -211,7 +296,7 @@ function load_preset(p) (
   p == 10 ? set_pr(0,   0, 250, 4000,  1, 1,  0,   8000, 0,  6,   1800, 0,   700,  0,   100, 0, 1,   5) :   // Telephone
   p == 11 ? set_pr(6,   0, 20,  20000, 1, 0,  0,   8000, 0,  0,   2500, 0,   700,  0,   100, 0, 1,   6) :   // Desk Colour Only
             set_pr(0,   0, 20,  20000, 1, 1,  0,   8000, 0,  0,   2500, 0,   700,  0,   100, 0, 1,   3);     // Reset all to defaults
-  slider_automate(262143);
+  slider_automate(335544319);         // sliders 1 - 26 and 29 (OUTPUT)
   gui_dirty = 1;
 );
 
@@ -248,13 +333,15 @@ XFL.ik = XF_K * (1 + 0.3 * dr * w_il);  XFR.ik = XF_K * (1 + 0.3 * dr * w_ir);
 inpk_disp = max(inpk_disp, inpk);  inpk = 0;
 outpk_disp = max(outpk_disp, outpk);  outpk = 0;
 ol_disp = max(ol_disp, olpk);  olpk = 0;
+hdg_disp = hmf_dg;  ldg_disp = lmf_dg;
 
 @sample
 cr_n <= 0 ? ( control_tick();  cr_n = CR; );
 cr_n -= 1;
 // per-sample glides for the things that switch (polarity, in / out keys, iron, trim)
-trim_s += (t_trim - trim_s) * xs_c;  pol_s += (t_pol - pol_s) * xs_c;
-fin_s += (t_fin - fin_s) * xs_c;  eqin_s += (t_eqin - eqin_s) * xs_c;  xw_s += (t_xw - xw_s) * xs_c;
+trim_s += (t_trim - trim_s) * xs_c;  out_s += (t_out - out_s) * xs_c;  pol_s += (t_pol - pol_s) * xs_c;
+fin_s += (t_fin - fin_s) * xs_c;  fm_s += (t_fm - fm_s) * xs_c;  fs_s += (t_fs - fs_s) * xs_c;  eqin_s += (t_eqin - eqin_s) * xs_c;  xw_s += (t_xw - xw_s) * xs_c;
+by_in();
 xl = spl0;  xr = spl1;
 inpk = max(inpk, max(abs(xl), abs(xr)));
 
@@ -262,28 +349,40 @@ inpk = max(inpk, max(abs(xl), abs(xr)));
 yl = xl;  yr = xr;
 input_stage();
 
-// 2. filters (in / out cross-faded)
+// Lab: to mid / side for the filters and EQ
+ym = (yl + yr) * 0.5;  ys = (yl - yr) * 0.5;
+yl = ym;  yr = ys;
+
+// 2. filters (in / out cross-faded, mid and side apart)
 fl = yl;  fr = yr;
 filters();
-yl += (fl - yl) * fin_s;  yr += (fr - yr) * fin_s;
+yl += (fl - yl) * fm_s;  yr += (fr - yr) * fs_s;
+
+// the dynamic bands listen to the signal coming into the EQ
+hdy_s > 0.0001 ? HMFD.dyn_det(yl, yr, hmf_ms);
+ldy_s > 0.0001 ? LMFD.dyn_det(yl, yr, lmf_ms);
 
 // 3. EQ (in / out cross-faded): the high half, then the low half
 el = yl;  er = yr;
 eq_high();  eq_low();
 yl += (el - yl) * eqin_s;  yr += (er - yr) * eqin_s;
+// back to left / right
+ym = yl;  yl = ym + yr;  yr = ym - yr;
 
 // 4. output transformer, supply wander
 xw_s > 0.00001 ? ( tl = OXL.out_xfmr(yl);  tr = OXR.out_xfmr(yr);  yl += (tl - yl) * xw_s;  yr += (tr - yr) * xw_s; );
 yl *= sup_g;  yr *= sup_g;
+yl *= out_s;  yr *= out_s;                  // Lab: OUTPUT level (glided 10 ms)
 
 outpk = max(outpk, max(abs(yl), abs(yr)));
 spl0 = yl;  spl1 = yr;
+by_out();
 
 @serialize
 file_var(0, pr_cur);
 file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
 
-@gfx 660 760
+@gfx 1020 760
 // version tag (JG, 29 Oct 2026): v1 = Legacy, v2 = Stable, v3 = the next graduation; a small dim tag just after the
 // panel title. ver_tag_at draws it at x with its baseline at yb, fs px high, in col (or the current colour if col < 0),
 // at 55 %; ver_tag puts it after text just drawn (dx, dy: extra offset in that text's heights). Font, colour and
@@ -388,7 +487,7 @@ function lk_key(x, y, w, h, on, c, str) local(hov, hit, k, lens, dn, i, t, dx, d
   );
   col(0xFFFFFF, on ? 0.45 : 0.22);  gfx_rect(px(x + 4 * k), py(y), ps(w - 8 * k), max(1, ps(1.5)));
   hov && !dn ? ( col(0xFFFFFF, 0.07); lk_rr(x, y, w, h - 1 / sc, 4 * k); );
-  gfx_setfont(9);  col(shade(c, on ? 0.30 : 0.17), 1);
+  gfx_setfont(9);  lk_ink >= 0 ? col(lk_ink, 1) : col(shade(c, on ? 0.30 : 0.17), 1);  lk_ink = -1;
   ui_keytext(px(x + w * 0.5), py(y + h * 0.5), str);
   hit;
 );
@@ -529,6 +628,7 @@ function kn(cx, cy, r, idx, vmin, vmax, def, cap, pcol, lbl, fmt)
     fmt == 2 || (fmt == 7 && v > vmin + 0.5) || (fmt == 8 && v < vmax - 5) ? (
       v < 1000 ? sprintf(#kv, "%d Hz", v) : sprintf(#kv, "%.2f kHz", v / 1000); ) :
     fmt == 7 || fmt == 8 ? strcpy(#kv, "OFF") :
+    fmt == 9 ? sprintf(#kv, "%.1f dBFS", v) :
                sprintf(#kv, "%.1f", v);
     gfx_setfont(3);  gfx_measurestr(#kv, w, h);
     ty = y - rr - ps(12) - h;
@@ -551,7 +651,9 @@ function rsp_band(f, kind, fc, db, q) local(a, w, sa) (
   kind == 1 ? a * rsp_mag(w, 1, sa / q, a, a, sa / q, 1) :
               a * rsp_mag(w, a, sa / q, 1, 1, sa / q, a);
 );
-function rsp_db(f) local(m, w, hs, ls, qq) (
+// side: 0 = the stereo curve, 1 = mid, 2 = side (Lab); the dynamic bands drawn where they are now
+function on_side(ms, sd) ( sd == 0 || ms == 0 || ms == sd; );
+function rsp_db(f, sd) local(m, w, hs, ls, qq, g) (
   m = 1;
   filt_in >= 0.5 ? (
     hpf > 20.5 ? ( w = rsp_w(f, hpf);  m *= rsp_mag(w, 1, 0, 0, 1, 1.41421356, 1); );
@@ -559,14 +661,14 @@ function rsp_db(f) local(m, w, hs, ls, qq) (
   );
   eq_in >= 0.5 ? (
     hs = hf_bell >= 0.5 ? 0 : 2;  ls = lf_bell >= 0.5 ? 0 : 1;
-    qq = 0.55 * (1 + 0.09 * abs(hf_g));   m *= rsp_band(f, hs, hf_f, hf_g, hs ? 0.6 : qq);
-    qq = 0.55 * (1 + 0.09 * abs(hmf_g));  m *= rsp_band(f, 0, hmf_f, hmf_g, qq);
-    qq = 0.55 * (1 + 0.09 * abs(lmf_g));  m *= rsp_band(f, 0, lmf_f, lmf_g, qq);
-    qq = 0.55 * (1 + 0.09 * abs(lf_g));   m *= rsp_band(f, ls, lf_f, lf_g, ls ? 0.6 : qq);
+    on_side(hf_ms, sd) ? ( qq = 0.55 * (1 + 0.09 * abs(hf_g));   m *= rsp_band(f, hs, hf_f, hf_g, hs ? 0.6 : qq); );
+    on_side(hmf_ms, sd) ? ( g = hmf_g + u_hdg;  qq = 0.55 * (1 + 0.09 * abs(g));  m *= rsp_band(f, 0, hmf_f, g, qq); );
+    on_side(lmf_ms, sd) ? ( g = lmf_g + u_ldg;  qq = 0.55 * (1 + 0.09 * abs(g));  m *= rsp_band(f, 0, lmf_f, g, qq); );
+    on_side(lf_ms, sd) ? ( qq = 0.55 * (1 + 0.09 * abs(lf_g));   m *= rsp_band(f, ls, lf_f, lf_g, ls ? 0.6 : qq); );
   );
   20 * log10(max(m, 0.000001)) + trim;
 );
-function response(x, y, w, h) local(i, f, d, yy, lx, ly, gx) (
+function response(x, y, w, h) local(i, f, d, yy, lx, ly, gx, sd, n, c1, c2) (
   col(0x8C99A6, 1);  gfx_rect(px(x - 2), py(y - 2), ps(w + 4), ps(h + 4), 1);
   col(0x0B120E, 1);  gfx_rect(px(x), py(y), ps(w), ps(h), 1);
   // grid: 100 Hz, 1 kHz, 10 kHz; +/-6, +/-12 dB
@@ -580,18 +682,29 @@ function response(x, y, w, h) local(i, f, d, yy, lx, ly, gx) (
   gfx_x = px(x + w * (4 - log10(20)) / 3) + ps(3);  gfx_y = py(y + h - 15);  gfx_drawstr("10k");
   gfx_x = px(x + 4);  gfx_y = py(y + 3);  gfx_drawstr("+18");
   gfx_x = px(x + 4);  gfx_y = py(y + h - 15);  gfx_drawstr("-18");
-  // the curve
-  i = 0;
-  loop(161,
-    f = 20 * 10 ^ (3 * i / 160);
-    d = max(-18, min(18, rsp_db(f)));
-    yy = y + h * 0.5 - d * h / 36;
-    lx = x + w * i / 160;
-    i > 0 ? (
-      col(0xF2A41E, 0.25);  gfx_line(px(gx), py(ly) + 1, px(lx), py(yy) + 1, 1);
-      col(0xF2C230, 1);     gfx_line(px(gx), py(ly), px(lx), py(yy), 1);
+  // the curve: one when everything works on stereo, else MID (amber) and SIDE (sky blue)
+  n = hf_ms || hmf_ms || lmf_ms || lf_ms ? 2 : 1;
+  sd = n == 2 ? 2 : 0;
+  loop(n,
+    c1 = sd == 2 ? 0x4F86B8 : 0xF2A41E;  c2 = sd == 2 ? 0x8EC6F0 : 0xF2C230;
+    i = 0;
+    loop(161,
+      f = 20 * 10 ^ (3 * i / 160);
+      d = max(-18, min(18, rsp_db(f, sd)));
+      yy = y + h * 0.5 - d * h / 36;
+      lx = x + w * i / 160;
+      i > 0 ? (
+        col(c1, 0.25);  gfx_line(px(gx), py(ly) + 1, px(lx), py(yy) + 1, 1);
+        col(c2, 1);     gfx_line(px(gx), py(ly), px(lx), py(yy), 1);
+      );
+      gx = lx;  ly = yy;  i += 1;
     );
-    gx = lx;  ly = yy;  i += 1;
+    sd = 1;
+  );
+  n == 2 ? (
+    gfx_setfont(5);
+    col(0xF2C230, 1);  gfx_x = px(x + w - 78);  gfx_y = py(y + 3);  gfx_drawstr("MID");
+    col(0x8EC6F0, 1);  gfx_x = px(x + w - 40);  gfx_y = py(y + 3);  gfx_drawstr("SIDE");
   );
 );
 
@@ -600,10 +713,10 @@ PRESET_MENU = "Init|Vocal: Presence|Vocal: Warm Broadcast|Kick: Thump + Click|Sn
 PB_KEY = 0xD8D4C4;  PB_INK = 0x2A2E2B;
 
 // ---------- frame setup ----------
-sc = min(gfx_w / 660, gfx_h / 760);
-ox = (gfx_w - 660 * sc) * 0.5;
+sc = min(gfx_w / 1020, gfx_h / 760);
+ox = (gfx_w - 1020 * sc) * 0.5;
 oy = (gfx_h - 760 * sc) * 0.5;
-lmb = mouse_cap & 1;
+lmb = mouse_cap & 1;  lk_ink = -1;
 click = lmb && !last_lmb;
 
 gfx_setfont(1, "Verdana", ps(24), 'b');
@@ -626,84 +739,118 @@ ol_disp > 1 ? ol_hold = 8 : ol_hold = max(0, ol_hold - 1);  ol_disp = 0;
 
 // ---------- faceplate ----------
 col(0x2A302C, 1);  gfx_rect(0, 0, gfx_w, gfx_h, 1);
-col(0x343B36, 1);  gfx_rect(px(0), py(0), ps(660), ps(56), 1);
-col(0x1E2320, 1);  gfx_rect(px(0), py(56), ps(660), ps(2), 1);
-col(0x1E2320, 1);  gfx_rect(px(0), py(757), ps(660), ps(3), 1);  gfx_rect(px(657), py(0), ps(3), ps(760), 1);
-rivet(8, 8);  rivet(652, 8);  rivet(8, 752);  rivet(652, 752);
-gfx_setfont(1);  col(0xEDEFE8, 1);  gfx_x = px(24);  gfx_y = py(6);  gfx_drawstr("C2E"); ver_tag("v2", 16, 0, 0);
+col(0x343B36, 1);  gfx_rect(px(0), py(0), ps(1020), ps(56), 1);
+col(0x1E2320, 1);  gfx_rect(px(0), py(56), ps(1020), ps(2), 1);
+col(0x1E2320, 1);  gfx_rect(px(0), py(757), ps(1020), ps(3), 1);  gfx_rect(px(1017), py(0), ps(3), ps(760), 1);
+rivet(8, 8);  rivet(1012, 8);  rivet(8, 752);  rivet(1012, 752);
+gfx_setfont(1);  col(0xEDEFE8, 1);  gfx_x = px(24);  gfx_y = py(6);  gfx_drawstr("C2E"); ver_tag("v3", 16, 0, 0);
 gfx_setfont(5);  col(0xC7BEB3, 1);  gfx_x = px(24);  gfx_y = py(36);  gfx_drawstr("CONSOLE EQUALISER");
-gfx_setfont(4);  col(0xE8782A, 1);  gfx_x = px(616); gfx_y = py(18);  gfx_drawstr("GFX");
+gfx_setfont(4);  col(0xE8782A, 1);  gfx_x = px(976); gfx_y = py(18);  gfx_drawstr("GFX");
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+by_key3(840 + ox / sc, 14 + oy / sc, 28, 7);       // BYPASS: the house key (ox / oy: this panel is centred)
 pb_k = preset_bar(196, 11, 34, 200, pr_cur, PRESET_MENU);
 pb_k > 0 ? ( prs_dirty = pb_k;  pr_cur = pb_k > 11 ? 1 : pb_k; );
 
-// ---------- the module ----------
-MX = 20;  MW = 300;
-col(0x46524A, 1);  gfx_rect(px(MX), py(66), ps(MW), ps(684), 1);
-col(0x2E3631, 1);  gfx_rect(px(MX), py(747), ps(MW), ps(3), 1);  gfx_rect(px(MX + MW - 3), py(66), ps(3), ps(684), 1);
-col(0x56645A, 1);  gfx_rect(px(MX), py(66), ps(MW - 3), ps(1), 1);
-rivet(MX + 10, 76);  rivet(MX + MW - 10, 76);  rivet(MX + 10, 740);  rivet(MX + MW - 10, 740);
-function divider(y) ( col(0x2E3631, 1);  gfx_rect(px(MX + 10), py(y), ps(MW - 20), ps(1.5), 1);  col(0x56645A, 1);  gfx_rect(px(MX + 10), py(y + 1.5), ps(MW - 20), ps(1), 1); );
-function rowname(y, s) ( gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(MX + 14);  gfx_y = py(y);  gfx_drawstr(s); );
-
-// INPUT: O/L, TRIM, PH
-rowname(84, "INPUT");
-led(MX + 30, 128, ol_hold > 0);  gfx_setfont(5);  col(0xEDEFE8, 0.8);  text_c(px(MX + 30), py(146), "O/L");
+// ---------- top section (Lab): INPUT and FILTERS side by side across the whole width ----------
+col(0x46524A, 1);  gfx_rect(px(20), py(66), ps(980), ps(130), 1);
+col(0x2E3631, 1);  gfx_rect(px(20), py(193), ps(980), ps(3), 1);  gfx_rect(px(997), py(66), ps(3), ps(130), 1);
+col(0x56645A, 1);  gfx_rect(px(20), py(66), ps(977), ps(1), 1);
+rivet(30, 76);  rivet(990, 76);  rivet(30, 186);  rivet(990, 186);
+col(0x2E3631, 1);  gfx_rect(px(509), py(78), ps(1.5), ps(106), 1);  col(0x56645A, 1);  gfx_rect(px(510.5), py(78), ps(1), ps(106), 1);
+gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(44);  gfx_y = py(82);  gfx_drawstr("INPUT");
+led(110, 132, ol_hold > 0);  gfx_setfont(5);  col(0xEDEFE8, 0.8);  text_c(px(110), py(150), "O/L");
 strcpy(#klo, "-20");  strcpy(#khi, "+20");
-kn(MX + 150, 124, 24, 1, -20, 20, 0, 0xEEEFEA, 0x1E1F1E, "TRIM", 1);
-lk_key(MX + 236, 108, 50, 34, phase >= 0.5, LK_SKY, "PH") ? ( slider(2) = phase >= 0.5 ? 0 : 1;  param_touched(2); );
-divider(176);
-
-// FILTERS: LPF (yellow), HPF (green), F
-rowname(186, "FILTERS");
+kn(260, 130, 24, 1, -20, 20, 0, 0xEEEFEA, 0x1E1F1E, "TRIM", 1);
+lk_key(380, 113, 54, 34, phase >= 0.5, LK_SKY, "PH") ? ( slider(2) = phase >= 0.5 ? 0 : 1;  param_touched(2); );
+gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(524);  gfx_y = py(82);  gfx_drawstr("FILTERS");
 klog = 1;  strcpy(#klo, "OFF");  strcpy(#khi, "400");
-kn(MX + 62, 236, 22, 3, 20, 400, 20, 0x3E8E4E, 0xF4F2EA, "HPF", 7);
+kn(640, 130, 22, 3, 20, 400, 20, 0x3E8E4E, 0xF4F2EA, "HPF", 7);
 klog = 1;  strcpy(#klo, "2k5");  strcpy(#khi, "OFF");
-kn(MX + 172, 236, 22, 4, 2500, 20000, 20000, 0xE8C43A, 0x1E1F1E, "LPF", 8);
-lk_key(MX + 236, 220, 50, 34, filt_in >= 0.5, LK_AMB, "F") ? ( slider(5) = filt_in >= 0.5 ? 0 : 1;  param_touched(5); );
-divider(290);
+kn(770, 130, 22, 4, 2500, 20000, 20000, 0xE8C43A, 0x1E1F1E, "LPF", 8);
+lk_key(880, 113, 54, 34, filt_in >= 0.5, LK_AMB, "F") ? ( slider(5) = filt_in >= 0.5 ? 0 : 1;  param_touched(5); );
 
-// EQ: four bands, gain (cream) beside frequency (the original's cap colours)
-rowname(300, "EQUALISER");
-lk_key(MX + 236, 296, 50, 30, eq_in >= 0.5, LK_AMB, "EQ") ? ( slider(6) = eq_in >= 0.5 ? 0 : 1;  param_touched(6); );
+// ---------- the EQ module ----------
+MX = 20;  MW = 660;  MY = 206;
+col(0x46524A, 1);  gfx_rect(px(MX), py(MY), ps(MW), ps(750 - MY), 1);
+col(0x2E3631, 1);  gfx_rect(px(MX), py(747), ps(MW), ps(3), 1);  gfx_rect(px(MX + MW - 3), py(MY), ps(3), ps(750 - MY), 1);
+col(0x56645A, 1);  gfx_rect(px(MX), py(MY), ps(MW - 3), ps(1), 1);
+rivet(MX + 10, MY + 10);  rivet(MX + MW - 10, MY + 10);  rivet(MX + 10, 740);  rivet(MX + MW - 10, 740);
+function rowname(y, s) ( gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(MX + 14);  gfx_y = py(y);  gfx_drawstr(s); );
+// Lab: STEREO / MID / SIDE lamp key - cream (black legend) / amber (black) / blue (white); click = menu
+function ms_box(cx, y, idx) local(v, hit) (
+  v = slider(idx);
+  gfx_setfont(5);  col(0xC7BEB3, 1);  text_c(px(MX + cx), py(y - 29), "M / S");
+  lk_ink = v == 2 ? 0xFFFFFF : 0x111111;
+  hit = lk_key(MX + cx - 42, y - 15, 84, 30, 1, v == 1 ? LK_AMB : v == 2 ? 0x2F74C8 : 0xF4EBCB, v == 1 ? "MID" : v == 2 ? "SIDE" : "STEREO");
+  hit ? (
+    gfx_x = px(MX + cx - 42);  gfx_y = py(y + 19);
+    v = gfx_showmenu(v == 0 ? "!Stereo|Mid|Side" : v == 1 ? "Stereo|!Mid|Side" : "Stereo|Mid|!Side");
+    v > 0 ? ( slider(idx) = v - 1;  param_touched(idx); );
+  );
+);
+// Lab: the dynamic part of a band - DYN key, its amber light, DEPTH (threshold and range in one)
+function dyn_row(y, i_on, i_amt, dg) local(on) (
+  on = slider(i_on) >= 0.5;
+  lk_key(MX + 400, y - 14, 54, 28, on, LK_AMB, "DYN") ? ( slider(i_on) = on ? 0 : 1;  param_touched(i_on); );
+  col(0x140A08, 1);  gfx_circle(px(MX + 427), py(y + 32), ps(6), 1, 1);
+  col(0xFFA020, on ? 0.15 + 0.85 * min(1, abs(dg) / max(0.5, abs(slider(i_amt)))) : 0.12);
+  gfx_circle(px(MX + 427), py(y + 32), ps(4.2), 1, 1);
+  on && abs(dg) > 0.3 ? ( col(0xFFA020, 0.3);  gfx_circle(px(MX + 427), py(y + 32), ps(8), 1, 1); );
+  gfx_setfont(5);  col(0xEDEFE8, 0.75);  text_c(px(MX + 556), py(y - 40), "0");
+  strcpy(#klo, "-15");  strcpy(#khi, "+15");
+  kn(MX + 556, y, 24, i_amt, -15, 15, -6, 0xEEEFEA, 0x1E1F1E, "DEPTH", 1);
+  !on ? ( col(0x46524A, 0.5);  gfx_rect(px(MX + 490), py(y - 48), ps(140), ps(92), 1); );
+);
+
+// EQ: four bands - M / S, gain (cream), frequency (the original's cap colours), then BELL / DYN keys
+gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(MX + 26);  gfx_y = py(MY + 26);  gfx_drawstr("EQUALISER");
+lk_key(MX + MW - 92, MY + 20, 54, 30, eq_in >= 0.5, LK_AMB, "IN") ? ( slider(6) = eq_in >= 0.5 ? 0 : 1;  param_touched(6); );
 function band(y, nm, ig, i_f, fmin, fmax, fdef, cap, pc, lo, hi, ib) (
   gfx_setfont(6);  col(0xEDEFE8, 1);  text_c(px(MX + 34), py(y), nm);
   strcpy(#klo, "-15");  strcpy(#khi, "+15");
-  kn(MX + 100, y, 22, ig, -15, 15, 0, 0xEEEFEA, 0x1E1F1E, "GAIN", 1);
+  kn(MX + 216, y, 22, ig, -15, 15, 0, 0xEEEFEA, 0x1E1F1E, "GAIN", 1);
   klog = 1;  strcpy(#klo, lo);  strcpy(#khi, hi);
-  kn(MX + 190, y, 22, i_f, fmin, fmax, fdef, cap, pc, "FREQ", 2);
+  kn(MX + 338, y, 22, i_f, fmin, fmax, fdef, cap, pc, "FREQ", 2);
   ib > 0 ? (
-    lk_key(MX + 240, y - 14, 46, 28, slider(ib) >= 0.5, LK_SAGE, "BELL") ? ( slider(ib) = slider(ib) >= 0.5 ? 0 : 1;  param_touched(ib); );
+    lk_key(MX + 400, y - 14, 54, 28, slider(ib) >= 0.5, LK_SAGE, "BELL") ? ( slider(ib) = slider(ib) >= 0.5 ? 0 : 1;  param_touched(ib); );
   );
 );
-band(370, "HF",  7,  8,  2700, 16000, 8000, 0xE8C43A, 0x1E1F1E, "2k7", "16k", 9);
-band(466, "HMF", 10, 11, 1100, 6800,  2500, 0x3E8E4E, 0xF4F2EA, "1k1", "6k8", 0);
-band(562, "LMF", 12, 13, 180,  2400,  700,  0x3E8E4E, 0xF4F2EA, "180", "2k4", 0);
-band(658, "LF",  14, 15, 47,   470,   100,  0x1E1F1E, 0xF4F2EA, "47",  "470", 16);
-!eq_in ? ( col(0x2A302C, 0.38);  gfx_rect(px(MX + 4), py(330), ps(MW - 8), ps(370), 1); );
+band(312, "HF",  7,  8,  2700, 16000, 8000, 0xE8C43A, 0x1E1F1E, "2k7", "16k", 9);
+band(420, "HMF", 10, 11, 1100, 6800,  2500, 0x3E8E4E, 0xF4F2EA, "1k1", "6k8", 0);
+band(528, "LMF", 12, 13, 180,  2400,  700,  0x3E8E4E, 0xF4F2EA, "180", "2k4", 0);
+band(636, "LF",  14, 15, 47,   470,   100,  0x1E1F1E, 0xF4F2EA, "47",  "470", 16);
+u_hdg = hdg_disp;  u_ldg = ldg_disp;
+ms_box(116, 312, 19);  ms_box(116, 420, 20);  ms_box(116, 528, 21);  ms_box(116, 636, 22);
+dyn_row(420, 23, 24, u_hdg);
+dyn_row(528, 25, 26, u_ldg);
+!eq_in ? ( col(0x2A302C, 0.38);  gfx_rect(px(MX + 4), py(MY + 52), ps(MW - 8), ps(480), 1); );
 
 // ---------- right strip: response, DRIFT, IRON, meters ----------
-col(0x404B44, 1);  gfx_rect(px(330), py(66), ps(310), ps(684), 1);
-col(0x2E3631, 1);  gfx_rect(px(330), py(747), ps(310), ps(3), 1);  gfx_rect(px(637), py(66), ps(3), ps(684), 1);
-col(0x56645A, 1);  gfx_rect(px(330), py(66), ps(307), ps(1), 1);
-rivet(340, 76);  rivet(630, 76);  rivet(340, 740);  rivet(630, 740);
-gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(344);  gfx_y = py(84);  gfx_drawstr("RESPONSE");
-response(344, 108, 282, 200);
-// DRIFT with its halo
+col(0x404B44, 1);  gfx_rect(px(690), py(MY), ps(310), ps(750 - MY), 1);
+col(0x2E3631, 1);  gfx_rect(px(690), py(747), ps(310), ps(3), 1);  gfx_rect(px(997), py(MY), ps(3), ps(750 - MY), 1);
+col(0x56645A, 1);  gfx_rect(px(690), py(MY), ps(307), ps(1), 1);
+rivet(700, MY + 10);  rivet(990, MY + 10);  rivet(700, 740);  rivet(990, 740);
+gfx_setfont(4);  col(0xEDEFE8, 1);  gfx_x = px(704);  gfx_y = py(MY + 26);  gfx_drawstr("RESPONSE");
+response(704, 256, 282, 176);
+// OUTPUT (Lab), with its "0" at the top
+gfx_setfont(5);  col(0xEDEFE8, 0.75);  text_c(px(760), py(472), "0");
+strcpy(#klo, "-20");  strcpy(#khi, "+20");
+kn(760, 512, 24, 29, -20, 20, 0, 0xEEEFEA, 0x1E1F1E, "OUTPUT", 1);
+// DRIFT with its halo, under OUTPUT
 u_t = drift / 10;
-col(0xE8782A, 0.18);  gfx_arc(px(400), py(380), ps(35), -0.75 * $pi, -0.75 * $pi + u_t * 1.5 * $pi, 1);
-col(0xE8782A, 0.55);  gfx_arc(px(400), py(380), ps(34), -0.75 * $pi, -0.75 * $pi + u_t * 1.5 * $pi, 1);
-kn(400, 380, 24, 18, 0, 10, 3, 0x6E7B70, 0xF4F2EA, "DRIFT", 3);
-gfx_setfont(5);  col(0xC7BEB3, 1);  text_c(px(400), py(436), "SUPPLY + IRON");
+col(0xE8782A, 0.18);  gfx_arc(px(760), py(636), ps(35), -0.75 * $pi, -0.75 * $pi + u_t * 1.5 * $pi, 1);
+col(0xE8782A, 0.55);  gfx_arc(px(760), py(636), ps(34), -0.75 * $pi, -0.75 * $pi + u_t * 1.5 * $pi, 1);
+kn(760, 636, 24, 18, 0, 10, 3, 0x6E7B70, 0xF4F2EA, "DRIFT", 3);
+gfx_setfont(5);  col(0xC7BEB3, 1);  text_c(px(760), py(692), "SUPPLY + IRON");
 // meters: IRON above IN; PEAK above OUT (aligned with the key, as on C2M)
-cs_key(500, 352, 40, 40, iron >= 0.5, LK_ORG, "IRON") ? ( slider(17) = iron >= 0.5 ? 0 : 1;  param_touched(17); );
+cs_key(860, 472, 40, 40, iron >= 0.5, LK_ORG, "IRON") ? ( slider(17) = iron >= 0.5 ? 0 : 1;  param_touched(17); );
 opk_h <= -59.9 ? strcpy(#opk, "-inf") : sprintf(#opk, "%+.1f", opk_h);
-gfx_setfont(5);  gfx_measurestr("PEAK", u_tw, u_th);  col(0xEDEFE8, 1);  gfx_x = px(592) - u_tw * 0.5;  gfx_y = py(352);  gfx_drawstr("PEAK");
-col(0x141815, 1);  gfx_rect(px(570), py(372), ps(44), ps(20), 1);
-col(opk_h > 0 ? 0xE0503A : opk_h > -6 ? 0xE8C060 : 0xEDEFE8, 1);  text_c(px(592), py(382), #opk);
-click && mouse_x >= px(570) && mouse_x < px(614) && mouse_y >= py(372) && mouse_y < py(392) ? opk_h = -60;
-vmeter(512, 414, 290, u_db(in_m),  "IN", -99);
-vmeter(584, 414, 290, u_db(out_m), "OUT", opk_h);
+gfx_setfont(5);  gfx_measurestr("PEAK", u_tw, u_th);  col(0xEDEFE8, 1);  gfx_x = px(952) - u_tw * 0.5;  gfx_y = py(472);  gfx_drawstr("PEAK");
+col(0x141815, 1);  gfx_rect(px(930), py(492), ps(44), ps(20), 1);
+col(opk_h > 0 ? 0xE0503A : opk_h > -6 ? 0xE8C060 : 0xEDEFE8, 1);  text_c(px(952), py(502), #opk);
+click && mouse_x >= px(930) && mouse_x < px(974) && mouse_y >= py(492) && mouse_y < py(512) ? opk_h = -60;
+vmeter(872, 532, 176, u_db(in_m),  "IN", -99);
+vmeter(944, 532, 176, u_db(out_m), "OUT", opk_h);
 
 // ---------- end of frame ----------
 !lmb ? drag_idx = 0;
