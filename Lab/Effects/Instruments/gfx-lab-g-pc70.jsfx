@@ -109,10 +109,11 @@ F_O1 = 18; F_O2 = 19; F_O3 = 20; F_O4 = 21; F_E1 = 22; F_E2 = 23; F_E3 = 24; F_E
 F_MS = 27; F_MC = 31; F_MA = 35; F_MD = 39; F_MWS = 43; F_MWC = 47; F_CLK = 51;
 F_DCO = 64; F_DCF = 65; F_PY = 66; F_ATK = 67; F_PY2 = 68;   // de-click: offset, flag, last two outputs, fade-in
 F_PE = 69; F_HN = 70; F_HL = 71;                              // pitch envelope, hammer / click noise state
-P_MS = 72; P_MC = 88; P_MA = 104; P_MD = 120; P_WS = 136; P_WC = 152;   // 16 partials (piano, organ)
+P_Q = 72; P_MA = 136; P_MD = 152;   // 16 partials (piano, organ): P_Q + 4k = sin / cos state, sin / cos step
+F_PG = 168; F_PN = 169; F_PA = 170;   // partial bank: release gain, partials in use, amplitude (once a block)
 F_KW = 55; F_KL = 56; F_KLP = 57; F_KAP = 58; F_KG = 59; F_KPO = 60; F_KHP = 61; F_KX = 62; F_DT = 63;
 KSB = 117000 + ceil(1.45 * srate); KSL = 4096;   // string / pluck delay lines, one per voice (above the reverb at any rate)
-evq = 4000;                      // MIDI event queue
+evq = 6000;                      // MIDI event queue (clear of the voice blocks, up to 4440)
 cbuf = 8192; cmask = 8191;       // chorus delay line
 PG = 70000;                      // GM voice programs: 46 x 16
 PT = 72000;                      // patches: 90 x 64 (kind, index, chorus, trim, reverb x 3, Mod Rack x 34, group)
@@ -332,29 +333,39 @@ function bell_tick(b, rel) local(k, s_, y) (
   y;
 );
 
-// 16-partial bank (synthetic piano, drawbar organ)
-function pn_set(b, k, f, amp, T) local(w) (
-  w = 2 * $pi * min(f, srate * 0.45) / srate;
-  b[P_MS + k] = 0; b[P_MC + k] = 1; b[P_WS + k] = sin(w); b[P_WC + k] = cos(w);
-  b[P_MA + k] = f < srate * 0.45 ? amp : 0; b[P_MD + k] = T > 0 ? tc(T) : 1;
+// 16-partial bank (synthetic piano, drawbar organ): each partial a rotating pair whose step carries its own
+// decay, so a sample costs one rotation per partial; the release (pedal / damper) is one gain for the voice, and
+// the amplitude bookkeeping (dead partials, the voice's end) runs once a block in pn_norm
+function pn_set(b, k, f, amp, T) local(w, d, q) (
+  k == 0 ? ( b[F_PG] = 1; b[F_PN] = 0; );
+  w = 2 * $pi * min(f, srate * 0.45) / srate; d = T > 0 ? tc(T) : 1;
+  b[P_MA + k] = f < srate * 0.45 ? amp : 0; b[P_MD + k] = d;
+  q = b + P_Q + k * 4; q[0] = 0; q[1] = b[P_MA + k]; q[2] = sin(w) * d; q[3] = cos(w) * d;
+  b[F_PN] = max(b[F_PN], k + 1); b[F_PA] = 1;
 );
-function pn_tick(b, rel) local(k, s_, y) (
-  k = 0; y = 0; pn_amp = 0;
-  loop(16,
-    b[P_MA + k] > 0.00001 ? (
-      s_ = b[P_MS + k] * b[P_WC + k] + b[P_MC + k] * b[P_WS + k];
-      b[P_MC + k] = b[P_MC + k] * b[P_WC + k] - b[P_MS + k] * b[P_WS + k];
-      b[P_MS + k] = s_;
-      b[P_MA + k] *= b[P_MD + k] * rel;
-      y += s_ * b[P_MA + k]; pn_amp += b[P_MA + k];
-    );
+function pn_tick(b, rel) local(q, s_, y, ms, mc) (
+  q = b + P_Q; y = 0;
+  loop(b[F_PN],
+    ms = q[0]; mc = q[1];
+    s_ = ms * q[3] + mc * q[2];
+    q[1] = mc * q[3] - ms * q[2];
+    q[0] = s_; y += s_;
+    q += 4;
+  );
+  rel != 1 ? b[F_PG] *= rel;
+  pn_amp = b[F_PA];
+  y * b[F_PG];
+);
+// once a block: the held organ partials back to their level (rounding drift), dead partials dropped, the amplitude
+function pn_norm(b) local(k, m, g, a, n, q) (
+  g = b[F_PG]; a = 0; n = 0; k = 0;
+  loop(b[F_PN],
+    q = b + P_Q + k * 4; m = sqrt(sqr(q[0]) + sqr(q[1]));
+    b[P_MD + k] === 1 && m > 0 ? ( q[0] *= b[P_MA + k] / m; q[1] *= b[P_MA + k] / m; m = b[P_MA + k]; );
+    m * g > 0.00001 ? ( a += m * g; n = k + 1; ) : ( q[0] = 0; q[1] = 0; );
     k += 1;
   );
-  y;
-);
-// the oscillator pairs drift in amplitude after many cycles: renormalise once a block
-function pn_norm(b) local(k, m) (
-  k = 0; loop(16, m = sqrt(sqr(b[P_MS + k]) + sqr(b[P_MC + k])); m > 0 ? ( b[P_MS + k] /= m; b[P_MC + k] /= m; ); k += 1; );
+  b[F_PN] = n; b[F_PA] = a;
 );
 
 // ---------- voices ----------

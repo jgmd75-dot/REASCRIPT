@@ -71,7 +71,12 @@ desc:Overland [drive] (GFX Lab)
 //
 // PRESETS: 12 (plus Reset), also as the last parameter "Preset" for screen readers (prs_sel, loaded on the audio side).
 //
-// STATUS: Lab (experimental, may change). v0.7.
+// TOP TAMER (v0.8, JG 30 Oct 2026: "fix the aliasing on 1x hot top end ... compression to the high band"): the
+//   top above 2.2 kHz is compressed before the saturation curves once DRIVE would push it into them hard (0.5 ms
+//   attack, 60 ms release, linked). A hot 4.1 kHz tone at 1x: fold-back -41 -> -54 dB; normal programme at the
+//   default DRIVE is untouched (bit for bit), at DRIVE 7 under 1 dB off the 5 - 10 kHz harmonics.
+//
+// STATUS: Lab (experimental, may change). v0.8.
 
 in_pin:left input
 in_pin:right input
@@ -274,24 +279,29 @@ function dk_run(l, r) instance(att, rel, env, hsL, hsR, gd, go, mas, air, apL, a
 );
 
 // coefficient set indices
-C_LC = 0;  C_HS = 1;  C_X1 = 2;  C_X2 = 3;  C_X3 = 4;  C_L3 = 5;  C_SUB = 6;  C_DF = 7;  C_FOG = 8;  C_GR = 9;
+C_LC = 0;  C_HS = 1;  C_X1 = 2;  C_X2 = 3;  C_X3 = 4;  C_L3 = 5;  C_SUB = 6;  C_DF = 7;  C_FOG = 8;  C_GR = 9;  C_TT = 10;
 
 // one channel: LIFT (pre) -> TRANSFER (2H / 4H / 3L, crossfaded) -> TERRAIN grit -> LIFT (post) -> FOG
-function ch_tick(x, sb, hb) instance(s2, s41, s42, s43, s44, s3l, s3h, sgr, env3, subff, subpv, hd, wlp)
-  local(y, y2, y4, y3, b1, r1, b2, r2, b3, b4, lo, hi, gc, sb1, sub, hp, gk, f, dl, ya, yh)
+function ch_tick(x, sb, hb) instance(s2, s41, s42, s43, s44, s3l, s3h, sgr, env3, subff, subpv, hd, wlp, hfh)
+  local(yc, hfl, y, y2, y4, y3, b1, r1, b2, r2, b3, b4, lo, hi, gc, sb1, sub, hp, gk, f, dl, ya, yh)
 (
   y = svc(x, C_LC, sb);                                         // LIFT: trim the mud
+  // TOP TAMER (v0.8, JG 30 Oct 2026: the 1x top end aliased when hot): what feeds the curves above a 2.2 kHz split is
+  // compressed (fast, linked L / R) once it would drive them hard, so a hot top can't fold back; below that it does
+  // nothing. HEAD (clean at every rate) takes the signal as it is
+  hfl = svc(y, C_TT, sb + 44);  hfh = y - hfl;                  // (subtractive: the two sum back exactly)
+  yc = hfl + hfh * hf_g;
   y2 = y4 = y3 = 0;
-  w2 > 0.0005 ? ( y2 = s2.stage(y, dg, st2_b, st2_k, st2_f); );
+  w2 > 0.0005 ? ( y2 = s2.stage(yc, dg, st2_b, st2_k, st2_f); );
   w4 > 0.0005 ? (
-    b1 = svc(svc(y, C_X1, sb + 2), C_X1, sb + 4);  r1 = y - b1;   // subtractive split: the bands sum back exactly
+    b1 = svc(svc(yc, C_X1, sb + 2), C_X1, sb + 4);  r1 = yc - b1;   // subtractive split: the bands sum back exactly
     b2 = svc(svc(r1, C_X2, sb + 6), C_X2, sb + 8);  r2 = r1 - b2;
     b3 = svc(svc(r2, C_X3, sb + 10), C_X3, sb + 12);  b4 = r2 - b3;
     dl = dg * (1 + 0.6 * lsat_s);
     y4 = s41.stage(b1, dl, st41_b, st41_k, st41_f) + s42.stage(b2, dg, 0.04, st42_k, st42_f) + s43.stage(b3, dg, 0.03, st43_k, st43_f) + s44.stage(b4, st44_g, 0.02, st44_k, st44_f);
   );
   w3 > 0.0005 ? (
-    lo = svc(svc(y, C_L3, sb + 14), C_L3, sb + 16);  hi = y - lo;
+    lo = svc(svc(yc, C_L3, sb + 14), C_L3, sb + 16);  hi = yc - lo;
     env3 += (abs(lo) - env3) * (abs(lo) > env3 ? e3_a : e3_r);   // slow, heavy glue on the lows
     gc = 1 / (1 + env3 * dg * 0.9);
     lo = s3l.stage(lo * gc * (1 + drive_s * 0.1), st3l_g, st3l_b, st3l_k, st3l_f);
@@ -334,6 +344,7 @@ sm   = 1 - exp(-1 / (0.02 * srate));                            // 20 ms glides 
 dc_k = 1 - exp(-2 * $pi * 2 / srate);
 aa_on = 1;  clp_aa = 1;                                         // ADAA on every curve (the old 4WD), at every OS setting
 CR = 16;  cr_n = 0;                                             // control rate: the glides and derived values every 16 samples
+hf_ti = 1 / 0.45;  HF_RT = 0.75;  hf_g = 1;                     // TOP TAMER: threshold (into the curve) and slope
 // OS: the distorting section (TRANSFER, HEAD, grit and the output decks, with what sits between them) runs at
 // 1x / 2x / 4x; 1x = the old 4WD (HEAD's own 2x, ADAA everywhere). Everything in it uses fsr, re-worked on a change.
 function ov_rate() (
@@ -347,7 +358,8 @@ function ov_rate() (
   dk_apl = (tan($pi * 4500 / fsr) - 1) / (tan($pi * 4500 / fsr) + 1);
   dk_apr = (tan($pi * 6500 / fsr) - 1) / (tan($pi * 6500 / fsr) + 1);
   dk_slk = 1 - exp(-2 * $pi * 2500 / fsr);
-  tp_k = 1 - exp(-2 * $pi * 6600 / fsr);                        // TAPE off: the gentle top slope
+  tp_k = 1 - exp(-2 * $pi * 6600 / fsr);
+  cs_lp(C_TT, 2200, 0.70710678);  hf_a = 1 - exp(-1 / (0.0005 * fsr));  hf_r = 1 - exp(-1 / (0.06 * fsr));   // TOP TAMER: split, attack, release
   coef_dirty = 1;  coef_hd = 1;  wlp_last = -1;                 // the control tick re-works the rest
   dkR.dk_block(dk_ddb);  dkM.dk_block(dk_ddb);  dkA.dk_block(dk_ddb);
 );
@@ -508,6 +520,10 @@ ok = 0;
 loop(os_f,
   aL = chL.ch_tick(ovuL.os_s(ok), SL, hb_s);
   aR = chR.ch_tick(ovuR.os_s(ok), SR, hb_s);
+  hf_e = max(abs(chL.hfh), abs(chR.hfh));                       // TOP TAMER: linked detector, used from the next sample
+  hf_env += (hf_e > hf_env ? hf_a : hf_r) * (hf_e - hf_env);
+  hf_o = hf_env * dg * hf_ti;
+  hf_g = hf_o > 1 ? 1 / (1 + HF_RT * (hf_o - 1)) : 1;
   // DIFF LOCK: lows to mono
   diff_w > 0.0005 ? (
     dlL = svc(svc(aL, C_DF, SL + 40), C_DF, SL + 42);
