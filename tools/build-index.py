@@ -96,7 +96,7 @@ def main():
         type='effect', category=CAT, desc=f'{sysname} (install this first: every GFX{" Lab" if LAB else ""} plug-in needs them)',
         about=f'The shared engine and panel files (.jsfx-inc) that every GFX{" Lab" if LAB else ""} plug-in imports. Install once.',
         files=[(f, f'Effects/{sysdir}/{f}', False) for f in incs])
-    for f in sorted(t for t in tracked if t.endswith('.lua')):
+    for f in sorted(t for t in tracked if t.endswith('.lua') and not t.startswith('dev/')):
         base = os.path.basename(f)
         head = open(os.path.join(src, f), encoding='utf-8', errors='replace').read(3000)
         m = re.search(r'@description\s+(.+)$', head, re.M)
