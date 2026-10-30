@@ -136,7 +136,7 @@ function update() (
   in_setup(slider1, 1);
   // (the engine runs at 2x: every corner below is given at half its frequency, as the filters work it out at the
   //  host rate)
-  ost_setup(gk_qb, gk_sb, 45, 3750, 0, 1);   // SQUASH / SAG glide per block; output stage: CLIP, always on
+  ost_setup(gk_qb, gk_sb, 45, 3750, -0.3, 1);   // SQUASH / SAG glide per block; output stage: CLIP, always on, -0.3 dBFS ceiling
   pdc_delay = 15;                            // the 2x (half-bands)
   lpL140.lp140_set(70); lpR140.lp140_set(70);
   nL.svf_set(165, 0.9); nR.svf_set(165, 0.9);
@@ -170,7 +170,7 @@ function gr_core(xl, xr) local(low_l, low_r, sig_l, sig_r, dry_low_l, dry_low_r)
   sig_l -= notch_coeff * nL.svf_bp(sig_l);
   sig_r -= notch_coeff * nR.svf_bp(sig_r);
   // Output clipper stage
-  ost_out(sig_l, sig_r);
+  ost_out(sig_l * gr_mk, sig_r * gr_mk);   // the make-up goes in before the clipper, so the -0.3 dBFS ceiling holds
 );
 
 // knob glides (30 ms), so presets and jumps don't step
@@ -179,11 +179,46 @@ gk_g = slider1; gk_b = slider2; gk_t = slider3; gk_s = slider4; gk_m = 10 ^ (sli
 gk_qb = slider5; gk_sb = slider4;
 update();
 
-// amp knob + a big label underneath that shows the value while touched (house style)
-function gx_knob(cx, r, idx, lo, hi, def, ptr, label, fmt) (
-  dy_knob(cx, gx_y, r, idx, lo, hi, def, 0, ptr, "", "");
+// machined flat knob (JG, 30 Oct 2026; as Raum81's ENAMEL cap): a flat machined-silver face on a dark turned skirt, a
+// dark pointer line; no shading, no value arc or highlight ring round it (JG) (pixels)
+function gx_mcap(cx, cy, r, n, col) local(a, ca, sa, k, p0, p1, i) (
+  a = -0.75 * $pi + n * 1.5 * $pi; ca = sin(a); sa = -cos(a);
+  ui_cola(0x000000, 0.3); gfx_circle(cx + 1.5 * sc, cy + 2.5 * sc, r, 1, 1);
+  ui_col(0x2A2B2E); gfx_circle(cx, cy, r, 1, 1);
+  ui_col(0x202124); dy_ring(cx, cy, r * 0.94, -$pi, $pi, 1 * sc); dy_ring(cx, cy, r * 0.86, -$pi, $pi, 1 * sc);   // turned grooves
+  k = r * 0.78;
+  ui_col(col); gfx_circle(cx, cy, k, 1, 1);
+  ui_col(ui_mix(col, 0x000000, 0.35)); gfx_circle(cx, cy, k, 0, 1);
+  p0 = k * 0.2; p1 = k * 0.94;
+  ui_col(0x141416); i = -1;
+  ui_ssline(cx + ca * p0, cy + sa * p0, cx + ca * p1, cy + sa * p1, 2.6 * sc, 1);
+);
+// the knob: drag (Shift = fine), double-click = default, wheel; a big label underneath that shows the value while
+// touched (house style). The dial always reads the parameter itself, so it follows presets and automation.
+function gx_knob(cx, r, idx, lo, hi, def, ptr, label, fmt) local(v, n, dx, dy, hov, did) (
+  did = 1600 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - gx_y * sc; hov = dx * dx + dy * dy <= sqr((r + 5) * sc);
+  pressed && hov && drag_id == 0 ? (
+    time_precise() - dy_lt < 0.35 && dy_lid == idx ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; dy_lt = 0; ) : (
+      drag_id = did; dy_y = mouse_y; dy_lt = time_precise(); dy_lid = idx; dy_n = (v - lo) / (hi - lo);
+    );
+  );
+  drag_id == did ? (
+    dy_n = min(max(dy_n + (dy_y - mouse_y) / (((mouse_cap & 8) ? 1200 : 220) * sc), 0), 1); dy_y = mouse_y;
+    v = lo + dy_n * (hi - lo);
+    slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    n = min(max((v - lo) / (hi - lo) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.025), 0), 1);
+    slider(idx) = lo + n * (hi - lo); ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max((v - lo) / (hi - lo), 0), 1);
+  dy_nums(cx, gx_y, r);
+  gx_mcap(cx * sc, gx_y * sc, r * sc, n, ptr);
+  dy_act = hov || drag_id == did;
+  dy_act ? ( ui_cola(0xFFFFFF, 0.08); gfx_circle(cx * sc, gx_y * sc, (r + 3) * sc, 1, 1); );
   gfx_setfont(2); ui_col(dy_act ? 0xFFFDD0 : dy_ink);
-  dy_act ? sprintf(#gx_lbl, fmt, slider(idx)) : strcpy(#gx_lbl, label);
+  dy_act ? sprintf(#gx_lbl, fmt, v) : strcpy(#gx_lbl, label);
   ui_text(cx * sc, (gx_y + 39) * sc, #gx_lbl);
 );
 
@@ -221,7 +256,9 @@ function gr_load(p) (
 // prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project or recalling its
 // state never reloads a preset over the saved settings.
 function prs_chk() local(k) (
-  prs_dirty > 0 ? (
+  prs_ui_dirty > 0 ? (                                    // the panel loaded it while the audio was idle: just record it
+    k = prs_ui_dirty; prs_ui_dirty = 0; prs_sel = k; slider_automate(prs_sel); prs_last = k;
+  ) : prs_dirty > 0 ? (
     k = prs_dirty; prs_dirty = 0; gr_load(k);
     k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
     prs_last = prs_sel;
@@ -269,7 +306,7 @@ uL.gr_up(in_l); uR.gr_up(in_r);
 gr_core(uL.o0, uR.o0); gr_l0 = ost_l; gr_r0 = ost_r;
 gr_core(uL.o1, uR.o1);
 
-master_g = gk_m * gr_mk;
+master_g = gk_m;
 spl0 = dL.gr_dn(gr_l0, ost_l) * master_g;
 spl1 = dR.gr_dn(gr_r0, ost_r) * master_g;
 
@@ -291,6 +328,25 @@ function ver_tag(s, slot, dx, dy) local(th) (
   th = gfx_texth;
   ver_tag_at(s, slot, gfx_x + (0.3 + dx) * th, gfx_y + (0.8 + dy) * th, 0.5 * th, -1);
 );
+// the panel's copy of gr_load (a function can't be shared by the audio and panel threads)
+function gr_load_ui(p) local(preset) (
+  preset = p;
+    preset == 1 ? ( slider1 = 0; slider2 = 0;   slider3 = 0.5; slider4 = 0.2; slider5 = 0.5; slider6 = 0;  slider7 = 1; );
+    preset == 2 ? ( slider1 = 6; slider2 = 100; slider3 = 0.3; slider4 = 0.4; slider5 = 0.7; slider6 = -2; slider7 = 2; );
+    preset == 3 ? ( slider1 = 9; slider2 = 100; slider3 = 0.8; slider4 = 0.1; slider5 = 0.3; slider6 = -4; slider7 = 1; );
+    preset == 4 ? ( slider1 = 4; slider2 = 0;   slider3 = 0.6; slider4 = 0.5; slider5 = 0.8; slider6 = -1; slider7 = 2; );
+    preset == 5 ? ( slider1 = 0; slider2 = 0;   slider3 = 0.2; slider4 = 0.1; slider5 = 0.3; slider6 = 0;  slider7 = 1; );
+    preset == 6 ? ( slider1 = 3; slider2 = 20;  slider3 = 0.35; slider4 = 0.35; slider5 = 0.6; slider6 = -1; slider7 = 1; );
+    preset == 7 ? ( slider1 = 5; slider2 = 0;   slider3 = 0.5; slider4 = 0.3; slider5 = 0.5; slider6 = -2; slider7 = 1; );
+    preset == 8 ? ( slider1 = 2; slider2 = 30;  slider3 = 0.4; slider4 = 0.15; slider5 = 0.4; slider6 = -1; slider7 = 1; );
+    preset == 9 ? ( slider1 = 6; slider2 = 40;  slider3 = 0.6; slider4 = 0.5; slider5 = 0.7; slider6 = -3; slider7 = 1; );
+    preset == 10 ? ( slider1 = 8; slider2 = 70; slider3 = 0.7; slider4 = 0.3; slider5 = 0.5; slider6 = -4; slider7 = 1; );
+    preset == 11 ? ( slider1 = 1; slider2 = 0;  slider3 = 0.25; slider4 = 0.4; slider5 = 0.8; slider6 = 0; slider7 = 1; );
+    preset == 12 ? ( slider1 = 12; slider2 = 100; slider3 = 1; slider4 = 0.6; slider5 = 0.9; slider6 = -8; slider7 = 1; );
+    preset > 0 ? slider_automate(127);   // sliders 1-7
+
+);
+
 prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
 ui_begin(620, 252);
 
@@ -300,7 +356,11 @@ gfx_gradrect(0, 0, gfx_w, gfx_h, 0.62, 0.22, 0.08, 0.16, 0, 0, 0, 0, 0.14 / gfx_
 // --- Header: logo + name, preset bar [PRESETS][<][>][LCD], S/M/L/? ---
 ui_header("GRUNT"); ver_tag("v3", 16, 0, 0);
 k_ = pk_preset(134 * sc, 7 * sc, 396 * sc, 30 * sc, pr_cur, "Default|Warm Console|American Crunch|British Punch|Clean Warmth|Tape Push|Bass DI Grit|Vocal Edge|Drum Bus Crunch|Fuzzy Keys|Subtle Glue|Full Grunt");
-k_ > 0 ? ( prs_dirty = k_; pr_cur = k_; );
+k_ > 0 ? ( prs_dirty = k_; pr_cur = k_; gx_pt = time_precise(); );
+// the audio side loads a preset at its next block; when no audio is running (REAPER idle, the project in a background
+// tab) the dials stayed put, so after 0.2 s the panel sets the values itself (as if each dial were turned) and hands
+// the preset number to the audio side to record
+prs_dirty > 0 && time_precise() - gx_pt > 0.2 ? ( k_ = prs_dirty; prs_dirty = 0; gr_load_ui(k_); prs_ui_dirty = k_; );
 // Size picker & help (no theme picker - this panel's "Waka" skin is fixed)
 // ui_begin() already clamps sc to the picked Size preset (never scales past it, only down
 // to fit a smaller window), so the panel content stops growing once the host window is
@@ -310,17 +370,18 @@ ui_size_picker(546 * sc, 15 * sc);
 // --- Recessed amp control strip: six matching amp knobs + the output meter ---
 pk_inset(26 * sc, 64 * sc, 568 * sc, 162 * sc, 0x2F1A0F);
 gfx_gradrect(26 * sc, 140 * sc, 568 * sc, 86 * sc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.12 / (86 * sc));   // shade towards the bottom
-dy_ink = 0xF6E6D4; dy_numc = 0xE6CDB4; dy_kst = 35; dy_num = 1; dy_bg = 0x2F1A0F;   // house white satin caps (value arc in the knob colour)
+dy_ink = 0xF6E6D4; dy_numc = 0xE6CDB4; dy_bg = 0x2F1A0F;   // machined flat knobs
 gx_y = 146;
 // printed section brackets over the knob pairs
 gfx_setfont(5);
 gx_box( 37, "PREAMP"); gx_box(197, "CHARACTER"); gx_box(357, "OUTPUT");
-gx_knob(70, 24, 1, -24, 12, 0,   0xFFFDD0, "GAIN",   "%+.1f dB");
-gx_knob(150, 17, 2, 0, 100, 0,    0xD8B040, "BOOST",  "%.0f%%");
-gx_knob(230, 24, 3, 0, 1, 0.5,    0xFFFDD0, "GRUNT",  "%.2f");
-gx_knob(310, 24, 4, 0, 1, 0.2,    0xFFFDD0, "SAG",    "%.2f");
-gx_knob(390, 24, 5, 0, 1, 0.5,    0xFFFDD0, "SQUASH", "%.2f");
-gx_knob(470, 24, 6, -24, 12, 0,   0xFFFDD0, "MASTER", "%+.1f dB");
+// cap colours by section (JG, 30 Oct 2026): pastel orange PREAMP, pastel green CHARACTER, pastel blue OUTPUT
+gx_knob(70, 24, 1, -24, 12, 0,   0xF4B886, "GAIN",   "%+.1f dB");
+gx_knob(150, 17, 2, 0, 100, 0,    0xF4B886, "BOOST",  "%.0f%%");
+gx_knob(230, 24, 3, 0, 1, 0.5,    0xA6D8A2, "GRUNT",  "%.2f");
+gx_knob(310, 24, 4, 0, 1, 0.2,    0xA6D8A2, "SAG",    "%.2f");
+gx_knob(390, 24, 5, 0, 1, 0.5,    0x9CC8EE, "SQUASH", "%.2f");
+gx_knob(470, 24, 6, -24, 12, 0,   0x9CC8EE, "MASTER", "%+.1f dB");
 
 // stereo output meter tucked into the right end of the strip (L | R, bottom to top)
 ui_screen(518 * sc, 76 * sc, 64 * sc, 128 * sc);
