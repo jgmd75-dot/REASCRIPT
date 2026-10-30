@@ -1,0 +1,751 @@
+desc:Overland [drive] (GFX Lab)
+//tags: saturation drive tape stereo
+//author: JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-lab-output, gfx-lab-ui, gfx-lab-panel, gfx-lab-clip, gfx-lab-os, gfx-lab-bypass (.jsfx-inc) in the same folder.
+//
+// Overland — a go-anywhere drive and weight processor. Mood: an 80s Japanese 4WD
+// camper van (two-tone paint, triple pinstripe, slanted decals). Brand names of
+// any reference vehicle stay out of the panel and the FX list.
+//
+// DRIVE runs two parallel layers that trade places as it rises:
+//   A  the TRANSFER layer, a wide soft curve (up to +15 dB):
+//      2H  one gentle stage, whole signal (warmth, thickening)
+//      4H  four bands (150 / 1.2k / 5k), each driven on its own, summed
+//      3L  low range for hill climbs: lows driven harder with slow heavy glue and
+//          a little sub-octave, the top driven lightly
+//      (TRANSFER switches crossfade over ~20 ms)
+//   B  HEAD, the GFX Head tape stage: tight-bias tanh at 2x, emphasis / de-
+//      emphasis, head bump, gap loss; as DRIVE rises more of the low end skips
+//      the curve, a high-pass tightens what it saturates and a high shelf opens
+//      the top. Its VOICE follows the livery (warm NORMAL, balanced MEDIUM,
+//      bright BRIGHT).
+//   The blend moves from A towards HEAD as DRIVE rises, and A is driven less as
+//   HEAD takes over: tape density instead of more fuzz. Both are level-matched at
+//   -12 dBFS (DRIVE changes the character, not the loudness).
+//   Warm liveries: the low-pass comes down as DRIVE rises (to ~5 kHz).
+//   Bright liveries: width and a left / right detune grow with DRIVE.
+// LIFT      ground clearance: trims mud below ~150 Hz (pre-drive) and adds a
+//           high shelf at 6 kHz (post-drive)
+// TERRAIN   tarmac to rough track: slow wobble in pitch and level; above half
+//           way, a little grit on the top end's transients
+// DIFF LOCK everything below ~120 Hz to mono
+// FOG       a warm haze: low-pass at 6.5 kHz with a touch of blur
+// LIVERY    the paint has a sound: darker liveries lift the highs less, saturate
+//           the lows more (asymmetric) and narrow slightly; lighter liveries do
+//           the opposite and widen. Changes glide.
+// OUTPUT DECKS (from TRIMD, at 1x): RACK (warm: weighty flat 4:1 limiter, mids into
+//   a knee clipper and back), MASTER (balanced: clean peak clamp, detector ignores
+//   the sub-bass, wide soft knee, faint top rounding), AIR (bright: air into a soft
+//   knee, phase-dispersed tops, side widened above 2.5 kHz as it works). Blended by
+//   the livery's lightness; pushed a little harder with DRIVE. They keep the
+//   wooliness under control.
+// OS (1x / 2x / 4x, the house OS key; v0.4, JG 30 Oct 2026, replacing 4WD / 2WD): the distorting section -
+//   TRANSFER, HEAD, the grit, then DIFF LOCK, width, the TERRAIN delay and the output decks (one section, so one
+//   up / down pair) - runs at the chosen rate. 1x = the old 4WD (HEAD at its own 2x, ADAA on every curve); 2x / 4x
+//   run all of it oversampled (latency +31 / +37 samples, reported). A change dips the output for ~5 ms.
+// Control work (glides, coefficients) runs every 16 samples, so nothing steps with the host's block size
+//   (v0.4: a VOICING change used to click in 256-sample blocks).
+// Output: house output stage, CLIP always on (-0.3 dBFS). Latency: 1.5 ms
+// (TERRAIN's wobble delay, always in the path so it never jumps), plus the OS filters.
+//
+// GUI (v0.3, 30 Oct 2026: JG asked for it "less cartoony, more like a regular plugin"): a forest-green
+//   faceplate in the house manner (Heft), each section on a recessed plate a shade lighter or darker: header
+//   with the OS key, the preset bar and S / M / L / ?; SPECTRUM (24 bands, 40 Hz - 16 kHz, on a dark display with a
+//   100 / 1k / 10k grid) and OUT L / R LED meters (-42 .. 0 dBFS, floating peak, click clears); then
+//   DRIVE (DRIVE + the MODE keys FULL / BANDS / LOW), TONE (CLARITY, MOTION), CHARACTER (MONO BASS,
+//   SOFTEN, the VOICING box - a click opens the list) and OUTPUT. Desk knobs, values on hover only.
+//   The controls are named for what they do (JG): the vehicle names above are the engine's own -
+//   TRANSFER 2H / 4H / 3L = MODE FULL / BANDS / LOW, LIFT = CLARITY, TERRAIN = MOTION (was WOBBLE), DIFF LOCK = MONO
+//   BASS, FOG = SOFTEN, LIVERY = VOICING (Bright & Wide .. Warm & Dense).
+//
+// CPU (v0.5): the curves' constants are worked out once per control tick, and the SPECTRUM analysis runs on
+//   the panel (an FFT of a ring the audio side fills) - about a quarter to a third less CPU, the sound bit for bit.
+//
+// TAPE (v0.6, JG 30 Oct 2026): a small grey square key in OUTPUT. Lit (default) = HEAD's own 2x at 1x, the sound
+//   so far; dark = HEAD's curve at the plain rate (about a quarter less CPU at 1x) with a gentle 6 dB / oct slope
+//   from 6.6 kHz on HEAD to keep the top from turning harsh. Crossfaded (20 ms). At 2x / 4x only the slope changes.
+//
+// BYPASS (v0.7, JG 30 Oct 2026: REAPER's on / off clicked): the house BYPASS key in the header, a 15 ms crossfade to
+//   the input delayed by the latency. After REAPER's own bypass the unit comes back from the input and fades in.
+//
+// PRESETS: 12 (plus Reset), also as the last parameter "Preset" for screen readers (prs_sel, loaded on the audio side).
+//
+// STATUS: Lab (experimental, may change). v0.7.
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-output.jsfx-inc
+import gfx-lab-ui.jsfx-inc
+import gfx-lab-panel.jsfx-inc
+import gfx-lab-clip.jsfx-inc
+import gfx-lab-os.jsfx-inc
+import gfx-lab-bypass.jsfx-inc
+
+slider1:drive=4<0,10,0.1>-Drive
+slider2:lift=3<0,10,0.1>-Clarity (low cut + air)
+slider3:terrain=2<0,10,0.1>-Motion (pitch / level drift, grit)
+slider4:xfer=1<0,2,1{Full,Bands,Low}>-Saturation mode
+slider5:diff=0<0,1,1{Off,On}>-Mono bass
+slider6:fog=0<0,1,1{Off,On}>-Soften
+slider7:out_db=0<-12,12,0.1>-Output (dB)
+slider8:livery=3<0,7,1{Bright & Wide,Bright,Open,Clear,Balanced,Rounded,Warm,Warm & Dense}>-Voicing
+slider9:os_sel=0<0,2,1{1x,2x,4x}>-Oversampling
+slider10:tape=1<0,1,1{Off,On}>-Tape (HEAD's own 2x at 1x)
+slider11:byp=0<0,1,1{Off,On}>-Bypass
+slider12:prs_sel=0<0,12,1{No preset,Init,Gravel Road,Coastal Fog,Hill Climb Bass,Highway Polish,Night Drive,Mountain Pass,Kick in the Mud,Toy Rally,Mix Bus Cruise,Dusty Tape,Off the Map}>-Preset
+
+@init
+#ui_man = "gfx-lab-overland";                   // the ? pop-up links to this manual
+ext_noinit = 1;
+gfx_ext_retina = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; ui_thm = 5; ui_hw = 1; );   // first instance: M, Init on the LCD, fixed faceplate
+ui_dflt = 1;
+ost_init(0);  ostL.ost_ch_init();  ostR.ost_ch_init();
+
+// ---------- memory map ----------
+LV = 0;          // liveries, 6 per entry (0..47)
+vb_m = 400;      // visualiser bars (GUI only)
+VR = 20000;  VRN = 16384;  VFB = 65536;             // visualiser: the output ring (audio side) and the FFT buffer (GUI side)
+CO = 500;        // SVF coefficient sets, 6 each (a1 a2 a3 m0 m1 m2)
+SL = 700;  SR = 800;                               // filter states per channel, 2 per filter
+DSZ = 8192;  DLB = 1000;  DRB = DLB + DSZ;       // TERRAIN delay lines (v0.4: they overlapped by 192 slots, which only showed at 4x)
+
+// liveries: upper, lower, stripe a, stripe b (accent), wheel (unused), decal
+function lv_set(i, up, lo, sa, sb, wh, dc) ( LV[i * 6] = up; LV[i * 6 + 1] = lo; LV[i * 6 + 2] = sa; LV[i * 6 + 3] = sb; LV[i * 6 + 4] = wh; LV[i * 6 + 5] = dc; );
+// liveries in order, brightest -> warmest (the lightness that also sets each one's sound)
+lv_set(0, 0x2FA7B6, 0xD7DBDB, 0x1E2A31, 0x1E2A31, 0x1C1C1C, 0x1E2A31);
+lv_set(1, 0xA7B8A8, 0x9DAE9E, 0x2C3830, 0x55705E, 0x1C1C1C, 0x2C3830);
+lv_set(2, 0xCBA676, 0xBF9A69, 0x5E3F24, 0xE8CDA0, 0x1C1C1C, 0x5E3F24);
+lv_set(3, 0x6F8299, 0xC9CCCB, 0x2C333D, 0xC85A38, 0xDCDCD6, 0x2C333D);
+lv_set(4, 0xE8E3D3, 0x3F5C40, 0x8E3029, 0xE8E3D3, 0xD0D0CA, 0xE8E3D3);
+lv_set(5, 0x222A39, 0xB9AB8C, 0xE0D2AA, 0xB4562E, 0xC8C8C2, 0x222A39);
+lv_set(6, 0x3B2F27, 0x8C6C4F, 0xE09A55, 0xD8BE7A, 0xC8C8C2, 0xE09A55);
+lv_set(7, 0x2F4B37, 0x2A4532, 0xC9A23F, 0xC9A23F, 0x1C1C1C, 0xC9A23F);
+
+// =====================================================================
+// DSP building blocks
+// =====================================================================
+function db2g(d) ( exp(d * 0.11512925464970228); );
+function tg(f) ( tan($pi * min(f, fsr * 0.45) / fsr); );            // fsr = the rate the engine runs at (srate x OS)
+function lv_lum(c) ( (0.3 * floor(c / 65536) + 0.59 * (floor(c / 256) % 256) + 0.11 * (c % 256)) / 255; );
+
+// coefficient sets for a shared-coefficient SVF (Cytomic): y = m0 x + m1 v1 + m2 v2
+function cs_core(i, g, k) local(c) ( c = CO + i * 6;  c[0] = 1 / (1 + g * (g + k));  c[1] = g * c[0];  c[2] = g * c[1]; );
+function cs_lp(i, f, q) local(c) ( cs_core(i, tg(f), 1 / q);  c = CO + i * 6;  c[3] = 0;  c[4] = 0;  c[5] = 1; );
+function cs_hp(i, f, q) local(c) ( cs_core(i, tg(f), 1 / q);  c = CO + i * 6;  c[3] = 1;  c[4] = -1 / q;  c[5] = -1; );
+function cs_ls(i, f, db) local(c, A) ( A = exp(db * 0.05756462732485115);  cs_core(i, tg(f) / sqrt(A), 1.41421356);
+  c = CO + i * 6;  c[3] = 1;  c[4] = 1.41421356 * (A - 1);  c[5] = A * A - 1; );
+function cs_hs(i, f, db) local(c, A) ( A = exp(db * 0.05756462732485115);  cs_core(i, tg(f) * sqrt(A), 1.41421356);
+  c = CO + i * 6;  c[3] = A * A;  c[4] = 1.41421356 * (1 - A) * A;  c[5] = 1 - A * A; );
+// one step: coefficient set i, state at s
+function svc(x, i, s) local(c, v1, v2, v3) (
+  c = CO + i * 6;  v3 = x - s[1];
+  v1 = c[0] * s[0] + c[1] * v3;  v2 = s[1] + c[1] * s[0] + c[2] * v3;
+  s[0] = 2 * v1 - s[0];  s[1] = 2 * v2 - s[1];
+  c[3] * x + c[4] * v1 + c[5] * v2;
+);
+
+// house soft saturator with first-order ADAA (half-sample lag made up)
+function sat_f(x) ( x / (1 + abs(x)); );
+function sat_ad(x) ( abs(x) - log(1 + abs(x)); );
+function adaa(x) instance(xp, Fp, yp) local(F, yc, d, y) (
+  F = sat_ad(x);  yc = sat_f(x);  d = x - xp;
+  abs(d) < 0.00001 ? ( y = sat_f(0.5 * (x + xp)); ) : ( y = (F - Fp) / d; );
+  y += 0.5 * (yc - yp);
+  xp = x;  Fp = F;  yp = yc;  y;
+);
+// a driven, biased stage, level-matched at -12 dBFS (DRIVE adds density, not level):
+// out = (f(g x + b) - f(b)) * ref / (f(g ref + b) - f(b))
+STG_REF = 0.25;
+// (at DRIVE 0 the stage is unity for small signals instead, so it starts transparent)
+// (k = stn(g, b) and fb = sat_f(b) are worked out once per control tick, not per sample)
+function stn(g, b) ( (1 - stg_t) * sqr(1 + b) / g + stg_t * STG_REF / (sat_f(g * STG_REF + b) - sat_f(b)); );
+function stage(x, g, b, k, fb) instance(a) (
+  ((aa_on ? a.adaa(x * g + b) : sat_f(x * g + b)) - fb) * k;
+);
+
+// ---------- RBJ biquads (per instance; fs = the rate the filter runs at) ----------
+function bq_set(type, f, q, gdb, fs) instance(b0, b1, b2, a1, a2) local(w0, cw, sw, al, amp, sa, n) (
+  w0 = 2 * $pi * min(f, fs * 0.45) / fs;  cw = cos(w0);  sw = sin(w0);  al = sw / (2 * q);  amp = 10 ^ (gdb / 40);
+  type == 0 ? ( n = 1 + al;  b0 = (1 - cw) * 0.5 / n;  b1 = (1 - cw) / n;  b2 = b0;  a1 = -2 * cw / n;  a2 = (1 - al) / n; ) :
+  type == 1 ? ( n = 1 + al;  b0 = (1 + cw) * 0.5 / n;  b1 = -(1 + cw) / n;  b2 = b0;  a1 = -2 * cw / n;  a2 = (1 - al) / n; ) :
+  type == 2 ? ( n = 1 + al / amp;  b0 = (1 + al * amp) / n;  b1 = -2 * cw / n;  b2 = (1 - al * amp) / n;  a1 = b1;  a2 = (1 - al / amp) / n; ) :
+  type == 3 ? ( sa = 2 * sqrt(amp) * al;  n = (amp + 1) - (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) + (amp - 1) * cw + sa) / n;  b1 = -2 * amp * ((amp - 1) + (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) + (amp - 1) * cw - sa) / n;  a1 = 2 * ((amp - 1) - (amp + 1) * cw) / n;  a2 = ((amp + 1) - (amp - 1) * cw - sa) / n; ) :
+  ( sa = 2 * sqrt(amp) * al;  n = (amp + 1) + (amp - 1) * cw + sa;                       // 4: low shelf
+    b0 = amp * ((amp + 1) - (amp - 1) * cw + sa) / n;  b1 = 2 * amp * ((amp - 1) - (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) - (amp - 1) * cw - sa) / n;  a1 = -2 * ((amp - 1) + (amp + 1) * cw) / n;  a2 = ((amp + 1) + (amp - 1) * cw - sa) / n; );
+);
+function bq_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;  x2 = x1;  x1 = x;  y2 = y1;  y1 = y;  y;
+);
+
+// ================= HEAD (ported from GFX Head / Headsmoother) =================
+function hd_aa() instance(u1, u2, u3, u4, d1, d2, d3, d4) local(fc, fs2) (
+  fs2 = 2 * srate;  fc = min(0.42 * srate, 20000);
+  u1.bq_set(0, fc, 0.5098, 0, fs2);  u2.bq_set(0, fc, 0.6013, 0, fs2);  u3.bq_set(0, fc, 0.9000, 0, fs2);  u4.bq_set(0, fc, 2.5629, 0, fs2);
+  d1.bq_set(0, fc, 0.5098, 0, fs2);  d2.bq_set(0, fc, 0.6013, 0, fs2);  d3.bq_set(0, fc, 0.9000, 0, fs2);  d4.bq_set(0, fc, 2.5629, 0, fs2);
+);
+// voicing + tape EQ, per block. Overland adds: hhp, a high-pass on what is saturated (rises with DRIVE), and hhs,
+// a high shelf after the stage (opens with DRIVE)
+function hd_eq(voice, hpf, hsdb) instance(emp, dem, vpre, vpost, bump, gap, dcb, lop, hhp, hhs) (
+  emp.bq_set(3, 3000, 0.7, 4, fsr);  dem.bq_set(3, 3000, 0.7, -4, fsr);
+  voice == 1 ? ( vpre.bq_set(2, 1400, 0.6, 3.5, fsr);  vpost.bq_set(2, 1400, 0.6, -1.5, fsr); ) :
+  voice == 2 ? ( vpre.bq_set(3, 6000, 0.7, 5, fsr);    vpost.bq_set(3, 6000, 0.7, -2, fsr); ) :
+               ( vpre.bq_set(2, 1000, 0.7, 0, fsr);    vpost.bq_set(2, 1000, 0.7, 0, fsr); );
+  bump.bq_set(2, 70, 0.9, hd_bump, fsr);
+  gap.bq_set(0, voice == 2 ? 21000 : voice == 1 ? 18000 : 16000, 0.55, 0, fsr);
+  dcb.bq_set(1, 10, 0.7, 0, fsr);
+  lop.bq_set(0, 250, 0.6, 0, fsr);
+  hhp.bq_set(1, hpf, 0.7071, 0, fsr);
+  hhs.bq_set(3, 5000, 0.7, hsdb, fsr);
+);
+// tanh with a small fixed bias ("tight bias"), level-matched at -12 dBFS
+function hd_sat(x, b) (                          // (hd_tb = ost_tanh(b), once per control tick)
+  (ost_tanh(hd_g * x + b) - hd_tb) * hd_c;
+);
+// TAPE off (v0.6): the 2x is skipped
+function hd_clr() instance(u1, u2, u3, u4, d1, d2, d3, d4) (
+  u1.x1 = u1.x2 = u1.y1 = u1.y2 = 0;  u2.x1 = u2.x2 = u2.y1 = u2.y2 = 0;  u3.x1 = u3.x2 = u3.y1 = u3.y2 = 0;  u4.x1 = u4.x2 = u4.y1 = u4.y2 = 0;
+  d1.x1 = d1.x2 = d1.y1 = d1.y2 = 0;  d2.x1 = d2.x2 = d2.y1 = d2.y2 = 0;  d3.x1 = d3.x2 = d3.y1 = d3.y2 = 0;  d4.x1 = d4.x2 = d4.y1 = d4.y2 = 0;
+);
+function hd_run(x, b) instance(emp, dem, vpre, vpost, bump, gap, dcb, lop, hhp, hhs, u1, u2, u3, u4, d1, d2, d3, d4, tlp) local(y, z, lo, yt) (
+  lo = lop.bq_run(x) * hd_lb;                      // the part of the lows that skips the curve
+  y = hhp.bq_run(vpre.bq_run(emp.bq_run(x - lo))) * 0.5;
+  os_f == 1 && tp_w > 0.0005 ? (                   // at 1x HEAD runs its own 2x (zero-stuffed up, filter, curve, filter, keep every second)
+    z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(y * 2))));
+    d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b)))));
+    z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(0))));
+    yt = d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b))))) * 2;
+    y = tp_w < 0.9995 ? hd_sat(y, b) * 2 + (yt - hd_sat(y, b) * 2) * tp_w : yt;
+  ) : ( y = hd_sat(y, b) * 2; );                   // 2x / 4x: the OS section already runs at the higher rate (TAPE off at 1x: plain)
+  y = hhs.bq_run(dcb.bq_run(gap.bq_run(bump.bq_run(vpost.bq_run(dem.bq_run(y)) + lo * hd_lg))));
+  // TAPE off: a gentle 6 dB / oct slope from 6.6 kHz takes the edge off (crossfaded; it tracks the signal while TAPE is on)
+  tp_w < 0.9995 ? ( tlp += tp_k * (y - tlp);  y = tlp + (y - tlp) * tp_w; ) : tlp = y;
+  y;
+);
+
+// ================= OUTPUT DECKS (ported from TRIMD: RACK, MASTER, AIR; inside the OS section) =================
+// m: 1 RACK, 3 MASTER, 4 AIR (TRIMD's model numbers)
+// (both channels' filters are set by the same call: JSFX can't pass an instance as an argument)
+function dk_pre(t, f, q, g) ( this.aL.bq_set(t, f, q, g, fsr);  this.aR.bq_set(t, f, q, g, fsr); );
+function dk_post(t, f, q, g) ( this.bL.bq_set(t, f, q, g, fsr);  this.bR.bq_set(t, f, q, g, fsr); );
+function dk_model(m) instance(atm, rlm, thr, rat, kh, kw0, kw1, mas, air, trim) (
+  mas = m == 3;  air = m == 4;
+  m == 1 ? ( atm = 3;    rlm = 180; thr = -5; rat = 0.75;  kh = 3; kw0 = 0.3; kw1 = 0.6;
+             this.dk_pre(2, 700, 0.7, 2);    this.dk_post(2, 700, 0.7, -2);    trim = 10 ^ (-2.26 / 20); ) :
+  m == 3 ? ( atm = 0.05; rlm = 300; thr = -2; rat = 0.95;  kh = 6; kw0 = 0.4; kw1 = 0.8;
+             this.dk_pre(4, 60, 0.707, 0);   this.dk_post(3, 12000, 0.707, -0.7); trim = 10 ^ (-2.24 / 20); ) :
+           ( atm = 1.5;  rlm = 150; thr = -5; rat = 0.667; kh = 4; kw0 = 0.3; kw1 = 0.6;
+             this.dk_pre(3, 6000, 0.707, 3); this.dk_post(3, 6000, 0.707, -1.5);  trim = 10 ^ (-2.63 / 20); );
+  this.kL.clp_set(2, 1, 0.93, 0);  this.kR.clp_set(2, 1, 0.93, 0);
+);
+function dk_block(ddb) instance(atm, rlm, att, rel, gd, go, trim, kw0, kw1, dv) (
+  dv = min(max(ddb / 24, 0), 1);
+  att = 1 - exp(-1 / (max(atm, 0.02) * 0.001 * fsr));  rel = 1 - exp(-1 / (rlm * 0.001 * fsr));
+  gd = 10 ^ (ddb / 20);  go = trim * 10 ^ (-0.5 * ddb / 20) * dk_mk;                  // TRIMD: out follows half the drive; dk_mk evens it
+  this.kL.clp_knee(kw0 + (kw1 - kw0) * dv);  this.kR.clp_knee(kw0 + (kw1 - kw0) * dv);
+);
+function dk_gr(e) instance(thr, rat, kh) local(o) (
+  o = 20 * log10(max(e, 0.000000001)) - thr;
+  o <= -kh ? 0 : o >= kh ? rat * o : rat * sqr(o + kh) / (4 * kh);
+);
+function dk_run(l, r) instance(att, rel, env, hsL, hsR, gd, go, mas, air, apL, apR, slp, wk, dv, ol, orr) local(pl, pr, al, ar, g, y, s, h) (
+  pl = this.aL.bq_run(l * gd);  pr = this.aR.bq_run(r * gd);
+  mas ? ( hsL += dk_hk * (pl - hsL);  hsR += dk_hk * (pr - hsR);  al = abs(pl - hsL);  ar = abs(pr - hsR); )
+      : ( al = abs(pl);  ar = abs(pr); );
+  al = max(al, ar);
+  env += (al > env ? att : rel) * (al - env);
+  g = 10 ^ (-this.dk_gr(env) / 20);
+  ol = this.bL.bq_run(this.kL.clp_run(pl * g)) * go;
+  orr = this.bR.bq_run(this.kR.clp_run(pr * g)) * go;
+  air ? (
+    wk = 0.25 * dv + 0.6 * (1 - g);
+    y = dk_apl * ol + apL;  apL = ol - dk_apl * y;  ol = y;
+    y = dk_apr * orr + apR;  apR = orr - dk_apr * y;  orr = y;
+    s = 0.5 * (ol - orr);  slp += dk_slk * (s - slp);  h = (s - slp) * wk;
+    ol += h;  orr -= h;
+  );
+);
+
+// coefficient set indices
+C_LC = 0;  C_HS = 1;  C_X1 = 2;  C_X2 = 3;  C_X3 = 4;  C_L3 = 5;  C_SUB = 6;  C_DF = 7;  C_FOG = 8;  C_GR = 9;
+
+// one channel: LIFT (pre) -> TRANSFER (2H / 4H / 3L, crossfaded) -> TERRAIN grit -> LIFT (post) -> FOG
+function ch_tick(x, sb, hb) instance(s2, s41, s42, s43, s44, s3l, s3h, sgr, env3, subff, subpv, hd, wlp)
+  local(y, y2, y4, y3, b1, r1, b2, r2, b3, b4, lo, hi, gc, sb1, sub, hp, gk, f, dl, ya, yh)
+(
+  y = svc(x, C_LC, sb);                                         // LIFT: trim the mud
+  y2 = y4 = y3 = 0;
+  w2 > 0.0005 ? ( y2 = s2.stage(y, dg, st2_b, st2_k, st2_f); );
+  w4 > 0.0005 ? (
+    b1 = svc(svc(y, C_X1, sb + 2), C_X1, sb + 4);  r1 = y - b1;   // subtractive split: the bands sum back exactly
+    b2 = svc(svc(r1, C_X2, sb + 6), C_X2, sb + 8);  r2 = r1 - b2;
+    b3 = svc(svc(r2, C_X3, sb + 10), C_X3, sb + 12);  b4 = r2 - b3;
+    dl = dg * (1 + 0.6 * lsat_s);
+    y4 = s41.stage(b1, dl, st41_b, st41_k, st41_f) + s42.stage(b2, dg, 0.04, st42_k, st42_f) + s43.stage(b3, dg, 0.03, st43_k, st43_f) + s44.stage(b4, st44_g, 0.02, st44_k, st44_f);
+  );
+  w3 > 0.0005 ? (
+    lo = svc(svc(y, C_L3, sb + 14), C_L3, sb + 16);  hi = y - lo;
+    env3 += (abs(lo) - env3) * (abs(lo) > env3 ? e3_a : e3_r);   // slow, heavy glue on the lows
+    gc = 1 / (1 + env3 * dg * 0.9);
+    lo = s3l.stage(lo * gc * (1 + drive_s * 0.1), st3l_g, st3l_b, st3l_k, st3l_f);
+    hi = s3h.stage(hi, st3h_g, 0.02, st3h_k, st3h_f);
+    // sub-octave: a flip-flop on the low band's upward zero crossings, shaped by its level, smoothed
+    sb1 = svc(lo, C_SUB, sb + 18);
+    (sb1 > 0 && subpv <= 0) ? subff = -subff;  subff == 0 ? subff = 1;  subpv = sb1;
+    sub = svc(subff * min(1, env3 * 2.5), C_SUB, sb + 20);
+    y3 = lo + hi + sub * sub_amt;
+  );
+  ya = y2 * w2 + y4 * w4 + y3 * w3;
+  yh = hd.hd_run(y, hb);                                         // HEAD, in parallel
+  y = ya + (yh - ya) * hmix;
+  // TERRAIN grit: the top end's transients roughened (only above half way)
+  grit > 0 ? (
+    hp = svc(y, C_GR, sb + 22);  gk = 1 + grit * 5;
+    y = y - hp + (aa_on ? sgr.adaa(hp * gk) : sat_f(hp * gk)) / gk * (1 + grit * 0.6);
+  );
+  y = svc(y, C_HS, sb + 24);                                    // LIFT: the top shelf
+  f = svc(y, C_FOG, sb + 26);  y += (f - y) * fog_w;             // FOG
+  wlp_on ? ( y = wlp.bq_run(y); );                               // warm liveries: the low-pass that comes down with DRIVE
+  y;
+);
+
+function update_targets() local(b) (
+  b = (lv_lum(LV[livery * 6]) + lv_lum(LV[livery * 6 + 1])) * 0.5;    // the paint's lightness, 0 dark .. 1 light
+  b = max(0, min(1, (b - 0.2) / 0.6));
+  hsc_t  = 0.55 + 0.9 * b;          // how much air LIFT adds
+  lsat_t = 1 - b;                   // extra drive + asymmetry in the lows
+  wid_t  = 0.88 + 0.3 * b;          // stereo width
+  drive_t = drive;  lift_t = lift;  terr_t = terrain;
+  xf = floor(xfer + 0.5);  w2t = xf <= 0;  w4t = xf == 1;  w3t = xf >= 2;
+  diff_t = diff;  fog_t = fog;  out_t = db2g(out_db);  os_tf = os_f2n(os_sel);
+  tp_t = tape >= 0.5;
+);
+
+first_run = 1;
+DLY = ceil(0.0015 * srate);                                     // (TERRAIN wobble 0.6 ms + detune 0.25 ms fit inside)                                     // TERRAIN's centre delay = the reported latency
+sm   = 1 - exp(-1 / (0.02 * srate));                            // 20 ms glides (per sample, at the base rate)
+dc_k = 1 - exp(-2 * $pi * 2 / srate);
+aa_on = 1;  clp_aa = 1;                                         // ADAA on every curve (the old 4WD), at every OS setting
+CR = 16;  cr_n = 0;                                             // control rate: the glides and derived values every 16 samples
+// OS: the distorting section (TRANSFER, HEAD, grit and the output decks, with what sits between them) runs at
+// 1x / 2x / 4x; 1x = the old 4WD (HEAD's own 2x, ADAA everywhere). Everything in it uses fsr, re-worked on a change.
+function ov_rate() (
+  fsr = srate * os_f;
+  e3_a = 1 - exp(-1 / (0.010 * fsr));  e3_r = 1 - exp(-1 / (0.30 * fsr));
+  cs_lp(C_X1, 150, 0.70710678);  cs_lp(C_X2, 1200, 0.70710678);  cs_lp(C_X3, 5000, 0.70710678);
+  cs_lp(C_L3, 200, 0.70710678);  cs_lp(C_SUB, 90, 0.7071);  cs_lp(C_DF, 120, 0.70710678);
+  cs_lp(C_FOG, 6500, 0.6);  cs_hp(C_GR, 3000, 0.7071);
+  dkR.dk_model(1);  dkM.dk_model(3);  dkA.dk_model(4);
+  dk_hk = 1 - exp(-2 * $pi * 90 / fsr);                         // MASTER: the side-chain's sub-bass high-pass
+  dk_apl = (tan($pi * 4500 / fsr) - 1) / (tan($pi * 4500 / fsr) + 1);
+  dk_apr = (tan($pi * 6500 / fsr) - 1) / (tan($pi * 6500 / fsr) + 1);
+  dk_slk = 1 - exp(-2 * $pi * 2500 / fsr);
+  tp_k = 1 - exp(-2 * $pi * 6600 / fsr);                        // TAPE off: the gentle top slope
+  coef_dirty = 1;  coef_hd = 1;  wlp_last = -1;                 // the control tick re-works the rest
+  dkR.dk_block(dk_ddb);  dkM.dk_block(dk_ddb);  dkA.dk_block(dk_ddb);
+);
+os_design();
+os_f = os_tf = os_f2n(os_sel);  os_base = DLY;
+os_gsetup();
+ov_rate();
+dw_pos = 0;  wob_t = 0;  wob_v = 0;  wob_tgt = 0;  ph1 = 0;  ph2 = 0;
+chL.hd.hd_aa();  chR.hd.hd_aa();  coef_hd = 1;  hd_lastd = -1;  wlp_last = -1;
+// visualiser: 24 band-pass filters on the output (mono sum)
+NB = 24;
+
+// ---------- control tick ----------
+function ctl() (
+  // control-rate glides (every CR samples, so nothing steps with the host's block size) for what needs new filter coefficients, or the livery's signature
+  kb = 1 - exp(-CR / (0.04 * srate));
+  lift_s += (lift_t - lift_s) * kb;  hsc_s += (hsc_t - hsc_s) * kb;  lsat_s += (lsat_t - lsat_s) * kb;  wid_s += (wid_t - wid_s) * kb;
+  drive_s += (drive_t - drive_s) * kb;  terr_s += (terr_t - terr_s) * kb;
+  (coef_dirty || abs(lift_s - lift_c) > 0.002 || abs(hsc_s - hsc_c) > 0.002) ? (
+    cs_ls(C_LC, 150, -0.8 * lift_s);  cs_hs(C_HS, 6000, 0.5 * lift_s * hsc_s);
+    lift_c = lift_s;  hsc_c = hsc_s;  coef_dirty = 0;
+  );
+  dg = db2g(drive_s * 1.5 * (1 - 0.4 * hmix));                    // layer A: up to +15 dB, less as HEAD takes over
+  stg_t = min(1, drive_s / 4);
+  dn = drive_s / 10;
+  hmix = 0.2 + 0.55 * dn ^ 1.2;                                  // A -> HEAD as DRIVE rises
+  // HEAD: drive, bias, low bypass, bump, its high-pass and high shelf, voice by livery
+  hd_g = 10 ^ (drive_s * 2.2 / 20);
+  hb_s = 0.03 + 0.07 * lsat_s;
+  hd_c = 0.25 / ((ost_tanh(hd_g * 0.125 + hb_s) - ost_tanh(hb_s)) - (ost_tanh(-hd_g * 0.125 + hb_s) - ost_tanh(hb_s)));
+  hd_lb = dn ^ 1.2;
+  hd_lg = sqrt(hd_g * hd_c * (1 - sqr(ost_tanh(hb_s))));
+  hd_bump = 1.5 * (1 - 0.5 * dn);
+  hvoice = lsat_s > 0.64 ? 0 : lsat_s > 0.36 ? 1 : 2;
+  (abs(drive_s - hd_lastd) > 0.01 || hvoice != hd_lastv || coef_hd) ? (
+    chL.hd.hd_eq(hvoice, 20 + 140 * dn ^ 1.5, 4 * dn);  chR.hd.hd_eq(hvoice, 20 + 140 * dn ^ 1.5, 4 * dn);
+    hd_lastd = drive_s;  hd_lastv = hvoice;  coef_hd = 0;
+  );
+  // warm: the low-pass comes down with DRIVE (to ~5 kHz at full warmth and drive)
+  wlp_f = 20000 * 2 ^ (-2 * lsat_s * dn);
+  wlp_on = wlp_f < 19000;
+  wlp_on && abs(wlp_f - wlp_last) > wlp_f * 0.002 ? (
+    chL.wlp.bq_set(0, wlp_f, 0.6, 0, fsr);  chR.wlp.bq_set(0, wlp_f, 0.6, 0, fsr);  wlp_last = wlp_f;
+  );
+  // bright: width and left / right detune grow with DRIVE
+  brt = 1 - lsat_s;
+  wid_d = wid_s * (1 + 0.35 * brt * dn);
+  det_dep = brt * dn * 0.00025 * fsr;                          // up to 0.25 ms antiphase
+  // output decks: drive and the livery blend (warm RACK, balanced MASTER, bright AIR)
+  dk_ddb = 2 + drive_s * 1.0;
+  // make-up: measured (pink-ish averages over liveries and TRANSFER modes) so loudness stays put as DRIVE turns
+  mk_i = min(4.999, dn * 5);  mk_k = floor(mk_i);  mk_f = mk_i - mk_k;
+  mk_a = mk_k == 0 ? 2.0 : mk_k == 1 ? 0.2 : mk_k == 2 ? -0.9 : mk_k == 3 ? -0.95 : -0.6;
+  mk_b = mk_k == 0 ? 0.2 : mk_k == 1 ? -0.9 : mk_k == 2 ? -0.95 : mk_k == 3 ? -0.6 : -0.1;
+  dk_mk = 10 ^ ((mk_a + (mk_b - mk_a) * mk_f) / 20);
+  dkR.dk_block(dk_ddb);  dkM.dk_block(dk_ddb);  dkA.dk_block(dk_ddb);
+  dwR = max(0, min(1, (lsat_s - 0.55) / 0.3));
+  dwA = max(0, min(1, (0.45 - lsat_s) / 0.2));
+  dwM = max(0, 1 - dwR - dwA);
+  sub_amt = drive_s * 0.035;
+  grit = max(0, (terr_s - 5) / 5);
+  // TERRAIN wobble: a smoothed random walk plus a slow sine; depth up to 0.6 ms and 0.5 dB
+  wob_t += CR / srate;
+  wob_t > 0.45 ? ( wob_t = 0;  wob_tgt = rand(2) - 1; );
+  wob_v += (wob_tgt - wob_v) * (1 - exp(-CR / (srate * 0.35)));
+  wob_dep = terr_s / 10 * 0.0006 * fsr;
+  wob_amp = terr_s / 10 * 0.5;
+  // per-tick constants for the curves (were worked out every sample)
+  hd_tb = ost_tanh(hb_s);
+  st2_b = 0.05 + 0.12 * lsat_s;  st2_k = stn(dg, st2_b);  st2_f = sat_f(st2_b);
+  st41_g = dg * (1 + 0.6 * lsat_s);  st41_b = 0.04 + 0.16 * lsat_s;  st41_k = stn(st41_g, st41_b);  st41_f = sat_f(st41_b);
+  st42_k = stn(dg, 0.04);  st42_f = sat_f(0.04);  st43_k = stn(dg, 0.03);  st43_f = sat_f(0.03);
+  st44_g = dg * 0.85;  st44_k = stn(st44_g, 0.02);  st44_f = sat_f(0.02);
+  st3l_g = dg * (1.5 + 0.6 * lsat_s);  st3l_b = 0.08 + 0.18 * lsat_s;  st3l_k = stn(st3l_g, st3l_b);  st3l_f = sat_f(st3l_b);
+  st3h_g = max(1, dg * 0.45);  st3h_k = stn(st3h_g, 0.02);  st3h_f = sat_f(0.02);
+);
+
+pdc_delay = os_base + os_lat(os_f);  by_setup(11);         // the house BYPASS (15 ms crossfade to the input, in time)
+rs_c = 1 / (0.015 * srate);  rs_f = 1;
+PB_N = 12;
+// ---------- presets (OUTPUT evens the loudness; loaded on the audio side only, through prs_chk) ----------
+function load_preset(p) (
+  p == 1 ? ( slider(1) = 4;  slider(2) = 3;  slider(3) = 2;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  slider(7) = 0;  slider(8) = 3; ) :   // Init
+  p == 2 ? ( slider(1) = 5;  slider(2) = 4;  slider(3) = 4;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  slider(7) = -0.5;  slider(8) = 2; ) :   // Gravel Road
+  p == 3 ? ( slider(1) = 3;  slider(2) = 2;  slider(3) = 3;  slider(4) = 0;  slider(5) = 0;  slider(6) = 1;  slider(7) = 0;  slider(8) = 4; ) :   // Coastal Fog
+  p == 4 ? ( slider(1) = 6;  slider(2) = 1;  slider(3) = 1;  slider(4) = 2;  slider(5) = 1;  slider(6) = 0;  slider(7) = 0;  slider(8) = 7; ) :   // Hill Climb Bass
+  p == 5 ? ( slider(1) = 2;  slider(2) = 6;  slider(3) = 0;  slider(4) = 0;  slider(5) = 0;  slider(6) = 0;  slider(7) = 0;  slider(8) = 3; ) :   // Highway Polish
+  p == 6 ? ( slider(1) = 4;  slider(2) = 2;  slider(3) = 5;  slider(4) = 1;  slider(5) = 0;  slider(6) = 1;  slider(7) = 1;  slider(8) = 5; ) :   // Night Drive
+  p == 7 ? ( slider(1) = 7;  slider(2) = 5;  slider(3) = 6;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  slider(7) = -1;  slider(8) = 1; ) :   // Mountain Pass
+  p == 8 ? ( slider(1) = 6;  slider(2) = 3;  slider(3) = 0;  slider(4) = 2;  slider(5) = 1;  slider(6) = 0;  slider(7) = 0;  slider(8) = 6; ) :   // Kick in the Mud
+  p == 9 ? ( slider(1) = 8;  slider(2) = 7;  slider(3) = 7;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  slider(7) = -1;  slider(8) = 0; ) :   // Toy Rally
+  p == 10 ? ( slider(1) = 3;  slider(2) = 3;  slider(3) = 1;  slider(4) = 1;  slider(5) = 1;  slider(6) = 0;  slider(7) = -0.5;  slider(8) = 3; ) :   // Mix Bus Cruise
+  p == 11 ? ( slider(1) = 5;  slider(2) = 1;  slider(3) = 8;  slider(4) = 0;  slider(5) = 0;  slider(6) = 1;  slider(7) = -0.5;  slider(8) = 6; ) :   // Dusty Tape
+  p == 12 ? ( slider(1) = 10;  slider(2) = 4;  slider(3) = 10;  slider(4) = 2;  slider(5) = 0;  slider(6) = 0;  slider(7) = -4.5;  slider(8) = 5; ) :   // Off the Map
+  p == 13 ? ( slider(1) = 4;  slider(2) = 3;  slider(3) = 2;  slider(4) = 1;  slider(5) = 0;  slider(6) = 0;  slider(7) = 0;  slider(8) = 3;  slider(9) = 0;  slider(10) = 1;  slider(11) = 0; ) : 0;   // Reset all to defaults
+  slider_automate(p == PB_N + 1 ? 2047 : 255);   // (Reset also brings OS, TAPE and BYPASS back)
+  prm_dirty = 1;
+);
+// PRESET parameter (JG, 28 Oct 2026: accessibility - a screen reader reaches the presets through REAPER's parameter list).
+// A change of prs_sel (a screen reader, the host, automation) loads that preset (0 = No preset: nothing loaded); the preset bar asks through
+// prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project never reloads a preset over its settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty;  prs_dirty = 0;  load_preset(k);
+    k <= PB_N ? ( prs_sel = k;  slider_automate(prs_sel);  prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(PB_N, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel;  prs_sel > 0 ? ( load_preset(prs_sel);  prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0;  prs_ok = 1; );
+);
+prs_ok = 0;  prs_dirty = 0;
+@slider
+prs_chk();
+update_targets();
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);   // output stage: CLIP, always on
+pdc_bot_ch = 0;  pdc_top_ch = 2;  pdc_delay = os_base + os_lat(os_f);
+first_run ? (
+  drive_s = drive_t;  lift_s = lift_t;  terr_s = terr_t;  hsc_s = hsc_t;  lsat_s = lsat_t;  wid_s = wid_t;
+  w2 = w2t;  w4 = w4t;  w3 = w3t;  diff_w = diff_t;  fog_w = fog_t;  out_s = out_t;  tp_w = tp_t;
+  first_run = 0;  coef_dirty = 1;
+);
+
+@block
+prs_chk();
+// back after REAPER's own bypass (or any gap): the buffers hold stale audio, so @sample clears what it can and comes
+// back from the input, fading the unit in (15 ms) once its latency has passed
+rs_now = time_precise();
+rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) ? rs_req = 1;
+rs_last = rs_now;
+// GUI edits arrive as a flag; targets are rebuilt here, on the audio thread
+prm_dirty ? ( prm_dirty = 0;  update_targets(); );
+// meters / visualiser hand-offs
+pkL_d = max(pkL_d, pkL);  pkL = 0;  pkR_d = max(pkR_d, pkR);  pkR = 0;
+
+@sample
+by_in();
+rs_req ? (
+  rs_req = 0;  rs_f = 0;  rs_wait = pdc_delay;
+  memset(SL, 0, 200);  memset(DLB, 0, DSZ);  memset(DRB, 0, DSZ);  memset(BY_BUF, 0, 2 * BY_N);
+  ovuL.os_clr();  ovuR.os_clr();  ovdL.os_clr();  ovdR.os_clr();
+  chL.hd.hd_clr();  chR.hd.hd_clr();
+);
+w2 += (w2t - w2) * sm;  w4 += (w4t - w4) * sm;  w3 += (w3t - w3) * sm;
+diff_w += (diff_t - diff_w) * sm;  fog_w += (fog_t - fog_w) * sm;  out_s += (out_t - out_s) * sm;
+tp_w <= 0.0005 && tp_t ? ( chL.hd.hd_clr();  chR.hd.hd_clr(); );   // TAPE back on: its 2x starts from silence, faded in
+tp_w += (tp_t - tp_w) * sm;  tp_w < 0.0001 && !tp_t ? tp_w = 0;  tp_w > 0.9999 && tp_t ? tp_w = 1;
+// OS: a change dips the output (5 ms), swaps at the silent point and re-works the rate, then comes back
+os_gate();
+os_chg ? ( ov_rate();  memset(SL, 0, 200);  memset(DLB, 0, DSZ);  memset(DRB, 0, DSZ);  dw_pos = 0;
+           ovuL.os_clr();  ovuR.os_clr();  ovdL.os_clr();  ovdR.os_clr();  cr_n = 0; );
+cr_n <= 0 ? ( cr_n = CR;  ctl(); );
+cr_n -= 1;
+
+// ---------- the OS section: TRANSFER / HEAD / grit, DIFF LOCK, width, TERRAIN, output decks ----------
+ovuL.os_up(spl0);  ovuR.os_up(spl1);
+ok = 0;
+loop(os_f,
+  aL = chL.ch_tick(ovuL.os_s(ok), SL, hb_s);
+  aR = chR.ch_tick(ovuR.os_s(ok), SR, hb_s);
+  // DIFF LOCK: lows to mono
+  diff_w > 0.0005 ? (
+    dlL = svc(svc(aL, C_DF, SL + 40), C_DF, SL + 42);
+    dlR = svc(svc(aR, C_DF, SR + 40), C_DF, SR + 42);
+    dm = (dlL + dlR) * 0.5;
+    aL += (dm - dlL) * diff_w;  aR += (dm - dlR) * diff_w;
+  );
+  // the livery's width
+  mm = (aL + aR) * 0.5;  ss = (aL - aR) * 0.5 * wid_d;  aL = mm + ss;  aR = mm - ss;
+
+  // TERRAIN wobble: modulated delay (centre DLY, always in the path) + level wobble
+  ph1 += 2 * $pi * 0.7 / fsr;  ph1 > 2 * $pi ? ph1 -= 2 * $pi;
+  wm = 0.65 * wob_v + 0.35 * sin(ph1);
+  DLB[dw_pos] = aL;  DRB[dw_pos] = aR;
+  ph2 += 2 * $pi * 0.33 / fsr;  ph2 > 2 * $pi ? ph2 -= 2 * $pi;
+  dts = det_dep * sin(ph2);                                     // bright liveries: antiphase L / R detune
+  rd = DLY * os_f + wob_dep * wm + dts;
+  rp = dw_pos - rd;  rp < 0 ? rp += DSZ;
+  ri = floor(rp);  rf = rp - ri;  rn = ri + 1;  rn >= DSZ ? rn = 0;
+  aL = DLB[ri] + (DLB[rn] - DLB[ri]) * rf;
+  rd = DLY * os_f + wob_dep * wm - dts;
+  rp = dw_pos - rd;  rp < 0 ? rp += DSZ;
+  ri = floor(rp);  rf = rp - ri;  rn = ri + 1;  rn >= DSZ ? rn = 0;
+  aR = DRB[ri] + (DRB[rn] - DRB[ri]) * rf;
+  // output decks (TRIMD RACK / MASTER / AIR), blended by livery
+  dkL = dkR2 = 0;
+  dwR > 0.001 ? ( dkR.dk_run(aL, aR);  dkL += dkR.ol * dwR;  dkR2 += dkR.orr * dwR; );
+  dwM > 0.001 ? ( dkM.dk_run(aL, aR);  dkL += dkM.ol * dwM;  dkR2 += dkM.orr * dwM; );
+  dwA > 0.001 ? ( dkA.dk_run(aL, aR);  dkL += dkA.ol * dwA;  dkR2 += dkA.orr * dwA; );
+  aL = dkL;  aR = dkR2;
+  dw_pos += 1;  dw_pos >= DSZ ? dw_pos = 0;
+  ok == 0 ? ( q0l = aL;  q0r = aR; ) : ok == 1 ? ( q1l = aL;  q1r = aR; ) : ok == 2 ? ( q2l = aL;  q2r = aR; ) : ( q3l = aL;  q3r = aR; );
+  ok += 1;
+);
+aL = ovdL.os_dn(q0l, q1l, q2l, q3l);  aR = ovdR.os_dn(q0r, q1r, q2r, q3r);
+dcL += (aL - dcL) * dc_k;  aL -= dcL;  dcR += (aR - dcR) * dc_k;  aR -= dcR;   // 2 Hz DC blocker (the biased curves left -37 dBFS of DC)
+os_gs = os_g * os_g * (3 - 2 * os_g);                           // the OS swap's dip
+lw = db2g(wob_amp * wm * 0.6);
+
+aL = ostL.ost_band(aL) * out_s * lw * os_gs;
+aR = ostR.ost_band(aR) * out_s * lw * os_gs;
+ost_out(aL, aR);  aL = ost_l;  aR = ost_r;            // house clipper, -0.3 dBFS ceiling
+rs_f < 1 ? (                                          // after a gap: the input until the stale tails have gone, then fade in
+  rs_wait > 0 ? rs_wait -= 1 : rs_f = min(rs_f + rs_c, 1);
+  rs_s = rs_f * rs_f * (3 - 2 * rs_f);
+  aL = by_il + (aL - by_il) * rs_s;  aR = by_ir + (aR - by_ir) * rs_s;
+);
+spl0 = aL;  spl1 = aR;
+by_out();                                             // the house BYPASS (lit = the input, delayed by the latency)
+aL = spl0;  aR = spl1;
+
+pkL = max(pkL, abs(aL));  pkR = max(pkR, abs(aR));
+VR[vr_w] = (aL + aR) * 0.5;  vr_w = (vr_w + 1) & (VRN - 1);     // the visualiser's ring: the panel does the analysis (v0.5: off the audio thread)
+spl0 = aL;  spl1 = aR;
+
+@serialize
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, ui_sz);       // panel size (older projects end before it)
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0;  prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@gfx 960 470
+ui_begin(960, 470);
+// =====================================================================
+// GUI - a regular plug-in faceplate (v0.3): forest green, recessed section plates with an accent rule each (Heft's manner),
+// house desk knobs, cream selector keys, lamp keys, the house preset bar and LED meters.
+// Design space 960 x 470. Knobs: drag (SHIFT = fine), wheel, double-click = default; the
+// value replaces the name while a knob is touched.
+// =====================================================================
+// faceplate: forest (JG, 30 Oct 2026, chosen from graphite / navy / forest / khaki); the section plates a shade either side
+PNL = 0x2F3B34;  INKW = 0xEDEBE4;  INKD = ui_mix(PNL, 0xFFFFFF, 0.5);  ov_lt = 0;
+AMB = 0xE89A3A;  SAGE = 0x9DB88E;  SKY = 0x8EC6F0;  LGRY = 0xC9CBCF;
+PL_LT = ui_mix(PNL, 0xFFFFFF, 0.07);  PL_DK = ui_mix(PNL, 0x000000, 0.25);
+WELL = 0x0E0F11;
+C_INK = INKW;
+sc != ov_fsc ? ( ov_fsc = sc;
+  ov_ft = ui_fitfont(10, 26 * sc);  ov_fk = ui_fitfont(11, 14 * sc);  ov_fs = ui_fitfont(12, 15 * sc);  ov_fm = ui_fitfont(13, 12.5 * sc); );
+gfx_setfont(10, "Trebuchet MS", ov_ft, 'b');        // title
+gfx_setfont(11, "Trebuchet MS", ov_fk, 'b');        // knob names, key legends
+gfx_setfont(12, "Trebuchet MS", ov_fs, 'b');        // section titles, display text
+gfx_setfont(13, "Trebuchet MS", ov_fm, 'b');        // small print (scales, subtitle)
+lk_font = 11;  lk_font2 = 11;  ck_font = 11;
+
+function ov_txt(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function ov_rtxt(rx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = rx * sc - tw; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function ov_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function ov_box(x, y, w, h) ( gfx_rect(x * sc, y * sc, w * sc, h * sc); );
+// a section: a 3 px accent rule with the title under it
+// a section: a recessed plate (a shade lighter or darker than the face; shaded top and left, lit bottom and right),
+// its title at the top with a 3 px accent rule under it
+function ov_sect(x, y, w, h, t, c, lt) (
+  ui_col(lt ? PL_LT : PL_DK); ov_box(x, y, w, h);
+  ui_cola(0x000000, 0.38); ov_box(x, y, w, 2); ov_box(x, y + 2, 2, h - 2);
+  ui_cola(0x000000, 0.14); ov_box(x + 2, y + 2, w - 2, 2); ov_box(x + 2, y + 4, 2, h - 4);
+  ui_cola(0xFFFFFF, ov_lt ? 0.30 : 0.08); ov_box(x + 2, y + h - 1, w - 2, 1); ov_box(x + w - 1, y + 2, 1, h - 3);
+  gfx_setfont(12); ui_col(INKW); ov_txt(x + 10, y + 9, t);
+  ui_col(c); ov_box(x + 10, y + 30, w - 20, 3);
+);
+// a recessed display well (dark, shaded top and left)
+function ov_well(x, y, w, h) (
+  ui_col(0x000000); ov_box(x, y, w, h);
+  ui_col(WELL); ov_box(x + 1, y + 1, w - 2, h - 2);
+  ui_cola(0x000000, 0.45); ov_box(x + 1, y + 1, w - 2, 2); ov_box(x + 1, y + 1, 2, h - 2);
+  ui_cola(0xFFFFFF, 0.06); ov_box(x + 1, y + h - 1, w - 1, 1); ov_box(x + w - 1, y + 1, 1, h - 1);
+);
+// a desk knob: the house ui_knob with its name in the panel's 14 px face
+function ov_knob(cx, cy, r, idx, lo, hi, def, cap, label, fmt) (
+  ui_kdesk = cap;  ui_kdesk_r = r;  ui_kdesk_d = 4;           // five marks: ends, quarters, centre
+  gfx_setfont(2, "Trebuchet MS", ov_fk, 'b');
+  ui_knob(cx * sc, cy * sc, idx, lo, hi, def, 0, label, fmt);
+);
+
+PRESET_MENU = "Init|Gravel Road|Coastal Fog|Hill Climb Bass|Highway Polish|Night Drive|Mountain Pass|Kick in the Mud|Toy Rally|Mix Bus Cruise|Dusty Tape|Off the Map";
+LIVERY_MENU = "Bright & Wide|Bright|Open|Clear|Balanced|Rounded|Warm|Warm & Dense";
+
+// meters / visualiser hand-off (decay per frame)
+// the 24 bands (40 Hz - 16 kHz) from an 8192-point FFT of the output's last 8192 samples; a sine reads its amplitude
+gvw = vr_w;  gi = 0;
+loop(8192, VFB[2 * gi] = VR[(gvw - 8192 + gi) & (VRN - 1)] * (0.5 - 0.5 * cos(2 * $pi * gi / 8192));  VFB[2 * gi + 1] = 0;  gi += 1; );
+fft(VFB, 8192);  fft_permute(VFB, 8192);
+gvi = 0;
+loop(24,
+  gfc = 40 * (400 ^ (gvi / 23));
+  gk0 = max(1, floor(gfc * 0.878 * 8192 / srate + 0.5));  gk1 = max(gk0, floor(gfc * 1.139 * 8192 / srate + 0.5));
+  ge = 0;  gi = gk0;  loop(gk1 - gk0 + 1, ge += sqr(VFB[2 * gi]) + sqr(VFB[2 * gi + 1]);  gi += 1; );
+  vb_m[gvi] = max(sqrt(4 * ge / (0.375 * 8192 * 8192)), vb_m[gvi] * 0.86);
+  gvi += 1;
+);
+mL = max(pkL_d, mL * 0.85); pkL_d = 0; mR = max(pkR_d, mR * 0.85); pkR_d = 0;
+
+// ---------- faceplate and header ----------
+ui_col(0x050506); gfx_rect(0, 0, gfx_w, gfx_h);
+pk_chassis(8 * sc, 4 * sc, 944 * sc, 458 * sc, PNL);
+ui_col(INKW); gfx_circle(40 * sc, 34 * sc, 14 * sc, 1, 1);
+gfx_setfont(4); ui_col(PNL); ui_text(40 * sc, 29 * sc, "GFX");
+gfx_setfont(10); ui_col(INKW); ov_txt(62, 18, "OVERLAND");
+gfx_setfont(13); ui_col(AMB); ov_txt(204, 27, "SATURATION & WEIGHT");
+// the house OS key: 1x (grey) / 2x (amber) / 4x (red), each click cycles
+os_key(380, 21, 9, INKW, 14);
+by_keywh(776, 18, 72, 28, 11, 15);    // the house BYPASS key (lit = bypassed)
+pk_pextra = "Reset all to defaults";   // the house preset bar: PRESETS, prev / next, LCD (click it for the list)
+k_ = pk_preset(414 * sc, 14 * sc, 350 * sc, 36 * sc, pr_cur, PRESET_MENU);
+k_ > 0 ? ( prs_dirty = k_;  pr_cur = k_ > PB_N ? 1 : k_; );   // the audio side loads it (prs_chk)
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d;  prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+ui_size_picker(882 * sc, 23 * sc);
+
+// ---------- SPECTRUM: 24 bands on the output, 40 Hz - 16 kHz ----------
+ov_sect(18, 66, 710, 206, "SPECTRUM", LGRY, 1);
+dx0 = 28; dy0 = 106; dw = 690; dh = 156;
+ov_well(dx0, dy0, dw, dh);
+gx = dx0 + 12; gy = dy0 + 10; gw = dw - 24; gh = dh - 34;      // the picture; the scale prints below it
+bw = gw / 24;
+gi = 0; loop(4, ui_cola(0xFFFFFF, 0.05); ov_box(gx, gy + gh * gi / 4, gw, 1); gi += 1; );
+gfx_setfont(13);
+gi = 0; loop(3,
+  gf = gi == 0 ? 100 : gi == 1 ? 1000 : 10000;
+  gxx = gx + (log(gf / 40) / log(400) * 23 + 0.5) * bw;
+  ui_cola(0xFFFFFF, 0.09); ov_box(gxx, gy, 1, gh);
+  ui_col(0x8C8E94); ov_ctxt(gxx, gy + gh + 12, gi == 0 ? "100" : gi == 1 ? "1k" : "10k");
+  gi += 1; );
+gsv = 0;
+loop(24,
+  db = vb_m[gsv] > 0.00001 ? 8.685889638065035 * log(vb_m[gsv]) : -100;
+  hh = max(2, min(gh, (db + 66) / 66 * gh));
+  gfx_gradrect((gx + gsv * bw + 2) * sc, (gy + gh - hh) * sc, (bw - 4) * sc, hh * sc,
+    0.91, 0.60, 0.23, 0.85, 0, 0, 0, 0, -0.35 / max(1, hh * sc), -0.30 / max(1, hh * sc), -0.12 / max(1, hh * sc), -0.35 / max(1, hh * sc));
+  ui_col(0xF6D9A8); ov_box(gx + gsv * bw + 2, gy + gh - hh, bw - 4, 2);
+  gsv += 1;
+);
+
+// ---------- OUT: L / R LED ladders (-42 .. 0 dBFS, floating peak; click clears) ----------
+ov_sect(736, 66, 206, 206, "OUT", LGRY, 0);
+mx = 812; my = 108; mh = 136;
+mLv.ui_ledm(mx * sc, my * sc, 18 * sc, mh * sc, mL);
+mRv.ui_ledm((mx + 32) * sc, my * sc, 18 * sc, mh * sc, mR);
+gfx_setfont(13); ui_col(INKD);
+gi = 0; loop(5, gd = gi == 0 ? 0 : gi == 1 ? -6 : gi == 2 ? -12 : gi == 3 ? -24 : -42;
+  ov_rtxt(mx - 8, my + mh - ((gd + 42) / 3 + 0.5) * mh / 15, gi == 0 ? "0" : gi == 1 ? "-6" : gi == 2 ? "-12" : gi == 3 ? "-24" : "-42"); gi += 1; );
+ov_ctxt(mx + 9, my + mh + 12, "L");  ov_ctxt(mx + 41, my + mh + 12, "R");
+
+// ---------- DRIVE: DRIVE and the saturation MODE (whole signal / three bands / lows) ----------
+ov_sect(18, 280, 304, 174, "DRIVE", AMB, 0);
+ov_knob(100, 372, 34, 1, 0, 10, 4, AMB, "DRIVE", "%.1f");
+gfx_setfont(13); ui_col(INKD); ov_ctxt(232, 322, "MODE");
+ck_key(196, 334, 72, 26, xfer == 0, "FULL") ? ( slider(4) = 0; ui_auto(4); );
+ck_key(196, 366, 72, 26, xfer == 1, "BANDS") ? ( slider(4) = 1; ui_auto(4); );
+ck_key(196, 398, 72, 26, xfer == 2, "LOW") ? ( slider(4) = 2; ui_auto(4); );
+
+// ---------- TONE: CLARITY (low cut + air) and MOTION (pitch / level drift, grit) ----------
+ov_sect(330, 280, 194, 174, "TONE", SAGE, 1);
+ov_knob(382, 372, 24, 2, 0, 10, 3, 0xD9D5CA, "CLARITY", "%.1f");
+ov_knob(474, 372, 24, 3, 0, 10, 2, 0xD9D5CA, "MOTION", "%.1f");
+
+// ---------- CHARACTER: MONO BASS, SOFTEN and the VOICING ----------
+ov_sect(532, 280, 196, 174, "CHARACTER", SKY, 0);
+lk_key(542, 320, 88, 30, diff >= 0.5, LK_ORA, "MONO BASS") ? ( slider(5) = diff >= 0.5 ? 0 : 1; ui_auto(5); );
+lk_key(638, 320, 80, 30, fog >= 0.5, LK_YEL, "SOFTEN") ? ( slider(6) = fog >= 0.5 ? 0 : 1; ui_auto(6); );
+gfx_setfont(13); ui_col(INKD); ov_ctxt(630, 372, "VOICING");
+lvi = livery | 0;
+lvx = 542; lvy = 382; lvw = 176; lvh = 30;
+lv_hov = mouse_x >= lvx * sc && mouse_x < (lvx + lvw) * sc && mouse_y >= lvy * sc && mouse_y < (lvy + lvh) * sc;
+ui_col(0x000000); ov_box(lvx, lvy, lvw, lvh);
+ui_col(lv_hov ? 0x34302B : 0x2A2622); ov_box(lvx + 1, lvy + 1, lvw - 2, lvh - 2);
+ui_cola(0x000000, 0.35); ov_box(lvx + 1, lvy + 1, lvw - 2, 2); ov_box(lvx + 1, lvy + 1, 2, lvh - 2);
+pk_pitem(LIVERY_MENU, lvi + 1, #lv_nm);
+gfx_setfont(12); ui_col(0xF2E6CC); ov_txt(lvx + 12, lvy + 7, #lv_nm);
+ui_col(0xB8B0A0); gfx_triangle((lvx + lvw - 18) * sc, (lvy + 12) * sc, (lvx + lvw - 8) * sc, (lvy + 12) * sc, (lvx + lvw - 13) * sc, (lvy + 18) * sc);
+pressed && lv_hov && drag_id == 0 ? (
+  drag_id = -1;
+  strcpy(#lv_m, ""); gi = 1;
+  loop(8, gi == lvi + 1 ? strcat(#lv_m, "!"); strcat(#lv_m, pk_pitem(LIVERY_MENU, gi, #lv_t)); gi < 8 ? strcat(#lv_m, "|"); gi += 1; );
+  gfx_x = lvx * sc; gfx_y = (lvy + lvh) * sc; gi = gfx_showmenu(#lv_m);
+  gi > 0 ? ( slider(8) = gi - 1; ui_auto(8); );
+);
+
+// ---------- OUTPUT ----------
+ov_sect(736, 280, 206, 174, "OUTPUT", LGRY, 1);
+ov_knob(852, 372, 28, 7, -12, 12, 0, 0x6C6F76, "OUTPUT", "%+.1f dB");
+// TAPE (v0.6, JG 30 Oct 2026): the small grey square key of the Grey rack's THICK, its red LED to the right, the name under
+// the pair. Lit = HEAD's own 2x at 1x (the sound so far); dark = lighter on CPU, with a gentle slope over the top
+tp_on = tape >= 0.5;
+tkx = 756; tky = 361; tks = 22; tkd = tp_on ? 1.5 : 0;
+tk_hov = mouse_x >= tkx * sc && mouse_x < (tkx + tks) * sc && mouse_y >= tky * sc && mouse_y < (tky + tks) * sc;
+ui_cola(0x000000, 0.5); ov_box(tkx + 1, tky + 2, tks, tks);
+ui_col(0x050505); ov_box(tkx, tky, tks, tks);
+ui_col(tp_on ? 0x8A8C90 : 0x9C9EA2); ov_box(tkx + 2, tky + 2 + tkd, tks - 4, tks - 4 - tkd);
+!tp_on ? ( ui_cola(0xFFFFFF, 0.28); ov_box(tkx + 2, tky + 2, tks - 4, 1); ui_cola(0x000000, 0.28); ov_box(tkx + 2, tky + tks - 4, tks - 4, 2); )
+       : ( ui_cola(0x000000, 0.35); ov_box(tkx + 2, tky + 2 + tkd, tks - 4, 1.5); );
+tk_hov ? ( ui_cola(0xFFFFFF, 0.08); ov_box(tkx + 2, tky + 2 + tkd, tks - 4, tks - 4 - tkd); );
+ui_col(0x000000); gfx_circle((tkx + tks + 12) * sc, (tky + tks * 0.5) * sc, 5.2 * sc, 1, 1);
+ui_col(tp_on ? 0xFF2A1A : 0x4A1410); gfx_circle((tkx + tks + 12) * sc, (tky + tks * 0.5) * sc, 3.8 * sc, 1, 1);
+tp_on ? ( ui_cola(0xFF3A2A, 0.3); gfx_circle((tkx + tks + 12) * sc, (tky + tks * 0.5) * sc, 8 * sc, 1, 1);
+          ui_cola(0xFFFFFF, 0.55); gfx_circle((tkx + tks + 11) * sc, (tky + tks * 0.5 - 1) * sc, 1.2 * sc, 1, 1); );
+gfx_setfont(11); ui_col(INKW); ov_ctxt(tkx + (tks + 17) * 0.5, tky + tks + 14, "TAPE");
+pressed && tk_hov && drag_id == 0 ? ( drag_id = -1; slider(10) = tp_on ? 0 : 1; ui_auto(10); );
+
+gfx_setfont(2, "Trebuchet MS", ui_fs2, 'b');
+// any change made here reaches the engine through a flag; targets are rebuilt in @block, never on the GUI thread
+ov_sum = drive + lift * 3.1 + terrain * 7.3 + xfer * 11.7 + diff * 13.1 + fog * 17.9 + out_db * 19.3 + livery * 23.9 + os_sel * 29.7 + tape * 31.3 + byp * 37.1;
+ov_sum != ov_lsum ? ( prm_dirty = 1;  ov_lsum = ov_sum; );
+pk_end();
+ui_end();
