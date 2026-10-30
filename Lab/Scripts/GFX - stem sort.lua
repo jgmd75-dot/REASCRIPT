@@ -1,5 +1,6 @@
 -- @description GFX - stem sort (a folder of stems to a sorted, coloured session)
--- @author JGWizrad / Garden FX (GFX)
+-- @author GardenFX
+-- by JGWizrad / Garden FX (GFX)
 -- @version 1.1
 -- @changelog
 --   NAMES: a style for the folder names (=BASS=, [BASS], -- BASS -- ... or your own), in capitals or Title case.

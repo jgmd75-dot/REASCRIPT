@@ -1,5 +1,6 @@
 -- GFX G-Deep - export MIDI
--- author: JGWizrad / Garden FX (GFX)
+-- author: GardenFX
+-- by JGWizrad / Garden FX (GFX)
 --
 -- Companion script for the GFX G-Deep 16 drum machine (JSFX).
 -- JSFX plugins cannot write files, so G-Deep's EXPORT MIDI button puts its step pattern into shared memory

@@ -1,5 +1,6 @@
 -- @description GFX ORCHD - pocket-calculator chord generator (was CC-80)
--- @author JGWizrad / Garden FX (GFX)
+-- @author GardenFX
+-- by JGWizrad / Garden FX (GFX)
 -- @version 1.3
 -- @changelog
 --   Renamed ORCHD (was CC-80). Same keys, sound and memory; the calculator says ORCHD.

@@ -1,5 +1,6 @@
 -- GFX - tidy FX names.lua
--- author: JGWizrad / Garden FX (GFX)
+-- author: GardenFX
+-- by JGWizrad / Garden FX (GFX)
 --
 -- Keeps "GFX ..." names in REAPER's FX browser (so the range stays grouped there) but shows tidy names on the
 -- tracks: "GFX Drive81 [preamp]" becomes "Drive81 [preamp]", and the instrument "G" goes too ("GFX G Moon [Arcana
