@@ -1,0 +1,616 @@
+desc:WS9 Comp [comp-limiter] (GFX Lab)
+//tags: compressor limiter stereo bus glue transformer iron saturation broadcast location battery programme dependent release
+//author: GardenFX
+// by JGWizrad / Garden FX (GFX)
+//
+// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel, gfx-lab-os, gfx-lab-bypass, gfx-lab-sidebar
+// (.jsfx-inc) in the same folder.
+//
+// WS9 COMP. A stereo comp-limiter in the spirit of the late-70s British broadcast and location units (a discrete path
+// with a transformer at each end, run from a battery in the field); the sound is designed from scratch. Its iron is
+// part of the compression: the input transformer rounds the peaks before the detector hears them, the output
+// transformer adds weight after the gain reduction, and the battery supply sets how soon both give way.
+//
+// SIGNAL FLOW
+//   input -> [oversampled: INPUT -> IN IRON -> SIDEBAR -> VCA -> OUTPUT -> OUT IRON -> MIX] -> DC blocker -> out.
+//   The detector listens after the SIDEBAR (through the SC HPF); its gain reaches the VCA one sample later.
+//   SIDEBAR    the WS9 series' SIDEBAR, automatic (gfx-lab-sidebar; JGWizrad's design, no controls): the signal is
+//              padded 18 dB, only peaks above a ceiling 14 dB over 0 VU are saturated, and what that adds is lifted back
+//              18 dB and folded into the full-level signal (high-passed at 220 Hz). Below the ceiling it does nothing.
+//              A tired BATTERY brings the ceiling down.
+//
+//   INPUT      -20 .. +20 dB into the unit, and it drives the input iron (JG, 30 Oct 2026, as WS9 Channel: by the golden
+//              ratio, 0.618 of the control's travel - 3 of 10 at 0 dB, 9.2 at +20 dB, clean from -10 dB down).
+//   IN IRON    the input transformer's core: a soft knee that rounds fast peaks (from about +9 dBFS when clean to about
+//              -12 dBFS fully driven) and, below ~150 Hz, flux saturation that adds low even harmonics. Level-matched for
+//              small signals, so driving it shaves peaks: the compressor then sees a rounder signal and grabs it more gently.
+//   THRESHOLD  -30 .. 0 dBFS.   RATIO (stepped) 1.5, 2, 3, 4, 8 : 1 and LIMIT (20 : 1), each with its own knee
+//              (10 dB at 1.5 : 1 down to 1 dB on LIMIT).
+//   ATTACK     0.1 - 30 ms.   RELEASE 50 ms - 2 s.
+//   GRAB       0 - 100 %: how programme-dependent the release is. At 0 one plain release. Turned up, a fast path
+//              catches peaks sooner (attack up to 4x quicker) and lets them go at a quarter of RELEASE, while a slow
+//              path holds the body of the sound and lets go at 2.5x RELEASE: peaks are grabbed and released, the level
+//              underneath stays steady.
+//   SC HPF     (stepped) OFF, 33, 66, 110, 220, 330 Hz, 12 dB/oct, in the detector: lows (or wind and handling noise
+//              on a location track) stop pumping the gain.
+//   LINK       lit = linked stereo (one detector, the louder side wins); dark = dual mono. Switching glides 10 ms.
+//   OUTPUT     -24 .. +18 dB (the makeup), into the output iron, which it drives the same way as INPUT.
+//   OUT IRON   the output transformer: more of the low flux saturation (weight, warmth, 2nd harmonic from a little
+//              asymmetry) and a softer knee (about +9 dBFS clean to about -10 dBFS fully driven), after the gain reduction.
+//   MIX        0 - 100 % (parallel compression; the dry side, after INPUT and OUTPUT, in time and in phase).
+//   SUPPLY     12 - 15 V, the battery. A fresh battery (15 V) gives the most headroom. As it runs down both irons give
+//              way sooner (up to +2.9 dB more drive at 12 V) and the release gets lazier (up to 1.56x longer). The
+//              supply also sags a little on loud passages (more on a tired battery). The readout shows the voltage
+//              the circuit sees, sag and all.
+//   DRIFT      (0 - 100 %, 50 % = standard, 0 = none): the battery slowly running down and recovering (up to 0.5 V at
+//              50 %) and the control voltage wandering (the threshold by a few tenths of a dB).
+//   OS         1x / 2x / 4x (default 1x): both irons, the sidebar, the VCA, OUTPUT and MIX run at that rate (one oversampled
+//              section). Changing it dips the sound for 5 ms and swaps at the silent point.
+//   BYPASS     the house BYPASS key: 15 ms crossfade to the untouched input, delayed by the latency.
+//   The house output stage passes straight through (a mix tool: no clip).
+// GUI: GR needle meter (the house steady backlit glow, dimmed while bypassed), output L / R bars (click to clear).
+// PRESETS    10 (Init + 9) plus Reset all to defaults. A preset sets every control but DRIFT, OS and BYPASS.
+// Latency: 0 / 31 / 37 samples at 1x / 2x / 4x (reported).
+
+slider1:0<0,1,1{Off,On}>-Bypass
+slider2:-12<-30,0,0.1>-Threshold (dBFS)
+slider3:1<0,5,1{1.5:1,2:1,3:1,4:1,8:1,Limit}>-Ratio
+slider4:3<0.1,30,0.01>-Attack (ms)
+slider5:300<50,2000,1>-Release (ms)
+slider6:50<0,100,1>-Grab (%)
+slider7:0<-20,20,0.1>-Input (dB)
+slider8:0<-24,18,0.1>-Output (dB)
+slider9:15<12,15,0.01>-Supply (V)
+slider10:0<0,5,1{Off,33 Hz,66 Hz,110 Hz,220 Hz,330 Hz}>-SC HPF
+slider11:100<0,100,1>-Mix (%)
+slider12:1<0,1,1{Off,On}>-Link
+slider13:50<0,100,1>-Drift (%)
+slider14:0<0,2,1{1x,2x,4x}>-Oversampling
+slider15:prs_sel=0<0,10,1{No preset,Init,Location Dialogue,Drum Bus Glue,Mix Bus Iron,Broadcast Limit,Tired Battery,Parallel Squash,Vocal Ride,Bass Weight,Clean Field}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-input.jsfx-inc
+import gfx-lab-output.jsfx-inc
+import gfx-lab-drift.jsfx-inc
+import gfx-lab-ui.jsfx-inc
+import gfx-lab-panel.jsfx-inc
+import gfx-lab-os.jsfx-inc
+import gfx-lab-bypass.jsfx-inc
+import gfx-lab-sidebar.jsfx-inc
+
+@init
+#ui_man = "gfx-lab-ws9-comp";                               // the ? pop-up links to this manual
+ext_noinit = 1;
+
+function lc_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function lc_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
+function lc_db(d) ( exp(d * 0.11512925464970228); );
+function lc_ratio(i) ( i == 0 ? 1.5 : i == 1 ? 2 : i == 2 ? 3 : i == 3 ? 4 : i == 4 ? 8 : 20; );
+function lc_knee(i) ( i == 0 ? 10 : i == 1 ? 8 : i == 2 ? 6 : i == 3 ? 4 : i == 4 ? 2 : 1; );
+function lc_hpf(i) ( i == 1 ? 33 : i == 2 ? 66 : i == 3 ? 110 : i == 4 ? 220 : 330; );
+
+// the sidechain high-pass (12 dB/oct, RBJ, at the base rate)
+function hp_set(f) instance(b0, b1, b2, a1, a2) local(w, cw, al, n) (
+  w = 2 * $pi * min(f, 0.45 * srate) / srate; cw = cos(w); al = sin(w) / (2 * 0.70710678); n = 1 + al;
+  b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+);
+function hp_run(x) instance(b0, b1, b2, a1, a2, s1, s2) local(y) ( y = b0 * x + s1; s1 = b1 * x - a1 * y + s2; s2 = b2 * x - a2 * y; y; );
+
+// ---------- the iron ----------
+// One transformer core at the running rate (base x os_f). Below the core's corner (a one-pole split, ~150 Hz IN,
+// ~120 Hz OUT) the flux saturates on its own curve, with a small bias for the even harmonics (gl = its drive, b the
+// bias, rb / kb keep it level and DC-free for small signals); then the whole signal meets the core's soft knee (g).
+// Both curves are x / sqrt(1 + x^2): graceful, no hard corner. Level-matched for small signals.
+function ir_sat(x) ( x / sqrt(1 + x * x); );
+function ir_run(u, g, gl, b, rb, kb, kc) instance(lp) local(lo) (
+  lp += (u - lp) * kc;
+  lo = (ir_sat(lp * gl + b) - rb) * kb / gl;
+  ir_sat((u - lp + lo) * g) / g;
+);
+// a block's targets for one iron: d = 0 .. 1 (the knob), hb = the battery's headroom factor
+function ir_tgt(d, kg, kl, kbias, hb) instance(tg, tgl, tb, trb, tkb) (
+  tg = lc_db(kg * d - 9) * hb; tgl = tg * (1 + kl * d); tb = kbias * d;
+  trb = ir_sat(tb); tkb = (1 + tb * tb) ^ 1.5;
+);
+function ir_glide(k) instance(tg, tgl, tb, trb, tkb, g, gl, b, rb, kb) (
+  g += (tg - g) * k; gl += (tgl - gl) * k; b += (tb - b) * k; rb += (trb - rb) * k; kb += (tkb - kb) * k;
+);
+function ir_snap() instance(tg, tgl, tb, trb, tkb, g, gl, b, rb, kb) ( g = tg; gl = tgl; b = tb; rb = trb; kb = tkb; );
+
+// ---------- the gain computer and the GRAB envelope ----------
+function lc_gc(lv) local(ov, k2) (
+  ov = lv - lc_th; k2 = lc_kw * 0.5;
+  -(ov <= -k2 ? 0 : ov >= k2 ? ov * lc_sl : lc_sl * sqr(ov + k2) / (2 * lc_kw));
+);
+// t = the target gain (dB, <= 0). gp = the plain envelope; gf (fast: quicker attack, a quarter of RELEASE) and gs (slow:
+// ten times the attack, 2.5x RELEASE) make the programme-dependent one; GRAB blends from plain to it.
+function lc_env(t) instance(gp, gf, gs) (
+  gp += (t < gp ? lc_ka : lc_kr) * (t - gp);
+  gf += (t < gf ? lc_kaf : lc_krf) * (t - gf);
+  gs += (t < gs ? lc_kas : lc_krs) * (t - gs);
+  gp + lc_gb * (min(gf, gs) - gp);
+);
+
+// one oversampled sample: IN IRON, the sidebar, the VCA (ga / gb), OUTPUT into OUT IRON, and MIX (x = the dry input); L in lc_pl, R in lc_pr
+function lc_os(xl, xr, ga, gb) local(a, b) (
+  a = iaL.ir_run(xl, iIn.g, iIn.gl, iIn.b, iIn.rb, iIn.kb, ir_kci);
+  b = iaR.ir_run(xr, iIn.g, iIn.gl, iIn.b, iIn.rb, iIn.kb, ir_kci);
+  a += shL.sb_run(a); b += shR.sb_run(b);                 // the WS9 sidebar (automatic): the peaks' harmonics folded back in
+  lc_wl = a; lc_wr = b;
+  a = obL.ir_run(a * ga * lc_mks, iOut.g, iOut.gl, iOut.b, iOut.rb, iOut.kb, ir_kco);     // OUTPUT into the output iron
+  b = obR.ir_run(b * gb * lc_mks, iOut.g, iOut.gl, iOut.b, iOut.rb, iOut.kb, ir_kco);
+  lc_pl = xl * lc_mks + lc_mxs * (a - xl * lc_mks); lc_pr = xr * lc_mks + lc_mxs * (b - xr * lc_mks);
+);
+function lc_rcoefs(f) local(w) (
+  w = 2 * $pi / (srate * f); ir_kci = 1 - exp(-150 * w); ir_kco = 1 - exp(-120 * w);
+  sb_rate(srate * f);
+);
+function lc_clear() (
+  uxL.os_clr(); uxR.os_clr(); dnL.os_clr(); dnR.os_clr();
+  iaL.lp = iaR.lp = obL.lp = obR.lp = 0;
+  shL.sb_clr(); shR.sb_clr();
+);
+
+// after REAPER's own bypass (the unit stopped, its buffers stale): clear everything and fade in from the dry input
+function lc_reset() (
+  lc_clear(); memset(BY_BUF, 0, 2 * BY_N);
+  eL.gp = eL.gf = eL.gs = eR.gp = eR.gf = eR.gs = 0; lc_msl = lc_msr = 0;
+  lc_gpl = lc_gnl = lc_gpr = lc_gnr = 1;
+  hL.s1 = hL.s2 = hR.s1 = hR.s2 = 0; lc_dxl = lc_dyl = lc_dxr = lc_dyr = 0;
+  in_dxL = in_dyL = in_dxR = in_dyR = 0; sg_e = 0;
+  lc_fi = 0;
+);
+
+// ---------- presets ----------
+#lc_pm = "Init|Location Dialogue|Drum Bus Glue|Mix Bus Iron|Broadcast Limit|Tired Battery|Parallel Squash|Vocal Ride|Bass Weight|Clean Field";
+function lc_set(th, ra, at, re, gr, ii, oi, v, hp, mx) (
+  slider2 = th; slider3 = ra; slider4 = at; slider5 = re; slider6 = gr; slider7 = ii; slider8 = oi; slider9 = v;
+  slider10 = hp; slider11 = mx; slider12 = 1;
+);
+function load_preset(p) local(i) (
+  //                    thr  rat  att  rel grab  input output supply hpf  mix
+  p == 1  ? lc_set(-12,   1,   3, 300,  50,   0,    0,   15,    0,  100) :     // Init
+  p == 2  ? lc_set(-25,   2,   3, 250,  60,  -3,  7.5,   15,    3,  100) :     // Location Dialogue
+  p == 3  ? lc_set(-17,   1,  10, 200,  70,   3,    0,   14,    2,  100) :     // Drum Bus Glue
+  p == 4  ? lc_set(-16,   0,  30, 400,  50,   0,  1.5,   15,    2,  100) :     // Mix Bus Iron
+  p == 5  ? lc_set( -4,   5, 0.3, 150,  80,   6,   -2,   15,    0,  100) :     // Broadcast Limit
+  p == 6  ? lc_set( -9,   2,   5, 300,  50,   9,   -6,   12.2,  1,  100) :     // Tired Battery
+  p == 7  ? lc_set(-20,   4,   1, 120,  90,  10,    0,   13,    0,   45) :     // Parallel Squash
+  p == 8  ? lc_set(-25,   2,   8, 350,  40,  -3,    8,   15,    3,  100) :     // Vocal Ride
+  p == 9  ? lc_set(-26,   3,  20, 250,  30,  -6,    9,   14,    0,  100) :     // Bass Weight
+  p == 10 ? lc_set(-16,   1,   3, 300,  50,   0,    2,   15,    2,  100) :     // Clean Field
+  p == 11 ? ( lc_set(-12, 1, 3, 300, 50, 0, 0, 15, 0, 100); slider13 = 50; );  // Reset all to defaults
+  i = 2; loop(12, ui_auto(i); i += 1; );
+  pr_cur = p == 11 ? 1 : p;
+);
+
+// ---------- state ----------
+function lc_srinit() (
+  lc_sr = srate;
+  lc_kd = lc_tc(1);                                   // the detector: a 1 ms mean square
+  lc_fst = 1 / (0.01 * srate);
+  c_kn = lc_tc(30); c_lk = lc_tc(10); c_sw = lc_tc(15);
+  sg_k = lc_tc(60);                                   // the supply's sag follows the level over ~60 ms
+  lc_dcc = 1 - 2 * $pi * 1.5 / srate;                 // the DC blocker (the iron's bias): 1.5 Hz, so the lows keep their phase (JG)
+  lc_hpi = -1; lc_fis = 1 / (0.01 * srate);
+  ost_init(0);
+  lc_rcoefs(os_f); lc_clear();
+);
+os_design();
+os_f = os_tf = os_f2n(slider14); os_base = 0;
+lc_srinit();
+os_gsetup();
+in_init();
+dV.drift_init(0.8 + rand(1) * 0.4); dT.drift_init(0.8 + rand(1) * 0.4);
+drift_macro(50);
+lc_snap = 1; lc_fi = 1;
+pdc_delay = os_lat(os_f);
+by_setup(1);
+
+ui_thm = 5; ui_hw = 1;                                // house keycaps for the preset bar and the size picker
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );                // new instances open in Medium, on Init
+ui_dflt = 1;
+
+// PRESET parameter (JG, 28 Oct 2026: accessibility). A change of prs_sel loads that preset (0 = nothing loaded); the
+// preset bar asks through prs_dirty. Both load here, on the audio side only. prs_last is saved, so opening a project
+// never reloads a preset over its settings.
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 10 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(10, prs_sel | 0));
+    prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;   // PRESET parameter: no reload on recall
+
+@block
+prs_chk();
+srate != lc_sr ? lc_srinit();
+lc_now = time_precise();
+lc_tp > 0 && lc_now - lc_tp > max(0.25, 4 * samplesblock / srate) ? lc_reset();   // a gap: REAPER's bypass came off
+lc_tp = lc_now;
+in_setup(0, 0);
+ost_setup(0, 0.3, 120, 6000, -0.3, 0);                // the house output stage: straight through (a mix tool)
+os_tf = os_f2n(slider14); pdc_delay = os_lat(os_f);    // (ost_setup zeroes pdc_delay)
+pdc_bot_ch = 0; pdc_top_ch = 2;                        // (in_pin / out_pin: REAPER carries any other channels round)
+drift_macro(slider13);
+lc_n = samplesblock / srate;
+lc_vv = dV.drift_tick(0.03 * dm_s * lc_n); lc_vt = dT.drift_tick(0.05 * dm_s * lc_n);
+// the battery: the SUPPLY knob, run down by DRIFT (0 .. 0.5 V at 50 %) and sagging on loud passages (more when tired)
+lc_vs = min(max(slider9, 12), 15);
+lc_sag = 0.4 * min(sqrt(sg_e) / 0.5, 1) * (1 + 0.6 * (15 - lc_vs) / 3);
+lc_v = max(lc_vs - 0.25 * dm_a * (0.5 + 0.5 * lc_vv) - lc_sag, 11);
+lc_hb = (15 / lc_v) ^ 1.5; lc_rf = (15 / lc_v) ^ 2;
+// the iron follows INPUT and OUTPUT (JG, 30 Oct 2026, as WS9 Channel): each pushed by the golden ratio's 0.618 of its
+// control's travel - 3 of 10 at 0 dB, 9.2 at +20 dB, clean from -10 dB down
+lc_ind = min(max(slider7, -20), 20); lc_outd = min(max(slider8, -24), 18);
+iIn.ir_tgt(min(max(0.3 + 0.618 * lc_ind / 20, 0), 1), 21, 0.8, 0.1, lc_hb);
+iOut.ir_tgt(min(max(0.3 + 0.618 * lc_outd / 20, 0), 1), 19, 2, 0.25, lc_hb);
+lc_igt = lc_db(lc_ind);
+sb_target(14, 1, 1, 220, lc_hb);                        // the sidebar: fixed (JG: automatic, not on the panel)
+// the compressor
+lc_tht = min(max(slider2, -30), 0) + 0.3 * dm_a * lc_vt;               // the control voltage wanders a little
+lc_ri = floor(min(max(slider3, 0), 5) + 0.5); lc_slt = 1 - 1 / lc_ratio(lc_ri); lc_kwt = lc_knee(lc_ri);
+lc_gb = min(max(slider6, 0), 100) / 100;
+lc_att = min(max(slider4, 0.1), 30); lc_rel = min(max(slider5, 50), 2000) * lc_rf;
+lc_ka = lc_tc(lc_att); lc_kr = lc_tc(lc_rel);
+lc_kaf = lc_tc(lc_att / (1 + 3 * lc_gb)); lc_krf = lc_tc(0.25 * lc_rel);
+lc_kas = lc_tc(10 * lc_att + 20); lc_krs = lc_tc(2.5 * lc_rel);
+lc_hi = floor(min(max(slider10, 0), 5) + 0.5); lc_hon = lc_hi > 0;
+lc_hon && lc_hi != lc_hpi ? ( lc_hpi = lc_hi; hL.hp_set(lc_hpf(lc_hi)); hR.hp_set(lc_hpf(lc_hi)); );
+lc_lkt = slider12 >= 0.5;
+lc_mkt = lc_db(lc_outd);
+lc_mxt = min(max(slider11, 0), 100) / 100;
+lc_snap ? ( lc_ig = lc_igt; lc_th = lc_tht; lc_sl = lc_slt; lc_kw = lc_kwt; lc_mks = lc_mkt; lc_mxs = lc_mxt; lc_lk = lc_lkt;
+            iIn.ir_snap(); iOut.ir_snap(); sb_snap(); lc_gpl = lc_gnl = lc_gpr = lc_gnr = 1; );
+lc_snap = 0;
+iaL.lp = lc_tn(iaL.lp); iaR.lp = lc_tn(iaR.lp); obL.lp = lc_tn(obL.lp); obR.lp = lc_tn(obR.lp);
+hL.s1 = lc_tn(hL.s1); hL.s2 = lc_tn(hL.s2); hR.s1 = lc_tn(hR.s1); hR.s2 = lc_tn(hR.s2);
+lc_msl = lc_tn(lc_msl); lc_msr = lc_tn(lc_msr); sg_e = lc_tn(sg_e);
+// the panel's mailboxes
+lca_gr_d = min(lca_gr_d, lc_grm); lc_grm = 0;
+lca_ol_d = max(lca_ol_d, lc_ol); lca_or_d = max(lca_or_d, lc_or); lc_ol = lc_or = 0;
+lca_v_d = lc_v;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+by_in();
+in_process(spl0, spl1);
+lc_xl = in_l * lc_ig; lc_xr = in_r * lc_ig;                      // INPUT
+abs(lc_xl) < 0.000000000000001 ? lc_xl = 0; abs(lc_xr) < 0.000000000000001 ? lc_xr = 0;
+// glides (no steps on a knob move or a preset change)
+iIn.ir_glide(c_kn); iOut.ir_glide(c_kn); sb_glide(c_kn, c_sw);
+(lc_cn += 1) >= 32 ? ( lc_cn = 0; sb_ctl(c_kn * 32); );
+lc_th += (lc_tht - lc_th) * c_kn; lc_sl += (lc_slt - lc_sl) * c_kn; lc_kw += (lc_kwt - lc_kw) * c_kn;
+lc_mks += (lc_mkt - lc_mks) * c_kn; lc_ig += (lc_igt - lc_ig) * c_kn; lc_mxs += (lc_mxt - lc_mxs) * c_kn; lc_lk += (lc_lkt - lc_lk) * c_lk;
+sg_e += (max(lc_xl * lc_xl, lc_xr * lc_xr) - sg_e) * sg_k;
+os_gate();
+os_chg ? ( lc_rcoefs(os_f); lc_clear(); os_hold += 2 * samplesblock; );
+// the oversampled section; the VCA's gain steps from the last sample's to this one's across the phases
+uxL.os_up(lc_xl); uxR.os_up(lc_xr);
+os_f == 1 ? (
+  lc_os(uxL.s0, uxR.s0, lc_gnl, lc_gnr); lc_dpl = lc_wl; lc_dpr = lc_wr; lc_yl = lc_pl; lc_yr = lc_pr;
+) : (
+  lc_dl = (lc_gnl - lc_gpl) / os_f; lc_dr = (lc_gnr - lc_gpr) / os_f;
+  lc_os(uxL.s0, uxR.s0, lc_gpl + lc_dl, lc_gpr + lc_dr); lc_dpl = lc_wl; lc_dpr = lc_wr; lc_a0 = lc_pl; lc_b0 = lc_pr;
+  lc_os(uxL.s1, uxR.s1, lc_gpl + 2 * lc_dl, lc_gpr + 2 * lc_dr); lc_a1 = lc_pl; lc_b1 = lc_pr;
+  os_f == 2 ? ( lc_yl = dnL.os_dn(lc_a0, lc_a1, 0, 0); lc_yr = dnR.os_dn(lc_b0, lc_b1, 0, 0); ) : (
+    lc_os(uxL.s2, uxR.s2, lc_gpl + 3 * lc_dl, lc_gpr + 3 * lc_dr); lc_a2 = lc_pl; lc_b2 = lc_pr;
+    lc_os(uxL.s3, uxR.s3, lc_gnl, lc_gnr); lc_a3 = lc_pl; lc_b3 = lc_pr;
+    lc_yl = dnL.os_dn(lc_a0, lc_a1, lc_a2, lc_a3); lc_yr = dnR.os_dn(lc_b0, lc_b1, lc_b2, lc_b3);
+  );
+);
+// the detector: IN IRON's output (its base-rate phase), through the SC HPF (always running: warm when switched)
+lc_hl = hL.hp_run(lc_dpl); lc_hr = hR.hp_run(lc_dpr);
+lc_hon ? ( lc_dpl = lc_hl; lc_dpr = lc_hr; );
+lc_msl += lc_kd * (lc_dpl * lc_dpl - lc_msl); lc_msr += lc_kd * (lc_dpr * lc_dpr - lc_msr);
+lc_mm = max(lc_msl, lc_msr);
+lc_ml = lc_msl + lc_lk * (lc_mm - lc_msl); lc_mr = lc_msr + lc_lk * (lc_mm - lc_msr);
+lc_tl = lc_gc(10 * log10(max(lc_ml, 0.00000000001)) + 3.0103);
+lc_tr = lc_gc(10 * log10(max(lc_mr, 0.00000000001)) + 3.0103);
+lc_gdl = eL.lc_env(lc_tl); lc_gdr = eR.lc_env(lc_tr);
+lc_grm = min(lc_grm, min(lc_gdl, lc_gdr));
+lc_gpl = lc_gnl; lc_gpr = lc_gnr;
+lc_gnl = exp(0.115129255 * lc_gdl); lc_gnr = exp(0.115129255 * lc_gdr);
+// the iron's bias leaves a little DC: a 1.5 Hz blocker (5 Hz shifted 20 Hz by 14 degrees; JG: tighter low end)
+lc_z = lc_yl - lc_dxl + lc_dcc * lc_dyl; lc_dxl = lc_yl; lc_dyl = lc_z; lc_yl = lc_z;
+lc_z = lc_yr - lc_dxr + lc_dcc * lc_dyr; lc_dxr = lc_yr; lc_dyr = lc_z; lc_yr = lc_z;
+lc_osg = os_g * os_g * (3 - 2 * os_g);                                // the OS swap's dip (an S-curve)
+lc_yl *= lc_osg; lc_yr *= lc_osg;
+lc_yl != lc_yl ? lc_yl = 0; lc_yr != lc_yr ? lc_yr = 0;
+lc_fi < 1 ? (                                                          // fading in after a reset, from the dry input
+  lc_fi = min(lc_fi + lc_fis, 1); lc_z = lc_fi * lc_fi * (3 - 2 * lc_fi);
+  lc_a = by_d == 0 ? by_il : BY_BUF[(by_w - by_d) & (BY_N - 1)]; lc_b = by_d == 0 ? by_ir : BY_BUF[BY_N + ((by_w - by_d) & (BY_N - 1))];
+  lc_yl = lc_a + lc_z * (lc_yl - lc_a); lc_yr = lc_b + lc_z * (lc_yr - lc_b);
+);
+ost_out(lc_yl, lc_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+by_out();
+lc_ol = max(lc_ol, abs(spl0)); lc_or = max(lc_or, abs(spl1));
+
+@gfx 1080 460
+ui_begin(1080, 460);
+// =====================================================================
+// GUI - a location unit's steel faceplate in field grey-green with cream print: three plates (the iron and the
+// compressor; the detector, output and supply; the meters), C2M desk knobs (copper caps on the irons, red on
+// THRESHOLD, yellow on the SC HPF), a GR needle meter with the house glow, output L / R bars. Design space 1080 x 460.
+// Knobs: drag (SHIFT = fine), wheel, double-click = default; the name shows the value while the knob is touched.
+// =====================================================================
+lv_look = 3;                                              // the colourway: duck-egg (JG, 30 Oct 2026; the others are trials)
+lv_look == 3 ? (                                         // duck-egg blue, navy print, navy header
+  LVP = 0xA8C6C4; LVPS = 0xB6D1CF; LVPH = 0x1F2B45; LVPW = 0x5F7C7A; LVI = 0x16213A; LVT = 0xE8E0CB; LVA = 0xC0402E;
+) : lv_look == 4 ? (                                     // mustard, black print, chocolate header
+  LVP = 0xC69C35; LVPS = 0xD2AA45; LVPH = 0x2E2119; LVPW = 0x7A5E1C; LVI = 0x1B1610; LVT = 0xF1E6CC; LVA = 0xE8E0CB;
+) : lv_look == 5 ? (                                     // heather (grey lilac), cream print, aubergine header
+  LVP = 0x857A92; LVPS = 0x7A6F87; LVPH = 0x2E2536; LVPW = 0x3A3044; LVI = 0xF2EADB; LVT = 0xF2EADB; LVA = 0xF0A63A;
+) : lv_look == 6 ? (                                     // cream with a brick-red header, dark brown print
+  LVP = 0xE6DDC8; LVPS = 0xEEE7D5; LVPH = 0x8E3426; LVPW = 0x9C917B; LVI = 0x2A1E16; LVT = 0xF6EEDC; LVA = 0x8E3426;
+) : lv_look == 1 ? (
+  LVP = 0xB8BBB4; LVPS = 0xC3C6BF; LVPH = 0x2B2D2C; LVPW = 0x6E716B; LVI = 0x1C1D1B; LVT = 0xE8E0CB; LVA = 0xB5402F;
+) : lv_look == 2 ? (
+  LVP = 0x4A2226; LVPS = 0x401D21; LVPH = 0x2A1214; LVPW = 0x140809; LVI = 0xEFE3CC; LVT = LVI; LVA = 0xF0A63A;
+) : (
+  LVP = 0x3E4F5E; LVPS = 0x364553; LVPH = 0x232C35; LVPW = 0x10151A; LVI = 0xE8E0CB; LVT = LVI; LVA = 0xF0A63A;
+);
+LVI2 = ui_mix(LVI, LVP, 0.38); LVT2 = ui_mix(LVT, LVPH, 0.38);
+// cap colours from the 70s British desk JG sent (JG, 30 Oct 2026): red, bottle green, grey, blue, yellow, orange
+CPR = 0x2F62A6; CRD = 0xC4222B; CSL = 0x2D5A48; CAM = 0xE07A1F; CYL = 0xF2C21B; CGY = 0xBDC0BA; CBK = 0xBDC0BA;
+
+sc != lv_fsc ? (
+  lv_fsc = sc;
+  lv_f10 = ui_fitfont(10, 14 * sc);     // knob labels
+  lv_f11 = ui_fitfont(11, 15 * sc);     // section titles
+  lv_f12 = ui_fitfont(12, 11 * sc);     // printed scales
+  lv_f13 = ui_fitfont(13, 14 * sc);     // lamp-key legends
+  lv_f14 = ui_fitfont(14, 27 * sc);     // the title
+  lv_f15 = ui_fitfont(15, 11.5 * sc);   // the subtitle
+);
+gfx_setfont(10, "Trebuchet MS", lv_f10, 'b'); gfx_setfont(11, "Trebuchet MS", lv_f11, 'b');
+gfx_setfont(12, "Trebuchet MS", lv_f12, 'b'); gfx_setfont(13, "Trebuchet MS", lv_f13, 'b');
+gfx_setfont(14, "Trebuchet MS", lv_f14, 'b'); gfx_setfont(15, "Trebuchet MS", lv_f15, 'b');
+
+function lv_r(x, y, w, h) ( gfx_rect(x * sc, y * sc, max(1, w * sc), max(1, h * sc)); );
+function lv_txt(x, y, s) ( gfx_x = x * sc; gfx_y = y * sc; gfx_drawstr(s); );
+function lv_ctxt(cx, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = cx * sc - tw * 0.5; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function lv_ltxt(x, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = x * sc; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function lv_thick(x1, y1, x2, y2, w) ( ui_ssline(x1, y1, x2, y2, w, 0); );
+// soft drop shadow (light from the top left): 4 layers at 13 % black, (+2, +3) to (+6, +8)
+function lv_shadow(x, y, w, h) local(j) ( j = 0; loop(4, ui_cola(0x000000, 0.13); lv_r(x + 2 + j * 1.3, y + 3 + j * 1.6, w + j * 0.6, h + j * 0.6); j += 1; ); );
+// a plate: a dark seam round it, the face, a header band (32 high) with a cream rule under it
+function lv_plate(x, y, w, h) (
+  lv_shadow(x, y, w, h);
+  ui_col(LVPW); lv_r(x, y, w, h);
+  ui_col(LVPS); lv_r(x + 1, y + 1, w - 2, h - 2);
+  ui_cola(0xFFFFFF, 0.07); lv_r(x + 1, y + 1, w - 2, 1); lv_r(x + 1, y + 1, 1, h - 2);
+  ui_cola(0x000000, 0.22); lv_r(x + 1, y + h - 3, w - 2, 2); lv_r(x + w - 3, y + 1, 2, h - 2);
+  ui_col(LVPH); lv_r(x + 1, y + 1, w - 2, 32);
+  ui_cola(LVT, 0.35); lv_r(x + 1, y + 33, w - 2, 1);
+);
+function lv_title(x, y, s) ( gfx_setfont(11); ui_col(LVT); lv_ltxt(x + 14, y + 17, s); );
+// a thin inked line between two sections on one plate
+function lv_split(x, y, h) ( ui_col(LVPW); lv_r(x, y + 1, 1, h - 2); ui_cola(0xFFFFFF, 0.06); lv_r(x + 1, y + 34, 1, h - 35); );
+
+function lv_hpf(i) ( i == 1 ? 33 : i == 2 ? 66 : i == 3 ? 110 : i == 4 ? 220 : 330; );   // (the panel's own copy)
+// knobs: the C2M desk knob; lv_lg = log scale, lv_step = stepped (set before; cleared after)
+lv_lg = 0; lv_step = 0;
+function lv_kn(v, lo, hi) ( lv_lg ? log(max(v, lo) / lo) / log(hi / lo) : (v - lo) / (hi - lo); );
+function lv_kv(n, lo, hi) ( lv_lg ? lo * exp(n * log(hi / lo)) : lo + n * (hi - lo); );
+// the knob (from the 70s British desk JG sent): a black fluted skirt, a flat coloured cap, a white pointer line running
+// across cap and skirt; a ring of dots round it (nd steps). Design px.
+function lv_cap(cx, cy, r, a, act, cap, nd) local(i, t, x, y, rr) (
+  x = cx * sc; y = cy * sc; rr = r * sc;
+  ui_col(LVI); i = 0;
+  loop(nd + 1, t = -0.75 * $pi + i / nd * 1.5 * $pi;
+    gfx_circle(x + sin(t) * (rr + 7 * sc), y - cos(t) * (rr + 7 * sc), (i == 0 || i == nd ? 1.5 : 1.2) * sc, 1, 1); i += 1; );
+  i = 0; loop(4, ui_cola(0x000000, 0.13); gfx_circle(x + (2 + i * 1.3) * sc, y + (3 + i * 1.6) * sc, rr + i * 0.6 * sc, 1, 1); i += 1; );
+  ui_col(0x121212); gfx_circle(x, y, rr, 1, 1);                                   // the skirt
+  i = 0; loop(30, t = i / 30 * 2 * $pi; ui_col(0x34343A);                         // its flutes
+    ui_ssline(x + sin(t) * rr * 0.74, y - cos(t) * rr * 0.74, x + sin(t) * rr * 0.95, y - cos(t) * rr * 0.95, 1.1 * sc, 0); i += 1; );
+  i = 0; loop(5, ui_cola(0x000000, 0.14 * (1 - i / 5)); gfx_circle(x, y, rr - i * 0.8 * sc, 0, 1); i += 1; );   // vignette edge
+  ui_cola(0xFFFFFF, act ? 0.22 : 0.14); ui_ssarc(x, y, rr * 0.97, -1.9, -0.1, 1 * sc);
+  ui_col(ui_mix(cap, 0x000000, 0.45)); gfx_circle(x, y, rr * 0.66, 1, 1);         // the cap
+  ui_col(cap); gfx_circle(x, y, rr * 0.62, 1, 1);
+  i = 0; loop(4, ui_cola(0x000000, 0.06 * (1 - i / 4)); gfx_circle(x, y, rr * 0.62 - i * 0.8 * sc, 0, 1); i += 1; );
+  ui_cola(0xFFFFFF, act ? 0.34 : 0.24); ui_ssarc(x, y, rr * 0.55, -1.7, -0.25, 1 * sc);
+  ui_col(((cap >> 16) & 255) * 0.3 + ((cap >> 8) & 255) * 0.59 + (cap & 255) * 0.11 > 165 ? 0x1A1A18 : 0xF7F5EE);   // dark on light caps
+  ui_ssline(x + sin(a) * rr * 0.12, y - cos(a) * rr * 0.12, x + sin(a) * rr * 0.96, y - cos(a) * rr * 0.96, (r > 24 ? 3 : 2.5) * sc, 1);
+);
+function lv_knob(cx, cy, r, idx, lo, hi, def, cap, nd) local(v, n, dx, dy, hov, did, act) (
+  did = 1700 + idx; v = slider(idx);
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 6) * sc);
+  pressed && hov && drag_id == 0 ? (
+    (time_precise() - lv_lt < 0.35 && lv_lid == idx) || (mouse_cap & 4) ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; lv_lt = 0; ) : (
+      drag_id = did; lv_y = mouse_y; lv_dz = 0; lv_lt = time_precise(); lv_lid = idx; lv_n = lv_kn(v, lo, hi);
+    );
+  );
+  drag_id == did ? (
+    lv_dz += abs(lv_y - mouse_y);
+    lv_dz > 3 * sc ? (
+      lv_n = min(max(lv_n + (lv_y - mouse_y) / (((mouse_cap & 8) ? 1000 : (lv_step ? 160 : 200)) * sc), 0), 1);
+      v = lv_kv(lv_n, lo, hi); lv_step ? v = floor(v + 0.5);
+      slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+    );
+    lv_y = mouse_y;
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    lv_step ? slider(idx) = min(max(floor(v + 0.5) + sign(mouse_wheel), lo), hi) : (
+      n = min(max(lv_kn(v, lo, hi) + mouse_wheel / 120 * ((mouse_cap & 8) ? 0.005 : 0.03), 0), 1);
+      slider(idx) = lv_kv(n, lo, hi);
+    );
+    ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(lv_kn(v, lo, hi), 0), 1);
+  act = hov || drag_id == did;
+  lv_cap(cx, cy, r, -0.75 * $pi + n * 1.5 * $pi, act, cap, nd);
+  lv_lg = 0; lv_step = 0;
+  act;
+);
+// the name under a knob (centre cy + r + 19), the value in its place while touched
+function lv_name(cx, cy, r, act, name, val) ( gfx_setfont(10); ui_col(act ? LVA : LVI); lv_ctxt(cx, cy + r + 19, act ? val : name); );
+// printed figures round a knob: n positions, labels "a|b|c" (empty = none)
+function lv_scale(cx, cy, r, n, nr, labels) local(i, k, k0, len, c, a) (
+  len = strlen(labels); k0 = 0; i = 0; k = 0;
+  gfx_setfont(12); ui_col(LVI2);
+  loop(len + 1,
+    c = k < len ? str_getchar(labels, k) : 124;
+    c == 124 ? (
+      strcpy_substr(#lv_sl, labels, k0, k - k0);
+      a = -0.75 * $pi + i / max(n - 1, 1) * 1.5 * $pi;
+      strlen(#lv_sl) ? lv_ctxt(cx + sin(a) * (r + nr), cy - cos(a) * (r + nr), #lv_sl);
+      i += 1; k0 = k + 1;
+    );
+    k += 1;
+  );
+);
+// a lamp key (gfx-ui)
+function lv_key(x, y, w, h, lbl, on, col) ( lk_well = 0x0A0B0A; lk_font = 13; lk_font2 = 13; lk_fit(x, y, w, h, on, col, lbl); );
+function lv_tog(idx) ( slider(idx) = slider(idx) >= 0.5 ? 0 : 1; ui_auto(idx); );
+function lv_rivet(x, y) ( ui_cola(0x000000, 0.35); gfx_circle((x + 1) * sc, (y + 1.5) * sc, 4 * sc, 1, 1);
+  ui_col(0x8E948A); gfx_circle(x * sc, y * sc, 4 * sc, 1, 1); ui_col(0xB9BEB2); gfx_circle((x - 0.8) * sc, (y - 0.8) * sc, 2.4 * sc, 1, 1); );
+
+// =====================================================================
+// Faceplate and header
+// =====================================================================
+ui_col(ui_mix(LVP, 0x000000, 0.3)); gfx_rect(0, 0, gfx_w, gfx_h);
+ui_col(LVP); lv_r(0, 0, 1080, 460);
+ui_cola(0xFFFFFF, 0.06); lv_r(0, 0, 1080, 1.5); lv_r(0, 0, 1.5, 460);
+ui_cola(0x000000, 0.30); lv_r(0, 457, 1080, 3); lv_r(1077, 0, 3, 460);       // a narrow darker bottom / right edge
+lv_rivet(8, 8); lv_rivet(1071, 8); lv_rivet(8, 451); lv_rivet(1071, 451);
+ui_col(LVPH); lv_r(16, 10, 1048, 54);
+ui_cola(0x000000, 0.3); lv_r(16, 10, 1048, 1); lv_r(16, 10, 1, 54);
+ui_col(LVA); lv_r(16, 64, 1048, 2);
+// the GFX roundel and the title
+ui_col(0xF0A63A); gfx_circle(44 * sc, 37 * sc, 15 * sc, 1, 1);
+gfx_setfont(4); ui_col(0x2A1E10); ui_text(44 * sc, 31.5 * sc, "GFX");
+gfx_setfont(14); ui_col(LVT); lv_ltxt(70, 37, "WS9 COMP"); gfx_measurestr("WS9 COMP", lv_tw, lv_th);
+lv_tx = 70 + lv_tw / sc + 14;
+gfx_setfont(15); ui_col(LVT2); lv_ltxt(lv_tx, 29, "LOCATION"); lv_ltxt(lv_tx, 45, "COMP-LIMITER");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );     // PRESET parameter: show a preset loaded by the host
+k_ = pk_preset(304 * sc, 20 * sc, 316 * sc, 34 * sc, pr_cur, #lc_pm);
+k_ > 0 ? prs_dirty = k_;
+by_key(756, 23, 1, 18);
+os_key(904, 26, 14, LVT2, 17);
+ui_size_picker(1002 * sc, 28 * sc);
+ui_vu_dim = slider1 >= 0.5;
+
+// =====================================================================
+// Row 1: INPUT IRON | COMPRESSOR | OUTPUT IRON
+// =====================================================================
+lv_plate(16, 78, 768, 200);
+lv_split(166, 78, 200); lv_split(634, 78, 200);
+lv_title(16, 78, "INPUT"); lv_title(166, 78, "COMPRESSOR"); lv_title(634, 78, "OUTPUT");
+lv_k1 = 184;
+lv_scale(91, lv_k1, 30, 2, 19, "-20|+20");
+lv_a = lv_knob(91, lv_k1, 30, 7, -20, 20, 0, CPR, 4); sprintf(#lvv, "%+.1f dB", slider7); lv_name(91, lv_k1, 30, lv_a, "INPUT", #lvv);
+lv_scale(236, lv_k1, 34, 2, 21, "-30|0");
+lv_a = lv_knob(236, lv_k1, 34, 2, -30, 0, -12, CRD, 4); sprintf(#lvv, "%.1f dBFS", slider2); lv_name(236, lv_k1, 34, lv_a, "THRESHOLD", #lvv);
+lv_scale(352, lv_k1, 24, 6, 17, "1.5|2|3|4|8|LIM");
+lv_step = 1; lv_a = lv_knob(352, lv_k1, 24, 3, 0, 5, 1, CSL, 5);
+slider3 >= 4.5 ? strcpy(#lvv, "LIMIT") : sprintf(#lvv, "%s : 1", slider3 < 0.5 ? "1.5" : slider3 < 1.5 ? "2" : slider3 < 2.5 ? "3" : slider3 < 3.5 ? "4" : "8");
+lv_name(352, lv_k1, 24, lv_a, "RATIO", #lvv);
+lv_scale(456, lv_k1, 24, 2, 17, ".1|30");
+lv_lg = 1; lv_a = lv_knob(456, lv_k1, 24, 4, 0.1, 30, 3, CSL, 4);
+slider4 < 1 ? sprintf(#lvv, "%.2f ms", slider4) : sprintf(#lvv, "%.1f ms", slider4); lv_name(456, lv_k1, 24, lv_a, "ATTACK", #lvv);
+lv_scale(560, lv_k1, 24, 2, 17, ".05|2");
+lv_lg = 1; lv_a = lv_knob(560, lv_k1, 24, 5, 50, 2000, 300, CSL, 4);
+slider5 < 1000 ? sprintf(#lvv, "%d ms", floor(slider5 + 0.5)) : sprintf(#lvv, "%.2f s", slider5 / 1000); lv_name(560, lv_k1, 24, lv_a, "RELEASE", #lvv);
+gfx_setfont(12); ui_col(LVI2); lv_ctxt(456, lv_k1 + 10, "");
+lv_scale(709, lv_k1, 30, 2, 19, "-24|+18");
+lv_a = lv_knob(709, lv_k1, 30, 8, -24, 18, 0, CPR, 4); sprintf(#lvv, "%+.1f dB", slider8); lv_name(709, lv_k1, 30, lv_a, "OUTPUT", #lvv);
+
+// =====================================================================
+// Row 2: DETECTOR | OUTPUT | SUPPLY
+// =====================================================================
+lv_plate(16, 294, 768, 150);
+lv_split(336, 294, 150); lv_split(560, 294, 150);
+lv_title(16, 294, "DETECTOR"); lv_title(336, 294, "PARALLEL"); lv_title(560, 294, "SUPPLY");
+lv_k2 = 378;
+lv_a = lv_knob(84, lv_k2, 22, 6, 0, 100, 50, CAM, 4); sprintf(#lvv, "%d %%", floor(slider6 + 0.5)); lv_name(84, lv_k2, 22, lv_a, "GRAB", #lvv);
+lv_scale(186, lv_k2, 22, 6, 15, "OFF|33|66|110|220|330");
+lv_step = 1; lv_a = lv_knob(186, lv_k2, 22, 10, 0, 5, 0, CYL, 5);
+slider10 < 0.5 ? strcpy(#lvv, "OFF") : sprintf(#lvv, "%d Hz", lv_hpf(floor(slider10 + 0.5))); lv_name(186, lv_k2, 22, lv_a, "SC HPF", #lvv);
+lv_key(250, lv_k2 - 24, 72, 48, "LINK", slider12 >= 0.5, LK_GRN) ? lv_tog(12);
+gfx_setfont(10); ui_col(LVI); lv_ctxt(286, lv_k2 + 41, slider12 >= 0.5 ? "STEREO" : "DUAL MONO");
+lv_scale(448, lv_k2, 22, 2, 15, "0|100");
+lv_a = lv_knob(448, lv_k2, 22, 11, 0, 100, 100, CGY, 4); sprintf(#lvv, "%d %%", floor(slider11 + 0.5)); lv_name(448, lv_k2, 22, lv_a, "MIX", #lvv);
+lv_scale(624, lv_k2, 22, 2, 15, "12|15");
+lv_a = lv_knob(624, lv_k2, 22, 9, 12, 15, 15, CBK, 6); sprintf(#lvv, "%.2f V", slider9); lv_name(624, lv_k2, 22, lv_a, "BATTERY", #lvv);
+lv_a = lv_knob(720, lv_k2, 15, 13, 0, 100, 50, CGY, 4); sprintf(#lvv, "%d %%", floor(slider13 + 0.5)); lv_name(720, lv_k2 + 7, 15, lv_a, "DRIFT", #lvv);
+// the voltage the circuit sees (sag and all): a light recessed readout box in SUPPLY's header band
+lv_v = lca_v_d > 0 ? lca_v_d : slider9;
+lv_shadow(694, 299, 76, 24);
+ui_col(0x101210); lv_r(694, 299, 76, 24);
+ui_col(0xE4E1D2); lv_r(695, 300, 74, 22);
+ui_cola(0x000000, 0.14); lv_r(695, 300, 74, 2); lv_r(695, 300, 2, 22);
+sprintf(#lvv, "%.2f V", lv_v); gfx_setfont(10); ui_col(0x1E1F1C); lv_ctxt(732, 311, #lvv);
+
+// =====================================================================
+// METERS: the GR needle (backlit), the output L / R bars
+// =====================================================================
+lv_plate(800, 78, 264, 366);
+lv_title(800, 78, "METERS");
+ui_spill(816 * sc, 126 * sc, 232 * sc, 158 * sc, 1);
+ui_col(0x070807); lv_r(816, 126, 232, 158);
+ui_glow(floor(817 * sc + 0.5), floor(127 * sc + 0.5), 230 * sc, 156 * sc, 1);
+LVINK = 0x2A1E10; LVRED = 0xB3341D;
+lv_g = lca_gr_d; lca_gr_d = 0;
+lv_nd += ((lv_g < lv_nd ? 0.55 : 0.18) * (lv_g - lv_nd));                      // the needle's ballistics
+function lv_ang(gr) ( 0.72 - 1.44 * (min(-gr, 20) / 20) ^ 0.6; );                // 0 dB right .. -20 dB left
+lv_px = 932; lv_py = 308; lv_rr = 150;
+lv_i = 0;
+loop(8,
+  lv_d = lv_i == 0 ? 0 : lv_i == 1 ? -2 : lv_i == 2 ? -4 : lv_i == 3 ? -6 : lv_i == 4 ? -8 : lv_i == 5 ? -10 : lv_i == 6 ? -14 : -20;
+  lv_t = lv_ang(lv_d); lv_ca = sin(lv_t); lv_sa = -cos(lv_t);
+  ui_col(lv_d <= -10 ? LVRED : LVINK);
+  lv_thick((lv_px + lv_ca * (lv_rr - 38)) * sc, (lv_py + lv_sa * (lv_rr - 38)) * sc, (lv_px + lv_ca * (lv_rr - 27)) * sc, (lv_py + lv_sa * (lv_rr - 27)) * sc, 1.6 * sc);
+  gfx_setfont(12); sprintf(#lvd, "%d", -lv_d); lv_ctxt(lv_px + lv_ca * (lv_rr - 15), lv_py + lv_sa * (lv_rr - 15), #lvd);
+  lv_i += 1;
+);
+gfx_setfont(10); ui_col(LVINK); lv_ctxt(932, 142, "GR  dB");
+lv_t = lv_ang(lv_nd); lv_ca = sin(lv_t); lv_sa = -cos(lv_t);
+ui_cola(0x3A2810, 0.3); lv_thick((lv_px + lv_ca * 48 + 1.5) * sc, (lv_py + lv_sa * 48 + 2) * sc, (lv_px + lv_ca * (lv_rr - 28) + 1.5) * sc, (lv_py + lv_sa * (lv_rr - 28) + 2) * sc, 2.2 * sc);
+ui_col(0x0B0B0A); lv_thick((lv_px + lv_ca * 48) * sc, (lv_py + lv_sa * 48) * sc, (lv_px + lv_ca * (lv_rr - 28)) * sc, (lv_py + lv_sa * (lv_rr - 28)) * sc, 1.9 * sc);
+ui_col(0x151816); lv_r(818, 262, 228, 21);
+ui_col(0x0A0A0A); gfx_circle(lv_px * sc, 280 * sc, 9 * sc, 1, 1);
+// the output: L / R bars, -48 .. 0 dBFS, a floating peak (1.2 s, then falling); click to clear
+function lv_cell(x, y, w, h, lit, zone) local(c) (
+  c = zone == 2 ? 0xFF3A2A : zone == 1 ? 0xFFC81E : 0x3CE05A;
+  lit ? ( ui_cola(c, 0.16); lv_r(x - 0.5, y - 1, w + 1, h + 2); ui_col(c); lv_r(x, y, w, h); ui_cola(0xFFFFFF, 0.22); lv_r(x, y, w, 1.5); )
+      : ( ui_col(ui_mix(c, 0x141614, 0.82)); lv_r(x, y, w, h); );
+);
+function lv_bar(x, y, w, h, v, pk) local(n, i, sw, d) (
+  n = 32; sw = w / n; i = 0;
+  loop(n, d = -48 + (i + 0.5) / n * 48; lv_cell(x + i * sw + 0.5, y, sw - 2, h, v >= d || (pk > -48 && abs(pk - d) < 0.75), d > -3 ? 2 : d > -12 ? 1 : 0); i += 1; );
+);
+function lv_fall(v, p) ( p = p > 0.0000001 ? 20 * log10(p) : -90; p > v ? p : max(v - 0.6, -90); );
+!lv_mi ? ( lv_ml = lv_mr = lv_pl = lv_pr = -90; lv_mi = 1; );
+lv_ml = lv_fall(lv_ml, lca_ol_d); lv_mr = lv_fall(lv_mr, lca_or_d); lca_ol_d = lca_or_d = 0;
+lv_ml > lv_pl ? ( lv_pl = lv_ml; lv_tl = time_precise(); ) : time_precise() - lv_tl > 1.2 ? lv_pl = max(lv_pl - 0.6, -90);
+lv_mr > lv_pr ? ( lv_pr = lv_mr; lv_tr = time_precise(); ) : time_precise() - lv_tr > 1.2 ? lv_pr = max(lv_pr - 0.6, -90);
+pressed && mouse_x >= 816 * sc && mouse_x < 1048 * sc && mouse_y >= 300 * sc && mouse_y < 352 * sc ? ( lv_pl = lv_ml; lv_pr = lv_mr; drag_id = -1; );
+ui_col(0x070807); lv_r(816, 300, 232, 52); ui_col(0x141614); lv_r(817, 301, 230, 50);
+lv_bar(840, 310, 200, 13, lv_ml, lv_pl); lv_bar(840, 330, 200, 13, lv_mr, lv_pr);
+gfx_setfont(12); ui_col(0xE8E0CB); lv_ctxt(828, 316.5, "L"); lv_ctxt(828, 336.5, "R");
+gfx_setfont(12); ui_col(LVI2); lv_i = 0;
+loop(5, lv_d = -lv_i * 12; lv_ctxt(840 + (lv_d + 48) / 48 * 200, 366, lv_i == 0 ? "0" : sprintf(#lvd, "%d", lv_d)); lv_i += 1; );
+gfx_setfont(10); ui_col(LVI); lv_ctxt(932, 392, "OUTPUT  dBFS");
+
+pk_end();
+ui_end();
