@@ -1,5 +1,6 @@
 -- @description GFX - make folder from selected tracks
--- @author JGWizrad / Garden FX (GFX)
+-- @author GardenFX
+-- by JGWizrad / Garden FX (GFX)
 -- @version 1.1
 -- @changelog
 --   A window in the GFX calculator style: type the folder's name, ENTER or MAKE FOLDER; MATCH, ITEMS and CLOSE FX keys.

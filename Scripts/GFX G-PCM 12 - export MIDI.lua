@@ -1,5 +1,6 @@
 -- GFX G-PCM 12 - export MIDI
--- author: JGWizrad / Garden FX (GFX)
+-- author: GardenFX
+-- by JGWizrad / Garden FX (GFX)
 --
 -- Companion script for the GFX G-PCM 12 drum machine (JSFX).
 -- JSFX plugins cannot write files, so G-PCM 12's EXPORT MIDI button puts the shown pattern into shared memory

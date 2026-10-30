@@ -1,5 +1,6 @@
 -- @description GFX - set selected tracks' input to all MIDI
--- @author JGWizrad / Garden FX (GFX)
+-- @author GardenFX
+-- by JGWizrad / Garden FX (GFX)
 -- @version 1.1
 -- @changelog
 --   A window in the GFX calculator style, with a MONITOR key and KEY for a shortcut.

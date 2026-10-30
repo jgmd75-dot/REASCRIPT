@@ -1,5 +1,6 @@
 -- @description GFX - collapse / expand all folders
--- @author JGWizrad / Garden FX (GFX)
+-- @author GardenFX
+-- by JGWizrad / Garden FX (GFX)
 -- @version 1.0.3
 -- @changelog
 --   KEY, then a key: that key becomes its own action (for a shortcut), working without the window.
