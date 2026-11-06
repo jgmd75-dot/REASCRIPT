@@ -57,7 +57,7 @@ slider50:7<0,10,1{1.1 kHz,2.2 kHz,3.3 kHz,4.4 kHz,5.5 kHz,6.6 kHz,7.7 kHz,8.8 kH
 slider51:0<-20,20,0.5>-Ch 2 (R / S) high gain (dB)
 slider52:40<0,100,1>-Ch 2 (R / S) high width (%)
 slider53:50<0,100,1>-Sheen (%)
-slider54:25<0,100,1>-Depth (%)
+slider54:0<0,100,1>-Depth (%)
 slider55:prs_sel=0<0,10,1{No preset,Init,Weight and Tighten,Air Lift,Mastering Polish,Vocal Presence,Smooth Top,Warm Bus,Mud Out,Driven Valve,MS Wide Air}>-Preset
 
 in_pin:left input
@@ -194,36 +194,39 @@ function sv_snapall() local(i, p) (
   sv_og0 = sv_ogt0; sv_og1 = sv_ogt1; sv_msc = sv_mst; sv_dk = 1; sv_dm = sv_dmt; sv_dv = sv_dvt; sv_di = sv_dit; sv_sh = sv_sht; sv_dp = sv_dpt;
 );
 
-function sv_sat(x) instance(lo, hl) local(y, h) (
-  y = this.vt.am_tube(x * sv_dve, 0.25) * sv_idve;
+function sv_sat(x) instance(lo, hl, hm, hp) local(y, h, d) (
+  y = this.vt.am_tube(x * sv_dve, sv_vb) * sv_idve;
   hl += sv_khs * (y - hl); h = y - hl;
   y += sv_shk * (this.st.am_tube(h * 2.5, 0.5) * 0.4 - h);
   lo += sv_klo * (y - lo);
-  y - lo + this.it.am_tube(lo * sv_di, 0.06) * sv_idi;
+  d = min(abs(lo - hp) * sv_hw + sv_hf, 1); hp = lo; hm += d * (lo - hm);
+  y - lo + this.it.am_tube((lo + sv_hk * (hm - lo)) * sv_di, 0.06) * sv_idi;
 );
 function sv_osclr() (
-  upA.os_clr(); upB.os_clr(); dnA.os_clr(); dnB.os_clr(); vsA.lo = vsB.lo = 0; vsA.hl = vsB.hl = 0;
+  upA.os_clr(); upB.os_clr(); dnA.os_clr(); dnB.os_clr(); vsA.lo = vsB.lo = 0; vsA.hl = vsB.hl = 0; vsA.hm = vsB.hm = vsA.hp = vsB.hp = 0;
   sv_klo = 1 - exp(-2 * $pi * 120 / (srate * os_f));
   sv_khs = 1 - exp(-2 * $pi * 1800 / (srate * os_f));
+  sv_hf = 1 - exp(-2 * $pi * 800 / (srate * os_f));
 );
-SVD = 200000;
-function sv_dsetup() local(i, ms) (
-  i = 0;
-  loop(4, ms = i == 0 ? 3.1 : i == 1 ? 4.7 : i == 2 ? 7.3 : 11.3; SVD[16384 + i] = min(4000, floor(ms * 0.001 * srate + 0.5)); i += 1; );
-  sv_dkh = 1 - exp(-2 * $pi * 330 / srate); sv_dkl = 1 - exp(-2 * $pi * 6600 / srate);
+function sv_dsetup() (
+  sv_dka = 1 - exp(-1 / (0.003 * srate)); sv_dkr = 1 - exp(-1 / (0.15 * srate));
+  sv_hw = 1 / 0.01;
 );
-function sv_dclr() ( memset(SVD, 0, 16384); sv_dw = 0; sv_dh1 = sv_dh2 = sv_dlp = 0; );
-function sv_depth(m) local(i, n, d, v) (
-  sv_dh1 += sv_dkh * (m - sv_dh1); m -= sv_dh1;
-  sv_dh2 += sv_dkh * (m - sv_dh2); m -= sv_dh2;
-  sv_dlp += sv_dkl * (m - sv_dlp); m = sv_dlp;
-  sv_dw = (sv_dw + 1) & 4095; i = 0;
-  loop(4,
-    n = SVD[16384 + i]; d = SVD[i * 4096 + ((sv_dw - n) & 4095)];
-    v = m + 0.5 * d; SVD[i * 4096 + sv_dw] = v; m = d - 0.5 * v;
-    i += 1;
-  );
-  abs(m) < 0.000000000001 ? 0 : m;
+function sv_dclr() ( sv_den = 0; lpA.l1 = lpA.l2 = lpA.hx = lpA.hy = lpB.l1 = lpB.l2 = lpB.hx = lpB.hy = 0; );
+function sv_dtick() local(f, g, t) (
+  sv_dw = min(sv_dp / 0.05, 1);
+  f = sv_dp <= 0.05 ? 1 : 25 ^ ((sv_dp - 0.05) / 0.95);
+  g = tan($pi * f / srate); sv_lk = 2;
+  sv_la1 = 1 / (1 + g * (g + sv_lk)); sv_la2 = g * sv_la1; sv_la3 = g * sv_la2;
+  t = sv_dp <= 0.05 ? 1999 : exp(log(1999) + (log(tan($pi * min(7000, 0.45 * srate) / srate)) - log(1999)) * sqrt((sv_dp - 0.05) / 0.95));
+  sv_ha = (t - 1) / (t + 1);
+);
+function sv_lap(x) instance(l1, l2, hx, hy) local(v1, v2, v3, y) (
+  v3 = x - l2; v1 = sv_la1 * l1 + sv_la2 * v3; v2 = l2 + sv_la2 * l1 + sv_la3 * v3;
+  l1 = 2 * v1 - l1; l2 = 2 * v2 - l2;
+  y = x - 2 * sv_lk * v1;
+  v3 = sv_ha * y + hx - sv_ha * hy; hx = y; hy = v3;
+  x + sv_dw * (v3 - x);
 );
 function sv_reset() (
   sv_clr(); sv_osclr(); sv_dclr(); memset(BY_BUF, 0, 2 * BY_N);
@@ -244,7 +247,7 @@ function sv_pflat(c) (
 );
 function sv_pcp() local(i) ( i = 0; loop(23, slider(30 + i) = slider(7 + i); i += 1; ); );
 function load_preset(p) local(i) (
-  sv_pflat(0); sv_pflat(1); slider3 = 0; slider4 = 1; slider5 = 0; slider6 = 0; slider53 = 50; slider54 = 25;
+  sv_pflat(0); sv_pflat(1); slider3 = 0; slider4 = 1; slider5 = 0; slider6 = 0; slider53 = 50; slider54 = 0;
   p == 2 ? (  sv_pb(0, 0, 1, 3,  3.5, 75); sv_pb(0, 1, 0, 2, -2.5, 45); slider7 = 2; sv_pcp(); ) :
   p == 3 ? (  sv_pb(0, 3, 1, 9,  3,   30); sv_pb(0, 2, 0, 8, -1,   50); slider53 = 65; sv_pcp(); ) :
   p == 4 ? (  sv_pb(0, 0, 1, 2,  1.5, 50); sv_pb(0, 1, 0, 3, -1,   30); sv_pb(0, 2, 0, 7, 1, 20);
@@ -278,7 +281,7 @@ os_design();
 os_f = os_tf = os_f2n(slider2); os_base = 0;
 sv_srinit();
 os_gsetup();
-sv_targets(); sv_snapall(); sv_fi = 1;
+sv_targets(); sv_snapall(); sv_dtick(); sv_fi = 1;
 pdc_delay = os_lat(os_f);
 by_setup(1);
 
@@ -333,15 +336,19 @@ sv_xl = spl0; sv_xr = spl1;
   sv_cn = 16;
   sv_i = 0; loop(8, sv_btick(SVB + sv_i * SVS, sv_i & 3); sv_i += 1; );
   sv_i = 0; loop(4, sv_ftick(SVF + sv_i * SVFS); sv_i += 1; );
+  sv_dtick();
 );
 sv_mst != sv_msc ? ( sv_dk = max(sv_dk - sv_dks, 0); sv_dk <= 0 ? ( sv_msc = sv_mst; sv_clr(); ); ) : sv_dk = min(sv_dk + sv_dks, 1);
 sv_og0 += sv_ko * (sv_ogt0 - sv_og0); sv_og1 += sv_ko * (sv_ogt1 - sv_og1); sv_dm += sv_kd * (sv_dmt - sv_dm);
 sv_dv += sv_ko * (sv_dvt - sv_dv); sv_di += sv_ko * (sv_dit - sv_di); sv_idi = 1 / sv_di;
 sv_sh += sv_ko * (sv_sht - sv_sh); sv_dp += sv_ko * (sv_dpt - sv_dp);
-sv_dve = sv_dv * (1 + 2 * sv_sh); sv_idve = 1 / sv_dve; sv_shk = 0.25 * sv_sh;
 sv_msc ? ( sv_a = 0.5 * (sv_xl + sv_xr); sv_b = 0.5 * (sv_xl - sv_xr); ) : ( sv_a = sv_xl; sv_b = sv_xr; );
 sv_a = sv_net(sv_flt(sv_flt(sv_a, SVF, 1), SVF + SVFS, 0), 0);
 sv_b = sv_net(sv_flt(sv_flt(sv_b, SVF + 2 * SVFS, 1), SVF + 3 * SVFS, 0), 1);
+sv_z = max(abs(sv_a), abs(sv_b)); sv_den += (sv_z > sv_den ? sv_dka : sv_dkr) * (sv_z - sv_den);
+sv_sag = sv_dp * sv_den / (sv_den + 0.35);
+sv_dve = sv_dv * (1 + 2 * sv_sh) + sv_dp * 0.1 + 0.8 * sv_sag; sv_idve = 1 / sv_dve; sv_shk = 0.25 * sv_sh;
+sv_vb = 0.25 + 0.3 * sv_sag; sv_hk = 0.4 * sv_dp;
 os_gate();
 os_chg ? ( sv_osclr(); os_hold += 2 * samplesblock; );
 upA.os_up(sv_a); upB.os_up(sv_b);
@@ -354,10 +361,10 @@ os_f == 1 ? (
   sv_a = dnA.os_dn(vsA.sv_sat(upA.s0), vsA.sv_sat(upA.s1), vsA.sv_sat(upA.s2), vsA.sv_sat(upA.s3));
   sv_b = dnB.os_dn(vsB.sv_sat(upB.s0), vsB.sv_sat(upB.s1), vsB.sv_sat(upB.s2), vsB.sv_sat(upB.s3));
 );
-sv_z = sv_a - sv_dxl + sv_dcc * sv_dyl; sv_dxl = sv_a; sv_dyl = sv_z; sv_a = sv_z * sv_og0;
-sv_z = sv_b - sv_dxr + sv_dcc * sv_dyr; sv_dxr = sv_b; sv_dyr = sv_z; sv_b = sv_z * sv_og1;
+sv_z = 1 - 0.08 * sv_sag; sv_a *= sv_z; sv_b *= sv_z;
+sv_z = sv_a - sv_dxl + sv_dcc * sv_dyl; sv_dxl = sv_a; sv_dyl = sv_z; sv_a = lpA.sv_lap(sv_z) * sv_og0;
+sv_z = sv_b - sv_dxr + sv_dcc * sv_dyr; sv_dxr = sv_b; sv_dyr = sv_z; sv_b = lpB.sv_lap(sv_z) * sv_og1;
 sv_msc ? ( sv_yl = sv_a + sv_b; sv_yr = sv_a - sv_b; ) : ( sv_yl = sv_a; sv_yr = sv_b; );
-sv_z = 0.3 * sv_dp * sv_depth(0.5 * (sv_yl + sv_yr)); sv_yl += sv_z; sv_yr -= sv_z;
 sv_z = sv_dk * sv_dk * (3 - 2 * sv_dk); sv_yl *= sv_z; sv_yr *= sv_z;
 sv_ql = by_d == 0 ? by_il : BY_BUF[(by_w - by_d) & (BY_N - 1)];
 sv_qr = by_d == 0 ? by_ir : BY_BUF[BY_N + ((by_w - by_d) & (BY_N - 1))];
@@ -719,7 +726,7 @@ sprintf(#sgsh, "%d %%", slider53); sg_name(1270, 278, sg_a, "SHEEN", #sgsh);
 gfx_setfont(12); ui_col(SGIK2); sg_ctxt(1238, 304, "0"); sg_ctxt(1270, 304, "%"); sg_ctxt(1302, 304, "100");
 ui_col(SGEG); sg_r(1212, 400, 116, 1); ui_cola(0xFFFFFF, 0.07); sg_r(1212, 401, 116, 1);
 gfx_setfont(12); ui_col(SGIK2); sg_ctxt(1270, 446, "FRONT TO BACK");
-sg_nd = 4; sg_a = sg_knob(1270, 522, 34, 54, 0, 100, 1, 25, 0x8FA9C8);
+sg_nd = 4; sg_a = sg_knob(1270, 522, 34, 54, 0, 100, 1, 0, 0x8FA9C8);
 sprintf(#sgdp, "%d %%", slider54); sg_name(1270, 578, sg_a, "DEPTH", #sgdp);
 gfx_setfont(12); ui_col(SGIK2); sg_ctxt(1238, 604, "0"); sg_ctxt(1270, 604, "%"); sg_ctxt(1302, 604, "100");
 gfx_setfont(12); ui_col(SGIK2); sg_ctxt(1270, 690, slider54 < 0.5 ? "DEPTH OFF" : "MONO-SAFE");
