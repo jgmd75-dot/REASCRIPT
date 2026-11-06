@@ -1,0 +1,41 @@
+# CLAUDE.md - REASCRIPT (GFX on ReaPack)
+
+This repo is the public ReaPack repository for the GFX Stable range. John adds
+`https://github.com/jgmd75-dot/REASCRIPT/raw/main/index.xml` in REAPER (Extensions > ReaPack > Import repositories).
+
+- **Never edit the files here by hand.** Everything is generated from GFX-II (the Stable) by
+  `python3 tools/build-index.py PATH/TO/GFX-II --message "what changed"`, then `git push origin HEAD:main`.
+  Run it after every Stable push (bug fixes), so ReaPack users get them.
+- The script copies the range, bumps the patch version (1.0.0 -> 1.0.1) of every package whose files changed
+  (`versions.json` keeps the hashes), commits the files, then writes `index.xml` with every download pinned to that
+  commit, and commits the index.
+- Packages: one per plug-in (type effect, category "Stable"), one "GFX system files" package with all the
+  `.jsfx-inc` files (ReaPack has no dependencies: users install it once), one per ReaScript (category "Scripts",
+  registered as actions), and "GFX Pulse patterns" (type data, into REAPER's Data/gfx-drum-patterns).
+- Effects install into `<REAPER>/Effects/GFX/Stable/`, sorted into the website's category folders (`Amps and drive/`,
+  `Dynamics/` ...; units off the site in `Legacy/`) with the system files in `System files - do not delete/` - the
+  same layout as the download ZIPs (JG, 28 Oct 2026, for screen-reader users). REAPER finds imports in any folder
+  under Effects, and an old project finds a plug-in that moved (JG tested both). The folders come from the website
+  checkout: pass `--site PATH/TO/WEBSITE` (default `../website`). Keep every effect package in the one ReaPack
+  category: the folder is in each file's path, so a move is an ordinary update (ReaPack removes the old file).
+- **Versions (JG, 30 Oct 2026):** the Stable build writes three ReaPack repositories so users tick each version on
+  or off: **GFX** (`index.xml`, the V3 range = stable.js, plus system files, scripts, Pulse patterns), **GFX V2**
+  (`V2/index.xml`, category "V2": the `-v2` files and the units in stable-v2.js but not in V3 - the rest of V2 is the
+  same file as V3) and **GFX V1** (`V1/index.xml`, category "V1": the website's `legacy/files`). V2 / V1 use the
+  main repo's "GFX system files" package. A Stable file in neither range nor legacy/files stops the build.
+- **GFX Essentials (JG, 1 Nov 2026):** a fourth Stable-build repository, `Essentials/index.xml` (index "GFX Essentials"):
+  the 30 starter units listed in the website's `stable.js` (`ESSENTIALS`) plus its own copy of the system files, one
+  category per website category, installing into `<REAPER>/Effects/GFX Essentials/<category>/`. A newcomer adds this one
+  link and installs everything; to move up to the whole range they remove GFX Essentials, then add GFX (never both).
+- **The Lab** is a second, separate ReaPack repository in the same git repo: `Lab/index.xml` (index "GFX Lab",
+  category "Lab"), files under `Lab/Effects/`, versions in `Lab/versions.json`. Rebuild it with
+  `python3 tools/build-index.py PATH/TO/LAB --lab --message "what changed"` after a Lab plug-in arrives, changes or
+  leaves. Its plug-ins and the "GFX Lab system files" package install into `<REAPER>/Effects/GFX Lab/Lab/`, apart
+  from the Stable, in the Lab page's group folders. John adds it with `https://github.com/jgmd75-dot/REASCRIPT/raw/main/Lab/index.xml`.
+- **Nothing published here carries comments** (JG, 5 - 6 Nov 2026): build-index runs `tools/jsfx_clean.py` on every
+  copied `.jsfx` / `.jsfx-inc` (keeping only the lines REAPER reads plus `//tags:`, `//author:`, the "by JGWizrad"
+  credit and "Requires") and `.lua` (keeping only `@description`, `@author`, `@version` and the credit), checks each
+  file is clean and stops if not. The code is unchanged (token / audio null on every unit; Lua bytecode identical).
+  The tools here carry no comments either - keep them that way when editing them; notes go in this file.
+  Search tags and preset names use no brand names.
+- The repo must stay public (ReaPack downloads without logging in).

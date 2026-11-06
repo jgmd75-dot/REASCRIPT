@@ -1,0 +1,298 @@
+desc:Headsmoother [tape sat + opto] (GFX)
+//tags: saturation tape compressor optical opto channel strip
+//author: GardenFX
+// by JGWizrad / Garden FX (GFX)
+// Requires gfx-drift, gfx-input, gfx-output, gfx-ui, gfx-panel, gfx-instrument and gfx-headsmooth (.jsfx-inc)
+
+import gfx-drift.jsfx-inc
+import gfx-input.jsfx-inc
+import gfx-output.jsfx-inc
+import gfx-ui.jsfx-inc
+import gfx-panel.jsfx-inc
+import gfx-dyn.jsfx-inc
+import gfx-faceplate.jsfx-inc
+import gfx-instrument.jsfx-inc
+import gfx-headsmooth.jsfx-inc
+
+slider1:3<0,10,0.01>-Head drive
+slider2:0<-24,6,0.1>-Head trim (dB)
+slider3:0<0,2,1{Normal,Medium,Bright}>-Head voice
+slider4:3<0,10,0.01>-Smooth compress
+slider5:0<-12,24,0.1>-Smooth output (dB)
+slider6:1<0,2,1{Slow,Medium,Fast}>-Smooth attack
+slider7:1<0,2,1{Slow,Medium,Fast}>-Smooth release
+slider8:0<0,1,1{Off,On}>-Smooth limit
+slider9:100<0,100,1>-Smooth blend (%)
+slider10:1<0,1,1{Off,On}>-Head on
+slider11:1<0,1,1{Off,On}>-Smooth on
+slider12:0<0,1,1{Smooth then Head,Head then Smooth}>-Order
+slider13:1<0,1,1{Off,On}>-Smooth colour
+slider14:0<-24,12,0.1>-Input trim (dB)
+slider15:1<0,1,1{Off,On}>-Input guard
+slider16:25<0,100,1>-Drift amount (%)
+slider17:0.25<0.02,2,0.01>-Drift speed (Hz)
+slider18:0<0,100,1>-Band sat (%)
+slider19:0<0,100,1>-Head boost (%)
+slider20:120<40,400,1>-Sat low band (Hz)
+slider21:6000<2000,16000,10>-Sat high band (Hz)
+slider22:-0.3<-24,0,0.1>-Ceiling (dB)
+slider23:1<0,1,1{Off,Clip}>-(unused, was output stage)
+slider24:50<0,100,1>-Drift (%)
+slider25:prs_sel=0<0,12,1{No preset,Init,Gentle Tape Glue,Vocal Smooth,Bass Even,Drum Bus Warmth,Bright Head Sheen,Hard Opto Level,Safety Limit,Parallel Squash,Head Only,Opto Only,Tape Before Comp}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+gdc_r = 1 - 2 * $pi / srate;
+gdc_x0 = gdc_y0 = 0; gdc_x1 = gdc_y1 = 0;
+#ui_man = "gfx-headsmoother";
+
+function bq_set(type, f, q, gdb, fs) instance(b0, b1, b2, a1, a2) local(w0, cw, sw, al, amp, sa, n) (
+  w0 = 2 * $pi * min(f, fs * 0.45) / fs; cw = cos(w0); sw = sin(w0); al = sw / (2 * q);
+  amp = 10 ^ (gdb / 40);
+  type == 0 ? (
+    n = 1 + al; b0 = (1 - cw) * 0.5 / n; b1 = (1 - cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 1 ? (
+    n = 1 + al; b0 = (1 + cw) * 0.5 / n; b1 = -(1 + cw) / n; b2 = b0; a1 = -2 * cw / n; a2 = (1 - al) / n;
+  ) : type == 2 ? (
+    n = 1 + al / amp; b0 = (1 + al * amp) / n; b1 = -2 * cw / n; b2 = (1 - al * amp) / n; a1 = b1; a2 = (1 - al / amp) / n;
+  ) : (
+    sa = 2 * sqrt(amp) * al;
+    n = (amp + 1) - (amp - 1) * cw + sa;
+    b0 = amp * ((amp + 1) + (amp - 1) * cw + sa) / n; b1 = -2 * amp * ((amp - 1) + (amp + 1) * cw) / n;
+    b2 = amp * ((amp + 1) + (amp - 1) * cw - sa) / n; a1 = 2 * ((amp - 1) - (amp + 1) * cw) / n;
+    a2 = ((amp + 1) - (amp - 1) * cw - sa) / n;
+  );
+);
+function bq_run(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+function tc(ms) ( 1 - exp(-1 / (max(ms, 0.05) * 0.001 * srate)); );
+
+function hd_aa() instance(u1, u2, u3, u4, d1, d2, d3, d4) local(fc, fs2) (
+  fs2 = 2 * srate; fc = min(0.42 * srate, 20000);
+  u1.bq_set(0, fc, 0.5098, 0, fs2); u2.bq_set(0, fc, 0.6013, 0, fs2);
+  u3.bq_set(0, fc, 0.9000, 0, fs2); u4.bq_set(0, fc, 2.5629, 0, fs2);
+  d1.bq_set(0, fc, 0.5098, 0, fs2); d2.bq_set(0, fc, 0.6013, 0, fs2);
+  d3.bq_set(0, fc, 0.9000, 0, fs2); d4.bq_set(0, fc, 2.5629, 0, fs2);
+);
+function hd_eq(gapmul) instance(emp, dem, vpre, vpost, bump, gap, dcb, lop) (
+  emp.bq_set(3, 3000, 0.7, 4, srate);  dem.bq_set(3, 3000, 0.7, -4, srate);
+  voice == 1 ? ( vpre.bq_set(2, 1400, 0.6, 3.5, srate); vpost.bq_set(2, 1400, 0.6, -1.5, srate); ) :
+  voice == 2 ? ( vpre.bq_set(3, 6000, 0.7, 5, srate);   vpost.bq_set(3, 6000, 0.7, -2, srate); ) :
+               ( vpre.bq_set(2, 1000, 0.7, 0, srate);   vpost.bq_set(2, 1000, 0.7, 0, srate); );
+  bump.bq_set(2, 70, 0.9, hd_bump, srate);
+  gap.bq_set(0, (voice == 2 ? 21000 : voice == 1 ? 18000 : 16000) * gapmul, 0.55, 0, srate);
+  dcb.bq_set(1, 10, 0.7, 0, srate);
+  lop.bq_set(0, 250, 0.6, 0, srate);
+);
+function hd_sat(x, b) local(tb, c) (
+  tb = ost_tanh(b);
+  c = 0.25 / ((ost_tanh(hd_g * 0.125 + b) - tb) - (ost_tanh(-hd_g * 0.125 + b) - tb));
+  (ost_tanh(hd_g * x + b) - tb) * c;
+);
+function hd_run(x, b) instance(emp, dem, vpre, vpost, bump, gap, dcb, lop, u1, u2, u3, u4, d1, d2, d3, d4) local(y, z, lo) (
+  lo = lop.bq_run(x) * hd_lb;
+  y = vpre.bq_run(emp.bq_run(x - lo)) * 0.5;
+  z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(y * 2))));
+  d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b)))));
+  z = u4.bq_run(u3.bq_run(u2.bq_run(u1.bq_run(0))));
+  y = d4.bq_run(d3.bq_run(d2.bq_run(d1.bq_run(hd_sat(z, b))))) * 2;
+  dcb.bq_run(gap.bq_run(bump.bq_run(vpost.bq_run(dem.bq_run(y)) + lo * hd_lg)));
+);
+function head_proc(l, r) (
+  hon_s += (slider10 - hon_s) * sm;
+  hl = hL.hd_run(l, bL) * trim_s; hr = hR.hd_run(r, bR) * trim_s;
+  hl = l + (hl - l) * hon_s; hr = r + (hr - r) * hon_s;
+  hpk = max(hpk, max(abs(hl), abs(hr)));
+);
+
+function gr_curve(lv) local(o) (
+  o = lv - thr;
+  o <= -kn * 0.5 ? 0 :
+  o >= kn * 0.5 ? o * (1 - 1 / ratio) :
+  (1 - 1 / ratio) * (o + kn * 0.5) ^ 2 / (2 * kn);
+);
+function colour(x, k, b) local(tb) (
+  tb = ost_tanh(b);
+  (ost_tanh(k * x + b) - tb) / (k * (1 - tb * tb));
+);
+function smooth_proc(l, r) local(dl, dr, lv, tgt, g, yl, yr) (
+  son_s += (slider11 - son_s) * sm;
+  dl = scL.bq_run(l); dr = scR.bq_run(r);
+  env += (0.5 * (dl * dl + dr * dr) - env) * crms;
+  lv = 10 * log10(max(env, 0.000000000001)) + 3;
+  tgt = gr_curve(lv);
+  hold += (gr - hold) * chold;
+  tgt > gr ? ( gr += (tgt - gr) * catt; grpk = gr; )
+           : gr += (tgt - gr) * tc(gr > grpk * 0.6 ? rel_ms * 0.3 : rel_ms * (1 + 2 * min(hold / 6, 1)));
+  g = 10 ^ (-gr / 20);
+  grdisp = max(grdisp, gr * son_s);
+  slider13 ? ( yl = colour(l * g * 0.5, kL, cbL) * 2; yr = colour(r * g * 0.5, kR, cbR) * 2; )
+           : ( yl = l * g; yr = r * g; );
+  cl = (l + (yl - l) * blend_s) * mk_s; cr = (r + (yr - r) * blend_s) * mk_s;
+  cl = l + (cl - l) * son_s; cr = r + (cr - r) * son_s;
+  spk = max(spk, max(abs(cl), abs(cr)));
+);
+
+function update() (
+  hd_g = 10 ^ (slider1 * 2.2 / 20);
+  slider18 = slider19 * slider10;
+  hd_b0 = (slider19 / 100) * 0.2;
+  hd_lb = (slider1 / 10) ^ 1.2;
+  hd_c = 0.25 / ((ost_tanh(hd_g * 0.125 + hd_b0) - ost_tanh(hd_b0)) - (ost_tanh(-hd_g * 0.125 + hd_b0) - ost_tanh(hd_b0)));
+  hd_lg = sqrt(hd_g * hd_c * (1 - ost_tanh(hd_b0) ^ 2));
+  hd_bump = 1.5 * (1 - 0.5 * slider1 / 10);
+  voice = slider3;
+  trim_t = 10 ^ (slider2 / 20);
+  thr = -slider4 * 3;
+  mk_t = 10 ^ (slider5 / 20);
+  ratio = slider8 ? 20 : 3; kn = slider8 ? 2 : 12;
+  att_ms = (slider6 == 0 ? 25 : slider6 == 1 ? 8 : 1.5) * (slider8 ? 0.5 : 1);
+  rel_ms = slider7 == 0 ? 900 : slider7 == 1 ? 350 : 90;
+  catt = tc(att_ms);
+  blend_t = slider9 / 100;
+  drift_macro(slider24);
+  drift = slider16 / 100 * dm_a; dspd = slider17 * dm_s;
+  in_setup(slider14, slider15);
+  ins_output_setup(18);
+);
+
+sm = tc(30);
+hL.hd_aa(); hR.hd_aa();
+scL.bq_set(1, 80, 0.70710678, 0, srate); scR.bq_set(1, 80, 0.70710678, 0, srate);
+crms = tc(5); chold = tc(1500);
+dBL.drift_init(0.8 + rand(1) * 0.5); dBR.drift_init(0.8 + rand(1) * 0.5);
+dGL.drift_init(0.8 + rand(1) * 0.5); dGR.drift_init(0.8 + rand(1) * 0.5);
+dKL.drift_init(0.8 + rand(1) * 0.5); dKR.drift_init(0.8 + rand(1) * 0.5);
+dCL.drift_init(0.8 + rand(1) * 0.5); dCR.drift_init(0.8 + rand(1) * 0.5);
+ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
+in_init();
+env = 0; gr = 0; grpk = 0; hold = 0; grdisp = 0; hpk = 0; spk = 0;
+!ui_dflt ? ui_hw = 1; !ui_dflt ? ui_kstyle = 0;
+update();
+trim_s = trim_t; mk_s = mk_t; blend_s = blend_t; hon_s = slider10; son_s = slider11;
+!ui_dflt ? pr_cur = 1;
+ui_dflt = 1;
+
+function load_preset(p) (
+  p == 1 ? ( slider(1) = 3; slider(2) = 0; slider(3) = 0; slider(4) = 3; slider(5) = 0; slider(6) = 1; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 2 ? ( slider(1) = 2; slider(2) = 0; slider(3) = 0; slider(4) = 2; slider(5) = 0; slider(6) = 1; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 3 ? ( slider(1) = 2.5; slider(2) = 0; slider(3) = 2; slider(4) = 5; slider(5) = 0; slider(6) = 0; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 4 ? ( slider(1) = 3; slider(2) = 0; slider(3) = 0; slider(4) = 6; slider(5) = 2; slider(6) = 1; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 5 ? ( slider(1) = 5; slider(2) = 0; slider(3) = 0; slider(4) = 4; slider(5) = 0; slider(6) = 2; slider(7) = 2; slider(8) = 0; slider(9) = 70; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 6 ? ( slider(1) = 3; slider(2) = 0; slider(3) = 2; slider(4) = 1.5; slider(5) = 0; slider(6) = 1; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 40; );
+  p == 7 ? ( slider(1) = 2; slider(2) = 0; slider(3) = 0; slider(4) = 8; slider(5) = 5.4; slider(6) = 1; slider(7) = 2; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 8 ? ( slider(1) = 2; slider(2) = 0; slider(3) = 0; slider(4) = 2; slider(5) = 0; slider(6) = 1; slider(7) = 1; slider(8) = 1; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 9 ? ( slider(1) = 3; slider(2) = 0; slider(3) = 0; slider(4) = 9; slider(5) = 2.3; slider(6) = 2; slider(7) = 1; slider(8) = 0; slider(9) = 40; slider(10) = 1; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 10 ? ( slider(1) = 5; slider(2) = 0; slider(3) = 1; slider(4) = 3; slider(5) = 0; slider(6) = 1; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 0; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 11 ? ( slider(1) = 3; slider(2) = 0; slider(3) = 0; slider(4) = 5; slider(5) = 1.3; slider(6) = 1; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 0; slider(11) = 1; slider(12) = 0; slider(13) = 1; slider(19) = 0; );
+  p == 12 ? ( slider(1) = 4; slider(2) = 0; slider(3) = 1; slider(4) = 5; slider(5) = 0.7; slider(6) = 1; slider(7) = 1; slider(8) = 0; slider(9) = 100; slider(10) = 1; slider(11) = 1; slider(12) = 1; slider(13) = 1; slider(19) = 0; );
+  slider_automate(2 ^ 0); slider_automate(2 ^ 1); slider_automate(2 ^ 2); slider_automate(2 ^ 3); slider_automate(2 ^ 4); slider_automate(2 ^ 5); slider_automate(2 ^ 6); slider_automate(2 ^ 7); slider_automate(2 ^ 8); slider_automate(2 ^ 9); slider_automate(2 ^ 10); slider_automate(2 ^ 11); slider_automate(2 ^ 12); slider_automate(2 ^ 18);
+);
+
+function prs_sl() (
+update();
+);
+function prs_hash() local(i, h) ( h = 0; i = 1; loop(25, i != 25 ? h += slider(i) * (1 + i * 0.7071); i += 1; ); h; );
+function prs_same() local(h, r) ( h = prs_hash(); r = h == prs_h0; prs_h0 = h; r; );
+function prs_chk() local(k) (
+  prs_dirty > 0 ? ( prs_pk = prs_dirty; prs_dirty = 0; prs_q = 1; ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_hs = prs_same();  prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 && prs_hs ? ( prs_pk = prs_sel; prs_q = 0; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+  prs_pk > 0 ? (
+    prs_g <= 0 ? (
+      k = prs_pk; prs_pk = 0; load_preset(k); prs_sl();
+      prs_q ? ( k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; ); prs_last = prs_sel; ) : prs_cur_d = k;
+      prs_gs = 1 / (0.030 * srate);
+    ) : prs_gs = -1 / (0.005 * srate);
+  );
+);
+prs_ok = 0; prs_dirty = 0; prs_pk = 0; prs_g = 1; prs_gs = 0;
+
+@slider
+prs_chk();
+prs_sl();
+
+@block
+prs_chk();
+update();
+dinc = dspd * samplesblock / srate;
+vbL = dBL.drift_tick(dinc); vbR = dBR.drift_tick(dinc);
+vgL = dGL.drift_tick(dinc); vgR = dGR.drift_tick(dinc);
+bL = hd_b0 + vbL * drift * 0.06; bR = hd_b0 + vbR * drift * 0.06;
+hL.hd_eq(2 ^ (vgL * drift * 0.25)); hR.hd_eq(2 ^ (vgR * drift * 0.25));
+vkL = dKL.drift_tick(dinc); vkR = dKR.drift_tick(dinc);
+vcL = dCL.drift_tick(dinc); vcR = dCR.drift_tick(dinc);
+kL = 1.2 * (1 + 0.6 * drift * vkL); kR = 1.2 * (1 + 0.6 * drift * vkR);
+cbL = 0.05 + 0.08 * drift * vcL;    cbR = 0.05 + 0.08 * drift * vcR;
+
+@serialize
+file_var(0, ui_sz);
+file_avail(0) != 0 ? file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;
+
+@sample
+gdc_y0 = spl0 - gdc_x0 + gdc_r * gdc_y0; gdc_x0 = spl0; spl0 = gdc_y0;
+gdc_y1 = spl1 - gdc_x1 + gdc_r * gdc_y1; gdc_x1 = spl1; spl1 = gdc_y1;
+trim_s += (trim_t - trim_s) * sm; mk_s += (mk_t - mk_s) * sm; blend_s += (blend_t - blend_s) * sm;
+slider12 ? (
+  head_proc(spl0, spl1); smooth_proc(hl, hr); oL = cl; oR = cr;
+) : (
+  smooth_proc(spl0, spl1); head_proc(cl, cr); oL = hl; oR = hr;
+);
+oL = ostL.ost_band(oL); oR = ostR.ost_band(oR);
+ost_out(oL, oR);
+spl0 = ost_l;
+spl1 = ost_r;
+prs_gs != 0 ? ( prs_g += prs_gs; prs_g <= 0 ? ( prs_g = 0; prs_gs = 0; ) : prs_g >= 1 ? ( prs_g = 1; prs_gs = 0; ); );
+prs_g < 1 ? ( prs_w = prs_g * prs_g * (3 - 2 * prs_g); spl0 *= prs_w; spl1 *= prs_w; );
+
+@gfx 780 480
+function ver_tag_at(s, slot, x, yb, fs, col) local(x0, y0, r, g, b, a, f) (
+  x0 = gfx_x; y0 = gfx_y; r = gfx_r; g = gfx_g; b = gfx_b; a = gfx_a; f = gfx_getfont();
+  col >= 0 ? ( gfx_r = (col >> 16) / 255; gfx_g = ((col >> 8) & 255) / 255; gfx_b = (col & 255) / 255; gfx_a = 1; );
+  gfx_setfont(slot, "Trebuchet MS", max(10, fs), 'b');
+  gfx_x = x; gfx_y = yb - 0.8 * gfx_texth; gfx_a *= 0.55; gfx_drawstr(s);
+  gfx_r = r; gfx_g = g; gfx_b = b; gfx_a = a; gfx_x = x0; gfx_y = y0; gfx_setfont(f + 1);
+);
+function ver_tag(s, slot, dx, dy) local(th) (
+  th = gfx_texth;
+  ver_tag_at(s, slot, gfx_x + (0.3 + dx) * th, gfx_y + (0.8 + dy) * th, 0.5 * th, -1);
+);
+ui_begin(780, 480);
+ui_col(0x0B0C0D); gfx_rect(0, 0, gfx_w, gfx_h);
+
+ui_theme(12);
+ui_col(HS_CRM); gfx_circle(30 * sc, 24 * sc, 13 * sc, 1, 1);
+gfx_setfont(4); ui_col(HS_GRN); ui_ctext(30 * sc, 24 * sc, "GFX");
+gfx_setfont(6, "Trebuchet MS", 16 * sc, 'b'); ui_col(HS_CRM); gfx_x = 52 * sc; gfx_y = 15 * sc; gfx_drawstr("HEADSMOOTHER"); ver_tag("v3", 16, 0, 0);
+ox = 512 * sc; oy0 = 12 * sc; ow = 130 * sc; oh = 24 * sc;
+gfx_setfont(4); ui_cola(HS_CRM, 0.6); gfx_x = ox - 42 * sc; gfx_y = 20 * sc; gfx_drawstr("ORDER");
+o_hov = mouse_x >= ox && mouse_x < ox + ow && mouse_y >= oy0 && mouse_y < oy0 + oh;
+o_hov && pressed && drag_id == 0 ? ( drag_id = -1; o_held = 1; slider12 = 1 - slider12; slider_automate(2 ^ 11); );
+!mdown ? o_held = 0;
+ui_bbckey(ox, oy0, ow, oh, slider12 ? "HEAD > SMOOTH" : "SMOOTH > HEAD", o_held, 1, 1, 1, o_hov, o_held, 2);
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );
+hs_k = pk_preset(196 * sc, 10 * sc, 262 * sc, 28 * sc, pr_cur, "Init|Gentle Tape Glue|Vocal Smooth|Bass Even|Drum Bus Warmth|Bright Head Sheen|Hard Opto Level|Safety Limit|Parallel Squash|Head Only|Opto Only|Tape Before Comp");
+hs_k > 0 ? ( prs_dirty = hs_k; pr_cur = hs_k; );
+ui_size_picker(704 * sc, 15 * sc);
+
+GAP = 8;
+slider12 ? ( hy = 50; sy = 50 + HS_HH + GAP; ) : ( sy = 50; hy = 50 + HS_SH + GAP; );
+
+hs_head_face(hy, 1, 2, 3, hpk, slider10); hpk = 0;
+ui_keycap(686 * sc, (hy + 8) * sc, 64 * sc, 24 * sc, "ON", slider10, 1) ? ( slider10 = 1 - slider10; slider_automate(2 ^ 9); );
+
+hs_smooth_face(sy, 4, 5, 6, 7, 8, 9, grdisp, spk, slider11); grdisp = 0; spk = 0;
+ui_keycap(600 * sc, (sy + 8) * sc, 80 * sc, 24 * sc, "COLOUR", slider13, 1) ? ( slider13 = 1 - slider13; slider_automate(2 ^ 12); );
+ui_keycap(686 * sc, (sy + 8) * sc, 64 * sc, 24 * sc, "ON", slider11, 1) ? ( slider11 = 1 - slider11; slider_automate(2 ^ 10); );
+
+pk_end();
+ui_end();

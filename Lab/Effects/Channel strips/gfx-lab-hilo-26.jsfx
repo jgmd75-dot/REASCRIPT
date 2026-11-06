@@ -1,0 +1,896 @@
+desc:HILO 26 [channel strip] (GFX Lab)
+//tags: channel strip hybrid analogue digital preamp converter eq dynamic eq gate compressor spectrum
+//author: GardenFX
+// by JGWizrad / Garden FX (GFX)
+// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel, gfx-lab-os, gfx-lab-bypass, gfx-lab-power, gfx-lab-sidebar
+
+slider1:0<0,1,1{Off,On}>-Bypass
+slider2:0<-24,12,0.1>-Trim (dB)
+slider3:1<0,1,1{Off,On}>-Guard
+slider4:22<11,550,1>-HPF (Hz)
+slider5:22000<2200,22000,10>-LPF (Hz)
+slider6:0<0,1,1{A,D}>-Front end
+slider7:6<-12,30,0.1>-Gain (dB)
+slider8:1<0,2,1{Clean 24-bit,Late 18-bit,Early 16-bit}>-Era
+slider9:0<0,1,1{A,D}>-EQ voicing
+slider10:110<22,880,1>-LF freq (Hz)
+slider11:0<-15,15,0.1>-LF gain (dB)
+slider12:0<0,1,1{Shelf,Peak}>-LF shape
+slider13:440<110,3300,1>-LMF freq (Hz)
+slider14:0<-15,15,0.1>-LMF gain (dB)
+slider15:1<0.4,8,0.01>-LMF Q
+slider16:0<0,1,1{Off,On}>-LMF dyn
+slider17:2200<660,9900,1>-HMF freq (Hz)
+slider18:0<-15,15,0.1>-HMF gain (dB)
+slider19:1<0.4,8,0.01>-HMF Q
+slider20:0<0,1,1{Off,On}>-HMF dyn
+slider21:9900<2200,20000,10>-HF freq (Hz)
+slider22:0<-15,15,0.1>-HF gain (dB)
+slider23:0<0,1,1{Shelf,Peak}>-HF shape
+slider24:1<0,1,1{Off,On}>-EQ in
+slider25:1<0,1,1{Off,On}>-Cramp
+slider26:0<0,1,1{A,D}>-Gate voicing
+slider27:-45<-80,0,0.1>-Gate threshold (dB)
+slider28:20<0,80,0.1>-Gate range (dB)
+slider29:200<20,2000,1>-Gate release (ms)
+slider30:1<0,1,1{Off,On}>-Spill
+slider31:990<330,3300,1>-Spill tone (Hz)
+slider32:0<0,1,1{Off,On}>-Gate in
+slider33:0<0,1,1{A,D}>-Comp voicing
+slider34:-12<-40,0,0.1>-Comp threshold (dB)
+slider35:3<1,20,0.01>-Comp ratio
+slider36:5<0.1,50,0.01>-Comp attack (ms)
+slider37:200<20,2000,1>-Comp release (ms)
+slider38:0<0,24,0.1>-Comp make-up (dB)
+slider39:100<0,100,1>-Comp mix (%)
+slider40:0<0,3,1{Off,110 Hz,220 Hz,330 Hz}>-Comp SC HPF
+slider41:0<0,1,1{Off,On}>-Comp in
+slider42:0<-24,12,0.1>-Level (dB)
+slider43:50<0,100,1>-Drift (%)
+slider44:1<0,2,1{1x,2x,4x}>-Oversampling
+slider45:prs_sel=0<0,12,1{No preset,Init,Lead Vocal,Kick Room,Snare Spill,Toms Spill,Slap Bass,Bass DI,Acoustic,Glass Keys,Overheads,Sampler Crunch,Hot Preamp}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-input.jsfx-inc
+import gfx-lab-output.jsfx-inc
+import gfx-lab-drift.jsfx-inc
+import gfx-lab-ui.jsfx-inc
+import gfx-lab-panel.jsfx-inc
+import gfx-lab-os.jsfx-inc
+import gfx-lab-bypass.jsfx-inc
+import gfx-lab-power.jsfx-inc
+import gfx-lab-sidebar.jsfx-inc
+
+@init
+#ui_man = "gfx-lab-hilo-26";
+ext_noinit = 1;
+
+HA_SPI = 100000; HA_SPO = 104096; HA_SPN = 4096;
+HA_HIS = 110000; HA_HN = 256;
+HG_FFT = 131072;
+HG_SMI = 140000; HG_SMO = 140400;
+
+function ha_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function ha_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
+function ha_db(d) ( exp(d * 0.11512925464970228); );
+function ha_lg(x) ( 8.685889638065035 * log(max(x, 0.0000000001)); );
+
+function ha_ss(u) local(q) ( q = u * u; u / sqrt(sqrt(1 + q * q)) + 0.025 * q / (1 + q); );
+function ha_fra(x) ( x = ha_rl * ha_ss(x * ha_g / ha_rl); x + this.sb_run(x); );
+function ha_frd(x) local(q) (
+  x *= ha_ag;
+  q = x * 0.7071 * x * 0.7071;
+  x = ha_rl * x / sqrt(1 + q * q);
+  x += this.sb_run(x);
+  q = x * x; q *= q; q *= q; q *= q;
+  x / sqrt(sqrt(sqrt(sqrt(1 + q))));
+);
+function ha_match(g) local(i, a, y, s, s2) (
+  s = s2 = 0; i = 0;
+  loop(32, a = 0.12589 * sin((i + 0.5) / 32 * 2 * $pi); y = ha_ss(a * g); s += y; s2 += y * y; i += 1; );
+  s2 = s2 / 32 - sqr(s / 32);
+  0.0890215 / sqrt(max(s2, 0.0000000001));
+);
+
+function ha_svfc(f) local(g) (
+  g = tan($pi * min(f, srate * 0.47) / srate);
+  ha_c1 = 1 / (1 + g * (g + 1.4142135623730951)); ha_c2 = g * ha_c1; ha_c3 = g * ha_c2;
+);
+function ha_svf(x, a1, a2, a3) instance(ic1, ic2) local(v1, v2, v3) (
+  v3 = x - ic2; v1 = a1 * ic1 + a2 * v3; v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2; ha_bpo = v1; v2;
+);
+function ha_svfclr() instance(ic1, ic2) ( ic1 = ic2 = 0; );
+function ha_svftidy() instance(ic1, ic2) ( ic1 = ha_tn(ic1); ic2 = ha_tn(ic2); );
+function ha_bqc(t, f, q, gdb) local(ag, w, cw, sw, al, sA, a0) (
+  ag = exp(gdb * 0.05756462732485115); w = 2 * $pi * min(f, srate * 0.45) / srate; cw = cos(w); sw = sin(w);
+  t == 3 ? (
+    al = sw / (2 * q); a0 = 1 + al;
+    ha_b0 = (1 - cw) * 0.5 / a0; ha_b1 = (1 - cw) / a0; ha_b2 = ha_b0; ha_a1 = -2 * cw / a0; ha_a2 = (1 - al) / a0;
+  ) : t == 2 ? (
+    al = sw / (2 * q); a0 = 1 + al / ag;
+    ha_b0 = (1 + al * ag) / a0; ha_b1 = -2 * cw / a0; ha_b2 = (1 - al * ag) / a0; ha_a1 = ha_b1; ha_a2 = (1 - al / ag) / a0;
+  ) : (
+    al = sw * 0.7071067811865476; sA = 2 * sqrt(ag) * al;
+    t == 0 ? (
+      a0 = (ag + 1) + (ag - 1) * cw + sA;
+      ha_b0 = ag * ((ag + 1) - (ag - 1) * cw + sA) / a0; ha_b1 = 2 * ag * ((ag - 1) - (ag + 1) * cw) / a0;
+      ha_b2 = ag * ((ag + 1) - (ag - 1) * cw - sA) / a0; ha_a1 = -2 * ((ag - 1) + (ag + 1) * cw) / a0;
+      ha_a2 = ((ag + 1) + (ag - 1) * cw - sA) / a0;
+    ) : (
+      a0 = (ag + 1) - (ag - 1) * cw + sA;
+      ha_b0 = ag * ((ag + 1) + (ag - 1) * cw + sA) / a0; ha_b1 = -2 * ag * ((ag - 1) + (ag + 1) * cw) / a0;
+      ha_b2 = ag * ((ag + 1) + (ag - 1) * cw - sA) / a0; ha_a1 = 2 * ((ag - 1) - (ag + 1) * cw) / a0;
+      ha_a2 = ((ag + 1) - (ag - 1) * cw - sA) / a0;
+    );
+  );
+);
+function ha_bqset() instance(b0, b1, b2, a1, a2) ( b0 = ha_b0; b1 = ha_b1; b2 = ha_b2; a1 = ha_a1; a2 = ha_a2; );
+function ha_bq(x) instance(b0, b1, b2, a1, a2, x1, x2, y1, y2) local(y) (
+  y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2; x2 = x1; x1 = x; y2 = y1; y1 = y; y;
+);
+function ha_bqclr() instance(x1, x2, y1, y2) ( x1 = x2 = y1 = y2 = 0; );
+function ha_bqtidy() instance(x1, x2, y1, y2) ( x1 = ha_tn(x1); x2 = ha_tn(x2); y1 = ha_tn(y1); y2 = ha_tn(y2); );
+
+function ha_fstep(f) ( 110 * 2 ^ (floor(log(f / 110) / log(2) * 12 + 0.5) / 12); );
+function ha_vstep(v) ( floor(v * 2 + 0.5) / 2; );
+function ha_qstep(q) ( 2 ^ (floor(log(q) / log(2) * 3 + 0.5) / 3); );
+
+function ha_band(snap, ft, gt, qt, pt, sh, t0, dy) instance(f, g, q, pk, dk, fc, gc, qc, tc) local(k, ge, qe, t, nw, fe, x, c) (
+  k = snap ? 1 : ha_c16;
+  f += (ft - f) * k; g += (gt - g) * k; q += (qt - q) * k;
+  snap ? ( pk = pt; dk = 1; ) : sh && pt != pk ? ( dk = max(dk - ha_dks, 0); dk == 0 ? pk = pt; ) : dk = min(dk + ha_dks, 1);
+  ge = g * dk * dk * (3 - 2 * dk) * dy;
+  t = sh ? ( pk ? 2 : t0 ) : 2;
+  qe = sh && !pk ? 0.7071 : q * (1 - ha_em + ha_em * (0.55 + 0.45 * min(abs(ge), 15) / 15));
+  fe = exp(f);
+  t == 2 && ha_cre > 0 ? ( x = $pi * fe / 48000; c = atan(x) / x; fe *= 1 + ha_cre * (c - 1); qe *= 1 + ha_cre * (c * (1 + x * x) - 1); );
+  nw = snap || abs(fe - fc) > 0.0001 * fe || abs(ge - gc) > 0.0005 || abs(qe - qc) > 0.0005 || t != tc;
+  nw ? ( fc = fe; gc = ge; qc = qe; tc = t; ha_bqc(t, fe, qe, ge); );
+  nw;
+);
+function ha_dcoef(f) instance(c1, c2, c3) ( ha_svfc(f); c1 = ha_c1; c2 = ha_c2; c3 = ha_c3; );
+function ha_damt(on) instance(fe, se, a, m) local(d) (
+  d = ha_lg(fe) - ha_lg(se);
+  a = fe > 0.0003 ? min(max((d - 2) / 8, 0), 1) : 0;
+  m += ((on ? 1 : 0) - m) * ha_c16s;
+  1 - m * (1 - a);
+);
+
+function ha_coefs(snap) local(k, ks) (
+  k = snap ? 1 : ha_c16; ks = snap ? 1 : ha_c16s;
+  ha_hf += (ha_hft - ha_hf) * k; ha_lf += (ha_lft - ha_lf) * k; ha_tf += (ha_tft - ha_tf) * k; ha_sf += (ha_sft - ha_sf) * k;
+  snap || abs(ha_hf - ha_hfc) > 0.0001 ? ( ha_hfc = ha_hf; ha_svfc(exp(ha_hf)); ha_h1 = ha_c1; ha_h2 = ha_c2; ha_h3 = ha_c3; );
+  snap || abs(ha_lf - ha_lfc) > 0.0001 ? ( ha_lfc = ha_lf; ha_svfc(exp(ha_lf)); ha_l1 = ha_c1; ha_l2 = ha_c2; ha_l3 = ha_c3; );
+  snap || abs(ha_tf - ha_tfc) > 0.0001 ? ( ha_tfc = ha_tf; ha_svfc(exp(ha_tf)); ha_s1 = ha_c1; ha_s2 = ha_c2; ha_s3 = ha_c3; );
+  snap || abs(ha_sf - ha_sfc) > 0.0001 ? ( ha_sfc = ha_sf; ha_svfc(exp(ha_sf)); ha_k1 = ha_c1; ha_k2 = ha_c2; ha_k3 = ha_c3; );
+  ha_eq += (ha_eqt - ha_eq) * k;
+  ha_em += (ha_emt - ha_em) * ks; ha_cre += ((1 - ha_emt) * ha_crt - ha_cre) * ks;
+  ha_dy2 = haD2.ha_damt(ha_d2t); ha_dy3 = haD3.ha_damt(ha_d3t);
+  haB1.ha_band(snap, ha_f1t, ha_g1t * ha_eq, 0.9, ha_p1t, 1, 0, 1) ? ( e1L.ha_bqset(); e1R.ha_bqset(); );
+  haB2.ha_band(snap, ha_f2t, ha_g2t * ha_eq, ha_q2t, 0, 0, 0, ha_dy2) ? ( e2L.ha_bqset(); e2R.ha_bqset(); );
+  haB3.ha_band(snap, ha_f3t, ha_g3t * ha_eq, ha_q3t, 0, 0, 0, ha_dy3) ? ( e3L.ha_bqset(); e3R.ha_bqset(); );
+  haB4.ha_band(snap, ha_f4t, ha_g4t * ha_eq, 0.9, ha_p4t, 1, 1, 1) ? ( e4L.ha_bqset(); e4R.ha_bqset(); );
+  dt2.ha_dcoef(exp(haB2.f)); dt3.ha_dcoef(exp(haB3.f));
+);
+function ha_fixed() (
+  ha_bqc(3, 20000, 0.52, 0); aE1L.ha_bqset(); aE1R.ha_bqset();
+  ha_bqc(3, 20000, 0.75, 0); aE2L.ha_bqset(); aE2R.ha_bqset();
+  ha_bqc(3, 20000, 2.2, 0); aE3L.ha_bqset(); aE3R.ha_bqset();
+  ha_bqc(1, 15000, 0.7, -2); dEL.ha_bqset(); dER.ha_bqset();
+  ha_bqc(3, 21000, 0.7071, 0); aLL.ha_bqset(); aLR.ha_bqset();
+);
+function ha_clrA() ( uaL.os_clr(); uaR.os_clr(); shL.sb_clr(); shR.sb_clr(); );
+function ha_clrD() ( udL.os_clr(); udR.os_clr(); sdL.sb_clr(); sdR.sb_clr(); );
+function ha_clrE1() ( aLL.ha_bqclr(); aLR.ha_bqclr(); );
+function ha_clrE2() ( aE1L.ha_bqclr(); aE1R.ha_bqclr(); aE2L.ha_bqclr(); aE2R.ha_bqclr(); aE3L.ha_bqclr(); aE3R.ha_bqclr(); dEL.ha_bqclr(); dER.ha_bqclr(); );
+function ha_clear() ( uxL.os_clr(); uxR.os_clr(); ha_clrA(); ha_clrD(); sb_rate(srate * os_f); );
+function ha_reset() (
+  ha_clear(); ha_clrE1(); ha_clrE2(); memset(BY_BUF, 0, 2 * BY_N);
+  hpL.ha_svfclr(); hpR.ha_svfclr(); lpL.ha_svfclr(); lpR.ha_svfclr(); spL.ha_svfclr(); spR.ha_svfclr(); scL.ha_svfclr(); scR.ha_svfclr();
+  dt2.ha_svfclr(); dt3.ha_svfclr();
+  e1L.ha_bqclr(); e1R.ha_bqclr(); e2L.ha_bqclr(); e2R.ha_bqclr(); e3L.ha_bqclr(); e3R.ha_bqclr(); e4L.ha_bqclr(); e4R.ha_bqclr();
+  ha_dxl = ha_dyl = ha_dxr = ha_dyr = 0; ha_env = 0;
+  ha_ge = 0; ha_gg = 0; ha_go = 0; ha_ce = 0; ha_grs = 0;
+  haD2.fe = haD2.se = haD3.fe = haD3.se = 0;
+  in_dxL = in_dyL = in_dxR = in_dyR = 0;
+  ha_fi = 0;
+);
+
+#ha_pm = "Init|Lead Vocal|Kick Room|Snare Spill|Toms Spill|Slap Bass|Bass DI|Acoustic|Glass Keys|Overheads|Sampler Crunch|Hot Preamp";
+function ha_pa(fm, gn, er, hp, lp, em, f1, g1, p1, f2) (
+  slider6 = fm; slider7 = gn; slider8 = er; slider4 = hp; slider5 = lp; slider9 = em; slider10 = f1; slider11 = g1; slider12 = p1; slider13 = f2;
+);
+function ha_pb(g2, q2, d2, f3, g3, q3, d3, f4, g4, p4) (
+  slider14 = g2; slider15 = q2; slider16 = d2; slider17 = f3; slider18 = g3; slider19 = q3; slider20 = d3; slider21 = f4; slider22 = g4; slider23 = p4;
+);
+function ha_pc(cr, gm, gt, gr, gl, sp, tn, gi, cm, ct) (
+  slider25 = cr; slider26 = gm; slider27 = gt; slider28 = gr; slider29 = gl; slider30 = sp; slider31 = tn; slider32 = gi; slider33 = cm; slider34 = ct;
+);
+function ha_pd(cq, ca, cl, mx, sh, ci, lv) (
+  slider35 = cq; slider36 = ca; slider37 = cl; slider39 = mx; slider40 = sh; slider41 = ci; slider42 = lv;
+);
+function load_preset(p) local(i) (
+  slider2 = 0; slider3 = 1; slider24 = 1;
+  p == 1 || p == 13 ? ( ha_pa(0,  6, 1,  22, 22000, 0,  110,  0, 0,  440); ha_pb( 0, 1,   0,  2200,  0, 1,   0,  9900,  0, 0); ha_pc(1, 0, -45, 20, 200, 1,  990, 0, 0, -12); ha_pd(3,  5,   200, 100, 0, 0,  0); ) :
+  p == 2  ? ( ha_pa(1,  9, 1,  88, 22000, 0,  110,  0, 0,  330); ha_pb(-2, 1.2, 0,  3300, -4, 1.6, 1, 11000,  3, 0); ha_pc(1, 0, -50,  6, 300, 1, 1320, 1, 1, -20); ha_pd(3,  4,   200, 100, 1, 1,  0); ) :
+  p == 3  ? ( ha_pa(0,  8, 1,  33, 11000, 0,   66,  5, 1,  330); ha_pb(-6, 1.6, 0,  3300,  4, 1.4, 0,  9900,  0, 0); ha_pc(1, 0, -30, 18, 180, 1,  660, 1, 0, -14); ha_pd(4, 20,   120, 100, 0, 1,  0); ) :
+  p == 4  ? ( ha_pa(0,  8, 1,  88, 22000, 0,  220,  3, 1,  550); ha_pb(-3, 1.4, 0,  5500,  4, 1.2, 0, 11000,  2, 0); ha_pc(1, 0, -28, 15, 150, 1,  990, 1, 1, -16); ha_pd(4,  3,   150,  70, 1, 1,  0); ) :
+  p == 5  ? ( ha_pa(0,  8, 1,  55, 16000, 0,  110,  4, 1,  440); ha_pb(-5, 1.2, 0,  4400,  3, 1.2, 0,  9900,  0, 0); ha_pc(1, 0, -34, 20, 400, 1,  770, 1, 0, -14); ha_pd(3, 10,   300, 100, 0, 1,  0); ) :
+  p == 6  ? ( ha_pa(1, 12, 1,  33, 22000, 1,   88,  3, 0,  550); ha_pb(-3, 1.4, 0,  2200,  5, 1.4, 0,  9900,  2, 0); ha_pc(1, 1, -60, 20, 120, 0,  990, 0, 1, -20); ha_pd(6,  1,   120, 100, 0, 1,  0); ) :
+  p == 7  ? ( ha_pa(0, 12, 1,  33,  8800, 0,   88,  3, 0,  660); ha_pb( 2, 1,   0,  2200,  2, 1,   0,  9900,  0, 0); ha_pc(1, 0, -60, 20, 200, 1,  990, 0, 0, -18); ha_pd(4, 15,   200, 100, 0, 1,  0); ) :
+  p == 8  ? ( ha_pa(0,  6, 1, 110, 22000, 0,  220, -2, 1,  330); ha_pb(-3, 1,   1,  4400,  2, 0.7, 0, 13000,  4, 0); ha_pc(1, 0, -60, 20, 200, 1,  990, 0, 0, -16); ha_pd(2.5, 12, 300, 100, 1, 1,  0); ) :
+  p == 9  ? ( ha_pa(1,  6, 1,  55, 22000, 1,  110,  0, 0,  440); ha_pb(-2, 1,   0,  4400,  2, 0.7, 0, 13000,  4, 0); ha_pc(1, 1, -60, 20, 200, 0,  990, 0, 1, -16); ha_pd(3,  5,   250, 100, 0, 1,  0); ) :
+  p == 10 ? ( ha_pa(0,  4, 1, 110, 22000, 0,  220, -2, 0,  440); ha_pb(-1, 0.8, 0,  3300, -2, 1.5, 1, 13000,  3, 0); ha_pc(1, 0, -60, 20, 200, 1,  990, 0, 0, -10); ha_pd(2, 20,   400,  60, 2, 1,  0); ) :
+  p == 11 ? ( ha_pa(1,  0, 2,  44, 22000, 1,  110,  3, 0,  880); ha_pb( 2, 1,   0,  3300,  3, 1.4, 0,  9900, -3, 0); ha_pc(1, 1, -60, 20, 100, 0,  990, 0, 1, -18); ha_pd(8,  0.3,  80, 100, 0, 1,  2); ) :
+  p == 12 ? ( ha_pa(0, 26, 1,  33, 22000, 0,  110,  2, 0,  550); ha_pb(-2, 1,   0,  2200,  2, 1,   0,  9900,  0, 0); ha_pc(1, 0, -60, 20, 200, 1,  990, 0, 0, -12); ha_pd(3,  5,   200, 100, 0, 0, -3); );
+  slider38 = floor(0.5 * (1 - 1 / slider35) * max(0, -12 - slider34) * 2 + 0.5) / 2;
+  p == 13 ? slider43 = 50;
+  i = 2; loop(41, ui_auto(i); i += 1; ); ui_auto(43);
+  pr_cur = p == 13 ? 1 : p;
+);
+
+function ha_srinit() (
+  ha_sr = srate;
+  c_kn = ha_tc(30);
+  ha_vuc = ha_tc(300);
+  ha_c16 = 1 - exp(-16 / (0.03 * srate));
+  ha_c16s = 1 - exp(-16 / (0.015 * srate));
+  ha_dks = 16 / (0.006 * srate);
+  ha_dcc = 1 - 2 * $pi * 5 / srate;
+  c_sw = ha_tc(15);
+  ha_xs = 1 / (0.015 * srate);
+  ha_ea = ha_tc(4); ha_er = ha_tc(80);
+  ha_dfa = ha_tc(5); ha_dfr = ha_tc(100); ha_dsl = ha_tc(1500);
+  ha_rnd = ha_tc(25);
+  ha_fis = 1 / (0.01 * srate);
+  ha_hsn = floor(0.02 * srate);
+  ha_fixed();
+  ost_init(0);
+  ha_clear();
+  ha_cc = 0;
+);
+os_design();
+os_f = os_tf = os_f2n(slider44); os_base = 0;
+ha_srinit();
+os_gsetup();
+in_init();
+dSup.drift_init(0.8 + rand(1) * 0.4); dVc.drift_init(0.6 + rand(1) * 0.4); dGt.drift_init(0.7 + rand(1) * 0.4);
+drift_mm_init();
+drift_macro(50);
+pwr_init(); pwr_hum_db = -84; pwr_sag = 0.15; pwr_wu_loss = 0.4; pwr_wu_drv = 0.8; pwr_wu_lp = 12000; pwr_wu_wob = 0.15; pwr_bloom = 0;
+ha_sd = 22222;
+ha_snap = 1; ha_fi = 1; ha_rl = 1;
+ha_fa = slider6 < 0.5; ha_e0 = slider8 < 0.5; ha_e1 = slider8 >= 0.5 && slider8 < 1.5; ha_e2 = slider8 >= 1.5;
+ha_gm = slider26 < 0.5; ha_cm = slider33 < 0.5;
+pdc_delay = os_lat(os_f);
+by_setup(1);
+memset(HA_SPI, 0, 2 * HA_SPN); ha_i = 0; loop(HA_HN, HA_HIS[ha_i * 3] = -120; HA_HIS[ha_i * 3 + 1] = 1; HA_HIS[ha_i * 3 + 2] = 0; ha_i += 1; ); ha_gsm = 1;
+
+ui_thm = 5; ui_hw = 1;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+function prs_hash() local(i, h) ( h = 0; i = 1; loop(45, i != 45 ? h += slider(i) * (1 + i * 0.7071); i += 1; ); h; );
+function prs_same() local(h, r) ( h = prs_hash(); r = h == prs_h0; prs_h0 = h; r; );
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 12 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(12, prs_sel | 0));
+    prs_hs = prs_same();  prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 && prs_hs ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+prs_chk();
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;
+pwr_ser();
+drift_mm_ser();
+
+@block
+prs_chk();
+srate != ha_sr ? ha_srinit();
+pwr_block(slider1 < 0.5);
+ha_now = time_precise();
+ha_tp > 0 && ha_now - ha_tp > max(0.25, 4 * samplesblock / srate) ? ha_reset();
+ha_tp = ha_now;
+in_setup(min(max(slider2, -24), 12), slider3 >= 0.5);
+ost_setup(0, 0.3, 120, 6000, -0.3, 1);
+os_tf = os_f2n(slider44); pdc_delay = os_lat(os_f);
+pdc_bot_ch = 0; pdc_top_ch = 2;
+drift_macro(slider43);
+ha_bt = samplesblock / srate;
+ha_sg = 0.05 * dm_a;
+ha_dsp = dSup.drift_tick(0.05 * dm_s * ha_bt);
+ha_vrt = ha_db(0.3 * dm_a * ha_dsp); ha_rft = ha_db(0.2 * dm_a * ha_dsp);
+ha_cdr = 0.5 * dm_a * dVc.drift_tick(0.04 * dm_s * ha_bt);
+ha_gdr = 1.0 * dm_a * dGt.drift_tick(0.04 * dm_s * ha_bt);
+drift_mm(0.1, 0.4);
+ha_hft = log(min(max(slider4, 11), 550)); ha_lft = log(min(max(slider5, 2200), 22000));
+ha_fat = slider6 < 0.5;
+ha_gn = min(max(slider7, -12), 30);
+ha_gt = ha_db(ha_gn - 6); ha_gt != ha_gtc ? ( ha_gtc = ha_gt; ha_mkt = ha_match(ha_gt); );
+ha_agt = ha_db(ha_gn - 6);
+ha_ert = slider8 < 0.5 ? 0 : slider8 < 1.5 ? 1 : 2;
+ha_emt = slider9 < 0.5;
+ha_v = min(max(slider10, 22), 880);    ha_f1t = log(ha_emt ? ha_v : min(max(ha_fstep(ha_v), 22), 880));
+ha_v = min(max(slider13, 110), 3300);  ha_f2t = log(ha_emt ? ha_v : min(max(ha_fstep(ha_v), 110), 3300));
+ha_v = min(max(slider17, 660), 9900);  ha_f3t = log(ha_emt ? ha_v : min(max(ha_fstep(ha_v), 660), 9900));
+ha_v = min(max(slider21, 2200), 20000); ha_f4t = log(ha_emt ? ha_v : min(max(ha_fstep(ha_v), 2200), 20000));
+ha_v = min(max(slider11, -15), 15); ha_g1t = ha_emt ? ha_v : ha_vstep(ha_v);
+ha_v = min(max(slider14, -15), 15); ha_g2t = ha_emt ? ha_v : ha_vstep(ha_v);
+ha_v = min(max(slider18, -15), 15); ha_g3t = ha_emt ? ha_v : ha_vstep(ha_v);
+ha_v = min(max(slider22, -15), 15); ha_g4t = ha_emt ? ha_v : ha_vstep(ha_v);
+ha_v = min(max(slider15, 0.4), 8); ha_q2t = ha_emt ? ha_v : ha_qstep(ha_v);
+ha_v = min(max(slider19, 0.4), 8); ha_q3t = ha_emt ? ha_v : ha_qstep(ha_v);
+ha_p1t = slider12 >= 0.5; ha_p4t = slider23 >= 0.5; ha_d2t = slider16 >= 0.5; ha_d3t = slider20 >= 0.5;
+ha_eqt = slider24 >= 0.5; ha_crt = slider25 >= 0.5;
+ha_gmt = slider26 < 0.5;
+ha_gth = ha_db(min(max(slider27, -80), 0) + (ha_gmt ? ha_gdr : 0));
+ha_gtl = ha_gth * (ha_gmt ? 0.631 : 0.708);
+ha_rgt = ha_db(-min(max(slider28, 0), 80));
+ha_grk = 1 - exp(-1 / (min(max(slider29, 20), 2000) * 0.001 * srate));
+ha_gak = ha_tc(ha_gmt ? 1 : 0.2); ha_gdk = exp(-1 / ((ha_gmt ? 0.005 : 0.003) * srate)); ha_ghn = floor((ha_gmt ? 0.02 : 0.01) * srate);
+ha_spt = slider30 >= 0.5; ha_tft = log(min(max(slider31, 330), 3300)); ha_git = slider32 >= 0.5;
+ha_cmt = slider33 < 0.5;
+ha_ctht = min(max(slider34, -40), 0) + (ha_cmt ? ha_cdr : 0);
+ha_crr = min(max(slider35, 1), 20); ha_cslt = 1 - 1 / ha_crr;
+ha_cak = ha_tc(min(max(slider36, 0.1), 50)); ha_crk = ha_tc(min(max(slider37, 20), 2000));
+ha_cmkt = min(max(slider38, 0), 24);
+ha_cxt = min(max(slider39, 0), 100) / 100;
+ha_sct = slider40 >= 0.5; ha_sft = log(slider40 < 1.5 ? 110 : slider40 < 2.5 ? 220 : 330);
+ha_cit = slider41 >= 0.5;
+ha_ogt = ha_db(min(max(slider42, -24), 12));
+sb_target(14, 1, 1, 220, 1 / (ha_fat ? ha_vrt : ha_rft));
+ha_snap ? ( ha_cth = ha_ctht; ha_csl = ha_cslt; ha_cmk = ha_cmkt; ha_g = ha_gt; ha_mk = ha_mkt; ha_ag = ha_agt; ha_og = ha_ogt;
+            ha_vr = ha_vrt; ha_rf = ha_rft; ha_rg = ha_rgt; ha_sp = ha_spt; ha_gi = ha_git; ha_ci = ha_cit; ha_cx = ha_cxt; ha_sc = ha_sct;
+            ha_eq = ha_eqt; ha_em = ha_emt; ha_cre = (1 - ha_emt) * ha_crt;
+            ha_fa = ha_fat; ha_gm = ha_gmt; ha_cm = ha_cmt; ha_e0 = ha_ert == 0; ha_e1 = ha_ert == 1; ha_e2 = ha_ert == 2;
+            ha_coefs(1); sb_snap(); ha_cc = 16; );
+ha_snap = 0;
+hpL.ha_svftidy(); hpR.ha_svftidy(); lpL.ha_svftidy(); lpR.ha_svftidy(); spL.ha_svftidy(); spR.ha_svftidy(); scL.ha_svftidy(); scR.ha_svftidy();
+dt2.ha_svftidy(); dt3.ha_svftidy();
+e1L.ha_bqtidy(); e1R.ha_bqtidy(); e2L.ha_bqtidy(); e2R.ha_bqtidy(); e3L.ha_bqtidy(); e3R.ha_bqtidy(); e4L.ha_bqtidy(); e4R.ha_bqtidy();
+aE1L.ha_bqtidy(); aE1R.ha_bqtidy(); aE2L.ha_bqtidy(); aE2R.ha_bqtidy(); aE3L.ha_bqtidy(); aE3R.ha_bqtidy();
+dEL.ha_bqtidy(); dER.ha_bqtidy(); aLL.ha_bqtidy(); aLR.ha_bqtidy();
+ha_dyl = ha_tn(ha_dyl); ha_dyr = ha_tn(ha_dyr); ha_env = ha_tn(ha_env); ha_ge = ha_tn(ha_ge); ha_gg = ha_tn(ha_gg); ha_ce = ha_tn(ha_ce); ha_grs = ha_tn(ha_grs);
+haD2.fe = ha_tn(haD2.fe); haD2.se = ha_tn(haD2.se); haD3.fe = ha_tn(haD3.fe); haD3.se = ha_tn(haD3.se);
+ha_ol_d = max(ha_ol_d, sqrt(ha_ol)); ha_or_d = max(ha_or_d, sqrt(ha_or)); ha_ol = ha_or = 0;
+ha_vl = ha_tn(ha_vl); ha_vr2 = ha_tn(ha_vr2);
+ha_gr_d = max(ha_gr_d, ha_grm); ha_grm = 0;
+ha_open_d = max(ha_open_d, ha_gom); ha_gom = 0;
+ha_over_d = max(ha_over_d, ha_ovm); ha_ovm = 0;
+ha_dy2_d = ha_dy2; ha_dy3_d = ha_dy3;
+ha_sbk_d = max(ha_sbk_d, sb_pk); sb_pk = 0;
+
+@sample
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+by_in();
+in_process(spl0, spl1);
+ha_spw = (ha_spw + 1) & (HA_SPN - 1); HA_SPI[ha_spw] = (in_l + in_r) * 0.5;
+ha_g += (ha_gt - ha_g) * c_kn; ha_mk += (ha_mkt - ha_mk) * c_kn; ha_og += (ha_ogt - ha_og) * c_kn;
+ha_vr += (ha_vrt - ha_vr) * c_kn; ha_rf += (ha_rft - ha_rf) * c_kn; ha_ag += (ha_agt * ha_rf - ha_ag) * c_kn;
+ha_rg += (ha_rgt - ha_rg) * c_kn; ha_sp += (ha_spt - ha_sp) * c_kn; ha_gi += (ha_git - ha_gi) * c_kn; ha_ci += (ha_cit - ha_ci) * c_kn;
+ha_cth += (ha_ctht - ha_cth) * c_kn; ha_csl += (ha_cslt - ha_csl) * c_kn; ha_cmk += (ha_cmkt - ha_cmk) * c_kn; ha_cx += (ha_cxt - ha_cx) * c_kn;
+ha_sc += (ha_sct - ha_sc) * c_kn;
+ha_gm += (ha_gmt - ha_gm) * c_sw; ha_cm += (ha_cmt - ha_cm) * c_sw;
+drift_mm_glide(c_kn);
+sb_glide(c_kn, c_sw);
+ha_cc -= 1; ha_cc <= 0 ? ( ha_cc = 16; ha_coefs(0); sb_ctl(ha_c16); );
+ha_fa0 = ha_fa; ha_fa = ha_fat ? min(ha_fa + ha_xs, 1) : max(ha_fa - ha_xs, 0);
+ha_fa0 == 0 && ha_fa > 0 ? ha_clrA(); ha_fa0 == 1 && ha_fa < 1 ? ha_clrD();
+ha_v = ha_e1; ha_e0 = ha_ert == 0 ? min(ha_e0 + ha_xs, 1) : max(ha_e0 - ha_xs, 0);
+ha_e1 = ha_ert == 1 ? min(ha_e1 + ha_xs, 1) : max(ha_e1 - ha_xs, 0); ha_v == 0 && ha_e1 > 0 ? ha_clrE1();
+ha_v = ha_e2; ha_e2 = ha_ert == 2 ? min(ha_e2 + ha_xs, 1) : max(ha_e2 - ha_xs, 0); ha_v == 0 && ha_e2 > 0 ? ha_clrE2();
+ha_xl = in_l; ha_xr = in_r;
+ha_v = hpL.ha_svf(ha_xl, ha_h1, ha_h2, ha_h3); ha_xl = ha_xl - 1.4142135623730951 * ha_bpo - ha_v;
+ha_v = hpR.ha_svf(ha_xr, ha_h1, ha_h2, ha_h3); ha_xr = ha_xr - 1.4142135623730951 * ha_bpo - ha_v;
+ha_xl = lpL.ha_svf(ha_xl, ha_l1, ha_l2, ha_l3); ha_xr = lpR.ha_svf(ha_xr, ha_l1, ha_l2, ha_l3);
+pwr_in(ha_xl, ha_xr); ha_xl = pwr_l; ha_xr = pwr_r;
+abs(ha_xl) < 0.000000000000001 ? ha_xl = 0; abs(ha_xr) < 0.000000000000001 ? ha_xr = 0;
+ha_rl = max(0.7, (1 + ha_fa * (ha_vr - 1)) * (1 - ha_sg * min(ha_env, 1)));
+os_gate();
+os_chg ? ( ha_clear(); os_hold += 2 * samplesblock; );
+uxL.os_up(ha_xl * dmm_kl); uxR.os_up(ha_xr * dmm_kr);
+ha_fa > 0 ? (
+  os_f == 1 ? ( ha_al = shL.ha_fra(uxL.s0); ha_ar = shR.ha_fra(uxR.s0); ) : (
+    ha_a0 = shL.ha_fra(uxL.s0); ha_b0 = shR.ha_fra(uxR.s0); ha_a1 = shL.ha_fra(uxL.s1); ha_b1 = shR.ha_fra(uxR.s1);
+    os_f == 2 ? ( ha_al = uaL.os_dn(ha_a0, ha_a1, 0, 0); ha_ar = uaR.os_dn(ha_b0, ha_b1, 0, 0); ) : (
+      ha_a2 = shL.ha_fra(uxL.s2); ha_b2 = shR.ha_fra(uxR.s2); ha_a3 = shL.ha_fra(uxL.s3); ha_b3 = shR.ha_fra(uxR.s3);
+      ha_al = uaL.os_dn(ha_a0, ha_a1, ha_a2, ha_a3); ha_ar = uaR.os_dn(ha_b0, ha_b1, ha_b2, ha_b3);
+    );
+  );
+  ha_al *= ha_mk; ha_ar *= ha_mk;
+);
+ha_fa < 1 ? (
+  os_f == 1 ? ( ha_dl = sdL.ha_frd(uxL.s0); ha_dr = sdR.ha_frd(uxR.s0); ) : (
+    ha_a0 = sdL.ha_frd(uxL.s0); ha_b0 = sdR.ha_frd(uxR.s0); ha_a1 = sdL.ha_frd(uxL.s1); ha_b1 = sdR.ha_frd(uxR.s1);
+    os_f == 2 ? ( ha_dl = udL.os_dn(ha_a0, ha_a1, 0, 0); ha_dr = udR.os_dn(ha_b0, ha_b1, 0, 0); ) : (
+      ha_a2 = sdL.ha_frd(uxL.s2); ha_b2 = sdR.ha_frd(uxR.s2); ha_a3 = sdL.ha_frd(uxL.s3); ha_b3 = sdR.ha_frd(uxR.s3);
+      ha_dl = udL.os_dn(ha_a0, ha_a1, ha_a2, ha_a3); ha_dr = udR.os_dn(ha_b0, ha_b1, ha_b2, ha_b3);
+    );
+  );
+  ha_ovm = max(ha_ovm, max(abs(ha_dl), abs(ha_dr)));
+  ha_yl = ha_e0 * ha_dl; ha_yr = ha_e0 * ha_dr;
+  ha_e1 > 0 ? (
+    ha_sd = (ha_sd * 16807) % 2147483647; ha_u = ha_sd / 2147483647;
+    ha_sd = (ha_sd * 16807) % 2147483647; ha_u -= ha_sd / 2147483647;
+    ha_v = aLL.ha_bq(ha_dl); ha_z = aLR.ha_bq(ha_dr);
+    ha_yl += ha_e1 * floor(ha_v * 131072 + ha_u + 0.5) / 131072; ha_yr += ha_e1 * floor(ha_z * 131072 - ha_u + 0.5) / 131072;
+  );
+  ha_e2 > 0 ? (
+    ha_v = aE3L.ha_bq(aE2L.ha_bq(aE1L.ha_bq(ha_dl))); ha_z = aE3R.ha_bq(aE2R.ha_bq(aE1R.ha_bq(ha_dr)));
+    ha_yl += ha_e2 * floor(ha_v * 8192 + 0.5) / 8192; ha_yr += ha_e2 * floor(ha_z * 8192 + 0.5) / 8192;
+  );
+  ha_v = 1 / max(ha_ag, 0.01); ha_dl = ha_yl * ha_v; ha_dr = ha_yr * ha_v;
+);
+ha_z = ha_fa * ha_fa * (3 - 2 * ha_fa);
+ha_yl = ha_fa >= 1 ? ha_al : ha_fa <= 0 ? ha_dl : ha_dl + ha_z * (ha_al - ha_dl);
+ha_yr = ha_fa >= 1 ? ha_ar : ha_fa <= 0 ? ha_dr : ha_dr + ha_z * (ha_ar - ha_dr);
+ha_yl *= dmm_ol; ha_yr *= dmm_or;
+ha_v = max(abs(ha_yl), abs(ha_yr)); ha_env += (ha_v - ha_env) * (ha_v > ha_env ? ha_ea : ha_er);
+ha_z = ha_yl - ha_dxl + ha_dcc * ha_dyl; ha_dxl = ha_yl; ha_dyl = ha_z; ha_yl = ha_z;
+ha_z = ha_yr - ha_dxr + ha_dcc * ha_dyr; ha_dxr = ha_yr; ha_dyr = ha_z; ha_yr = ha_z;
+ha_v = (ha_yl + ha_yr) * 0.5;
+ha_d2t || haD2.m > 0.001 ? ( dt2.ha_svf(ha_v, dt2.c1, dt2.c2, dt2.c3); ha_z = abs(ha_bpo);
+  haD2.fe += (ha_z - haD2.fe) * (ha_z > haD2.fe ? ha_dfa : ha_dfr); haD2.se += (haD2.fe - haD2.se) * ha_dsl; );
+ha_d3t || haD3.m > 0.001 ? ( dt3.ha_svf(ha_v, dt3.c1, dt3.c2, dt3.c3); ha_z = abs(ha_bpo);
+  haD3.fe += (ha_z - haD3.fe) * (ha_z > haD3.fe ? ha_dfa : ha_dfr); haD3.se += (haD3.fe - haD3.se) * ha_dsl; );
+ha_yl = e4L.ha_bq(e3L.ha_bq(e2L.ha_bq(e1L.ha_bq(ha_yl))));
+ha_yr = e4R.ha_bq(e3R.ha_bq(e2R.ha_bq(e1R.ha_bq(ha_yr))));
+ha_v = max(abs(ha_yl), abs(ha_yr)); ha_ge = ha_v > ha_ge ? ha_v : ha_ge * ha_gdk;
+ha_lvm = max(ha_lvm, ha_ge);
+ha_ge > ha_gth ? ( ha_go = 1; ha_gh = ha_ghn; ) : ha_gh > 0 ? ha_gh -= 1 : ha_ge < ha_gtl ? ha_go = 0;
+ha_gg += (ha_go - ha_gg) * (ha_go > ha_gg ? ha_gak : ha_grk);
+ha_gs = ha_gg + ha_gm * (ha_gg * ha_gg * (3 - 2 * ha_gg) - ha_gg);
+ha_v = ha_sp * ha_gm;
+ha_v > 0.0001 ? ( ha_dl = spL.ha_svf(ha_yl, ha_s1, ha_s2, ha_s3); ha_dr = spR.ha_svf(ha_yr, ha_s1, ha_s2, ha_s3); ) : ( ha_dl = ha_yl; ha_dr = ha_yr; );
+ha_cl = ha_rg * (ha_yl + ha_v * (ha_dl - ha_yl)); ha_cr = ha_rg * (ha_yr + ha_v * (ha_dr - ha_yr));
+ha_yl += ha_gi * (ha_cl + ha_gs * (ha_yl - ha_cl) - ha_yl); ha_yr += ha_gi * (ha_cr + ha_gs * (ha_yr - ha_cr) - ha_yr);
+ha_gom = max(ha_gom, ha_gi > 0.5 ? ha_gs : 1); ha_gsm = min(ha_gsm, ha_gi > 0.5 ? ha_gs : 1);
+ha_sc > 0.001 ? (
+  ha_v = scL.ha_svf(ha_yl, ha_k1, ha_k2, ha_k3); ha_dl = ha_yl - 1.4142135623730951 * ha_bpo - ha_v;
+  ha_v = scR.ha_svf(ha_yr, ha_k1, ha_k2, ha_k3); ha_dr = ha_yr - 1.4142135623730951 * ha_bpo - ha_v;
+  ha_v = max(abs(ha_yl + ha_sc * (ha_dl - ha_yl)), abs(ha_yr + ha_sc * (ha_dr - ha_yr)));
+) : ha_v = max(abs(ha_yl), abs(ha_yr));
+ha_ce += (ha_v - ha_ce) * (ha_v > ha_ce ? ha_cak : ha_crk);
+ha_o = ha_lg(ha_ce) - ha_cth; ha_kw = 6 * ha_cm;
+ha_gr = ha_o <= -0.5 * ha_kw ? 0 : ha_kw > 0.01 && ha_o < 0.5 * ha_kw ? ha_csl * sqr(ha_o + 0.5 * ha_kw) / (2 * ha_kw) : ha_csl * ha_o;
+ha_grs = ha_gr >= ha_grs ? ha_gr : ha_grs + (ha_gr - ha_grs) * (1 - ha_cm + ha_cm * ha_rnd);
+ha_grm = max(ha_grm, ha_grs * ha_ci);
+ha_v = ha_db(ha_ci * (ha_cmk - ha_grs));
+ha_v = 1 + ha_cx * (ha_v - 1);
+ha_yl *= ha_v; ha_yr *= ha_v;
+ha_z = ha_fa * ha_fa * (3 - 2 * ha_fa); ha_v = (1 - ha_z) * ha_e2;
+ha_v > 0 ? ( ha_dl = dEL.ha_bq(ha_yl); ha_dr = dER.ha_bq(ha_yr); ha_yl += ha_v * (ha_dl - ha_yl); ha_yr += ha_v * (ha_dr - ha_yr); );
+pwr_out(ha_yl, ha_yr); ha_yl = pwr_l; ha_yr = pwr_r;
+ha_osg = os_g * os_g * (3 - 2 * os_g);
+ha_yl *= ha_og * ha_osg; ha_yr *= ha_og * ha_osg;
+ha_yl != ha_yl ? ha_yl = 0; ha_yr != ha_yr ? ha_yr = 0;
+ha_fi < 1 ? (
+  ha_fi = min(ha_fi + ha_fis, 1); ha_z = ha_fi * ha_fi * (3 - 2 * ha_fi);
+  ha_a = by_d == 0 ? by_il : BY_BUF[(by_w - by_d) & (BY_N - 1)]; ha_b = by_d == 0 ? by_ir : BY_BUF[BY_N + ((by_w - by_d) & (BY_N - 1))];
+  ha_yl = ha_a + ha_z * (ha_yl - ha_a); ha_yr = ha_b + ha_z * (ha_yr - ha_b);
+);
+ost_out(ha_yl, ha_yr);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+by_out();
+ha_vl += (spl0 * spl0 - ha_vl) * ha_vuc; ha_vr2 += (spl1 * spl1 - ha_vr2) * ha_vuc;
+ha_ol = max(ha_ol, ha_vl); ha_or = max(ha_or, ha_vr2);
+HA_SPO[ha_spw] = (spl0 + spl1) * 0.5;
+ha_hc += 1;
+ha_hc >= ha_hsn ? (
+  ha_hc = 0; ha_hw = (ha_hw + 1) & (HA_HN - 1);
+  HA_HIS[ha_hw * 3] = ha_lg(ha_lvm); HA_HIS[ha_hw * 3 + 1] = ha_gsm; HA_HIS[ha_hw * 3 + 2] = ha_grhm;
+  ha_lvm = 0; ha_gsm = 1; ha_grhm = 0;
+  ha_hw_d = ha_hw;
+);
+ha_grhm = max(ha_grhm, ha_grs * ha_ci);
+
+@gfx 1400 720
+ui_begin(1400, 720);
+HG_BAR = 0xD94A6A; HG_RULE = 0xFFC94A; HG_FT = 0xFFF7E6; HG_FM = 0xF4F0DE; HG_FB = 0x34AFBC;
+HG_S1 = 0xFFFDF6; HG_S2 = 0xF7E9D3; HG_INK = 0x3A2228; HG_SUBI = 0x8A6862; HG_LIT = 0xB0304E;
+HG_AMB = 0xF0A83C; HG_TEAL = 0x4FD8D0; HG_AUL = 0xD98A12; HG_DUL = 0x14928A; HG_NUL = 0xC9A9A0;
+HG_KNB = 0x3A2A2E; HG_SCR = 0x0B1215;
+ui_vu_dim = slider1 >= 0.5;
+sc != hg_fsc ? (
+  hg_fsc = sc;
+  hg_f10 = ui_fitarial(10, 14 * sc);
+  hg_f11 = ui_fitarial(11, 12 * sc);
+  hg_f12 = ui_fitarial(12, 17 * sc);
+  hg_f13 = ui_fitarial(13, 27 * sc);
+);
+function hg_font(i) (
+  i == 10 ? gfx_setfont(10, "Arial", hg_f10, 'b') : i == 11 ? gfx_setfont(11, "Arial", hg_f11, 'b') :
+  i == 12 ? gfx_setfont(12, "Arial", hg_f12, 'b') : gfx_setfont(13, "Arial", hg_f13, 'b');
+);
+function hg_rect(x, y, w, h) local(x0, y0) ( x0 = floor(x * sc + 0.5); y0 = floor(y * sc + 0.5); gfx_rect(x0, y0, max(1, floor((x + w) * sc + 0.5) - x0), max(1, floor((y + h) * sc + 0.5) - y0)); );
+function hg_rr(x, y, w, h, r) local(x0, y0, ww, hh, rad, rdi, i, dy, ins, ci, fr, a0, yt, yb) (
+  x0 = floor(x * sc + 0.5); y0 = floor(y * sc + 0.5); ww = floor(w * sc + 0.5); hh = floor(h * sc + 0.5);
+  rad = min(r * sc, min(ww, hh) * 0.5); rdi = ceil(rad); a0 = gfx_a;
+  gfx_rect(x0, y0 + rdi, ww, hh - 2 * rdi);
+  i = 0; loop(rdi,
+    dy = rad - (i + 0.5); ins = dy > 0 ? rad - sqrt(max(rad * rad - dy * dy, 0)) : 0; ci = ceil(ins); fr = ci - ins;
+    yt = y0 + i; yb = y0 + hh - 1 - i;
+    gfx_a = a0; gfx_rect(x0 + ci, yt, ww - 2 * ci, 1); gfx_rect(x0 + ci, yb, ww - 2 * ci, 1);
+    ci > 0 && fr > 0.02 ? ( gfx_a = a0 * fr; gfx_rect(x0 + ci - 1, yt, 1, 1); gfx_rect(x0 + ww - ci, yt, 1, 1); gfx_rect(x0 + ci - 1, yb, 1, 1); gfx_rect(x0 + ww - ci, yb, 1, 1); );
+    i += 1; );
+  gfx_a = a0;
+);
+function hg_disc(x, y, r) ( gfx_circle(x * sc, y * sc, r * sc, 1, 1); );
+function hg_ctxt(cx, cy, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = cx * sc - w * 0.5; gfx_y = cy * sc - h * 0.5; gfx_drawstr(s); );
+function hg_ltxt(x, cy, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc; gfx_y = cy * sc - h * 0.5; gfx_drawstr(s); );
+function hg_rtxt(x, cy, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x * sc - w; gfx_y = cy * sc - h * 0.5; gfx_drawstr(s); );
+function hg_hz(f) local(v) (
+  f < 1000 ? sprintf(#hgfq, "%d Hz", floor(f + 0.5)) : ( v = f / 1000;
+    v >= 9.95 ? sprintf(#hgfq, "%d kHz", floor(v + 0.5)) : sprintf(#hgfq, "%.1f kHz", v); );
+  #hgfq;
+);
+function hg_ms(t) ( t >= 1000 ? sprintf(#hgms, "%.2f s", t / 1000) : t >= 10 ? sprintf(#hgms, "%.0f ms", t) : sprintf(#hgms, "%.1f ms", t); #hgms; );
+function hg_fstep(f) ( 110 * 2 ^ (floor(log(f / 110) / log(2) * 12 + 0.5) / 12); );
+function hg_vstep(v) ( floor(v * 2 + 0.5) / 2; );
+function hg_qstep(q) ( 2 ^ (floor(log(q) / log(2) * 3 + 0.5) / 3); );
+function hg_shadow(x, y, w, h, r) local(j) ( j = 0; loop(4, ui_cola(0, 0.13); hg_rr(x + 2 + j * 1.33 - j, y + 3 + j * 1.67 - j, w + 2 * j, h + 2 * j, r + j); j += 1; ); gfx_a = 1; );
+function hg_face(pw, ph) local(y0, h1, h2) (
+  y0 = 65 * sc; h1 = (ph - 65) * 0.58 * sc; h2 = gfx_h - y0 - h1;
+  gfx_gradrect(0, y0, gfx_w, h1 + 1, ((HG_FT >> 16) & 255) / 255, ((HG_FT >> 8) & 255) / 255, (HG_FT & 255) / 255, 1,
+    0, 0, 0, 0, (((HG_FM >> 16) & 255) - ((HG_FT >> 16) & 255)) / 255 / h1, (((HG_FM >> 8) & 255) - ((HG_FT >> 8) & 255)) / 255 / h1, ((HG_FM & 255) - (HG_FT & 255)) / 255 / h1, 0);
+  gfx_gradrect(0, y0 + h1, gfx_w, h2, ((HG_FM >> 16) & 255) / 255, ((HG_FM >> 8) & 255) / 255, (HG_FM & 255) / 255, 1,
+    0, 0, 0, 0, (((HG_FB >> 16) & 255) - ((HG_FM >> 16) & 255)) / 255 / h2, (((HG_FB >> 8) & 255) - ((HG_FM >> 8) & 255)) / 255 / h2, ((HG_FB & 255) - (HG_FM & 255)) / 255 / h2, 0);
+  ui_col(HG_BAR); gfx_rect(0, 0, gfx_w, floor(62 * sc + 0.5));
+  gfx_gradrect(0, 0, gfx_w, 62 * sc, 1, 1, 1, 0.10, 0, 0, 0, 0, 0, 0, 0, -0.10 / (62 * sc));
+  ui_cola(0, 0.45); hg_rect(0, 62, pw, 2); ui_col(HG_RULE); hg_rect(0, 64, pw, 1.5); gfx_a = 1;
+  ui_cola(0, 0.18); gfx_rect(gfx_w - max(floor(4 * sc), 2), y0, max(floor(4 * sc), 2), gfx_h); gfx_rect(0, gfx_h - max(floor(4 * sc), 2), gfx_w, max(floor(4 * sc), 2)); gfx_a = 1;
+);
+function hg_rivets(pw, ph) local(i, x, y) (
+  i = 0; loop(4, x = i & 1 ? pw - 12 : 10; y = i & 2 ? ph - 10 : 74;
+    ui_col(0x2A2C30); hg_disc(x, y, 3.2); ui_col(0x8A8F96); hg_disc(x - 0.8, y - 0.8, 1.5); i += 1; );
+);
+function hg_lamp(cx, cy, on) local(hov, hit) (
+  hov = sqr(mouse_x - cx * sc) + sqr(mouse_y - cy * sc) <= sqr(11 * sc);
+  hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  on ? ( ui_cola(HG_AMB, 0.25); hg_disc(cx, cy, 11); gfx_a = 1; );
+  ui_col(0x5A4A48); hg_disc(cx, cy, 8); ui_col(0xEDE4D2); hg_disc(cx, cy, 7);
+  ui_col(on ? HG_AMB : 0x9A8A78); hg_disc(cx, cy, 4.2);
+  on ? ( ui_cola(0xFFFFFF, 0.8); hg_disc(cx - 1, cy - 1, 1.4); gfx_a = 1; );
+  hit;
+);
+function hg_ad(x, y, m) local(hit, i, xx, on, c) (
+  hit = 0;
+  hg_shadow(x, y, 62, 22, 4);
+  ui_col(0x0C0D0F); hg_rr(x - 3, y - 3, 68, 28, 5);
+  i = 0; loop(2,
+    xx = x + i * 32; on = (m == i); c = i ? HG_TEAL : HG_AMB;
+    ui_col(on ? c : 0x33363B); hg_rr(xx, y, 30, 22, 3);
+    on ? ( ui_cola(0xFFFFFF, 0.3); hg_rr(xx + 3, y + 3, 24, 16, 2); gfx_a = 1; );
+    hg_font(10); ui_col(on ? 0x10161A : 0x9EA3AA); hg_ctxt(xx + 15, y + 11.5, i ? "D" : "A");
+    mouse_x >= xx * sc && mouse_x < (xx + 30) * sc && mouse_y >= y * sc && mouse_y < (y + 22) * sc && pressed && drag_id == 0 ? ( hit = i + 1; drag_id = -1; );
+    i += 1; );
+  hit;
+);
+function hg_sub(x, y, w, h, num, title, mode, lamp) local(tx, tw, th) (
+  hg_shadow(x, y, w, h, 6);
+  gfx_gradrect(x * sc, y * sc, w * sc, h * sc, ((HG_S1 >> 16) & 255) / 255, ((HG_S1 >> 8) & 255) / 255, (HG_S1 & 255) / 255, 1,
+    0, 0, 0, 0, (((HG_S2 >> 16) & 255) - ((HG_S1 >> 16) & 255)) / 255 / (h * sc), (((HG_S2 >> 8) & 255) - ((HG_S1 >> 8) & 255)) / 255 / (h * sc), ((HG_S2 & 255) - (HG_S1 & 255)) / 255 / (h * sc), 0);
+  ui_cola(0xFFFFFF, 0.6); hg_rect(x, y, w, 1.5); hg_rect(x, y, 1.5, h);
+  ui_cola(0, 0.12); hg_rect(x, y + h - 2, w, 2); hg_rect(x + w - 2, y, 2, h); gfx_a = 1;
+  hg_font(11); ui_col(HG_SUBI); hg_ltxt(x + 14, y + 20, num);
+  tx = lamp ? x + 54 : x + 36;
+  hg_font(12); ui_col(HG_INK); hg_ltxt(tx, y + 20, title); gfx_measurestr(title, tw, th);
+  ui_col(mode == 0 ? HG_AUL : mode == 1 ? HG_DUL : HG_NUL); hg_rect(tx, y + 33, tw / sc, 3);
+);
+function hg_key(x, y, w, h, s, on, c) local(hov, hit) (
+  hov = mouse_x >= x * sc && mouse_x < (x + w) * sc && mouse_y >= y * sc && mouse_y < (y + h) * sc;
+  hit = hov && pressed && drag_id == 0; hit ? drag_id = -1;
+  hg_shadow(x, y, w, h, 4);
+  ui_col(0x0C0D0F); hg_rr(x - 3, y - 3, w + 6, h + 6, 5);
+  on ? ( ui_col(c); hg_rr(x, y, w, h, 3); ui_cola(0xFFFFFF, 0.28); hg_rr(x + 3, y + 3, w - 6, h - 6, 3); gfx_a = 1; ui_col(0x2A1A06); )
+     : ( ui_col(hov ? 0x45484E : 0x3A3D42); hg_rr(x, y, w, h, 3); ui_cola(0, 0.16); hg_rect(x + 2, y + h - 4, w - 4, 2); gfx_a = 1; ui_col(0xD2D5DA); );
+  hg_font(10); hg_ctxt(x + w * 0.5, y + h * 0.5 + 0.5, s);
+  hit;
+);
+function hg_led(cx, cy, r, on, c) (
+  ui_col(0x0A0B0C); hg_disc(cx, cy, r + 2.5);
+  on ? ( ui_cola(c, 0.25); hg_disc(cx, cy, r + 5); gfx_a = 1; );
+  ui_col(on ? c : ui_mix(c, 0x16181B, 0.75)); hg_disc(cx, cy, r);
+  on ? ( ui_cola(0xFFFFFF, 0.7); hg_disc(cx - r * 0.3, cy - r * 0.32, r * 0.3); gfx_a = 1; );
+);
+function hg_cap(cx, cy, r, a, act, cap, nd) local(i, t, x, y, rr, ir, rd, px, py) (
+  x = cx * sc; y = cy * sc; rr = r * sc;
+  ui_col(hg_dim ? ui_mix(HG_SUBI, HG_S2, 0.5) : HG_SUBI); i = 0;
+  loop(nd + 1, t = -0.75 * $pi + i / nd * 1.5 * $pi;
+    gfx_circle(x + sin(t) * (rr + 8 * sc), y - cos(t) * (rr + 8 * sc), ((i == 0 || i == nd || i * 2 == nd) ? 2.2 : 1.6) * sc, 1, 1); i += 1; );
+  i = 0; loop(4, ui_cola(0, 0.13); gfx_circle(x + (2 + i * 1.33) * sc, y + (3 + i * 1.67) * sc, rr + i * sc, 1, 1); i += 1; ); gfx_a = 1;
+  ui_col(act ? 0x262A30 : 0x1B1D21); gfx_circle(x, y, rr, 1, 1);
+  ui_cola(0, 0.35); gfx_circle(x, y, rr - 1 * sc, 0, 1); gfx_a = 1;
+  ir = rr * 0.68;
+  ui_col(0x101113); gfx_circle(x, y, ir + 2 * sc, 1, 1);
+  ui_col(hg_dim ? ui_mix(cap, 0x6A6A6A, 0.5) : cap); gfx_circle(x, y, ir, 1, 1);
+  ui_cola(0xFFFFFF, 0.07); gfx_circle(x - ir * 0.25, y - ir * 0.3, ir * 0.8, 1, 1); gfx_a = 1;
+  rd = max(ir * 0.19, 2 * sc); px = x + sin(a) * ir * 0.62; py = y - cos(a) * ir * 0.62;
+  ui_col(0xF2EEE4); gfx_circle(px, py, rd, 1, 1);
+);
+function hg_tonorm(v, lo, hi, lg) ( lg ? log(max(v, lo) / lo) / log(hi / lo) : (v - lo) / (hi - lo); );
+function hg_fromnorm(n, lo, hi, lg) ( lg ? lo * exp(n * log(hi / lo)) : lo + n * (hi - lo); );
+function hg_knob(cx, cy, r, idx, lo, hi, def, cap, lg) local(v, n, dx, dy, hov, did, act, st) (
+  did = 2000 + idx; v = slider(idx); st = hg_st; hg_st = 0;
+  dx = mouse_x - cx * sc; dy = mouse_y - cy * sc; hov = dx * dx + dy * dy <= sqr((r + 6) * sc);
+  pressed && hov && drag_id == 0 ? (
+    (time_precise() - hg_lt < 0.35 && hg_lid == idx) || (mouse_cap & 4) ? ( slider(idx) = def; ui_auto(idx); drag_id = -1; hg_lt = 0; ) : (
+      drag_id = did; hg_my = mouse_y; hg_dz = 0; hg_lt = time_precise(); hg_lid = idx; hg_kn = hg_tonorm(v, lo, hi, lg);
+    );
+  );
+  drag_id == did ? (
+    hg_dz += abs(hg_my - mouse_y);
+    hg_dz > 3 * sc ? (
+      hg_kn = min(max(hg_kn + (hg_my - mouse_y) / (((mouse_cap & 8) ? 1000 : 200) * sc), 0), 1);
+      v = hg_fromnorm(hg_kn, lo, hi, lg); st > 0 ? v = floor(v / st + 0.5) * st;
+      slider(idx) != v ? ( slider(idx) = v; ui_auto(idx); );
+    );
+    hg_my = mouse_y;
+  );
+  hov && mouse_wheel != 0 && drag_id == 0 ? (
+    n = min(max(hg_tonorm(v, lo, hi, lg) + mouse_wheel / 120 * (st > 0 ? 1 / ((hi - lo) / st) : (mouse_cap & 8) ? 0.005 : 0.03), 0), 1);
+    v = hg_fromnorm(n, lo, hi, lg); st > 0 ? v = floor(v / st + 0.5) * st;
+    slider(idx) = v; ui_auto(idx); mouse_wheel = 0;
+  );
+  v = slider(idx); n = min(max(hg_tonorm(v, lo, hi, lg), 0), 1);
+  act = hov || drag_id == did;
+  hg_cap(cx, cy, r, -0.75 * $pi + n * 1.5 * $pi, act, cap, st > 0 ? (hi - lo) / st : 4);
+  act;
+);
+function hg_name(cx, y, act, name, val) ( hg_font(10); ui_col(act ? HG_LIT : hg_dim ? ui_mix(HG_INK, HG_S2, 0.55) : HG_INK); hg_ctxt(cx, y, act ? val : name); );
+function hg_resp(fq, t, f, q, g) local(w, w2, ag, num, den, re1, im1, re2, im2) (
+  t != 2 ? q = 0.7071;
+  w = fq / f; w2 = w * w; ag = 10 ^ (g / 40);
+  t == 2 ? ( re1 = 1 - w2; im1 = w * ag / q; re2 = 1 - w2; im2 = w / (q * ag); )
+  : t == 0 ? ( re1 = (ag - w2) * ag; im1 = sqrt(ag) * w / q * ag; re2 = 1 - ag * w2; im2 = sqrt(ag) * w / q; )
+  : ( re1 = (1 - ag * w2) * ag; im1 = sqrt(ag) * w / q * ag; re2 = ag - w2; im2 = sqrt(ag) * w / q; );
+  num = re1 * re1 + im1 * im1; den = re2 * re2 + im2 * im2;
+  10 * log10(max(num, 0.0000000001) / max(den, 0.0000000001));
+);
+function hg_band(fi, gi, q0, lo, hi) local(x, c, d) (
+  d = slider9 >= 0.5;
+  hg_bf = min(max(d ? hg_fstep(slider(fi)) : slider(fi), lo), hi);
+  hg_bg = min(max(d ? hg_vstep(slider(gi)) : slider(gi), -15), 15);
+  hg_bq = d ? hg_qstep(q0) : q0 * (0.55 + 0.45 * min(abs(hg_bg), 15) / 15);
+  d && slider25 >= 0.5 ? ( x = $pi * hg_bf / 48000; c = atan(x) / x; hg_bf *= c; hg_bq *= c * (1 + x * x); );
+);
+function hg_curve(fq, dy2, dy3) local(t, w) (
+  w = fq / min(max(slider4, 11), 550); w *= w; w *= w; t = 10 * log10(w / (1 + w));
+  w = min(max(slider5, 2200), 22000) / fq; w *= w; w *= w; t += 10 * log10(w / (1 + w));
+  slider24 >= 0.5 ? (
+    hg_band(10, 11, 0.9, 22, 880); t += hg_resp(fq, slider12 >= 0.5 ? 2 : 0, hg_bf, slider12 >= 0.5 ? hg_bq : 0.7071, hg_bg);
+    hg_band(13, 14, slider15, 110, 3300); t += hg_resp(fq, 2, hg_bf, hg_bq, hg_bg * dy2);
+    hg_band(17, 18, slider19, 660, 9900); t += hg_resp(fq, 2, hg_bf, hg_bq, hg_bg * dy3);
+    hg_band(21, 22, 0.9, 2200, 20000); t += hg_resp(fq, slider23 >= 0.5 ? 2 : 1, hg_bf, slider23 >= 0.5 ? hg_bq : 0.7071, hg_bg);
+  );
+  t;
+);
+function hg_spec(ring, sm) local(i, j, w, re, im, m, b0, b1, f, v, n) (
+  i = 0; loop(2048,
+    w = 0.5 - 0.5 * cos(2 * $pi * i / 2047);
+    HG_FFT[i * 2] = ring[(ha_spw - 2047 + i) & (HA_SPN - 1)] * w; HG_FFT[i * 2 + 1] = 0; i += 1; );
+  fft(HG_FFT, 2048); fft_permute(HG_FFT, 2048);
+  i = 0; loop(230,
+    f = 20 * 1000 ^ (i / 229); b0 = floor(f / srate * 2048); b1 = max(b0, floor(20 * 1000 ^ ((i + 1) / 229) / srate * 2048));
+    m = 0; j = max(b0, 1); loop(min(b1 - j + 1, 40), j < 1024 ? ( re = HG_FFT[j * 2]; im = HG_FFT[j * 2 + 1]; m = max(m, re * re + im * im); ); j += 1; );
+    v = 10 * log10(max(m, 0.000000000001)) - 54.2 + 2 * log(f / 1000) / log(2);
+    n = sm[i]; sm[i] = v > n ? v : max(n - 1, -120);
+    i += 1; );
+);
+!hg_mi ? ( hg_ml = hg_mr = hg_hl = hg_hr = -90; hg_grs = 0; hg_i = 0; loop(800, HG_SMI[hg_i] = -120; hg_i += 1; ); hg_mi = 1; );
+hg_face(1400, 720);
+ui_col(0x5A1E2E); hg_disc(36, 31, 17.5); ui_col(0xFFF6EC); hg_disc(36, 31, 16); ui_col(HG_BAR); gfx_circle(36 * sc, 31 * sc, 13 * sc, 0, 1);
+gfx_setfont(14, "Arial", 11 * sc * hg_f10 / (14 * sc), 'b'); ui_col(HG_BAR); ui_ctext(36 * sc, 31 * sc, "GFX");
+hg_font(13); ui_col(0xFFF6EC); hg_ltxt(64, 26, "HILO 26");
+hg_font(11); ui_col(0xFFE2E6); hg_ltxt(66, 48, "HYBRID CHANNEL");
+pk_pextra = "Reset all to defaults";
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );
+k_ = pk_preset(330 * sc, 14 * sc, 360 * sc, 34 * sc, pr_cur, #ha_pm);
+k_ > 0 ? prs_dirty = k_;
+os_key(738, 20, 44, 0xFFF6EC, 16);
+by_key(1150, 17, 1, 9);
+ui_size_picker(1300 * sc, 22 * sc);
+hg_rivets(1400, 720);
+hg_sx = 24; hg_sy = 80; hg_sw = 1352; hg_sh = 196;
+ui_col(0x1A1C1F); hg_rr(hg_sx - 4, hg_sy - 4, hg_sw + 8, hg_sh + 8, 6);
+ui_col(HG_SCR); hg_rr(hg_sx, hg_sy, hg_sw, hg_sh, 3);
+ui_cola(0, 0.6); hg_rect(hg_sx, hg_sy, hg_sw, 3); hg_rect(hg_sx, hg_sy, 3, hg_sh); gfx_a = 1;
+hg_e0 = hg_sx + 44; hg_e1 = hg_sx + 960; hg_ey0 = hg_sy + 28; hg_ey1 = hg_sy + hg_sh - 26; hg_em = (hg_ey0 + hg_ey1) * 0.5; hg_dbp = (hg_ey1 - hg_ey0) / 36;
+function hg_fx(f) ( hg_e0 + log(f / 20) / log(1000) * (hg_e1 - hg_e0); );
+function hg_xf(x) ( 20 * 1000 ^ min(max((x - hg_e0) / (hg_e1 - hg_e0), 0), 1); );
+hg_font(11); ui_col(0x9EA3AB); hg_ltxt(hg_sx + 16, hg_sy + 15, "01"); ui_col(0xDCDDE0); hg_ltxt(hg_sx + 38, hg_sy + 15, "SCREEN");
+ui_cola(HG_TEAL, 0.55); hg_rtxt(hg_e1 - 4, hg_sy + 15, "IN"); ui_col(HG_TEAL); hg_rtxt(hg_e1 - 40, hg_sy + 15, "OUT"); gfx_a = 1;
+hg_i = 0; loop(12, hg_v = hg_i == 0 ? 22 : hg_i == 1 ? 33 : hg_i == 2 ? 55 : hg_i == 3 ? 110 : hg_i == 4 ? 220 : hg_i == 5 ? 330 : hg_i == 6 ? 550 : hg_i == 7 ? 1100 : hg_i == 8 ? 2200 : hg_i == 9 ? 3300 : hg_i == 10 ? 5500 : 11000;
+  ui_col(0x22343A); hg_rect(hg_fx(hg_v), hg_ey0, 1, hg_ey1 - hg_ey0); hg_i += 1; );
+hg_i = 0; loop(5, hg_v = -12 + hg_i * 6; ui_col(hg_v ? 0x1E2E36 : 0x3A5258); hg_rect(hg_e0, hg_em - hg_v * hg_dbp, hg_e1 - hg_e0, 1);
+  hg_font(11); ui_col(0x6F8A90); hg_rtxt(hg_e0 - 8, hg_em - hg_v * hg_dbp, hg_v > 0 ? sprintf(#hgd, "+%d", hg_v) : sprintf(#hgd, "%d", hg_v)); hg_i += 1; );
+hg_font(11); ui_col(0x6F8A90);
+hg_ctxt(hg_fx(110), hg_ey1 + 13, "110"); hg_ctxt(hg_fx(330), hg_ey1 + 13, "330"); hg_ctxt(hg_fx(1100), hg_ey1 + 13, "1.1k"); hg_ctxt(hg_fx(3300), hg_ey1 + 13, "3.3k"); hg_ctxt(hg_fx(11000), hg_ey1 + 13, "11k");
+hg_spec(HA_SPI, HG_SMI); hg_spec(HA_SPO, HG_SMO);
+function hg_spy(v) ( min(max(hg_ey1 - (v + 100) / 96 * (hg_ey1 - hg_ey0), hg_ey0), hg_ey1); );
+hg_i = 0; loop(230, hg_x = hg_e0 + hg_i / 229 * (hg_e1 - hg_e0); hg_y = hg_spy(HG_SMO[hg_i]);
+  ui_cola(HG_TEAL, 0.16); hg_rect(hg_x, hg_y, (hg_e1 - hg_e0) / 229 + 0.6, hg_ey1 - hg_y); hg_i += 1; ); gfx_a = 1;
+hg_i = 1; loop(229, hg_x0 = hg_e0 + (hg_i - 1) / 229 * (hg_e1 - hg_e0); hg_x = hg_e0 + hg_i / 229 * (hg_e1 - hg_e0);
+  ui_cola(HG_TEAL, 0.35); ui_ssline(hg_x0 * sc, hg_spy(HG_SMI[hg_i - 1]) * sc, hg_x * sc, hg_spy(HG_SMI[hg_i]) * sc, 1.1 * sc, 0);
+  ui_cola(HG_TEAL, 0.85); ui_ssline(hg_x0 * sc, hg_spy(HG_SMO[hg_i - 1]) * sc, hg_x * sc, hg_spy(HG_SMO[hg_i]) * sc, 1.3 * sc, 0);
+  hg_i += 1; ); gfx_a = 1;
+hg_c = slider9 < 0.5 ? HG_AMB : HG_TEAL;
+hg_d2 = slider16 >= 0.5 ? ha_dy2_d : 1; hg_d3 = slider20 >= 0.5 ? ha_dy3_d : 1;
+(slider16 >= 0.5 || slider20 >= 0.5) && slider24 >= 0.5 ? (
+  hg_i = 0; loop(121, hg_x = hg_e0 + hg_i / 120 * (hg_e1 - hg_e0); hg_y = hg_em - min(max(hg_curve(hg_xf(hg_x), 1, 1), -18), 18) * hg_dbp;
+    hg_i > 0 && (hg_i & 2) ? ( ui_cola(hg_c, 0.6); ui_ssline(hg_px * sc, hg_py * sc, hg_x * sc, hg_y * sc, 1.5 * sc, 1); );
+    hg_px = hg_x; hg_py = hg_y; hg_i += 1; ); gfx_a = 1;
+);
+hg_i = 0; loop(241, hg_x = hg_e0 + hg_i / 240 * (hg_e1 - hg_e0); hg_y = hg_em - min(max(hg_curve(hg_xf(hg_x), hg_d2, hg_d3), -18), 18) * hg_dbp;
+  hg_i > 0 ? ( ui_cola(hg_c, 0.25); ui_ssline(hg_px * sc, hg_py * sc, hg_x * sc, hg_y * sc, 5 * sc, 1); ui_col(hg_c); ui_ssline(hg_px * sc, hg_py * sc, hg_x * sc, hg_y * sc, 2.4 * sc, 1); );
+  hg_px = hg_x; hg_py = hg_y; hg_i += 1; ); gfx_a = 1;
+hg_hov = 0;
+hg_b = 0; loop(4,
+  hg_fi = hg_b == 0 ? 10 : hg_b == 1 ? 13 : hg_b == 2 ? 17 : 21;
+  hg_lo = hg_b == 0 ? 22 : hg_b == 1 ? 110 : hg_b == 2 ? 660 : 2200; hg_hi = hg_b == 0 ? 880 : hg_b == 1 ? 3300 : hg_b == 2 ? 9900 : 20000;
+  hg_x = hg_fx(min(max(slider(hg_fi), hg_lo), hg_hi)); hg_y = hg_em - slider(hg_fi + 1) * hg_dbp;
+  hg_on = sqr(mouse_x - hg_x * sc) + sqr(mouse_y - hg_y * sc) <= sqr(11 * sc);
+  pressed && hg_on && drag_id == 0 ? (
+    time_precise() - hg_hlt < 0.35 && hg_hlb == hg_b ? ( slider(hg_fi + 1) = 0; ui_auto(hg_fi + 1); drag_id = -1; hg_hlt = 0; )
+    : ( drag_id = 3000 + hg_b; hg_hlt = time_precise(); hg_hlb = hg_b; );
+  );
+  drag_id == 3000 + hg_b ? (
+    slider(hg_fi) = floor(min(max(hg_xf(mouse_x / sc), hg_lo), hg_hi) + 0.5); ui_auto(hg_fi);
+    slider(hg_fi + 1) = floor(min(max((hg_em - mouse_y / sc) / hg_dbp, -15), 15) * 10 + 0.5) / 10; ui_auto(hg_fi + 1);
+    hg_x = hg_fx(slider(hg_fi)); hg_y = hg_em - slider(hg_fi + 1) * hg_dbp;
+  );
+  hg_c = hg_b == 0 ? 0xC08850 : hg_b == 1 ? 0x8EC6F0 : hg_b == 2 ? 0x7CCB8A : 0xEC7A6E;
+  ui_cola(hg_c, 0.25); hg_disc(hg_x, hg_y, 11); gfx_a = 1; ui_col(HG_SCR); hg_disc(hg_x, hg_y, 9.5); ui_col(hg_c); hg_disc(hg_x, hg_y, 8);
+  hg_font(11); ui_col(HG_SCR); hg_ctxt(hg_x, hg_y + 0.5, sprintf(#hgd, "%d", hg_b + 1));
+  (hg_on || drag_id == 3000 + hg_b) ? ( hg_hov = hg_b + 1; hg_hx = hg_x; hg_hy = hg_y; );
+  hg_b += 1; );
+hg_dx0 = hg_sx + 990; hg_dx1 = hg_sx + hg_sw - 18; hg_dy0 = hg_sy + 28; hg_dy1 = hg_sy + hg_sh - 26;
+ui_col(0x22343A); hg_rect(hg_sx + 972, hg_sy + 10, 1, hg_sh - 20);
+hg_font(11); ui_col(0xDCDDE0); hg_ltxt(hg_dx0, hg_sy + 15, "DYNAMICS");
+ui_col(HG_TEAL); hg_rtxt(hg_dx1, hg_sy + 15, "GR"); ui_col(slider26 < 0.5 ? HG_AMB : HG_TEAL); hg_rtxt(hg_dx1 - 30, hg_sy + 15, "GATE");
+hg_ln = 172; hg_cw = (hg_dx1 - hg_dx0) / hg_ln; hg_hw = ha_hw_d;
+hg_i = 0; loop(hg_ln,
+  hg_j = (hg_hw - hg_ln + 1 + hg_i) & (HA_HN - 1); hg_x = hg_dx0 + hg_i * hg_cw;
+  hg_v = HA_HIS[hg_j * 3]; hg_g = HA_HIS[hg_j * 3 + 1]; hg_r = HA_HIS[hg_j * 3 + 2];
+  hg_g < 0.5 ? ( ui_cola(slider26 < 0.5 ? HG_AMB : HG_TEAL, 0.16); hg_rect(hg_x, hg_dy0, hg_cw + 0.4, hg_dy1 - hg_dy0); );
+  hg_y = hg_dy1 - min(max((hg_v + 60) / 60, 0), 1) * (hg_dy1 - hg_dy0);
+  ui_cola(0xDCE6E8, 0.22); hg_rect(hg_x, hg_y, hg_cw + 0.4, hg_dy1 - hg_y);
+  hg_v > -59 ? ( ui_cola(0xDCE6E8, 0.8); hg_rect(hg_x, hg_y, hg_cw + 0.4, 1.2); );
+  hg_r > 0.05 ? ( ui_col(HG_TEAL); hg_rect(hg_x, hg_dy0 + min(hg_r, 20) / 20 * (hg_dy1 - hg_dy0) * 0.6, hg_cw + 0.4, 2); );
+  hg_i += 1; ); gfx_a = 1;
+hg_font(11); ui_col(0x6F8A90); hg_ltxt(hg_dx0, hg_dy1 + 13, "-60"); hg_rtxt(hg_dx1, hg_dy1 + 13, "0 dBFS");
+hg_hov ? (
+  hg_fi = hg_hov == 1 ? 10 : hg_hov == 2 ? 13 : hg_hov == 3 ? 17 : 21;
+  sprintf(#hgv, "%s  %+.1f dB", hg_hz(slider(hg_fi)), slider(hg_fi + 1));
+  hg_font(11); gfx_measurestr(#hgv, hg_tw, hg_th);
+  hg_x = min(max(hg_hx - hg_tw / sc * 0.5 - 8, hg_e0), hg_e1 - hg_tw / sc - 16); hg_y = hg_hy > hg_em ? hg_hy - 38 : hg_hy + 16;
+  ui_cola(0x1A2226, 0.95); hg_rr(hg_x, hg_y, hg_tw / sc + 16, 22, 4); gfx_a = 1; ui_col(0xF2F4F4); hg_ltxt(hg_x + 8, hg_y + 11, #hgv);
+);
+hg_y0 = 294; hg_mh = 410; hg_r1 = hg_y0 + 100; hg_r2 = hg_y0 + 204; hg_r3 = hg_y0 + 300;
+hg_dim = 0;
+hg_x = 16; hg_sub(hg_x, hg_y0, 150, hg_mh, "02", "INPUT", -1, 0);
+hg_k = hg_knob(hg_x + 75, hg_r1, 18, 2, -24, 12, 0, HG_KNB, 0); hg_name(hg_x + 75, hg_r1 + 37, hg_k, "TRIM", sprintf(#hgv, "%+.1f dB", slider2));
+hg_k = hg_knob(hg_x + 40, hg_r2, 16, 4, 11, 550, 22, 0xE2C23A, 1); hg_name(hg_x + 40, hg_r2 + 35, hg_k, "HPF", hg_hz(slider4));
+hg_k = hg_knob(hg_x + 110, hg_r2, 16, 5, 2200, 22000, 22000, 0x141516, 1); hg_name(hg_x + 110, hg_r2 + 35, hg_k, "LPF", slider5 >= 21950 ? "OPEN" : hg_hz(slider5));
+hg_key(hg_x + 35, hg_r3 - 13, 80, 26, "GUARD", slider3 >= 0.5, HG_AMB) ? ( slider3 = slider3 >= 0.5 ? 0 : 1; ui_auto(3); );
+hg_x = 182; hg_sub(hg_x, hg_y0, 180, hg_mh, "03", "FRONT", slider6 >= 0.5, 0);
+hg_a = hg_ad(hg_x + 104, hg_y0 + 9, slider6 >= 0.5); hg_a ? ( slider6 = hg_a - 1; ui_auto(6); );
+hg_k = hg_knob(hg_x + 90, hg_r1 + 6, 30, 7, -12, 30, 6, HG_KNB, 0);
+hg_name(hg_x + 90, hg_r1 + 55, hg_k, "GAIN", slider6 >= 0.5 ? sprintf(#hgv, "AD %+.1f dB", slider7 - 6) : sprintf(#hgv, "%+.1f dB", slider7));
+hg_font(11); ui_col(HG_SUBI); hg_ctxt(hg_x + 90, hg_r2 - 14, slider6 >= 0.5 ? "ERA" : "MIC AMP");
+hg_bx = hg_x + 22; hg_by = hg_r2;
+ui_col(0x121416); hg_rr(hg_bx, hg_by, 136, 32, 3); ui_cola(0, 0.6); hg_rect(hg_bx, hg_by, 136, 2); gfx_a = 1;
+hg_font(10); ui_col(slider6 >= 0.5 ? HG_TEAL : HG_AMB);
+hg_ctxt(hg_x + 90, hg_by + 17, slider6 < 0.5 ? "DISCRETE" : slider8 < 0.5 ? "CLEAN 24-BIT" : slider8 < 1.5 ? "LATE 18-BIT" : "EARLY 16-BIT");
+slider6 >= 0.5 && pressed && drag_id == 0 && mouse_x >= hg_bx * sc && mouse_x < (hg_bx + 136) * sc && mouse_y >= hg_by * sc && mouse_y < (hg_by + 32) * sc ? (
+  drag_id = -1; gfx_x = mouse_x; gfx_y = mouse_y;
+  hg_m = gfx_showmenu(sprintf(#hgm, "%sCLEAN 24-BIT|%sLATE 18-BIT|%sEARLY 16-BIT", slider8 < 0.5 ? "!" : "", slider8 >= 0.5 && slider8 < 1.5 ? "!" : "", slider8 >= 1.5 ? "!" : ""));
+  hg_m > 0 ? ( slider8 = hg_m - 1; ui_auto(8); );
+);
+hg_ov = ha_over_d; ha_over_d = 0;
+hg_font(11); ui_col(HG_SUBI); hg_ctxt(hg_x + 52, hg_r3 + 4, "OVER"); hg_ctxt(hg_x + 128, hg_r3 + 4, "SIDEBAR");
+hg_led(hg_x + 52, hg_r3 + 26, 5.5, slider6 >= 0.5 && hg_ov >= 0.98, 0xFF3A2A);
+hg_sbk = ha_sbk_d; ha_sbk_d = 0; hg_led(hg_x + 128, hg_r3 + 26, 5.5, hg_sbk > 0.0005, HG_AMB);
+hg_x = 378; hg_sub(hg_x, hg_y0, 392, hg_mh, "04", "EQUALISER", slider9 >= 0.5, 1);
+hg_lamp(hg_x + 42, hg_y0 + 20, slider24 >= 0.5) ? ( slider24 = slider24 >= 0.5 ? 0 : 1; ui_auto(24); );
+hg_a = hg_ad(hg_x + 316, hg_y0 + 9, slider9 >= 0.5); hg_a ? ( slider9 = hg_a - 1; ui_auto(9); );
+hg_dim = slider24 < 0.5;
+hg_b = 0; loop(4,
+  hg_cx = hg_x + 54 + hg_b * 94;
+  hg_fi = hg_b == 0 ? 10 : hg_b == 1 ? 13 : hg_b == 2 ? 17 : 21;
+  hg_lo = hg_b == 0 ? 22 : hg_b == 1 ? 110 : hg_b == 2 ? 660 : 2200; hg_hi = hg_b == 0 ? 880 : hg_b == 1 ? 3300 : hg_b == 2 ? 9900 : 20000;
+  hg_df = hg_b == 0 ? 110 : hg_b == 1 ? 440 : hg_b == 2 ? 2200 : 9900;
+  hg_c = hg_b == 0 ? 0xC08850 : hg_b == 1 ? 0x8EC6F0 : hg_b == 2 ? 0x7CCB8A : 0xEC7A6E;
+  hg_font(10); ui_col(hg_b == 0 ? 0x8A5626 : hg_b == 1 ? 0x2A68A0 : hg_b == 2 ? 0x2A7F44 : 0xB83A30);
+  hg_ctxt(hg_cx, hg_y0 + 56, hg_b == 0 ? "LF" : hg_b == 1 ? "LMF" : hg_b == 2 ? "HMF" : "HF");
+  hg_v = slider9 >= 0.5 ? hg_vstep(slider(hg_fi + 1)) : slider(hg_fi + 1);
+  hg_k = hg_knob(hg_cx, hg_r1 + 6, 22, hg_fi + 1, -15, 15, 0, hg_c, 0); hg_name(hg_cx, hg_r1 + 47, hg_k, "GAIN", sprintf(#hgv, "%+.1f dB", hg_v));
+  hg_v = slider9 >= 0.5 ? min(max(hg_fstep(slider(hg_fi)), hg_lo), hg_hi) : slider(hg_fi);
+  hg_k = hg_knob(hg_cx, hg_r2, 18, hg_fi, hg_lo, hg_hi, hg_df, HG_KNB, 1); hg_name(hg_cx, hg_r2 + 37, hg_k, "FREQ", hg_hz(hg_v));
+  hg_b == 0 || hg_b == 3 ? (
+    hg_key(hg_cx - 32, hg_r3 - 13, 64, 26, "PEAK", slider(hg_fi + 2) >= 0.5, 0xFFD24A) ? ( slider(hg_fi + 2) = slider(hg_fi + 2) >= 0.5 ? 0 : 1; ui_auto(hg_fi + 2); );
+  ) : (
+    hg_v = slider9 >= 0.5 ? hg_qstep(slider(hg_fi + 2)) : slider(hg_fi + 2);
+    hg_k = hg_knob(hg_cx, hg_r3 - 4, 15, hg_fi + 2, 0.4, 8, 1, HG_KNB, 1); hg_name(hg_cx, hg_r3 + 30, hg_k, "Q", sprintf(#hgv, "Q %.2f", hg_v));
+    hg_key(hg_cx - 28, hg_r3 + 50, 56, 24, "DYN", slider(hg_fi + 3) >= 0.5, 0x7CCB8A) ? ( slider(hg_fi + 3) = slider(hg_fi + 3) >= 0.5 ? 0 : 1; ui_auto(hg_fi + 3); );
+  );
+  hg_b += 1; );
+hg_key(hg_x + 54 + 3 * 94 - 36, hg_r3 + 50, 72, 24, "CRAMP", slider25 >= 0.5 && slider9 >= 0.5, HG_TEAL) ? ( slider25 = slider25 >= 0.5 ? 0 : 1; ui_auto(25); );
+slider9 < 0.5 ? ( ui_cola(HG_S2, 0.55); hg_rect(hg_x + 54 + 3 * 94 - 40, hg_r3 + 46, 80, 32); gfx_a = 1; );
+hg_dim = 0;
+hg_x = 786; hg_sub(hg_x, hg_y0, 188, hg_mh, "05", "GATE", slider26 >= 0.5, 1);
+hg_lamp(hg_x + 42, hg_y0 + 20, slider32 >= 0.5) ? ( slider32 = slider32 >= 0.5 ? 0 : 1; ui_auto(32); );
+hg_a = hg_ad(hg_x + 112, hg_y0 + 9, slider26 >= 0.5); hg_a ? ( slider26 = hg_a - 1; ui_auto(26); );
+hg_dim = slider32 < 0.5;
+hg_k = hg_knob(hg_x + 50, hg_r1, 18, 27, -80, 0, -45, HG_KNB, 0); hg_name(hg_x + 50, hg_r1 + 37, hg_k, "THRESH", sprintf(#hgv, "%.1f dB", slider27));
+hg_k = hg_knob(hg_x + 140, hg_r1, 18, 28, 0, 80, 20, HG_KNB, 0); hg_name(hg_x + 140, hg_r1 + 37, hg_k, "RANGE", sprintf(#hgv, "%.0f dB", slider28));
+hg_k = hg_knob(hg_x + 50, hg_r2, 18, 29, 20, 2000, 200, HG_KNB, 1); hg_name(hg_x + 50, hg_r2 + 37, hg_k, "RELEASE", hg_ms(slider29));
+hg_dim = slider32 < 0.5 || slider26 >= 0.5;
+hg_k = hg_knob(hg_x + 140, hg_r2, 18, 31, 330, 3300, 990, HG_KNB, 1); hg_name(hg_x + 140, hg_r2 + 37, hg_k, "TONE", hg_hz(slider31));
+hg_key(hg_x + 20, hg_r3 - 13, 82, 26, "SPILL", slider30 >= 0.5 && slider26 < 0.5, HG_AMB) ? ( slider30 = slider30 >= 0.5 ? 0 : 1; ui_auto(30); );
+slider26 >= 0.5 ? ( ui_cola(HG_S2, 0.55); hg_rect(hg_x + 14, hg_r3 - 17, 94, 34); gfx_a = 1; );
+hg_dim = 0;
+hg_ops = ha_open_d; ha_open_d = 0;
+hg_led(hg_x + 148, hg_r3, 5.5, slider32 >= 0.5 && hg_ops > 0.5, 0x3CE05A); hg_font(11); ui_col(HG_SUBI); hg_ctxt(hg_x + 148, hg_r3 + 22, "OPEN");
+hg_x = 990; hg_sub(hg_x, hg_y0, 228, hg_mh, "06", "COMP", slider33 >= 0.5, 1);
+hg_lamp(hg_x + 42, hg_y0 + 20, slider41 >= 0.5) ? ( slider41 = slider41 >= 0.5 ? 0 : 1; ui_auto(41); );
+hg_a = hg_ad(hg_x + 152, hg_y0 + 9, slider33 >= 0.5); hg_a ? ( slider33 = hg_a - 1; ui_auto(33); );
+hg_dim = slider41 < 0.5;
+hg_k = hg_knob(hg_x + 42, hg_r1, 18, 34, -40, 0, -12, HG_KNB, 0); hg_name(hg_x + 42, hg_r1 + 37, hg_k, "THRESH", sprintf(#hgv, "%.1f dB", slider34));
+hg_k = hg_knob(hg_x + 114, hg_r1, 18, 35, 1, 20, 3, HG_KNB, 1); hg_name(hg_x + 114, hg_r1 + 37, hg_k, "RATIO", slider35 >= 19.95 ? "LIMIT" : sprintf(#hgv, "%.1f : 1", slider35));
+hg_k = hg_knob(hg_x + 186, hg_r1, 18, 38, 0, 24, 0, HG_KNB, 0); hg_name(hg_x + 186, hg_r1 + 37, hg_k, "MAKE-UP", sprintf(#hgv, "+%.1f dB", slider38));
+hg_k = hg_knob(hg_x + 42, hg_r2, 18, 36, 0.1, 50, 5, HG_KNB, 1); hg_name(hg_x + 42, hg_r2 + 37, hg_k, "ATTACK", hg_ms(slider36));
+hg_k = hg_knob(hg_x + 114, hg_r2, 18, 37, 20, 2000, 200, HG_KNB, 1); hg_name(hg_x + 114, hg_r2 + 37, hg_k, "RELEASE", hg_ms(slider37));
+hg_k = hg_knob(hg_x + 186, hg_r2, 18, 39, 0, 100, 100, HG_KNB, 0); hg_name(hg_x + 186, hg_r2 + 37, hg_k, "MIX", sprintf(#hgv, "%d %%", floor(slider39 + 0.5)));
+hg_st = 1; hg_k = hg_knob(hg_x + 42, hg_r3 + 4, 15, 40, 0, 3, 0, 0xE2C23A, 0);
+hg_name(hg_x + 42, hg_r3 + 38, hg_k, "SC HPF", slider40 < 0.5 ? "OFF" : slider40 < 1.5 ? "110 Hz" : slider40 < 2.5 ? "220 Hz" : "330 Hz");
+hg_dim = 0;
+hg_g0 = ha_gr_d; ha_gr_d = 0;
+hg_g0 >= hg_grs ? ( hg_grs = hg_g0; hg_gtm = time_precise(); ) : time_precise() - hg_gtm > 0.3 ? hg_grs = max(hg_g0, hg_grs - 0.8);
+hg_font(11); ui_col(HG_SUBI); hg_ctxt(hg_x + 142, hg_r3 - 18, "GR");
+hg_i = 0; loop(10, hg_cx = hg_x + 90 + hg_i * 11.5;
+  hg_led(hg_cx, hg_r3 + 4, 3.4, slider41 >= 0.5 && hg_grs >= (hg_i + 1) * 2 - 1, hg_i < 4 ? 0x3CE05A : hg_i < 7 ? 0xFFC81E : 0xFF3A2A); hg_i += 1; );
+hg_font(11); ui_col(HG_SUBI); hg_ctxt(hg_x + 90, hg_r3 + 24, "0"); hg_ctxt(hg_x + 194, hg_r3 + 24, "-20");
+hg_x = 1234; hg_sub(hg_x, hg_y0, 150, hg_mh, "07", "OUTPUT", -1, 0);
+hg_k = hg_knob(hg_x + 46, hg_r1, 20, 42, -24, 12, 0, HG_KNB, 0); hg_name(hg_x + 46, hg_r1 + 39, hg_k, "LEVEL", sprintf(#hgv, "%+.1f dB", slider42));
+hg_k = hg_knob(hg_x + 46, hg_r2, 14, 43, 0, 100, 50, HG_KNB, 0); hg_name(hg_x + 46, hg_r2 + 33, hg_k, "DRIFT", sprintf(#hgv, "%d %%", floor(slider43 + 0.5)));
+hg_pl = ha_ol_d; hg_pr = ha_or_d; ha_ol_d = ha_or_d = 0;
+hg_v = hg_pl > 0.0000001 ? 20 * log10(hg_pl) : -90; hg_ml = hg_v > hg_ml ? hg_v : max(hg_ml - 0.6, -90);
+hg_v = hg_pr > 0.0000001 ? 20 * log10(hg_pr) : -90; hg_mr = hg_v > hg_mr ? hg_v : max(hg_mr - 0.6, -90);
+hg_ml > hg_hl ? ( hg_hl = hg_ml; hg_tl = time_precise(); ) : time_precise() - hg_tl > 1.2 ? hg_hl = max(hg_hl - 0.6, -90);
+hg_mr > hg_hr ? ( hg_hr = hg_mr; hg_tr = time_precise(); ) : time_precise() - hg_tr > 1.2 ? hg_hr = max(hg_hr - 0.6, -90);
+pressed && mouse_x >= (hg_x + 92) * sc && mouse_x < (hg_x + 140) * sc && mouse_y >= (hg_y0 + 50) * sc && mouse_y < (hg_y0 + 356) * sc ? ( hg_hl = hg_ml; hg_hr = hg_mr; drag_id = -1; );
+hg_k = 0; loop(2,
+  hg_cx = hg_x + 104 + hg_k * 24; ui_col(0x0E0F11); hg_rr(hg_cx - 9, hg_y0 + 52, 18, 300, 3);
+  hg_i = 0; loop(12,
+    hg_d = hg_i == 0 ? 15 : hg_i == 1 ? 10 : hg_i == 2 ? 6 : hg_i == 3 ? 3 : hg_i == 4 ? 0 : hg_i == 5 ? -3 : hg_i == 6 ? -6 : hg_i == 7 ? -10 : hg_i == 8 ? -15 : hg_i == 9 ? -20 : hg_i == 10 ? -30 : -40;
+    hg_v = hg_k ? hg_mr : hg_ml; hg_h = hg_k ? hg_hr : hg_hl;
+    hg_c = hg_d >= 10 ? 0xFF3A2A : hg_d >= 6 ? 0xFF8A1E : hg_d >= 0 ? 0xFFC81E : hg_d >= -10 ? 0x3CE05A : 0x3A9CFF;
+    hg_on = hg_v + 18 >= hg_d - 1.5 || abs(hg_h + 18 - hg_d) < 1.5;
+    ui_col(hg_on ? hg_c : ui_mix(hg_c, 0x0E0F11, 0.8)); hg_disc(hg_cx, hg_y0 + 66 + hg_i * 24.5, 5);
+    hg_on ? ( ui_cola(0xFFFFFF, 0.6); hg_disc(hg_cx - 1.5, hg_y0 + 64.5 + hg_i * 24.5, 1.5); gfx_a = 1; );
+    hg_i += 1; );
+  hg_font(11); ui_col(HG_SUBI); hg_ctxt(hg_cx, hg_y0 + 368, hg_k ? "R" : "L");
+  hg_k += 1; );
+
+pk_end();
+ui_help_xh = 192;
+ui_name_keys(); ui_help();
+ui_help_open ? ( mouse_x = ui_mx; mouse_y = ui_my;  pwr_panel(ui_help_cx + 30 * ui_help_s, ui_help_cy + 118 * ui_help_s, ui_help_s, 15, ui_help_clk, ui_mw); );
+prev_down = mdown; mouse_wheel = 0;

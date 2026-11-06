@@ -1,0 +1,142 @@
+desc:GFX Output stage (include)
+//author: JGWizrad / Garden FX (GFX)
+
+@init
+
+function ost_tanh(x) local(e) (
+  x = min(max(x, -20), 20); e = exp(2 * x); (e - 1) / (e + 1);
+);
+
+function ost_curve(x, d, b) local(tbias, s) (
+  tbias = ost_tanh(d * b);
+  s = d * (1 - tbias * tbias);
+  (ost_tanh(d * (x + b)) - tbias) / s;
+);
+
+function ost_clip(x, c) local(a, k) (
+  a = abs(x); k = 0.8 * c;
+  a < k ? x : ( ost_clipped = 1; sign(x) * (k + (c - k) * ost_tanh((a - k) / (c - k))); );
+);
+
+function ost_acr(x, d, b, tb, s) instance(x1, z1, lc1, th1) local(z, q, lcz, thz, w, y) (
+  z = d * (x + b); q = 1 + exp(-2 * abs(z));
+  lcz = abs(z) + log(q); thz = sign(z) * (2 / q - 1);
+  y = d * (x1 + b); w = y - z1;
+  abs(w) > 0.0003 ? ( q = 1 + exp(-2 * abs(y)); lc1 = abs(y) + log(q); th1 = sign(y) * (2 / q - 1); )
+                  : ( q = w * (1 - th1 * th1); lc1 += w * (th1 + 0.5 * q); th1 += q; );
+  w = z - y;
+  y = abs(w) > 0.00001 ? (lcz - lc1) / w : ost_tanh(0.5 * (z + y));
+  x1 = x; z1 = z; lc1 = lcz; y -= tb - 0.5 * (thz - th1); th1 = thz;
+  y / s - x;
+);
+function ost_acx(x) instance(x1, c1) ( x1 = x; c1 = -1; );
+function ost_acz() instance(x1, z1, lc1, th1, c1) ( x1 = z1 = th1 = 0; lc1 = log(2); c1 = -1; );
+function ost_cpt(x, k, w) local(u, e) (
+  u = abs(x) - k;
+  u > 0 ? (
+    u /= w; e = exp(-2 * u);
+    ost_q = sign(x) * w * ((1 - e) / (1 + e) - u);
+    w * w * (log(1 + e) - 0.69314718055994531 + u - 0.5 * u * u);
+  ) : ( ost_q = 0; 0; );
+);
+function ost_acl(x, c) instance(x1, fa1, q1, c1) local(k, w, fa, q, y) (
+  k = 0.8 * c;
+  abs(x) < k && abs(x1) < k ? ( y = x; fa = q = 0; ) : (
+    w = c - k;
+    c !== c1 ? ( fa1 = ost_cpt(x1, k, w); q1 = ost_q; );
+    fa = ost_cpt(x, k, w); q = ost_q;
+    abs(x) >= k ? ost_clipped = 1;
+    y = abs(x - x1) > 0.00001 ? (fa - fa1) / (x - x1) : ( ost_cpt(0.5 * (x + x1), k, w); ost_q; );
+    y = x + y + 0.5 * (q - q1);
+    abs(y) > c ? y = x + q;
+  );
+  x1 = x; fa1 = fa; q1 = q; c1 = c;
+  y;
+);
+ost_aa = 1;
+
+function ost_init(mem) (
+  ost_gr = 1; ost_clipped = 0;
+  ost_envc = 1 - exp(-1 / (0.15 * srate));
+  ost_lastlf = -1; ost_lasthf = -1;
+  ost_kd = 10 ^ (-1 / (20 * 0.001 * srate)); ost_ku = 1 / ost_kd;
+  ost_xi = 0;
+  ost_cl.ost_acz(); ost_cr.ost_acz();
+);
+
+function ost_setup(sat, bias, lf, hf, ceil_db, mode) local(w0, cw, alp, q0) (
+  ost_amt = sat;
+  ost_drv = 1 + 12 * sat * sqrt(sat);
+  ost_wet = min(sat * 3, 1);
+  ost_bias = bias * 0.3;
+  ost_cc = 10 ^ (ceil_db / 20);
+  ost_ceil = ost_cc;
+  ost_mode = mode >= 0.5;
+  !ost_xi ? ( ost_st = ost_mode; ost_xi = 1; );
+  lf != ost_lastlf ? (
+    ost_lastlf = lf;
+    w0 = 2 * $pi * min(lf, srate * 0.45) / srate; cw = cos(w0); alp = sin(w0) / (2 * 0.70710678); q0 = 1 + alp;
+    ost_lb0 = (1 - cw) * 0.5 / q0; ost_lb1 = (1 - cw) / q0; ost_lb2 = ost_lb0;
+    ost_la1 = -2 * cw / q0; ost_la2 = (1 - alp) / q0;
+  );
+  hf != ost_lasthf ? (
+    ost_lasthf = hf;
+    w0 = 2 * $pi * min(hf, srate * 0.45) / srate; cw = cos(w0); alp = sin(w0) / (2 * 0.70710678); q0 = 1 + alp;
+    ost_hb0 = (1 + cw) * 0.5 / q0; ost_hb1 = -(1 + cw) / q0; ost_hb2 = ost_hb0;
+    ost_ha1 = -2 * cw / q0; ost_ha2 = (1 - alp) / q0;
+  );
+  pdc_bot_ch = 0; pdc_top_ch = 2;
+  pdc_delay = 0;
+);
+
+function ost_ch_init() instance(lz1, lz2, hz1, hz2, dcx, dcy, env) (
+  lz1 = 0; lz2 = 0; hz1 = 0; hz2 = 0; dcx = 0; dcy = 0; env = 0;
+  this.ah.ost_acz();
+);
+
+function ost_band(x) instance(lz1, lz2, hz1, hz2, dcx, dcy, env) local(lo, rest, hi, mid, b, d, t) (
+  lo = ost_lb0 * x + lz1;
+  lz1 = ost_lb1 * x - ost_la1 * lo + lz2;
+  lz2 = ost_lb2 * x - ost_la2 * lo;
+  rest = x - lo;
+  hi = ost_hb0 * rest + hz1;
+  hz1 = ost_hb1 * rest - ost_ha1 * hi + hz2;
+  hz2 = ost_hb2 * rest - ost_ha2 * hi;
+  mid = rest - hi;
+
+  env += (abs(x) - env) * ost_envc;
+  ost_amt > 0 ? (
+    b = ost_bias * (0.4 + 1.2 * min(env, 1));
+    b = min(b, 1.25 / ost_drv);
+    d = ost_wet * (ost_curve(lo, ost_drv, b) - lo);
+    ost_aa ? (
+      t = ost_tanh(ost_drv * b * 0.5);
+      hi += ost_wet * this.ah.ost_acr(hi, ost_drv, b * 0.5, t, ost_drv * (1 - t * t));
+    ) : (
+      this.ah.ost_acx(hi);
+      hi = hi + ost_wet * (ost_curve(hi, ost_drv, b * 0.5) - hi);
+    );
+  ) : ( d = 0; this.ah.ost_acx(hi); );
+  dcy = d - dcx + 0.9995 * dcy; dcx = d;
+  lo + dcy + mid + hi;
+);
+
+function ost_out(l, r) local(c) (
+  c = 0;
+  ost_mode ? (
+    ost_st == 1 ? c = ost_cc : (
+      ost_st == 0 ? ost_ct = max(1.25 * max(abs(l), abs(r)), ost_cc)
+                  : ost_ct = max(ost_ct * ost_kd, ost_cc);
+      ost_st = ost_ct > ost_cc ? 2 : 1;
+      c = ost_ct;
+    );
+  ) : ost_st ? (
+    ost_ct = (ost_st == 1 ? ost_cc : ost_ct) * ost_ku;
+    ost_ct < 31.6 ? ( ost_st = 3; c = ost_ct; ) : ost_st = 0;
+  );
+  c > 0 && ost_aa ? ( l = ost_cl.ost_acl(l, c); r = ost_cr.ost_acl(r, c); ) : (
+    ost_cl.ost_acx(l); ost_cr.ost_acx(r);
+    c > 0 ? ( l = ost_clip(l, c); r = ost_clip(r, c); );
+  );
+  ost_l = l; ost_r = r;
+);
