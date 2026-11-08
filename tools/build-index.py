@@ -57,7 +57,7 @@ def parts(src, tracked):
         m = load_site('build-lab-zip')
         fold = {f: g for g, items in m.groups() for _, _, f in items}
         sysname = 'GFX Lab system files'
-        pk = {f: effect_pkg(os.path.join(src, f), f, f'Effects/{fold.get(f, "Other")}/{f}', 'Lab', sysname, True)
+        pk = {f: effect_pkg(os.path.join(src, f), f, f'Effects/{fold.get(f, "Legacy")}/{f}', 'Lab', sysname, True)
               for f in units}
         pk[sysname] = dict(
             type='effect', category='Lab', desc=f'{sysname} (install this first: every GFX Lab plug-in needs them)',
