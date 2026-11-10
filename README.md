@@ -43,6 +43,12 @@ The experimental GFX Lab plug-ins are a separate repository, so you can leave th
 then install **GFX Lab system files** first, and any Lab plug-ins you like (they appear as "GFX Lab ...", under
 Effects/GFX Lab/Lab). Lab plug-ins change often and may sound different between versions.
 
+Retired Lab plug-ins are in a further optional repository, **GFX Lab Legacy**, for old projects that use one:
+
+`https://github.com/jgmd75-dot/REASCRIPT/raw/main/Lab/Legacy/index.xml`
+
+(it needs **GFX Lab system files** from the GFX Lab repository; files go under Effects/GFX Lab Legacy/Legacy).
+
 ## What's here
 
 - `Effects/` - the Stable range (`gfx-*.jsfx`) and the GFX system files (`gfx-*.jsfx-inc`)
@@ -50,7 +56,7 @@ Effects/GFX Lab/Lab). Lab plug-ins change often and may sound different between 
 - `Data/gfx-drum-patterns/` - pattern files for Pulse
 - `index.xml` - the ReaPack index (generated - don't edit by hand)
 - `V2/`, `V1/` - the GFX V2 and GFX V1 repositories (`V2/index.xml`, `V1/index.xml`)
-- `Lab/` - the Lab repository: its plug-ins and system files (`Lab/Effects/`) and its own `Lab/index.xml`
+- `Lab/` - the Lab repository: its plug-ins and system files (`Lab/Effects/`) and its own `Lab/index.xml`; `Lab/Legacy/` - the GFX Lab Legacy repository (retired Lab units)
 - `tools/build-index.py` - rebuilds the Stable from a GFX-II checkout, or the Lab from a LAB checkout (`--lab`)
 
 GFX is free donationware by JGWizrad: [gardenfx.uk](https://www.gardenfx.uk/) · [Ko-fi](https://ko-fi.com/jgwizrad).

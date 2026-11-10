@@ -57,8 +57,10 @@ def parts(src, tracked):
         m = load_site('build-lab-zip')
         fold = {f: g for g, items in m.groups() for _, _, f in items}
         sysname = 'GFX Lab system files'
-        pk = {f: effect_pkg(os.path.join(src, f), f, f'Effects/{fold.get(f, "Legacy")}/{f}', 'Lab', sysname, True)
-              for f in units}
+        pk = {f: effect_pkg(os.path.join(src, f), f, f'Effects/{fold[f]}/{f}', 'Lab', sysname, True)
+              for f in units if fold.get(f, 'Legacy') != 'Legacy'}
+        old = {f: effect_pkg(os.path.join(src, f), f, f'Effects/{f}', 'Legacy', sysname, True)
+               for f in units if fold.get(f, 'Legacy') == 'Legacy'}
         pk[sysname] = dict(
             type='effect', category='Lab', desc=f'{sysname} (install this first: every GFX Lab plug-in needs them)',
             about='The shared engine and panel files (.jsfx-inc) that every GFX Lab plug-in imports. Install once.',
@@ -66,7 +68,12 @@ def parts(src, tracked):
         add_scripts(pk, src, tracked)
         return [('Lab/', 'GFX Lab', 'Lab', pk, sysname,
                  'GFX Lab: the experimental GFX plug-ins for REAPER by JGWizrad - new ideas built in the open; they '
-                 'change often. Install "GFX Lab system files" first, then any Lab plug-ins you like. gardenfx.uk/lab')]
+                 'change often. Install "GFX Lab system files" first, then any Lab plug-ins you like. Retired Lab '
+                 'units are in the separate GFX Lab Legacy repository. gardenfx.uk/lab'),
+                ('Lab/Legacy/', 'GFX Lab Legacy', 'Legacy', old, sysname,
+                 'GFX Lab Legacy: retired GFX Lab plug-ins, kept so projects made with them still open. Optional: '
+                 'add it only if an old project asks for one. They need the "GFX Lab system files" package from the '
+                 'GFX Lab repository (Lab/index.xml): add that repository too. gardenfx.uk/legacy')]
 
     m = load_site('sync-plugins')
     cats, plugs = m.site_data()
