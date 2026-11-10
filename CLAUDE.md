@@ -39,3 +39,8 @@ This repo is the public ReaPack repository for the GFX Stable range. John adds
   The tools here carry no comments either - keep them that way when editing them; notes go in this file.
   Search tags and preset names use no brand names.
 - The repo must stay public (ReaPack downloads without logging in).
+- **Never rebase after build-index** (10 Nov 2026, GitHub issue #2): the index pins every download to the "Files" commit's
+  hash, so a rebase that rewrites that commit leaves the index pointing at a commit GitHub doesn't have and every
+  download 404s (the GFX index pointed at cd2b581 for three days after the Tandem Q build was rebased to 0f7608a). If
+  another session pushed first, re-clone (or reset to origin/main) and run build-index again. Before pushing, check
+  each index's `commit=` is in `git log origin/main..HEAD` or already on origin.
