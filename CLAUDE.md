@@ -32,6 +32,12 @@ This repo is the public ReaPack repository for the GFX Stable range. John adds
   `python3 tools/build-index.py PATH/TO/LAB --lab --message "what changed"` after a Lab plug-in arrives, changes or
   leaves. Its plug-ins and the "GFX Lab system files" package install into `<REAPER>/Effects/GFX Lab/Lab/`, apart
   from the Stable, in the Lab page's group folders. John adds it with `https://github.com/jgmd75-dot/REASCRIPT/raw/main/Lab/index.xml`.
+- **GFX Lab Legacy (JG, 10 Nov 2026: "the legacy folder shouldn't download with gfx or gfx lab package"):** the Lab build
+  also writes `Lab/Legacy/index.xml` (index "GFX Lab Legacy", category "Legacy", files under `Lab/Legacy/Effects/`,
+  versions in `Lab/Legacy/versions.json`): every Lab file with no card on the website's Lab page (the retired units).
+  It is optional - added only by someone whose old project needs one - and uses the GFX Lab repository's "GFX Lab system
+  files"; it installs into `<REAPER>/Effects/GFX Lab Legacy/Legacy/`. A unit that leaves the Lab page leaves GFX Lab:
+  ReaPack keeps an installed copy as an obsolete package (it never deletes it), so old projects still open.
 - **Nothing published here carries comments** (JG, 5 - 6 Nov 2026): build-index runs `tools/jsfx_clean.py` on every
   copied `.jsfx` / `.jsfx-inc` (keeping only the lines REAPER reads plus `//tags:`, `//author:`, the "by JGWizrad"
   credit and "Requires") and `.lua` (keeping only `@description`, `@author`, `@version` and the credit), checks each
