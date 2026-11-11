@@ -87,7 +87,7 @@ nheld = 0; dirty = 1; penv = 0; clk = 0; vwp = 0; vph = 0; tl = 0; bpz1 = 0; bpz
 function fold(w) ( while (w < 0) ( w += 12; ); while (w > 90) ( w -= 12; ); w; );
 
 function rebuild() local(n, d, w, b) (
-  memset(tg, 0, 91); memset(pg, 0, 91);
+  memset(tg, 0, 91); memset(pg, 0, 91); tw_live = 1;
   n = 0;
   loop(128,
     held[n] ? (
@@ -240,6 +240,7 @@ ost_init(20000); ostL.ost_ch_init(); ostR.ost_ch_init();
 RMB = 200000; RCL = 210000; RCR = 220000; RAL = 230000; RAR = 232000; RMSK = 8191; RAMSK = 1023;
 memset(RMB, 0, 40000); rm_w = 0; rm_aw = 0; rm_ll = 0; rm_lr = 0;
 RO_HB = 300000; RO_DB = 308192; RO_MSK = 8191;
+tq_t = 0.0000001; tq_on = 256; tq_rn = 8192 + 64; tq_o = tq_on; tq_r = tq_m = tq_rn;
 ro_hbase = 0.002 * srate; ro_dbase = 0.002 * srate;
 ro_hdop = 0.15 / 343 * srate;
 ro_ddop = 0.08 / 343 * srate;
@@ -392,17 +393,21 @@ dirty ? ( rebuild(); dirty = 0; );
 penv *= pdec;
 pk_ = penv * plev;
 sum = 0;
-ai = 0;
-loop(91,
-  gt = tg[ai] + pg[ai] * pk_;
-  (gt + cg[ai]) > 0.000001 ? (
-    cg[ai] += (gt - cg[ai]) * ksm;
-    s_ = ws[ai] * wco[ai] + wc[ai] * wsi[ai];
-    wc[ai] = wc[ai] * wco[ai] - ws[ai] * wsi[ai];
-    ws[ai] = s_;
-    sum += cg[ai] * s_;
-  ) : cg[ai] = 0;
-  ai += 1;
+tw_live ? (
+  ai = 0; tw_na = 0;
+  loop(91,
+    gt = tg[ai] + pg[ai] * pk_;
+    (gt + cg[ai]) > 0.000001 ? (
+      cg[ai] += (gt - cg[ai]) * ksm;
+      s_ = ws[ai] * wco[ai] + wc[ai] * wsi[ai];
+      wc[ai] = wc[ai] * wco[ai] - ws[ai] * wsi[ai];
+      ws[ai] = s_;
+      sum += cg[ai] * s_;
+      tw_na += 1;
+    ) : cg[ai] = 0;
+    ai += 1;
+  );
+  tw_live = tw_na > 0;
 );
 sum *= 0.09;
 
@@ -427,31 +432,43 @@ vwp = (vwp + 1) & vmask;
 
 os_gate();
 os_chg ? ( OSU.os_clr(); OSD.os_clr(); );
+abs(sum) > tq_t ? tq_o = 0 : tq_o < tq_on ? tq_o += 1;
+tq_o >= tq_on ? sum = 0 : (
 OSU.os_up(sum);
 os_f == 1 ? sum = tw_drv(OSU.s0) :
 os_f == 2 ? ( d0 = tw_drv(OSU.s0); d1 = tw_drv(OSU.s1); sum = OSD.os_dn(d0, d1, 0, 0); ) :
 ( d0 = tw_drv(OSU.s0); d1 = tw_drv(OSU.s1); d2 = tw_drv(OSU.s2); d3 = tw_drv(OSU.s3); sum = OSD.os_dn(d0, d1, d2, d3); );
+abs(sum) > tq_t ? tq_o = 0;
+);
 tl += (sum - tl) * tone_c; sum = tl;
 swell_s += (swell_t - swell_s) * sm;
 out_s += (out_t - out_s) * sm;
 sum *= swell_s * swell_s * out_s * 0.4;
 
+abs(sum) > tq_t ? tq_r = 0 : tq_r < tq_rn ? tq_r += 1;
+tq_r < tq_rn ? (
 ro_lo = rs_l2.ro_bq(rs_l1.ro_bq(sum, rk_lp.b0, rk_lp.b1, rk_lp.b2, rk_lp.a1, rk_lp.a2), rk_lp.b0, rk_lp.b1, rk_lp.b2, rk_lp.a1, rk_lp.a2);
 ro_hi = rs_h2.ro_bq(rs_h1.ro_bq(sum, rk_hp.b0, rk_hp.b1, rk_hp.b2, rk_hp.a1, rk_hp.a2), rk_hp.b0, rk_hp.b1, rk_hp.b2, rk_hp.a1, rk_hp.a2);
 RO_HB[ro_wp] = ro_hi; RO_DB[ro_wp] = ro_lo;
+);
 ro_run ? (
   ro_s += (ro_t - ro_s) * ro_sw;
   ro_x = ro_ch * ro_wch - ro_sh * ro_wsh; ro_sh = ro_sh * ro_wch + ro_ch * ro_wsh; ro_ch = ro_x;
   ro_x = ro_cd * ro_wcd - ro_sd * ro_wsd; ro_sd = ro_sd * ro_wcd + ro_cd * ro_wsd; ro_cd = ro_x;
+  tq_r >= tq_rn ? ( suL = suR = sum * (1 - ro_s); ) : (
   ro_ca = ro_ch * ro_csp - ro_sh * ro_ssp; ro_cb = ro_ch * ro_csp + ro_sh * ro_ssp;
   ro_hl = rhl1.ro_htap(ro_ca, 0) + ro_hrf * rhl2.ro_htap(-ro_ca, ro_hrfd);
   ro_hr = rhr1.ro_htap(ro_cb, 0) + ro_hrf * rhr2.ro_htap(-ro_cb, ro_hrfd);
   ro_wl = ro_hl * ro_hn * ro_hg + ro_dtap(ro_cd * ro_csp - ro_sd * ro_ssp) * ro_dn * ro_dg;
   ro_wr = ro_hr * ro_hn * ro_hg + ro_dtap(ro_cd * ro_csp + ro_sd * ro_ssp) * ro_dn * ro_dg;
   suL = sum + (ro_wl * RO_LV - sum) * ro_s; suR = sum + (ro_wr * RO_LV - sum) * ro_s;
+  abs(ro_wl) + abs(ro_wr) > tq_t ? tq_r = 0;
+  );
 ) : ( suL = sum; suR = sum; );
 ro_wp = (ro_wp + 1) & RO_MSK;
 
+abs(suL) + abs(suR) > tq_t ? tq_m = 0 : tq_m < tq_rn ? tq_m += 1;
+rm_mix > 0 && tq_m >= tq_rn ? ( rmL = suL * (1 - 0.3 * rm_mix); rmR = suR * (1 - 0.3 * rm_mix); rm_w = (rm_w + 1) & RMSK; rm_aw = (rm_aw + 1) & RAMSK; ) :
 rm_mix > 0 ? (
   RMB[rm_w] = 0.5 * (suL + suR);
   rm_el = 0.70 * RMB[(rm_w - rm_t0) & RMSK] - 0.55 * RMB[(rm_w - rm_t1) & RMSK] + 0.45 * RMB[(rm_w - rm_t2) & RMSK]
@@ -468,6 +485,7 @@ rm_mix > 0 ? (
   rm_w = (rm_w + 1) & RMSK; rm_aw = (rm_aw + 1) & RAMSK;
   rmL = suL * (1 - 0.3 * rm_mix) + rm_xl * rm_mix * 0.6;
   rmR = suR * (1 - 0.3 * rm_mix) + rm_xr * rm_mix * 0.6;
+  abs(rm_xl) + abs(rm_xr) + abs(rm_ol) + abs(rm_or) > tq_t ? tq_m = 0;
 ) : ( rmL = suL; rmR = suR; );
 
 pwr_out(rmL, rmR); rmL = pwr_l; rmR = pwr_r;
