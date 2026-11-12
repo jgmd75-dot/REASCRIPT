@@ -1,4 +1,4 @@
--- @description GFX - sampler scan (sample folders for Drum Sampler and Instrument Sampler)
+-- @description GFX Drum Sampler scan (sample folders for Drum Sampler Mini)
 -- @author GardenFX
 -- by JGWizrad / Garden FX (GFX)
 -- @version 1.0
@@ -20,17 +20,19 @@ end
 
 local function browse()
   if reaper.JS_Dialog_BrowseForFolder then
-    local ok, folder = reaper.JS_Dialog_BrowseForFolder("GFX Samplers: add a sample folder", "")
+    local ok, folder = reaper.JS_Dialog_BrowseForFolder("GFX Drum Sampler: add a sample folder", "")
     if ok == 1 and folder ~= "" then return trim(folder) end
     return nil
   end
-  local ok, folder = reaper.GetUserInputs("GFX Samplers: add a sample folder", 1, "Folder:,extrawidth=420", "")
+  local ok, folder = reaper.GetUserInputs("GFX Drum Sampler: add a sample folder", 1, "Folder:,extrawidth=420", "")
   if ok and trim(folder) ~= "" then return trim(folder) end
   return nil
 end
 
 local function ask_folders()
-  local list = split(reaper.GetExtState("gfx_smart_sampler", "folders"))
+  local saved = reaper.GetExtState("gfx_drum_sampler", "folders")
+  if saved == "" then saved = reaper.GetExtState("gfx_smart_sampler", "folders") end
+  local list = split(saved)
   if #list == 0 then
     local folder = browse()
     if not folder then return nil end
@@ -38,13 +40,13 @@ local function ask_folders()
   else
     local answer = reaper.MB("Your sample folders:\n\n" .. table.concat(list, "\n") ..
       "\n\nYes: add another folder.\nNo: change the list (to take a folder out, or just press OK to look through them again).",
-      "GFX Samplers", 3)
+      "GFX Drum Sampler", 3)
     if answer == 6 then
       local folder = browse()
       if not folder then return nil end
       list[#list + 1] = folder
     elseif answer == 7 then
-      local ok, text = reaper.GetUserInputs("GFX Samplers: sample folders", 1,
+      local ok, text = reaper.GetUserInputs("GFX Drum Sampler: sample folders", 1,
         "Folders (separate with ;):,extrawidth=420", table.concat(list, ";"))
       if not ok then return nil end
       list = split(text)
@@ -52,7 +54,7 @@ local function ask_folders()
       return nil
     end
   end
-  reaper.SetExtState("gfx_smart_sampler", "folders", table.concat(list, ";"), true)
+  reaper.SetExtState("gfx_drum_sampler", "folders", table.concat(list, ";"), true)
   return list
 end
 
@@ -87,7 +89,7 @@ end
 local folders = ask_folders()
 if not folders or #folders == 0 then return end
 
-local lines, total, missing = { "GFX Smart Sampler library" }, 0, {}
+local lines, total, missing = { "Drum Sampler Mini library" }, 0, {}
 for _, folder in ipairs(folders) do
   local root = trim(folder)
   if reaper.EnumerateFiles(root, 0) == nil and reaper.EnumerateSubdirectories(root, 0) == nil then
@@ -104,18 +106,18 @@ for _, folder in ipairs(folders) do
   end
 end
 
-local dir = reaper.GetResourcePath() .. sep .. "Data" .. sep .. "gfx-smart-sampler"
+local dir = reaper.GetResourcePath() .. sep .. "Data" .. sep .. "gfx-drum-sampler"
 reaper.RecursiveCreateDirectory(dir, 0)
 local fh = io.open(dir .. sep .. "library.txt", "w")
 if not fh then
-  reaper.MB("Could not write " .. dir .. sep .. "library.txt", "GFX Samplers", 0)
+  reaper.MB("Could not write " .. dir .. sep .. "library.txt", "GFX Drum Sampler", 0)
   return
 end
 fh:write(table.concat(lines, "\n"), "\n")
 fh:close()
 
 local msg = string.format("Found %d sound files.", total)
-if total >= MAXFILES then msg = msg .. string.format(" (the samplers take the first %d.)", MAXFILES) end
+if total >= MAXFILES then msg = msg .. string.format(" (Drum Sampler Mini takes the first %d.)", MAXFILES) end
 if #missing > 0 then msg = msg .. "\n\nThese folders could not be found:\n" .. table.concat(missing, "\n") end
-msg = msg .. "\n\nOn Drum Sampler or Instrument Sampler, click the display at the top and choose Read the library again."
-reaper.MB(msg, "GFX Samplers", 0)
+msg = msg .. "\n\nOn Drum Sampler, click the display at the top and choose Read the library again."
+reaper.MB(msg, "GFX Drum Sampler", 0)
