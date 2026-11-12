@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Usage: python3 tools/build-index.py PATH/TO/GFX-II [--lab] [--site PATH/TO/WEBSITE] --message MESSAGE"""
+"""Usage: python3 tools/build-index.py PATH/TO/GFX-II|LAB|GFX-V4 [--lab|--v4] [--site PATH/TO/WEBSITE] --message MESSAGE"""
 import hashlib, json, os, re, shutil, subprocess, sys, datetime
 from xml.sax.saxutils import escape, quoteattr
 from urllib.parse import quote
@@ -9,6 +9,7 @@ import jsfx_clean
 REPO = 'jgmd75-dot/REASCRIPT'
 TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAB = '--lab' in sys.argv
+V4 = '--v4' in sys.argv
 WEBSITE = 'https://www.gardenfx.uk/'
 
 
@@ -53,6 +54,27 @@ def parts(src, tracked):
         sys.exit(f'No website checkout at {SITE} (pass --site PATH): the install folders come from it.')
     incs = sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx-inc'))
     units = sorted(f for f in tracked if '/' not in f and f.endswith('.jsfx'))
+    if V4:
+        m = load_site('build-v4')
+        fold = {f: g for g, items in m.groups() for _, _, f in items}
+        units = [f for f in units if f.startswith('gfx-v4-')]
+        incs = [f for f in incs if f.startswith('gfx-v4-')]
+        lost = [f for f in units if f not in fold]
+        if lost:
+            sys.exit(f'Not on the website\'s V4 page: {", ".join(lost)}')
+        sysname = 'GFX V4 system files'
+        pk = {f: effect_pkg(os.path.join(src, f), f, f'Effects/{fold[f]}/{f}', 'V4', sysname) for f in units}
+        for p in pk.values():
+            p['about'] += ' Needs REAPER 6.74 or newer.'
+        pk[sysname] = dict(
+            type='effect', category='V4', desc=f'{sysname} (install this first: every GFX V4 plug-in needs them)',
+            about='The shared engine and panel files (.jsfx-inc) that every GFX V4 plug-in imports. Install once.',
+            files=[(os.path.join(src, f), f'Effects/{m.SYS_DIR}/{f}', False) for f in incs])
+        return [('V4/', 'GFX V4', 'V4', pk, sysname,
+                 'GFX V4: the current GFX range, free JSFX plug-ins for REAPER by JGWizrad - 66 effects, 26 '
+                 'instruments and a MIDI arpeggiator. Install "GFX V4 system files" first, then any plug-ins you like '
+                 '(or Install all packages). Needs REAPER 6.74 or newer. It sits beside GFX (V3) and GFX Lab without '
+                 'touching either. gardenfx.uk/v4')]
     if LAB:
         m = load_site('build-lab-zip')
         fold = {f: g for g, items in m.groups() for _, _, f in items}
