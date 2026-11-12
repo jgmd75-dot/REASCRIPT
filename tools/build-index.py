@@ -71,7 +71,7 @@ def parts(src, tracked):
             about='The shared engine and panel files (.jsfx-inc) that every GFX V4 plug-in imports. Install once.',
             files=[(os.path.join(src, f), f'Effects/{m.SYS_DIR}/{f}', False) for f in incs])
         return [('V4/', 'GFX V4', 'V4', pk, sysname,
-                 'GFX V4: the current GFX range, free JSFX plug-ins for REAPER by JGWizrad - 66 effects, 26 '
+                 'GFX V4: the current GFX range, free JSFX plug-ins for REAPER by JGWizrad - 61 effects, 25 '
                  'instruments and a MIDI arpeggiator. Install "GFX V4 system files" first, then any plug-ins you like '
                  '(or Install all packages). Needs REAPER 6.74 or newer. It sits beside GFX (V3) and GFX Lab without '
                  'touching either. gardenfx.uk/v4')]
