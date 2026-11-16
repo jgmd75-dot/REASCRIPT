@@ -1,4 +1,4 @@
--- @description GFX FRX25 scan (sample folders for FRX-25 Mini)
+-- @description GFX FRX25 scan (sample folders for FRX-25)
 -- @author GardenFX
 -- by JGWizrad / Garden FX (GFX)
 -- @version 1.0
@@ -87,7 +87,7 @@ end
 local folders = ask_folders()
 if not folders or #folders == 0 then return end
 
-local lines, total, missing = { "FRX-25 Mini library" }, 0, {}
+local lines, total, missing = { "FRX-25 library" }, 0, {}
 for _, folder in ipairs(folders) do
   local root = trim(folder)
   if reaper.EnumerateFiles(root, 0) == nil and reaper.EnumerateSubdirectories(root, 0) == nil then
@@ -115,7 +115,7 @@ fh:write(table.concat(lines, "\n"), "\n")
 fh:close()
 
 local msg = string.format("Found %d sound files.", total)
-if total >= MAXFILES then msg = msg .. string.format(" (FRX-25 Mini takes the first %d.)", MAXFILES) end
+if total >= MAXFILES then msg = msg .. string.format(" (FRX-25 takes the first %d.)", MAXFILES) end
 if #missing > 0 then msg = msg .. "\n\nThese folders could not be found:\n" .. table.concat(missing, "\n") end
-msg = msg .. "\n\nOn FRX-25 Mini, open EDIT > SOUNDS and choose SAMPLE FOLDERS > Read the library again."
+msg = msg .. "\n\nOn FRX-25, open EDIT > SOUNDS and choose SAMPLE FOLDERS > Read the library again."
 reaper.MB(msg, "GFX FRX25", 0)

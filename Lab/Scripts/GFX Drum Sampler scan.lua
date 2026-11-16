@@ -1,4 +1,4 @@
--- @description GFX Drum Sampler scan (sample folders for Drum Sampler Mini)
+-- @description GFX Drum Sampler scan (sample folders for Drum Sampler)
 -- @author GardenFX
 -- by JGWizrad / Garden FX (GFX)
 -- @version 1.0
@@ -89,7 +89,7 @@ end
 local folders = ask_folders()
 if not folders or #folders == 0 then return end
 
-local lines, total, missing = { "Drum Sampler Mini library" }, 0, {}
+local lines, total, missing = { "Drum Sampler library" }, 0, {}
 for _, folder in ipairs(folders) do
   local root = trim(folder)
   if reaper.EnumerateFiles(root, 0) == nil and reaper.EnumerateSubdirectories(root, 0) == nil then
@@ -117,7 +117,7 @@ fh:write(table.concat(lines, "\n"), "\n")
 fh:close()
 
 local msg = string.format("Found %d sound files.", total)
-if total >= MAXFILES then msg = msg .. string.format(" (Drum Sampler Mini takes the first %d.)", MAXFILES) end
+if total >= MAXFILES then msg = msg .. string.format(" (Drum Sampler takes the first %d.)", MAXFILES) end
 if #missing > 0 then msg = msg .. "\n\nThese folders could not be found:\n" .. table.concat(missing, "\n") end
 msg = msg .. "\n\nOn Drum Sampler, click the display at the top and choose Read the library again."
 reaper.MB(msg, "GFX Drum Sampler", 0)
