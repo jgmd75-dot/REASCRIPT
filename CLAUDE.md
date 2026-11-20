@@ -1,7 +1,13 @@
 # CLAUDE.md - REASCRIPT (GFX on ReaPack)
 
-This repo is the public ReaPack repository for the GFX Stable range. John adds
-`https://github.com/jgmd75-dot/REASCRIPT/raw/main/index.xml` in REAPER (Extensions > ReaPack > Import repositories).
+This repo is the public ReaPack repository for GFX. `https://github.com/jgmd75-dot/REASCRIPT/raw/main/index.xml`
+(index "GFX") is the current range, V4 (JG, 20 Nov 2026: "v4 should just show up as GFX").
+
+- **GFX = V4, V3 = GFX V3 (JG, 20 Nov 2026):** the V4 build (`--v4`) writes the same index, named "GFX", to both
+  `index.xml` and `V4/index.xml` (the old V4 link keeps working); its files stay under `V4/Effects/`. The Stable build
+  writes the V3 index to `V3/index.xml` (index "GFX V3"); its files stay under the top-level `Effects/`, `Scripts/`,
+  `Data/`. ReaPack keeps the name a repository was imported with, so an existing "GFX" user now gets V4 on sync and
+  their V3 packages turn obsolete (kept installed); they add `V3/index.xml` to keep V3 updates.
 
 - **Never edit the files here by hand.** Everything is generated from GFX-II (the Stable) by
   `python3 tools/build-index.py PATH/TO/GFX-II --message "what changed"`, then `git push origin HEAD:main`.
@@ -19,7 +25,7 @@ This repo is the public ReaPack repository for the GFX Stable range. John adds
   checkout: pass `--site PATH/TO/WEBSITE` (default `../website`). Keep every effect package in the one ReaPack
   category: the folder is in each file's path, so a move is an ordinary update (ReaPack removes the old file).
 - **Versions (JG, 30 Oct 2026):** the Stable build writes three ReaPack repositories so users tick each version on
-  or off: **GFX** (`index.xml`, the V3 range = stable.js, plus system files, scripts, Pulse patterns), **GFX V2**
+  or off: **GFX V3** (`V3/index.xml`, the V3 range = stable.js, plus system files, scripts, Pulse patterns), **GFX V2**
   (`V2/index.xml`, category "V2": the `-v2` files and the units in stable-v2.js but not in V3 - the rest of V2 is the
   same file as V3) and **GFX V1** (`V1/index.xml`, category "V1": the website's `legacy/files`). V2 / V1 use the
   main repo's "GFX system files" package. A Stable file in neither range nor legacy/files stops the build.

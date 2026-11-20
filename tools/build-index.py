@@ -70,11 +70,11 @@ def parts(src, tracked):
             type='effect', category='V4', desc=f'{sysname} (install this first: every GFX V4 plug-in needs them)',
             about='The shared engine and panel files (.jsfx-inc) that every GFX V4 plug-in imports. Install once.',
             files=[(os.path.join(src, f), f'Effects/{m.SYS_DIR}/{f}', False) for f in incs])
-        return [('V4/', 'GFX V4', 'V4', pk, sysname,
-                 'GFX V4: the current GFX range, free JSFX plug-ins for REAPER by JGWizrad - 61 effects, 25 '
-                 'instruments and a MIDI arpeggiator. Install "GFX V4 system files" first, then any plug-ins you like '
-                 '(or Install all packages). Needs REAPER 6.74 or newer. It sits beside GFX (V3) and GFX Lab without '
-                 'touching either. gardenfx.uk/v4')]
+        return [('V4/', 'GFX', 'V4', pk, sysname,
+                 'GFX: the current GFX range (V4), free JSFX plug-ins for REAPER by JGWizrad. Install "GFX V4 system '
+                 'files" first, then any plug-ins you like (or Install all packages). Needs REAPER 6.74 or newer. '
+                 'Earlier versions are in the separate GFX V3, GFX V2 and GFX V1 repositories. gardenfx.uk/v4',
+                 ['V4/', ''])]
     if LAB:
         m = load_site('build-lab-zip')
         fold = {f: g for g, items in m.groups() for _, _, f in items}
@@ -142,11 +142,12 @@ def parts(src, tracked):
             if f not in v3:
                 sys.exit(f'ESSENTIALS names {f}, which is not in the V3 range')
             ess[f] = dict(v3[f], category=cats[plugs[n][1]], flat=True)
-    need = ' They need the "GFX system files" package from the GFX repository (index.xml): add that repository too.'
-    return [('', 'GFX', 'Stable', v3, sysname,
-             'GFX (Garden FX) V3: free JSFX plug-ins and ReaScripts for REAPER by JGWizrad - the current range. '
-             'Install "GFX system files" first, then any plug-ins you like. Earlier versions are in the separate '
-             'GFX V2 and GFX V1 repositories. gardenfx.uk'),
+    need = ' They need the "GFX system files" package from the GFX V3 repository (V3/index.xml): add that repository too.'
+    return [('', 'GFX V3', 'Stable', v3, sysname,
+             'GFX V3: the GFX 3.0 range, free JSFX plug-ins and ReaScripts for REAPER by JGWizrad, so projects made '
+             'with them still open. Install "GFX system files" first, then any plug-ins you like. The current range '
+             'is the GFX repository (index.xml). Earlier versions are in the separate GFX V2 and GFX V1 '
+             'repositories. gardenfx.uk', ['V3/']),
             ('V2/', 'GFX V2', 'V2', v2, sysname,
              'GFX V2: the GFX 2.0 units that changed or left the range in V3 - the earlier versions (-v2 files) and '
              'the units V3 dropped - so projects made with them still open. Everything else in V2 is the same file '
@@ -156,8 +157,8 @@ def parts(src, tracked):
              ' gardenfx.uk'),
             ('Essentials/', 'GFX Essentials', m.SYS_DIR, ess, sysname,
              'GFX Essentials: 30 GFX plug-ins to start with, three for each job, by JGWizrad. Install everything in '
-             'this repository. For the whole range later, remove GFX Essentials and add the GFX repository '
-             '(index.xml) instead - not both. gardenfx.uk')]
+             'this repository. For the whole V3 range later, remove GFX Essentials and add the GFX V3 repository '
+             '(V3/index.xml) instead - not both. gardenfx.uk')]
 
 
 def add_scripts(pk, src, tracked):
@@ -179,7 +180,8 @@ def main():
     plan = parts(src, tracked)
 
     news, report = [], []
-    for sub, iname, cat, pk, sysname, about in plan:
+    plan = [t if len(t) == 7 else t + ([t[0]],) for t in plan]
+    for sub, iname, cat, pk, sysname, about, _ in plan:
         here = os.path.join(TOP, sub)
         for d in ('Effects', 'Scripts', 'Data'):
             shutil.rmtree(os.path.join(here, d), ignore_errors=True)
@@ -224,7 +226,7 @@ def main():
         git('commit', '-q', '-m', f'Files: {msg}')
     commit = git('rev-parse', 'HEAD')
 
-    for (sub, iname, cat0, pk, sysname, about), (new, fresh) in zip(plan, news):
+    for (sub, iname, cat0, pk, sysname, about, isubs), (new, fresh) in zip(plan, news):
         if not fresh:
             continue
         cats = {}
@@ -259,8 +261,10 @@ def main():
         out.append('    <link rel="donation">https://ko-fi.com/jgwizrad</link>')
         out.append('  </metadata>')
         out.append('</index>')
-        open(os.path.join(TOP, sub, 'index.xml'), 'w').write('\n'.join(out) + '\n')
-        git('add', sub + 'index.xml')
+        for isub in isubs:
+            os.makedirs(os.path.join(TOP, isub), exist_ok=True)
+            open(os.path.join(TOP, isub, 'index.xml'), 'w').write('\n'.join(out) + '\n')
+            git('add', isub + 'index.xml')
     git('commit', '-q', '-m', f'Index: {msg}')
     print(f'Files at {commit[:7]}')
     print('\n'.join(report))
