@@ -1,7 +1,7 @@
 -- @description GFX - actions matrix
 -- @author GardenFX
 -- by JGWizrad / Garden FX (GFX)
--- @version 2.0
+-- @version 2.1
 
 local SECTION = "GFX_actions"
 local NG, MAXK, MINK = 8, 12, 4
@@ -814,9 +814,9 @@ end
 local function fonts()
   if K.fs == K.s then return end
   K.fs = K.s
-  font(2, FONT, 15, true)
-  font(3, FONT, 13, true)
-  font(4, FONT, 13, true)
+  font(2, FONT, 16, true)
+  font(3, FONT, 14, true)
+  font(4, FONT, 14, true)
   font(5, FONT, 19, true)
   font(6, MONO, 34, true)
   font(7, MONO, 19, true)
@@ -1055,8 +1055,13 @@ end
 
 local function fit(DW, DH, bg)
   col(bg); gfx.rect(0, 0, gfx.w, gfx.h, 1)
-  K.s = math.max(0.5, math.min(gfx.w / DW, gfx.h / DH))
-  K.ox, K.oy = math.floor((gfx.w - DW * K.s) / 2), math.floor((gfx.h - DH * K.s) / 2)
+  local r = gfx.ext_retina or 1
+  K.s = math.max(r, math.min(gfx.w / DW, gfx.h / DH, 3 * r))
+  K.dw, K.dh = DW * K.s, DH * K.s
+  K.sx = math.max(0, math.min(K.sx or 0, K.dw - gfx.w))
+  K.sy = math.max(0, math.min(K.sy or 0, K.dh - gfx.h))
+  K.ox = K.dw <= gfx.w and math.floor((gfx.w - K.dw) / 2) or -math.floor(K.sx)
+  K.oy = K.dh <= gfx.h and math.floor((gfx.h - K.dh) / 2) or -math.floor(K.sy)
   fonts()
   K.lh, K.lg = hover, hover_g
   hover, hover_g, K.band = nil, nil, nil
@@ -1215,7 +1220,50 @@ local function model_d(DW, DH)
 end
 
 local DRAW = { A = model_a, B = model_b, C = model_c, D = model_d }
-local function draw() local w, h = dims(); DRAW[model](w, h) end
+local function bars()
+  local r = gfx.ext_retina or 1
+  local t = math.floor(8 * r)
+  if K.dh and K.dh > gfx.h then
+    local len = math.max(30 * r, gfx.h * gfx.h / K.dh)
+    local pos = (gfx.h - len) * K.sy / (K.dh - gfx.h)
+    gfx.set(0, 0, 0, 0.35); gfx.rect(gfx.w - t, 0, t, gfx.h, 1)
+    gfx.set(0.92, 0.9, 0.85, K.drag == 'y' and 0.95 or 0.7); gfx.rect(gfx.w - t + 2, math.floor(pos), t - 4, math.floor(len), 1)
+  end
+  if K.dw and K.dw > gfx.w then
+    local len = math.max(30 * r, gfx.w * gfx.w / K.dw)
+    local pos = (gfx.w - len) * K.sx / (K.dw - gfx.w)
+    gfx.set(0, 0, 0, 0.35); gfx.rect(0, gfx.h - t, gfx.w, t, 1)
+    gfx.set(0.92, 0.9, 0.85, K.drag == 'x' and 0.95 or 0.7); gfx.rect(math.floor(pos), gfx.h - t + 2, math.floor(len), t - 4, 1)
+  end
+end
+local function scroll()
+  local r = gfx.ext_retina or 1
+  local step = 60 * (K.s or 1)
+  local wv, hv = gfx.mouse_wheel or 0, gfx.mouse_hwheel or 0
+  gfx.mouse_wheel, gfx.mouse_hwheel = 0, 0
+  if (gfx.mouse_cap & 8) == 8 or not (K.dh and K.dh > gfx.h) then hv, wv = hv + wv, 0 end
+  if wv ~= 0 then K.sy = (K.sy or 0) - wv / 120 * step end
+  if hv ~= 0 then K.sx = (K.sx or 0) - hv / 120 * step end
+  local t = 8 * r
+  local down = (gfx.mouse_cap & 1) == 1
+  if down and not K.dwas and not K.held then
+    if K.dh and K.dh > gfx.h and gfx.mouse_x >= gfx.w - t then K.drag = 'y'
+    elseif K.dw and K.dw > gfx.w and gfx.mouse_y >= gfx.h - t then K.drag = 'x' end
+    K.dm = K.drag == 'y' and gfx.mouse_y or gfx.mouse_x
+    K.d0 = K.drag == 'y' and (K.sy or 0) or (K.sx or 0)
+  end
+  if not down then K.drag = nil end
+  K.dwas = down
+  if K.drag == 'y' then
+    local len = math.max(30 * r, gfx.h * gfx.h / K.dh)
+    K.sy = K.d0 + (gfx.mouse_y - K.dm) * (K.dh - gfx.h) / math.max(1, gfx.h - len)
+  elseif K.drag == 'x' then
+    local len = math.max(30 * r, gfx.w * gfx.w / K.dw)
+    K.sx = K.d0 + (gfx.mouse_x - K.dm) * (K.dw - gfx.w) / math.max(1, gfx.w - len)
+  end
+  return K.drag ~= nil
+end
+local function draw() local w, h = dims(); DRAW[model](w, h); bars() end
 
 load()
 local headless = setmetatable({}, { __index = function(_, id)
@@ -1235,9 +1283,14 @@ reaper.atexit(function()
 end)
 
 local pw, ph = dims()
-local sc = tonumber(reaper.GetExtState(SECTION, "scale")) or 1
+local sc = math.max(1, math.min(2, tonumber(reaper.GetExtState(SECTION, "scale")) or 1))
+local function screen_h()
+  local ok, _, t, _, b = pcall(reaper.my_getViewport, 0, 0, 0, 0, 0, 0, 0, 0, true)
+  if ok and type(t) == 'number' and type(b) == 'number' and b - t > 200 then return math.abs(b - t) - 60 end
+  return 900
+end
 gfx.ext_retina = 1
-gfx.init("GFX actions", math.floor(pw * sc + 0.5), math.floor(ph * sc + 0.5), tonumber(reaper.GetExtState(SECTION, "dock")) or 0)
+gfx.init("GFX actions", math.floor(pw * sc + 0.5), math.min(math.floor(ph * sc + 0.5), screen_h()), tonumber(reaper.GetExtState(SECTION, "dock")) or 0)
 
 local rwas = false
 local function loop()
@@ -1254,11 +1307,11 @@ local function loop()
   if w ~= pw or h ~= ph then
     if gfx.dock(-1) & 1 == 0 then
       local r = gfx.ext_retina or 1
-      gfx.init('', math.floor(w * K.s / r + 0.5), math.floor(h * K.s / r + 0.5))
+      gfx.init('', math.floor(w * K.s / r + 0.5), math.min(math.floor(h * K.s / r + 0.5), screen_h()))
     end
     pw, ph = w, h
   end
-  mouse_frame()
+  if scroll() then K.mx, K.my, K.down, K.released, K.pressed = -1, -1, false, false, false else mouse_frame() end
   draw()
   local rdown = (gfx.mouse_cap & 2) == 2
   if rwas and not rdown then
