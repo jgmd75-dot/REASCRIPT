@@ -73,7 +73,8 @@ def parts(src, tracked):
         return [('V4/', 'GFX', 'V4', pk, sysname,
                  'GFX: the current GFX range (V4), free JSFX plug-ins for REAPER by JGWizrad. Install "GFX V4 system '
                  'files" first, then any plug-ins you like (or Install all packages). Needs REAPER 6.74 or newer. '
-                 'Earlier versions are in the separate GFX V3, GFX V2 and GFX V1 repositories. gardenfx.uk/v4',
+                 'The same list is at V4/index.xml, the fixed V4 link: add only one of the two. Earlier versions are in '
+                 'the separate GFX V3, GFX V2 and GFX V1 repositories. gardenfx.uk/v4',
                  ['V4/', ''])]
     if LAB:
         m = load_site('build-lab-zip')

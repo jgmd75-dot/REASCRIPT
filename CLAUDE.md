@@ -9,6 +9,16 @@ This repo is the public ReaPack repository for GFX. `https://github.com/jgmd75-d
   `Data/`. ReaPack keeps the name a repository was imported with, so an existing "GFX" user now gets V4 on sync and
   their V3 packages turn obsolete (kept installed); they add `V3/index.xml` to keep V3 updates.
 
+- **One fixed link per version (JG, 21 Nov 2026):** every collection keeps its own link for good: `V4/index.xml`,
+  `V3/index.xml`, `V2/index.xml`, `V1/index.xml`, and later `V5/index.xml` (index "GFX V5", its own category and files
+  under `V5/`). The root `index.xml` stays V4 for good, so its users are not moved again; **V5 never takes over the
+  root**. Root and `V4/index.xml` stay the same index, both named "GFX": a new user who adds both gets ReaPack's
+  "already configured with a different URL, overwrite?" question, so one remote and no copies. ReaPack installs effects
+  into `Effects/<remote name>/<category>/`, and the remote name is the one it was imported with, so a user who imported
+  `V4/index.xml` before 20 Nov ("GFX V4") and also has the root ("GFX") gets two copies of V4. Nothing in the index can
+  merge two remotes: the fix is the help on the website's GFX page (`v4/#twolinks`): add V3/index.xml first if V3 is
+  needed, then Manage repositories > right-click GFX > Uninstall. Website and forum text list one link per version.
+
 - **Never edit the files here by hand.** Everything is generated from GFX-II (the Stable) by
   `python3 tools/build-index.py PATH/TO/GFX-II --message "what changed"`, then `git push origin HEAD:main`.
   Run it after every Stable push (bug fixes), so ReaPack users get them.
