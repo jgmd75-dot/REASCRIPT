@@ -11,7 +11,9 @@ local DEFAULTS = {
   { 'TRACKS', {
     { 'NEW TRACK', 'GFX - new track.lua', 'GFX_new_track', 'bottom' },
     { 'AT TOP',    'GFX - new track.lua', 'GFX_new_track', 'top' },
-    { 'NEW TRACK AT 01', '_00c9ecf693c24424b2945eb4f6961bc9' } } },
+    { 'NEW TRACK AT 01', '_00c9ecf693c24424b2945eb4f6961bc9' },
+    { 'CLOSE ALL FX', '_gfx_close_fx' },
+    { 'DUPLICATE + NAME', '_gfx_dup_rename' } } },
   { 'FOLDERS', {
     { 'MAKE FOLDER', 'GFX - make folder.lua', 'GFX_make_folder', 'make' } } },
   { 'MIDI / CHORDS', {
@@ -33,13 +35,20 @@ local DEFAULTS = {
   { 'BOUNCING', {
     { 'RENDER CHILDREN', '_0ddd8a0ccd068e44a3a4b3e02cc85e18' },
     { 'RENDER + REMOVE', '_64a7c26d2412e441bc068528e49a347f' },
-    { 'SAVE AND CLEAN',  '_f1646a0a24b424469c96c4b6e21bd3dc' } } },
+    { 'SAVE AND CLEAN',  '_f1646a0a24b424469c96c4b6e21bd3dc' },
+    { 'GLUE TRACKS', 'GFX - glue tracks to one.lua', 'GFX_glue', 'glue' },
+    { 'FREEZE FOLDER', '_gfx_freeze_folder' } } },
   { 'EDIT', {
     { 'NEXT TRANSIENT',   '_84a30a3f9e034e9d942cce9054b39778' },
     { 'RECORD FROM END',  '_479943799ae242c78fc13f3ea6f2a170' },
     { 'AUTO SCROLL',      '_70ff512dc0d34087a499b2baa1a3a90e' },
     { 'ENV POINTS EDGES', '_3c673cf056af4400803707008dbc8126' },
-    { 'VOL AT REGIONS',   '_977795d8cce5474f8c9ac00605de3750' } } },
+    { 'VOL AT REGIONS',   '_977795d8cce5474f8c9ac00605de3750' },
+    { 'POINT AT REGION',  '_gfx_env_region_start' },
+    { 'TRANSIENTS ITEM',  '_gfx_transients_item' },
+    { 'BYPASS FX STOP',   '_gfx_bypass_stop' },
+    { 'HEAL ALL SPLITS',  '_gfx_heal_splits' },
+    { 'TRANSIENTS 2ND BEAT', '_gfx_transients_beat' } } },
 }
 
 local B = {}
@@ -252,6 +261,148 @@ function B.points_regions()
   reaper.UpdateArrange()
 end
 
+function B.env_region_start()
+  local keep = reaper.GetCursorPosition()
+  reaper.Main_OnCommand(40042, 0)
+  reaper.Main_OnCommand(40173, 0)
+  reaper.Main_OnCommand(40915, 0)
+  reaper.SetEditCurPos(keep, false, false)
+end
+local function transients(skip)
+  local list = sel_items()
+  if #list == 0 then return false, 'NO ITEMS' end
+  local keep = reaper.GetCursorPosition()
+  for _, it in ipairs(list) do
+    local p0 = reaper.GetMediaItemInfo_Value(it, 'D_POSITION')
+    local p1 = p0 + reaper.GetMediaItemInfo_Value(it, 'D_LENGTH')
+    reaper.Main_OnCommand(40289, 0)
+    reaper.SetMediaItemSelected(it, true)
+    reaper.SetEditCurPos(p0, false, false)
+    local last = p0
+    for _ = 1, 100000 do
+      reaper.Main_OnCommand(40375, 0)
+      local c = reaper.GetCursorPosition()
+      if c <= last + 0.0005 or c >= p1 - 0.0005 then break end
+      reaper.Main_OnCommand(41842, 0)
+      last = c
+      if skip then
+        local nb = reaper.TimeMap2_QNToTime(0, reaper.TimeMap2_timeToQN(0, c) + 1)
+        if nb >= p1 then break end
+        reaper.SetEditCurPos(nb, false, false)
+      end
+    end
+  end
+  reaper.Main_OnCommand(40289, 0)
+  for _, it in ipairs(list) do reaper.SetMediaItemSelected(it, true) end
+  reaper.SetEditCurPos(keep, false, false)
+end
+function B.transients_item() return transients(false) end
+function B.transients_beat() return transients(true) end
+
+local named_cmd = {}
+local function cmd_named(want)
+  if named_cmd[want] then return named_cmd[want] end
+  if not reaper.kbd_enumerateActions then return nil end
+  local sec, i = reaper.SectionFromUniqueID(0), 0
+  while true do
+    local c, name = reaper.kbd_enumerateActions(sec, i)
+    if not c or c <= 0 then break end
+    if name == want then named_cmd[want] = c; return c end
+    i = i + 1
+  end
+end
+local GFX_PAL = { 0xC0504D, 0xD9844A, 0xD8B44A, 0x9BBB59, 0x4BACA6, 0x4F81BD, 0x7B6AB0, 0xB0609A,
+                  0x8C6D4F, 0x6E8C5A, 0x5A7C8C, 0x8C5A6E }
+local function next_colour(cn)
+  local n = 1
+  for k, c in ipairs(GFX_PAL) do
+    if reaper.ColorToNative(c >> 16 & 255, c >> 8 & 255, c & 255) | 0x1000000 == cn then n = k % #GFX_PAL + 1 end
+  end
+  local c = GFX_PAL[n]
+  return reaper.ColorToNative(c >> 16 & 255, c >> 8 & 255, c & 255) | 0x1000000
+end
+function B.dup_rename()
+  if #selected() == 0 then return false, 'NO TRACKS' end
+  reaper.Main_OnCommand(40062, 0)
+  local dups = selected()
+  local _, first = reaper.GetTrackName(dups[1])
+  local ok, name = reaper.GetUserInputs('Duplicate tracks', 1, 'Name,extrawidth=120', first)
+  for k, tr in ipairs(dups) do
+    reaper.SetMediaTrackInfo_Value(tr, 'I_CUSTOMCOLOR', next_colour(reaper.GetMediaTrackInfo_Value(tr, 'I_CUSTOMCOLOR')))
+    if ok and name ~= '' then
+      reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME', #dups > 1 and (name .. ' ' .. k) or name, true)
+    end
+  end
+  reaper.TrackList_AdjustWindows(false)
+end
+function B.freeze_folder()
+  local list = selected()
+  if #list == 0 then return false, 'NO TRACKS' end
+  local c = cmd_named('Track: Freeze to stereo (render pre-fader, save/remove items and online FX)')
+  if not c then return false, 'NEEDS NEWER REAPER' end
+  reaper.Main_OnCommand(c, 0)
+  for _, tr in ipairs(list) do
+    reaper.SetMediaTrackInfo_Value(tr, 'I_FXEN', 0)
+    if is_folder(tr) then
+      for _, ch in ipairs(children(tr)) do reaper.SetMediaTrackInfo_Value(ch, 'B_MUTE', 1) end
+    end
+  end
+  select_only(list)
+end
+
+local function all_tracks()
+  local t = tracks()
+  table.insert(t, 1, reaper.GetMasterTrack(0))
+  return t
+end
+function B.close_fx()
+  for _, tr in ipairs(all_tracks()) do
+    for f = 0, reaper.TrackFX_GetCount(tr) - 1 do reaper.TrackFX_Show(tr, f, 2) end
+    for f = 0, reaper.TrackFX_GetRecCount(tr) - 1 do reaper.TrackFX_Show(tr, 0x1000000 + f, 2) end
+    if reaper.TrackFX_GetCount(tr) > 0 then reaper.TrackFX_Show(tr, 0, 0) end
+    if reaper.TrackFX_GetRecCount(tr) > 0 then reaper.TrackFX_Show(tr, 0x1000000, 0) end
+  end
+  for i = 0, reaper.CountMediaItems(0) - 1 do
+    local it = reaper.GetMediaItem(0, i)
+    for k = 0, reaper.CountTakes(it) - 1 do
+      local tk = reaper.GetTake(it, k)
+      if tk then
+        local n = reaper.TakeFX_GetCount(tk)
+        for f = 0, n - 1 do reaper.TakeFX_Show(tk, f, 2) end
+        if n > 0 then reaper.TakeFX_Show(tk, 0, 0) end
+      end
+    end
+  end
+end
+function B.bypass_stop()
+  local keep = {}
+  for _, tr in ipairs(all_tracks()) do
+    keep[tr] = reaper.GetMediaTrackInfo_Value(tr, 'I_FXEN')
+    reaper.SetMediaTrackInfo_Value(tr, 'I_FXEN', 0)
+  end
+  if reaper.GetPlayState() & 5 ~= 0 then reaper.SetEditCurPos(reaper.GetPlayPosition(), true, false) end
+  reaper.OnStopButton()
+  for tr, v in pairs(keep) do reaper.SetMediaTrackInfo_Value(tr, 'I_FXEN', v) end
+end
+function B.heal_splits()
+  local spots = {}
+  for _, it in ipairs(sel_items()) do
+    spots[#spots + 1] = { reaper.GetMediaItem_Track(it), reaper.GetMediaItemInfo_Value(it, 'D_POSITION') }
+  end
+  if #spots == 0 then return false, 'NO ITEMS' end
+  reaper.Main_OnCommand(40548, 0)
+  reaper.Main_OnCommand(40289, 0)
+  for _, sp in ipairs(spots) do
+    for j = 0, reaper.CountTrackMediaItems(sp[1]) - 1 do
+      local it = reaper.GetTrackMediaItem(sp[1], j)
+      local p = reaper.GetMediaItemInfo_Value(it, 'D_POSITION')
+      if sp[2] >= p - 0.000001 and sp[2] < p + reaper.GetMediaItemInfo_Value(it, 'D_LENGTH') then
+        reaper.SetMediaItemSelected(it, true)
+      end
+    end
+  end
+end
+
 local BUILTIN = {
   _00c9ecf693c24424b2945eb4f6961bc9 = { 'NEW TRACK AT 01', true, { '40296', B.insert_above, '40939' } },
   _04d3935480a94a28ae80b7a0de99754c = { 'SHOW ALL TRACKS', true,
@@ -283,6 +434,14 @@ local BUILTIN = {
     { B.focus_arrange, '40434', B.scroll_play_50, '41817' } },
   _3c673cf056af4400803707008dbc8126 = { 'ADD POINTS BEFORE AND AFTER AND UNSELECT', true,
     { B.points_edges, '40332', '40331', '40020', B.unset_repeat } },
+  _gfx_close_fx = { 'CLOSE ALL FX AND CHAINS', false, { B.close_fx } },
+  _gfx_bypass_stop = { 'BYPASS FX STOP', false, { B.bypass_stop } },
+  _gfx_heal_splits = { 'HEAL ALL SPLITS', true, { B.heal_splits } },
+  _gfx_transients_beat = { 'INSERT STRETCH MARKER EVERY SECOND BEAT', true, { B.transients_beat } },
+  _gfx_dup_rename = { 'JG DUPLICATE AND RENAME TRACKS', true, { B.dup_rename } },
+  _gfx_freeze_folder = { 'JG FREEZE FOLDER MUTE FX', true, { B.freeze_folder } },
+  _gfx_env_region_start = { 'ADD SINGLE POINT AT REGION START', true, { B.env_region_start } },
+  _gfx_transients_item = { 'ADD TRANSIENTS TO WHOLE ITEM', true, { B.transients_item } },
   _977795d8cce5474f8c9ac00605de3750 = { 'ADD VOLUME POINTS AT REGIONS', true,
     { '41866', B.points_regions, B.points_edges, '40331', '40723', '40401', '40891' } },
 }
@@ -327,6 +486,32 @@ local function load()
     if gname[g] == '' then gname[g] = DEFAULTS[g][1] end
     keys[g] = {}
     for i = 1, MAXK do keys[g][i] = dec(reaper.GetExtState(SECTION, 'g' .. g .. 's' .. i)) end
+  end
+  if reaper.GetExtState(SECTION, 'init3') ~= '1' then
+    local add = { { 7, 'GLUE TRACKS', 'GFX - glue tracks to one.lua', 'GFX_glue', 'glue' },
+                  { 8, 'POINT AT REGION', '_gfx_env_region_start' }, { 8, 'TRANSIENTS ITEM', '_gfx_transients_item' },
+                  { 8, 'BYPASS FX STOP', '_gfx_bypass_stop' }, { 8, 'HEAL ALL SPLITS', '_gfx_heal_splits' },
+                  { 8, 'TRANSIENTS 2ND BEAT', '_gfx_transients_beat' },
+                  { 1, 'CLOSE ALL FX', '_gfx_close_fx' }, { 1, 'DUPLICATE + NAME', '_gfx_dup_rename' },
+                  { 7, 'FREEZE FOLDER', '_gfx_freeze_folder' } }
+    for _, a in ipairs(add) do
+      local have = false
+      for g = 1, NG do for i = 1, MAXK do
+        local k = keys[g][i]
+        if k and (k.cmd == a[3] or k.file == a[3]) then have = true end
+      end end
+      if not have then
+        for i = 1, MAXK do
+          if not keys[a[1]][i] then
+            keys[a[1]][i] = a[4] and { kind = 'gfx', name = a[2], file = a[3], ext = a[4], id = a[5] }
+                            or { kind = 'act', name = a[2], cmd = a[3] }
+            save(a[1], i)
+            break
+          end
+        end
+      end
+    end
+    reaper.SetExtState(SECTION, 'init3', '1', true)
   end
 end
 
