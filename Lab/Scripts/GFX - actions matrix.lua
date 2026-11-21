@@ -18,7 +18,8 @@ local DEFAULTS = {
     { 'MAKE FOLDER', 'GFX - make folder.lua', 'GFX_make_folder', 'make' } } },
   { 'MIDI / CHORDS', {
     { 'MIDI INPUT', 'GFX - input to all MIDI.lua', 'GFX_input_midi', 'set' },
-    { 'ORCHD',      'GFX_ORCHD.lua', '', '' } } },
+    { 'ORCHD',      'GFX_ORCHD.lua', '', '' },
+    { 'ARM SELECTED ONLY', '_gfx_arm_selected' } } },
   { 'NAMES', {
     { 'TIDY FX', 'GFX - tidy FX names.lua', 'GFX_tidy_names', 'tidy' } } },
   { 'SHOW / HIDE', {
@@ -32,7 +33,8 @@ local DEFAULTS = {
     { 'DOCKER + COLOUR',   '_gfx_docker_colour' } } },
   { 'PLACEMENT', {
     { 'MASTERING PLACE', '_ce77e62c025842ed83fa1107d9653913' },
-    { 'SPLIT AND MUTE',  '_fcf3962a462d0d47a0cf0bb9660236c5' } } },
+    { 'SPLIT AND MUTE',  '_fcf3962a462d0d47a0cf0bb9660236c5' },
+    { 'IMPORT LP',       '_gfx_import_lp' } } },
   { 'BOUNCING', {
     { 'RENDER CHILDREN', '_0ddd8a0ccd068e44a3a4b3e02cc85e18' },
     { 'RENDER + REMOVE', '_64a7c26d2412e441bc068528e49a347f' },
@@ -49,7 +51,8 @@ local DEFAULTS = {
     { 'TRANSIENTS ITEM',  '_gfx_transients_item' },
     { 'BYPASS FX STOP',   '_gfx_bypass_stop' },
     { 'HEAL ALL SPLITS',  '_gfx_heal_splits' },
-    { 'TRANSIENTS 2ND BEAT', '_gfx_transients_beat' } } },
+    { 'TRANSIENTS 2ND BEAT', '_gfx_transients_beat' },
+    { 'LOOP BETWEEN POINTS', '_gfx_loop_points' } } },
 }
 
 local B = {}
@@ -351,6 +354,65 @@ function B.freeze_folder()
   select_only(list)
 end
 
+function B.arm_selected()
+  for _, tr in ipairs(tracks()) do reaper.SetMediaTrackInfo_Value(tr, 'I_RECARM', reaper.IsTrackSelected(tr) and 1 or 0) end
+end
+function B.loop_points()
+  local env = reaper.GetSelectedEnvelope(0)
+  if not env then
+    local tr = reaper.GetTrack(0, 0)
+    if tr then
+      for j = 0, reaper.CountTrackEnvelopes(tr) - 1 do
+        local e = reaper.GetTrackEnvelope(tr, j)
+        local _, ch = reaper.GetEnvelopeStateChunk(e, '', false)
+        if ch:match('\nVIS 1') then env = e; break end
+      end
+    end
+  end
+  if not env then return false, 'NO ENVELOPE' end
+  local cur, a, b = reaper.GetCursorPosition(), nil, nil
+  for k = 0, reaper.CountEnvelopePoints(env) - 1 do
+    local _, pos = reaper.GetEnvelopePoint(env, k)
+    if pos <= cur + 0.000001 then a = pos elseif not b then b = pos end
+  end
+  if not a or not b then return false, 'NO POINTS' end
+  reaper.GetSet_LoopTimeRange(true, false, a, b, false)
+  reaper.GetSet_LoopTimeRange(true, true, a, b, false)
+  local c = cmd_named('Options: Set loop points linked to time selection')
+  if c then reaper.Main_OnCommand(c, 0) end
+end
+local function run_named(name)
+  local c = cmd_named(name)
+  if c then reaper.Main_OnCommand(c, 0) end
+  return c
+end
+function B.import_lp()
+  local n = reaper.CountTracks(0)
+  reaper.InsertTrackAtIndex(n, true)
+  select_only({ reaper.GetTrack(0, n) })
+  reaper.SetEditCurPos(0, true, false)
+  local before = reaper.CountMediaItems(0)
+  reaper.Main_OnCommand(40018, 0)
+  if reaper.CountMediaItems(0) == before then return false, 'NOTHING IMPORTED' end
+  reaper.Main_OnCommand(40295, 0)
+  for _, it in ipairs(sel_items()) do reaper.SetMediaItemInfo_Value(it, 'C_LOCK', 1) end
+  reaper.Main_OnCommand(40290, 0)
+  run_named('Markers: Insert region from selected items and edit...')
+  local t = {}
+  for _, it in ipairs(sel_items()) do t[#t + 1] = reaper.GetMediaItem_Track(it) end
+  select_only(t)
+  run_named('Tempo envelope: Insert tempo/time signature change marker at edit cursor...')
+  local _, e = reaper.GetSet_LoopTimeRange(false, false, 0, 0, false)
+  reaper.SetEditCurPos(e, true, false)
+  local k, i = 0, 0
+  while true do
+    local r = reaper.EnumProjectMarkers(i)
+    if r == 0 then break end
+    k = k + 1; i = i + 1
+  end
+  local c = GFX_PAL[k % #GFX_PAL + 1]
+  reaper.AddProjectMarker2(0, false, e, 0, '', -1, reaper.ColorToNative(c >> 16 & 255, c >> 8 & 255, c & 255) | 0x1000000)
+end
 function B.docker_colour()
   local c = cmd_named('View: Show docker')
   if c and reaper.GetToggleCommandState(c) ~= 1 then reaper.Main_OnCommand(c, 0) end
@@ -466,6 +528,9 @@ local BUILTIN = {
   _gfx_dup_rename = { 'JG DUPLICATE AND RENAME TRACKS', true, { B.dup_rename } },
   _gfx_freeze_folder = { 'JG FREEZE FOLDER MUTE FX', true, { B.freeze_folder } },
   _gfx_docker_colour = { 'JG SHOW DOCKER AND ZOOM', true, { B.docker_colour } },
+  _gfx_arm_selected = { 'REC ARM ONLY SELECTED TRACK', true, { B.arm_selected } },
+  _gfx_loop_points = { 'LOOP BETWEEN ENVELOPE POINTS', false, { B.loop_points } },
+  _gfx_import_lp = { 'LP IMPORT ITEMS', true, { B.import_lp } },
   _gfx_env_region_start = { 'ADD SINGLE POINT AT REGION START', true, { B.env_region_start } },
   _gfx_transients_item = { 'ADD TRANSIENTS TO WHOLE ITEM', true, { B.transients_item } },
   _977795d8cce5474f8c9ac00605de3750 = { 'ADD VOLUME POINTS AT REGIONS', true,
@@ -513,13 +578,15 @@ local function load()
     keys[g] = {}
     for i = 1, MAXK do keys[g][i] = dec(reaper.GetExtState(SECTION, 'g' .. g .. 's' .. i)) end
   end
-  if reaper.GetExtState(SECTION, 'init4') ~= '1' then
+  if reaper.GetExtState(SECTION, 'init5') ~= '1' then
     local add = { { 7, 'GLUE TRACKS', 'GFX - glue tracks to one.lua', 'GFX_glue', 'glue' },
                   { 8, 'POINT AT REGION', '_gfx_env_region_start' }, { 8, 'TRANSIENTS ITEM', '_gfx_transients_item' },
                   { 8, 'BYPASS FX STOP', '_gfx_bypass_stop' }, { 8, 'HEAL ALL SPLITS', '_gfx_heal_splits' },
                   { 8, 'TRANSIENTS 2ND BEAT', '_gfx_transients_beat' },
                   { 1, 'CLOSE ALL FX', '_gfx_close_fx' }, { 1, 'DUPLICATE + NAME', '_gfx_dup_rename' },
-                  { 7, 'FREEZE FOLDER', '_gfx_freeze_folder' }, { 5, 'DOCKER + COLOUR', '_gfx_docker_colour' } }
+                  { 7, 'FREEZE FOLDER', '_gfx_freeze_folder' }, { 5, 'DOCKER + COLOUR', '_gfx_docker_colour' },
+                  { 3, 'ARM SELECTED ONLY', '_gfx_arm_selected' }, { 8, 'LOOP BETWEEN POINTS', '_gfx_loop_points' },
+                  { 6, 'IMPORT LP', '_gfx_import_lp' } }
     for _, a in ipairs(add) do
       local have = false
       for g = 1, NG do for i = 1, MAXK do
@@ -537,7 +604,7 @@ local function load()
         end
       end
     end
-    reaper.SetExtState(SECTION, 'init4', '1', true)
+    reaper.SetExtState(SECTION, 'init5', '1', true)
   end
 end
 
