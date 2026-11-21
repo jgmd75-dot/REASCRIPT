@@ -28,7 +28,8 @@ local DEFAULTS = {
     { 'UNCOLLAPSE ALL',    '_a39433292195444e81cbd807fe66cba3' },
     { 'ZOOM ALL',          '_3ab5ce2ff6f641698e1187290369d3a5' },
     { 'ZOOM FOLDERS',      '_19da43adac8641daaaf8a621b634c3bf' },
-    { 'ZOOM MINIMAL',      '_5409a0868b3e483383fcd5daaae7f54f' } } },
+    { 'ZOOM MINIMAL',      '_5409a0868b3e483383fcd5daaae7f54f' },
+    { 'DOCKER + COLOUR',   '_gfx_docker_colour' } } },
   { 'PLACEMENT', {
     { 'MASTERING PLACE', '_ce77e62c025842ed83fa1107d9653913' },
     { 'SPLIT AND MUTE',  '_fcf3962a462d0d47a0cf0bb9660236c5' } } },
@@ -350,6 +351,30 @@ function B.freeze_folder()
   select_only(list)
 end
 
+function B.docker_colour()
+  local c = cmd_named('View: Show docker')
+  if c and reaper.GetToggleCommandState(c) ~= 1 then reaper.Main_OnCommand(c, 0) end
+  local stack, n = {}, 0
+  for _, tr in ipairs(tracks()) do
+    local fd = reaper.GetMediaTrackInfo_Value(tr, 'I_FOLDERDEPTH')
+    if fd == 1 then
+      local p = GFX_PAL[n % #GFX_PAL + 1]
+      n = n + 1
+      local cn = reaper.ColorToNative(p >> 16 & 255, p >> 8 & 255, p & 255) | 0x1000000
+      reaper.SetMediaTrackInfo_Value(tr, 'I_CUSTOMCOLOR', cn)
+      stack[#stack + 1] = cn
+    else
+      if stack[#stack] then reaper.SetMediaTrackInfo_Value(tr, 'I_CUSTOMCOLOR', stack[#stack]) end
+      if fd < 0 then for _ = 1, -fd do stack[#stack] = nil end end
+    end
+    local tc = reaper.GetMediaTrackInfo_Value(tr, 'I_CUSTOMCOLOR')
+    for j = 0, reaper.CountTrackMediaItems(tr) - 1 do
+      reaper.SetMediaItemInfo_Value(reaper.GetTrackMediaItem(tr, j), 'I_CUSTOMCOLOR', tc)
+    end
+  end
+  reaper.UpdateArrange()
+end
+
 local function all_tracks()
   local t = tracks()
   table.insert(t, 1, reaper.GetMasterTrack(0))
@@ -440,6 +465,7 @@ local BUILTIN = {
   _gfx_transients_beat = { 'INSERT STRETCH MARKER EVERY SECOND BEAT', true, { B.transients_beat } },
   _gfx_dup_rename = { 'JG DUPLICATE AND RENAME TRACKS', true, { B.dup_rename } },
   _gfx_freeze_folder = { 'JG FREEZE FOLDER MUTE FX', true, { B.freeze_folder } },
+  _gfx_docker_colour = { 'JG SHOW DOCKER AND ZOOM', true, { B.docker_colour } },
   _gfx_env_region_start = { 'ADD SINGLE POINT AT REGION START', true, { B.env_region_start } },
   _gfx_transients_item = { 'ADD TRANSIENTS TO WHOLE ITEM', true, { B.transients_item } },
   _977795d8cce5474f8c9ac00605de3750 = { 'ADD VOLUME POINTS AT REGIONS', true,
@@ -487,13 +513,13 @@ local function load()
     keys[g] = {}
     for i = 1, MAXK do keys[g][i] = dec(reaper.GetExtState(SECTION, 'g' .. g .. 's' .. i)) end
   end
-  if reaper.GetExtState(SECTION, 'init3') ~= '1' then
+  if reaper.GetExtState(SECTION, 'init4') ~= '1' then
     local add = { { 7, 'GLUE TRACKS', 'GFX - glue tracks to one.lua', 'GFX_glue', 'glue' },
                   { 8, 'POINT AT REGION', '_gfx_env_region_start' }, { 8, 'TRANSIENTS ITEM', '_gfx_transients_item' },
                   { 8, 'BYPASS FX STOP', '_gfx_bypass_stop' }, { 8, 'HEAL ALL SPLITS', '_gfx_heal_splits' },
                   { 8, 'TRANSIENTS 2ND BEAT', '_gfx_transients_beat' },
                   { 1, 'CLOSE ALL FX', '_gfx_close_fx' }, { 1, 'DUPLICATE + NAME', '_gfx_dup_rename' },
-                  { 7, 'FREEZE FOLDER', '_gfx_freeze_folder' } }
+                  { 7, 'FREEZE FOLDER', '_gfx_freeze_folder' }, { 5, 'DOCKER + COLOUR', '_gfx_docker_colour' } }
     for _, a in ipairs(add) do
       local have = false
       for g = 1, NG do for i = 1, MAXK do
@@ -511,7 +537,7 @@ local function load()
         end
       end
     end
-    reaper.SetExtState(SECTION, 'init3', '1', true)
+    reaper.SetExtState(SECTION, 'init4', '1', true)
   end
 end
 
