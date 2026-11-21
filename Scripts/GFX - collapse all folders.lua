@@ -41,9 +41,43 @@ local function zoom_to_items()
   reaper.CSurf_OnScroll(0, -100000)
 end
 
-local function finish(name)
+local function select_only(list)
+  for _, tr in ipairs(tracks()) do reaper.SetTrackSelected(tr, false) end
+  for _, tr in ipairs(list) do reaper.SetTrackSelected(tr, true) end
+end
+
+local function fit_tracks(opt)
+  local keep, vis = {}, {}
+  for _, tr in ipairs(tracks()) do
+    if reaper.IsTrackSelected(tr) then keep[#keep + 1] = tr end
+    if reaper.GetTrackDepth(tr) == 0 and reaper.GetMediaTrackInfo_Value(tr, "B_SHOWINTCP") == 1 then vis[#vis + 1] = tr end
+  end
+  if #vis == 0 then return end
+  select_only(vis)
+  reaper.Main_OnCommand(40723, 0)
+  reaper.TrackList_AdjustWindows(false)
+  if opt.heights then
+    local total, w = 0, 0
+    for _, tr in ipairs(vis) do
+      total = total + reaper.GetMediaTrackInfo_Value(tr, "I_TCPH")
+      w = w + (is_folder(tr) and FOLDER_H or TRACK_H)
+    end
+    for _, tr in ipairs(vis) do
+      local h = math.floor(total * (is_folder(tr) and FOLDER_H or TRACK_H) / w)
+      reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", h)
+    end
+  end
+  select_only(keep)
+  reaper.TrackList_AdjustWindows(false)
+end
+
+local function finish(name, opt, fit)
   reaper.PreventUIRefresh(-1)
   reaper.TrackList_AdjustWindows(false)
+  if opt.zoom then
+    if fit then fit_tracks(opt) end
+    zoom_to_items()
+  end
   reaper.UpdateArrange()
   reaper.Undo_EndBlock(name, -1)
 end
@@ -52,7 +86,7 @@ local function collapse(opt)
   local all = tracks()
   reaper.Undo_BeginBlock()
   reaper.PreventUIRefresh(1)
-  if opt.heights and select(2, reaper.GetProjExtState(0, SECTION, "heights")) == "" then
+  if (opt.heights or opt.zoom) and select(2, reaper.GetProjExtState(0, SECTION, "heights")) == "" then
     local saved = {}
     for _, tr in ipairs(all) do
       saved[#saved + 1] = reaper.GetTrackGUID(tr) .. "=" .. reaper.GetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE")
@@ -72,6 +106,10 @@ local function collapse(opt)
       stack[#stack + 1] = cn
     end
     if reaper.GetTrackDepth(tr) > 0 then reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINMIXER", 0) end
+    if opt.loose and fd ~= 1 and reaper.GetTrackDepth(tr) == 0 then
+      reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINTCP", 0)
+      reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINMIXER", 0)
+    end
     if fd ~= 1 then
       if opt.colour and stack[#stack] then reaper.SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", stack[#stack]) end
       if opt.heights then reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", TRACK_H) end
@@ -84,8 +122,7 @@ local function collapse(opt)
       end
     end
   end
-  finish("GFX - collapse all folders")
-  if opt.zoom then zoom_to_items() end
+  finish("GFX - collapse all folders", opt, true)
 end
 
 local function mixer_folders_on()
@@ -119,8 +156,7 @@ local function expand(opt)
   end
   reaper.SetProjExtState(0, SECTION, "heights", "")
   mixer_folders_on()
-  finish("GFX - expand all folders")
-  if opt.zoom then zoom_to_items() end
+  finish("GFX - expand all folders", opt, false)
 end
 
 local K = { s = 1, ox = 0, oy = 0, down = false, was = false, clicked = false, held = nil }
@@ -280,7 +316,8 @@ end
 
 local DW, DH = 440, 322
 local function opt_get(k) return reaper.GetExtState(SECTION, k) ~= "0" end
-local opt = { colour = opt_get("colour"), heights = opt_get("heights"), zoom = opt_get("zoom") }
+local opt = { colour = opt_get("colour"), heights = opt_get("heights"), zoom = opt_get("zoom"),
+              loose = reaper.GetExtState(SECTION, "loose") == "1" }
 local status = "READY"
 local n_all, n_shut, n_tr = 0, 0, 0
 
@@ -314,6 +351,7 @@ local function draw()
   if opt.colour then on[#on + 1] = 'COLOUR' end
   if opt.heights then on[#on + 1] = 'HEIGHTS' end
   if opt.zoom then on[#on + 1] = 'ZOOM' end
+  if opt.loose then on[#on + 1] = 'LOOSE' end
   text(x0 + 18, ly + 84, #on > 0 and table.concat(on, ' ') or 'COLLAPSE ONLY', 0x1C2416)
   text(x0 + w0 - 18, ly + 84, status, 0x1C2416, 2)
 
@@ -322,18 +360,19 @@ local function draw()
   if key('toggle', shut and 'SHOW ALL' or 'COLLAPSE', x0, y, w0, kh, 0xE48A2A, 0x1E1E1E, shut) then toggle() end
 
   y = y + kh + 10
-  local u = (w0 - gap * 2) / 3
-  for i, k in ipairs({ { 'colour', 'COLOUR' }, { 'heights', 'HEIGHTS' }, { 'zoom', 'ZOOM' } }) do
+  local u = (w0 - gap * 3) / 4
+  for i, k in ipairs({ { 'colour', 'COLOUR' }, { 'heights', 'HEIGHTS' }, { 'zoom', 'ZOOM' }, { 'loose', 'LOOSE' } }) do
     if key(k[1], k[2], x0 + (u + gap) * (i - 1), y, u, kh, 0x6F6F76, 0xF4F1E8, opt[k[1]]) then
       opt_flip(k[1])
     end
   end
   gfx.setfont(4)
-  text(x0, y + kh + 12, 'KEY: a shortcut that toggles with these settings.', mul(FACE, 0.58))
+  text(x0, y + kh + 12, 'LOOSE: hide tracks in no folder. KEY: a shortcut.', mul(FACE, 0.58))
 end
 
 if K.remote_start({ toggle = toggle, colour = function() opt_flip('colour') end,
-                    heights = function() opt_flip('heights') end, zoom = function() opt_flip('zoom') end }) then return end
+                    heights = function() opt_flip('heights') end, zoom = function() opt_flip('zoom') end,
+                    loose = function() opt_flip('loose') end }) then return end
 
 local _, _, sec, cmd = reaper.get_action_context()
 reaper.SetExtState(SECTION, "running", "1", false)
