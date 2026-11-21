@@ -1,7 +1,7 @@
 -- @description GFX - make folder from selected tracks
 -- @author GardenFX
 -- by JGWizrad / Garden FX (GFX)
--- @version 1.2
+-- @version 1.3
 
 local SECTION = "GFX_make_folder"
 local PALETTE = { 0xC0504D, 0xD9844A, 0xD8B44A, 0x9BBB59, 0x4BACA6, 0x4F81BD, 0x7B6AB0, 0xB0609A,
@@ -44,6 +44,12 @@ local function make_folder(name, opt)
   for _, tr in ipairs({ folder, table.unpack(sel) }) do
     reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINTCP", 1)
     reaper.SetMediaTrackInfo_Value(tr, "B_SHOWINMIXER", 1)
+  end
+  local ok, ch = reaper.GetTrackStateChunk(folder, "", false)
+  if ok then
+    local n
+    ch, n = ch:gsub("\nBUSCOMP (%-?%d+) %-?%d+", "\nBUSCOMP %1 0", 1)
+    if n > 0 then reaper.SetTrackStateChunk(folder, ch, false) end
   end
   if opt.items then
     for _, tr in ipairs(sel) do
