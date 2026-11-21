@@ -1072,7 +1072,8 @@ end
 local function fit(DW, DH, bg)
   col(bg); gfx.rect(0, 0, gfx.w, gfx.h, 1)
   local r = gfx.ext_retina or 1
-  K.s = math.max(0.6 * r, math.min(gfx.w / DW, gfx.h / DH))
+  if model == 'C' then K.s = math.max(0.6 * r, math.min(gfx.w / DW, gfx.h / DH))
+  else K.s = math.max(0.6 * r, math.min(gfx.w / DW, 3 * r)) end
   K.dw, K.dh = DW * K.s, DH * K.s
   K.sx = math.max(0, math.min(K.sx or 0, K.dw - gfx.w))
   K.sy = math.max(0, math.min(K.sy or 0, K.dh - gfx.h))
