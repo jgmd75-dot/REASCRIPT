@@ -1,7 +1,7 @@
 -- @description GFX - stem sort (a folder of stems to a sorted, coloured session)
 -- @author GardenFX
 -- by JGWizrad / Garden FX (GFX)
--- @version 1.1
+-- @version 1.2
 
 local SECTION = "GFX_stem_sort"
 
@@ -621,6 +621,22 @@ function K.make(id, label)
   local f = io.open(path, 'w')
   if not f then return end
   f:write(string.format('-- %s: the %s key, made with its KEY button\nGFX_MAIN = %q\n'
+    .. 'if not reaper.file_exists(GFX_MAIN) then\n'
+    .. '  local want = GFX_MAIN:match("([^/\\\\]+)$")\n'
+    .. '  local function look(d, n)\n'
+    .. '    if reaper.file_exists(d .. "/" .. want) then return d .. "/" .. want end\n'
+    .. '    if n == 0 then return end\n'
+    .. '    local i = 0\n'
+    .. '    while true do\n'
+    .. '      local s = reaper.EnumerateSubdirectories(d, i)\n'
+    .. '      if not s or s == "" then return end\n'
+    .. '      local p = look(d .. "/" .. s, n - 1)\n'
+    .. '      if p then return p end\n'
+    .. '      i = i + 1\n'
+    .. '    end\n'
+    .. '  end\n'
+    .. '  GFX_MAIN = look(reaper.GetResourcePath() .. "/Scripts", 4) or GFX_MAIN\n'
+    .. 'end\n'
     .. 'reaper.SetExtState(%q, "remote", %q, false)\ndofile(GFX_MAIN)\n', KEY_NAME, nice, KEY_FILE, KEY_EXT, id))
   f:close()
   local cmd = reaper.AddRemoveReaScript(true, 0, path, true)
