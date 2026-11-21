@@ -1,7 +1,7 @@
 -- @description GFX - actions matrix
 -- @author GardenFX
 -- by JGWizrad / Garden FX (GFX)
--- @version 2.1
+-- @version 2.2
 
 local SECTION = "GFX_actions"
 local NG, MAXK, MINK = 8, 12, 4
@@ -1056,7 +1056,7 @@ end
 local function fit(DW, DH, bg)
   col(bg); gfx.rect(0, 0, gfx.w, gfx.h, 1)
   local r = gfx.ext_retina or 1
-  K.s = math.max(r, math.min(gfx.w / DW, gfx.h / DH, 3 * r))
+  K.s = math.max(0.6 * r, math.min(gfx.w / DW, gfx.h / DH))
   K.dw, K.dh = DW * K.s, DH * K.s
   K.sx = math.max(0, math.min(K.sx or 0, K.dw - gfx.w))
   K.sy = math.max(0, math.min(K.sy or 0, K.dh - gfx.h))
