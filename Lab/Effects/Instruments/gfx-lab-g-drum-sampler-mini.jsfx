@@ -21,6 +21,9 @@ slider4:0<-100,100,1>-Comp amount (%)
 slider5:0<0,1,1{Off,On}>-Sat in
 slider6:0<-100,100,1>-Width high (%)
 slider7:0<-100,100,1>-Width low (%)
+slider9:0<0,1,1{Off,On}>-Sequencer play (with transport)
+slider10:0<0,75,1>-Sequencer swing (%)
+slider11:0<0,7,1{A,B,C,D,E,F,G,H}>-Pattern
 
 in_pin:none
 out_pin:left output
@@ -41,8 +44,8 @@ out_pin:out 8 left
 out_pin:out 8 right
 
 @init
-function psw_all(v) ( slider_show(127, v); slider_show(psw_view, v); );
-function psw_allg(v) ( slider_show(127, v); slider_show(psw_view, v); );
+function psw_all(v) ( slider_show(1919, v); slider_show(psw_view, v); );
+function psw_allg(v) ( slider_show(1919, v); slider_show(psw_view, v); );
 #ui_man = "gfx-lab-g-drum-sampler-mini";
 ext_noinit = 1;
 
@@ -112,6 +115,25 @@ function ppm_str_a(k, dst) local(b, n, i) (
   b = pp_adr(k); n = b[0]; str_setlen(dst, n); i = 0; loop(n, str_setchar(dst, i, b[1 + i], 'cu'); i += 1; ); dst;
 );
 memset(PFR, 0, NSL); memset(PLT, 0, NP);
+PAT = 4500; PLEN = 6600; SQH = 6800;
+function rowlen(p, r) local(l) ( l = PLEN[p * 16 + r]; l < 2 || l > 16 ? 16 : l; );
+function prow(p, r, str) local(i, c) (
+  i = 0; loop(16, c = str_getchar(str, i); PAT[p * 256 + r * 16 + i] = c == '*' ? 2 : c == 'o' ? 1 : 0; i += 1; );
+);
+function factory_patterns() (
+  memset(PAT, 0, 8 * 256); memset(PLEN, 0, 8 * 16);
+  prow(0, 0, "*-------*-o-----"); prow(0, 1, "----*-------*---"); prow(0, 4, "o-o-o-o-o-o-o-o-"); prow(0, 13, "*---------------");
+  prow(1, 0, "*--o--o---*--o--"); prow(1, 1, "----*--o-o--*---"); prow(1, 4, "oo*ooo*ooo*ooo*o"); prow(1, 6, "--------------o-");
+  prow(2, 0, "*-----*---*-----"); prow(2, 1, "----*-------*---"); prow(2, 4, "o-o-o-o-o-o-o-o-"); prow(2, 3, "--o--o----o--o--");
+  prow(3, 0, "*---*---*---*---"); prow(3, 1, "----*-------*---"); prow(3, 4, "o---o---o---o---"); prow(3, 6, "--*---*---*---*-");
+  prow(4, 0, "*---*---*---*---"); prow(4, 3, "----*-------*---"); prow(4, 5, "o-o-o-o-o-o-o-o-"); prow(4, 6, "--*---*---*---*-"); prow(4, 7, "-o-o-o-o-o-o-o-o");
+  prow(5, 0, "*---------------"); prow(5, 8, "*-o-o-----------"); prow(5, 9, "------*-o-------"); prow(5, 10, "----------*-o---");
+  prow(5, 11, "--------------**"); prow(5, 13, "*---------------");
+  prow(6, 0, "*--o----*--o----"); prow(6, 2, "---o--o---o--o--"); prow(6, 12, "o-ooo-ooo-ooo-oo"); prow(6, 7, "--o---o---o-o---");
+  prow(6, 3, "o-----o-o-----o-"); prow(6, 5, "o--o--o---o-o---");
+);
+!pat_init ? ( factory_patterns(); pat_init = 1; );
+memset(SQH, 0, NP); lastkey = -1; cur_step = -1; cur_step_d = -1; cur_pat = slider11 | 0; sq_was = 0;
 
 function load_slot(k, path) local(h, nch, sr, n, b, i, j, got, f, sz, tr, fn) (
   PFR[k] = 0; PNCH[k] = 1; PSR[k] = 44100;
@@ -390,6 +412,15 @@ m_idx = 0; spos = 0;
 tr_on = play_state == 1 || play_state == 5;
 tr_prev && !tr_on ? rel_all();
 tr_prev = tr_on;
+fact_dirty ? ( fact_dirty = 0; factory_patterns(); );
+sq_play = slider9 >= 0.5; sq_swing = min(max(slider10, 0), 75) / 100 * 0.5;
+playing = (play_state & 1) && sq_play;
+bp0 = beat_position; bps = tempo / 60 / srate;
+!playing ? (
+  lastkey = -1; cur_step = -1; cur_pat = max(0, min(7, slider11 | 0));
+  sq_was ? ( gi_b = 0; loop(NP, SQH[gi_b] ? ( vrel(gi_b); SQH[gi_b] = 0; ); gi_b += 1; ); sq_was = 0; );
+) : sq_was = 1;
+cur_step_d = cur_step; cur_pat_d = cur_pat;
 gi_b = 0; loop(NP,
   AQC[gi_b] != AQD[gi_b] ? ( AQD[gi_b] = AQC[gi_b]; PADS[gi_b * 16 + 3] == 2 && VLP[gi_b] ? vfade(gi_b, 15) : trig(gi_b, AQV[gi_b]); );
   AQR[gi_b] != AQE[gi_b] ? ( AQE[gi_b] = AQR[gi_b]; PADS[gi_b * 16 + 3] == 1 ? vrel(gi_b); );
@@ -430,6 +461,7 @@ file_avail(0) != 0 ? (
 ) : (
   memset(RRM, 0, NP); gi_s = 17; loop(32, pp_adr(gi_s)[0] = 0; gi_s += 1; );
 );
+file_avail(0) != 0 ? ( file_mem(0, PAT, 8 * 256); file_mem(0, PLEN, 8 * 16); );
 file_avail(0) >= 0 ? (
   gi_s = 0; loop(NSL, pp_adr(gi_s)[0] > 0 || (gi_s > 16 && PFR[gi_s] > 1) ? LREQ[gi_s] += 1; gi_s += 1; );
   us_dirty = 1;
@@ -439,6 +471,26 @@ file_avail(0) >= 0 ? (
 while (m_idx < m_cnt && MQO[m_idx] <= spos) (
   m_p = 0; loop(NP, PADS[m_p * 16 + 5] == MQN[m_idx] ? ( MQT[m_idx] ? trig(m_p, MQV[m_idx]) : vrel(m_p); ); m_p += 1; );
   m_idx += 1;
+);
+playing ? (
+  q_b = bp0 + spos * bps;
+  q_b >= 0 ? (
+    q_n = floor(q_b * 4); q_fr = q_b * 4 - q_n;
+    q_eff = (q_n & 1) && q_fr < sq_swing ? q_n - 1 : q_n;
+    q_eff != lastkey ? (
+      q_eff % 16 == 0 || lastkey < 0 ? cur_pat = max(0, min(7, slider11 | 0));
+      lastkey = q_eff; cur_step = q_eff % 16;
+      q_r = 0;
+      loop(NP,
+        q_v = PAT[cur_pat * 256 + q_r * 16 + q_eff % rowlen(cur_pat, q_r)];
+        q_v ? (
+          SQH[q_r] ? vrel(q_r);
+          trig(q_r, q_v == 2 ? 1 : 0.7); SQH[q_r] = PADS[q_r * 16 + 3] == 1;
+        ) : SQH[q_r] ? ( vrel(q_r); SQH[q_r] = 0; );
+        q_r += 1;
+      );
+    );
+  );
 );
 spos += 1;
 oL = 0; oR = 0; memset(AXL + 1, 0, 7); memset(AXR + 1, 0, 7);
@@ -1336,6 +1388,10 @@ function sm_spk(x, y, on) (
   on ? ( ui_ssarc((x + 10) * sc, (y + 7) * sc, 4 * sc, 0.6, 2.5, 1.3 * sc); ui_ssarc((x + 10) * sc, (y + 7) * sc, 7.5 * sc, 0.7, 2.4, 1.3 * sc); );
 );
 
+function sq_pname(p) (
+  p == 0 ? "ROCK" : p == 1 ? "FUNK" : p == 2 ? "ELECTRO" : p == 3 ? "DISCO" : p == 4 ? "HOUSE" : p == 5 ? "TOM FILL" : p == 6 ? "LATIN" : "USER";
+);
+function rowlen_g(p, r) local(l) ( l = PLEN[p * 16 + r]; l < 2 || l > 16 ? 16 : l; );
 function col_x(c) ( c == 0 ? 0 : c == 1 ? 28 : c == 2 ? 330 : c == 3 ? 426 : c == 4 ? 480 : c == 5 ? 530 : c == 7 ? 584 : 726; );
 function col_next(c) ( c == 5 ? 7 : c == 7 ? 8 : c + 1; );
 ui_col(ui_mix(mk_face, 0x000000, 0.3)); gfx_rect(0, 0, gfx_w, gfx_h);
@@ -1357,35 +1413,36 @@ gfx_setfont(14); ui_col(mk_ink); mg_ltxt(68, 30, "DRUM SAMPLER");
 gfx_setfont(11); ui_col(mk_ink2); mg_ltxt(70, 50, "SAMPLE DRUM KIT");
 
 sm_mlit = time_precise() - sm_mt_d < 0.12;
-ui_cola(0x000000, 0.35); mg_rr(293, 23, 66, 26, 4);
-ui_col(0x2E2F34); mg_rr(294, 24, 64, 24, 4);
-pk_led(309 * sc, 36 * sc, 4 * sc, sm_mlit, 0x3ADF6A);
-gfx_setfont(11); ui_col(0xC8C4BC); mg_ltxt(319, 36.5, "MIDI");
+ui_cola(0x000000, 0.35); mg_rr(262, 23, 66, 26, 4);
+ui_col(0x2E2F34); mg_rr(263, 24, 64, 24, 4);
+pk_led(278 * sc, 36 * sc, 4 * sc, sm_mlit, 0x3ADF6A);
+gfx_setfont(11); ui_col(0xC8C4BC); mg_ltxt(288, 36.5, "MIDI");
 
-pk_lcd(372 * sc, 18 * sc, 236 * sc, 34 * sc, 0);
+pk_lcd(340 * sc, 18 * sc, 208 * sc, 34 * sc, 0);
 lib_st == -1 ? strcpy(#lst, "ADD A SAMPLE FOLDER") : lib_st == 1 ? sprintf(#lst, "READING %d", NL) :
 lib_st == 2 ? sprintf(#lst, "SORTING %d / %d", srt_i, NL) : (
   NROOT == 1 ? ( last_name(950, #lr); sprintf(#lst, "%d IN %s", NL, #lr); ) :
   sprintf(#lst, "%d SOUNDS", NL);
 );
 ui_col(pk_lcdc); pk_lcdfont(9, 17.5 * sc); gfx_measurestr(#lst, gtw, gth);
-pk_fitstr(#lst, 380 * sc, 35 * sc - gth * 0.5, 17.5 * sc, 210 * sc);
-ui_col(ui_mix(pk_lcdc, 0x000000, 0.35)); mg_quad(593, 32, 600, 32, 596.5, 37, 596.5, 37);
+pk_fitstr(#lst, 348 * sc, 35 * sc - gth * 0.5, 17.5 * sc, 180 * sc);
+ui_col(ui_mix(pk_lcdc, 0x000000, 0.35)); mg_quad(533, 32, 540, 32, 536.5, 37, 536.5, 37);
 lib_st == 2 ? (
-  ui_cola(pk_lcdc, 0.25); gfx_rect(380 * sc, 45 * sc, 210 * sc, 2 * sc);
-  ui_col(pk_lcdc); gfx_rect(380 * sc, 45 * sc, 210 * sc * srt_i / max(NL, 1), 2 * sc);
+  ui_cola(pk_lcdc, 0.25); gfx_rect(348 * sc, 45 * sc, 182 * sc, 2 * sc);
+  ui_col(pk_lcdc); gfx_rect(348 * sc, 45 * sc, 182 * sc * srt_i / max(NL, 1), 2 * sc);
 );
-pressed && drag_id == 0 && mouse_x >= 372 * sc && mouse_x < 608 * sc && mouse_y >= 18 * sc && mouse_y < 52 * sc ? (
+pressed && drag_id == 0 && mouse_x >= 340 * sc && mouse_x < 548 * sc && mouse_y >= 18 * sc && mouse_y < 52 * sc ? (
   drag_id = -1;
   strcpy(#fm, lib_st == 3 || lib_st == -1 ? "Read the library again" : "#Read the library again");
   strcat(#fm, "|How to add a sample folder");
   NROOT > 0 ? strcat(#fm, "||#Your sample folders:");
   gi = 0; loop(NROOT, strcat(#fm, "|#"); strcat(#fm, 950 + gi); gi += 1; );
-  gfx_x = 372 * sc + ui_mdx; gfx_y = 52 * sc + ui_mdy;
+  gfx_x = 340 * sc + ui_mdx; gfx_y = 52 * sc + ui_mdy;
   gsel = gfx_showmenu(#fm);
-  gsel == 1 ? ( lib_st = 0; kit_cur = 0; ) : gsel == 2 ? ( gfx_x = 372 * sc + ui_mdx; gfx_y = 52 * sc + ui_mdy; add_folder_menu(); );
+  gsel == 1 ? ( lib_st = 0; kit_cur = 0; ) : gsel == 2 ? ( gfx_x = 340 * sc + ui_mdx; gfx_y = 52 * sc + ui_mdy; add_folder_menu(); );
 );
-mg_tkey(626, 17, 64, sm_ed, 0xFFB020, "EDIT") ? ( sm_ed = !sm_ed; sm_ed ? pad_pick(sel_pad); );
+mg_tkey(560, 17, 64, sm_ed == 2, 0xFFB020, "STEPS") ? sm_ed = sm_ed == 2 ? 0 : 2;
+mg_tkey(634, 17, 64, sm_ed == 1, 0xFFB020, "EDIT") ? ( sm_ed = sm_ed == 1 ? 0 : 1; sm_ed == 1 ? pad_pick(sel_pad); );
 sm_stop(712, 21, 92, 28, snd_d) ? stp += 1;
 ui_size_picker(826 * sc, 24 * sc);
 
@@ -1515,6 +1572,66 @@ ui_size_picker(826 * sc, 24 * sc);
   bx_lkey(716, 194, 60, 5, "SAT");
   bx_lkey(716, 242, 60, 3, "COMP");
   sm_kn(726, 306, 18, 340, 4, -100, 100, 0, sm_cap, 0, "AMOUNT");
+) : sm_ed == 2 ? (
+  bx_sub(16, 80, 776, 301, "STEPS");
+  gpat = max(0, min(7, slider11 | 0));
+  sprintf(#spn, "PATTERN %c   %s", 65 + gpat, sq_pname(gpat));
+  gfx_setfont(12); ui_col(0x231A08); mg_ltxt(110, 102, #spn);
+  sm_lkey(582, 89, 98, 24, sq_bank == 0, "PADS 1 - 8") ? sq_bank = 0;
+  sm_lkey(686, 89, 98, 24, sq_bank == 1, "PADS 9 - 16") ? sq_bank = 1;
+  gfx_setfont(11);
+  gs = 0; loop(16, gx = 128 + gs * 29 + floor(gs / 4) * 6;
+    sprintf(#sn, "%d", gs + 1); ui_col(cur_step_d == gs && cur_pat_d == gpat ? mk_acc : mk_ink2); mg_ctxt(gx + 13, 131, #sn); gs += 1; );
+  ui_col(mk_ink2); mg_ctxt(636, 131, "LEN");
+  gr = 0;
+  loop(8,
+    gp = sq_bank * 8 + gr; gy = 142 + gr * 28;
+    ui_col(prim(gp)); mg_r(30, gy + 2, 4, 22);
+    gfx_setfont(13); ui_col(gp == sel_pad ? mk_acc : mk_ink); mg_fit(pname(gp), 40, gy + 13, 84);
+    pressed && drag_id == 0 && mouse_x >= 28 * sc && mouse_x < 124 * sc && mouse_y >= gy * sc && mouse_y < (gy + 26) * sc ? (
+      drag_id = -1; pad_pick(gp); AQV[gp] = 0.8; AQC[gp] += 1; );
+    glen = rowlen_g(gpat, gp);
+    gs = 0;
+    loop(16,
+      gx = 128 + gs * 29 + floor(gs / 4) * 6;
+      gv = PAT[gpat * 256 + gp * 16 + gs];
+      ghv = mouse_x >= gx * sc && mouse_x < (gx + 26) * sc && mouse_y >= gy * sc && mouse_y < (gy + 25) * sc;
+      ghv && pressed && drag_id == 0 ? ( drag_id = -1; gv = (gv + 1) % 3; PAT[gpat * 256 + gp * 16 + gs] = gv; );
+      ui_col(0x08090A); mg_rr(gx, gy, 26, 25, 3);
+      ui_col(gv == 2 ? ui_mix(prim(gp), 0xFFFFFF, 0.45) : gv == 1 ? prim(gp) : ui_mix(mk_sub, 0x000000, gs % 4 == 0 ? 0.25 : 0.4));
+      mg_rr(gx + 2, gy + 2, 22, 21, 2);
+      gv == 2 ? ( ui_col(0xFFFFFF); mg_r(gx + 6, gy + 5, 14, 2); );
+      cur_step_d >= 0 && cur_pat_d == gpat && gs == cur_step_d % glen ? ( ui_cola(0xFFFFFF, 0.28); mg_rr(gx + 2, gy + 2, 22, 21, 2); );
+      ghv ? ( ui_cola(0xFFFFFF, 0.10); mg_rr(gx + 2, gy + 2, 22, 21, 2); );
+      gs >= glen ? ( ui_cola(0x000000, 0.55); mg_rr(gx, gy, 26, 25, 3); );
+      gs += 1;
+    );
+    sprintf(#ln2, "%d", glen);
+    mg_dbox(616, gy, 40, #ln2, 0) ? (
+      strcpy(#lm, ""); gi = 2; loop(15, gi > 2 ? strcat(#lm, "|"); gi == glen ? strcat(#lm, "!"); sprintf(#ltx, "%d steps", gi); strcat(#lm, #ltx); gi += 1; );
+      gfx_x = mouse_x; gfx_y = mouse_y; gsel = gfx_showmenu(#lm); gsel > 0 ? PLEN[gpat * 16 + gp] = gsel + 1;
+    );
+    gr += 1;
+  );
+  mg_dwell(668, 126, 112, 240);
+  sm_lkey(680, 136, 88, 28, slider9 >= 0.5, "PLAY") ? ( slider9 = slider9 >= 0.5 ? 0 : 1; ui_auto(9); );
+  gfx_setfont(11); ui_col(0xB8B4AA); mg_ctxt(724, 180, "PATTERN");
+  gi = 0; loop(8,
+    sprintf(#pk1, "%c", 65 + gi);
+    sm_lkey(681 + (gi % 4) * 22, 190 + floor(gi / 4) * 28, 20, 24, gpat == gi, #pk1) ? ( slider11 = gi; ui_auto(11); );
+    gi += 1; );
+  mg_k = mg_knob(724, 266, 14, 10, 0, 75, 0, 0, sm_cap);
+  sprintf(#smv, "%d %%", slider10 + 0.5); gfx_setfont(10); ui_col(mg_k ? mk_acc : mk_ink); mg_ctxt(724, 294, mg_k ? #smv : "SWING");
+  bx_okey(680, 308, 88, 24, "COPY TO") ? (
+    strcpy(#cm, ""); gi = 0; loop(8, gi > 0 ? strcat(#cm, "|"); sprintf(#ct, "%s%c  %s", gi == gpat ? "#" : "", 65 + gi, sq_pname(gi)); strcat(#cm, #ct); gi += 1; );
+    gfx_x = mouse_x; gfx_y = mouse_y; gsel = gfx_showmenu(#cm);
+    gsel > 0 && gsel - 1 != gpat ? ( memcpy(PAT + (gsel - 1) * 256, PAT + gpat * 256, 256); memcpy(PLEN + (gsel - 1) * 16, PLEN + gpat * 16, 16); );
+  );
+  bx_okey(680, 338, 88, 24, "CLEAR") ? (
+    gfx_x = mouse_x; gfx_y = mouse_y;
+    gsel = gfx_showmenu("Clear this pattern|Load the factory patterns into A - G (your patterns are replaced)");
+    gsel == 1 ? ( memset(PAT + gpat * 256, 0, 256); memset(PLEN + gpat * 16, 0, 16); ) : gsel == 2 ? fact_dirty = 1;
+  );
 ) : (
   bx_sub(16, 80, 776, 301, "LIBRARY");
   gfx_setfont(6); ui_col(0x2A1E08);
