@@ -1,0 +1,610 @@
+desc:Bure [channel strip] (GFX Lab)
+//tags: channel strip commentary voice broadcast speech progressive compressor limiter protection eq high pass
+//author: GardenFX
+// by JGWizrad / Garden FX (GFX)
+// Requires gfx-lab-input, gfx-lab-output, gfx-lab-drift, gfx-lab-ui, gfx-lab-panel, gfx-lab-power, gfx-lab-bypass, gfx-lab-sliders, gfx-lab-v5-parts, gfx-lab-v5-palette (.jsfx-inc) in the same folder.
+
+slider19:psw_view=0<0,1,1{Panel only,Show all}>-Parameter sliders
+slider1:0<-20,20,0.1>-Gain (dB)
+slider2:0<0,1,1{Normal,Inverted}>-Polarity
+slider3:88<15,350,1>-HPF (Hz, 15 = off)
+slider4:0<0,1,1{Off,On}>-Cough (mute)
+slider5:1<0,1,1{Out,In}>-EQ in
+slider6:0<-12,12,0.1>-Low (dB)
+slider7:0<-12,12,0.1>-Presence (dB)
+slider8:3300<1100,5500,1>-Presence freq (Hz)
+slider9:0<-12,12,0.1>-Air (dB)
+slider10:22<3,22,0.1>-LPF (kHz, 22 = off)
+slider11:1<0,1,1{Out,In}>-Comp in
+slider12:-24<-40,-6,0.1>-Comp threshold (dBFS)
+slider13:-10<-24,-1,0.1>-Limit (dBFS)
+slider14:0<0,1,1{Normal,Slow}>-Recovery
+slider15:0<-20,20,0.1>-Output trim (dB)
+slider16:0<0,100,1>-Sat (%)
+slider17:50<0,100,1>-Drift (%)
+slider18:0<0,1,1{Off,On}>-Bypass
+slider20:prs_sel=0<0,10,1{No preset,Init,Commentary,Studio Talk,Podcast,Phone Guest,Crowd Mic,Voice-over,Live Vocal,Light Guard,Hard Guard}>-Preset
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import gfx-lab-input.jsfx-inc
+import gfx-lab-output.jsfx-inc
+import gfx-lab-drift.jsfx-inc
+import gfx-lab-ui.jsfx-inc
+import gfx-lab-panel.jsfx-inc
+import gfx-lab-power.jsfx-inc
+import gfx-lab-bypass.jsfx-inc
+import gfx-lab-sliders.jsfx-inc
+import gfx-lab-v5-parts.jsfx-inc
+import gfx-lab-v5-palette.jsfx-inc
+
+@init
+ext_gr_meter = 0;
+function psw_all(v) ( slider_show(2 ^ 20 - 1, v); );
+function psw_allg(v) ( slider_show(2 ^ 20 - 1, v); );
+#ui_man = "gfx-lab-bure";
+ext_noinit = 1;
+
+function br_tn(x) ( abs(x) < 0.000000000001 ? 0 : x; );
+function br_tc(ms) ( 1 - exp(-1 / (max(ms, 0.005) * 0.001 * srate)); );
+function br_sm(g) ( g * g * (3 - 2 * g); );
+
+HPC = 100; LPC = 105; B0C = 110; B1C = 115; B2C = 120;
+function br_w(f) ( 2 * $pi * min(max(f, 5), 0.45 * srate) / srate; );
+function br_lsh(o, f, gdb, q) local(ag, w, cw, al, s, a0) (
+  ag = 10 ^ (gdb / 40); w = br_w(f); cw = cos(w); al = sin(w) / (2 * q); s = 2 * sqrt(ag) * al;
+  a0 = (ag + 1) + (ag - 1) * cw + s;
+  o[0] = ag * ((ag + 1) - (ag - 1) * cw + s) / a0; o[1] = 2 * ag * ((ag - 1) - (ag + 1) * cw) / a0; o[2] = ag * ((ag + 1) - (ag - 1) * cw - s) / a0;
+  o[3] = -2 * ((ag - 1) + (ag + 1) * cw) / a0; o[4] = ((ag + 1) + (ag - 1) * cw - s) / a0;
+);
+function br_hsh(o, f, gdb, q) local(ag, w, cw, al, s, a0) (
+  ag = 10 ^ (gdb / 40); w = br_w(f); cw = cos(w); al = sin(w) / (2 * q); s = 2 * sqrt(ag) * al;
+  a0 = (ag + 1) - (ag - 1) * cw + s;
+  o[0] = ag * ((ag + 1) + (ag - 1) * cw + s) / a0; o[1] = -2 * ag * ((ag - 1) + (ag + 1) * cw) / a0; o[2] = ag * ((ag + 1) + (ag - 1) * cw - s) / a0;
+  o[3] = 2 * ((ag - 1) - (ag + 1) * cw) / a0; o[4] = ((ag + 1) - (ag - 1) * cw - s) / a0;
+);
+function br_pk(o, f, gdb, q) local(ag, w, cw, al, n) (
+  ag = 10 ^ (gdb / 40); w = br_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al / ag;
+  o[0] = (1 + al * ag) / n; o[1] = -2 * cw / n; o[2] = (1 - al * ag) / n; o[3] = -2 * cw / n; o[4] = (1 - al / ag) / n;
+);
+function br_hp2(o, f, q) local(w, cw, al, n) (
+  w = br_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al;
+  o[0] = (1 + cw) * 0.5 / n; o[1] = -(1 + cw) / n; o[2] = o[0]; o[3] = -2 * cw / n; o[4] = (1 - al) / n;
+);
+function br_lp2(o, f, q) local(w, cw, al, n) (
+  w = br_w(f); cw = cos(w); al = sin(w) / (2 * q); n = 1 + al;
+  o[0] = (1 - cw) * 0.5 / n; o[1] = (1 - cw) / n; o[2] = o[0]; o[3] = -2 * cw / n; o[4] = (1 - al) / n;
+);
+function br_bq(x, o) instance(s1, s2) local(y) ( y = o[0] * x + s1; s1 = o[1] * x - o[3] * y + s2; s2 = o[2] * x - o[4] * y; y; );
+function br_bqz() instance(s1, s2) ( s1 = s2 = 0; );
+function br_bqt() instance(s1, s2) ( s1 = br_tn(s1); s2 = br_tn(s2); );
+
+function br_upd(k) local(m) (
+  m = abs(br_hf_ - br_hft) + abs(br_lf_ - br_lft) + abs(br_g0_ - br_g0t) + abs(br_g1_ - br_g1t) + abs(br_f1_ - br_f1t) + abs(br_g2_ - br_g2t);
+  m > 0.0001 || k >= 1 ? (
+    br_hf_ *= (br_hft / br_hf_) ^ k; br_lf_ *= (br_lft / br_lf_) ^ k; br_f1_ *= (br_f1t / br_f1_) ^ k;
+    br_g0_ += (br_g0t - br_g0_) * k; br_g1_ += (br_g1t - br_g1_) * k; br_g2_ += (br_g2t - br_g2_) * k;
+    br_hp2(HPC, br_hf_, 0.7071); br_lp2(LPC, br_lf_, 0.7071);
+    br_lsh(B0C, 110, br_g0_, 0.7071); br_pk(B1C, br_f1_, br_g1_, 1); br_hsh(B2C, 11000, br_g2_, 0.7071);
+  );
+);
+
+function ch_run(x) instance(y) (
+  y = x;
+  br_eH > 0 ? y += br_eH * (this.h0.br_bq(y, HPC) - y) : this.h0.br_bqz();
+  br_eE > 0 ? y += br_eE * (this.e2.br_bq(this.e1.br_bq(this.e0.br_bq(y, B0C), B1C), B2C) - y);
+  br_eL > 0 ? y += br_eL * (this.lp.br_bq(y, LPC) - y);
+  y;
+);
+function ch_reset() ( this.h0.br_bqz(); this.h1.br_bqz(); this.e0.br_bqz(); this.e1.br_bqz(); this.e2.br_bqz(); this.lp.br_bqz(); );
+function ch_tidy() ( this.h0.br_bqt(); this.h1.br_bqt(); this.e0.br_bqt(); this.e1.br_bqt(); this.e2.br_bqt(); this.lp.br_bqt(); );
+
+function cm_curve(o, span) ( o <= 0 ? 0 : o < span ? o * o * o / (3 * span * span) : span / 3 + (o - span); );
+function cm_run(a, b) instance(ms, pk, gf, gs, gp, lv) local(x2, p, rd, pd, t, o) (
+  x2 = 0.5 * (a * a + b * b); ms += cm_krms * (x2 - ms);
+  p = max(abs(a), abs(b)); pk = p > pk ? p : pk * cm_kpk;
+  rd = 10 * log10(max(ms, 0.0000000001)) + 3.0103;
+  pd = 20 * log10(max(pk, 0.00001));
+  lv = max(rd, pd - 6);
+  o = lv - cm_th;
+  t = -cm_curve(o, cm_span);
+  t < gf ? gf += (cm_ka + cm_kad * min(max(-t - 6, 0) / 12, 1)) * (t - gf) : gf += cm_kr * (t - gf);
+  gs += (gf < gs ? cm_ksa : cm_ksr) * (gf - gs);
+  t = min(gf, gs);
+  o = pd + t - cm_pc;
+  o > 0 ? ( gp = min(gp, -o); ) : gp += cm_kpr * (0 - gp);
+  t + gp;
+);
+function cm_reset() instance(ms, pk, gf, gs, gp, lv) ( ms = pk = gf = gs = gp = 0; lv = -120; );
+function cm_tidy() instance(ms, pk) ( ms = br_tn(ms); pk = br_tn(pk); );
+
+#br_pm = "Init|Commentary|Studio Talk|Podcast|Phone Guest|Crowd Mic|Voice-over|Live Vocal|Light Guard|Hard Guard";
+function br_set(g, hp, eq, lo, pr, pf, ai, lp, ci, th, li, sl) (
+  slider2 = 0; slider3 = hp; slider4 = 0; slider5 = eq; slider6 = lo; slider7 = pr; slider8 = pf; slider9 = ai; slider10 = lp;
+  slider11 = ci; slider12 = th; slider13 = li; slider14 = sl;
+);
+function load_preset(p) local(i) (
+  p == 1  ? br_set(0, 88, 1, 0, 0, 3300, 0, 22, 1, -24, -10, 0) :
+  p == 2  ? br_set(0, 110, 1, -2, 2.5, 3300, 1.5, 22, 1, -26, -11, 0) :
+  p == 3  ? br_set(0, 77, 1, 1, 1.5, 2200, 2, 22, 1, -24, -9, 0) :
+  p == 4  ? br_set(0, 88, 1, 1.5, 2, 3300, 2, 22, 1, -27, -12, 1) :
+  p == 5  ? br_set(0, 330, 1, -4, 4, 2200, -6, 5.5, 1, -28, -12, 0) :
+  p == 6  ? br_set(0, 165, 1, -3, 0, 3300, 1, 16, 1, -30, -14, 1) :
+  p == 7  ? br_set(0, 66, 1, 2, 1.5, 4400, 2.5, 22, 1, -25, -10, 1) :
+  p == 8  ? br_set(0, 110, 1, -1, 2, 3300, 2, 22, 1, -22, -7, 0) :
+  p == 9  ? br_set(0, 88, 0, 0, 0, 3300, 0, 22, 1, -18, -6, 0) :
+  p == 10 ? br_set(0, 110, 1, -1, 1.5, 3300, 1, 22, 1, -32, -14, 0);
+  i = 2; loop(16, ui_auto(i); i += 1; );
+  pr_cur = p;
+);
+
+function br_srinit() (
+  br_sr = srate;
+  cm_krms = br_tc(8); cm_kpk = exp(-1 / (0.004 * srate));
+  cm_ka = br_tc(4); cm_kad = br_tc(0.6) - cm_ka; cm_kpr = br_tc(60);
+  br_fst = 1 / (0.012 * srate);
+  br_gsm = 1 - exp(-1 / (0.015 * srate));
+  br_gk = 1 - exp(-32 / (0.05 * srate));
+  ost_init(0); ostL.ost_ch_init(); ostR.ost_ch_init();
+);
+br_srinit();
+in_init();
+dTh.drift_init(0.8 + rand(1) * 0.4); dS.drift_init(0.7 + rand(1) * 0.4);
+drift_macro(50);
+chL.ch_reset(); chR.ch_reset(); cm.cm_reset();
+br_snap = 1;
+rs_g = 1; rs_req = 0;
+pdc_bot_ch = 0; pdc_top_ch = 2; pdc_delay = 0;
+by_setup(18);
+pwr_init(); pwr_sag = 0.08; pwr_wu_loss = 0.25; pwr_wu_drv = 1.1; pwr_wu_lp = 14000; pwr_wu_wob = 0.05; pwr_bloom = 0;
+xgr_a = 0; lv_disp = -120;
+
+ui_hw = 0;
+!ui_dflt ? ( ui_sz = 0; pr_cur = 1; );
+ui_dflt = 1;
+
+function prs_hash() local(i, h) ( h = 0; i = 1; loop(17, i != 4 ? h += slider(i) * (1 + i * 0.7071); i += 1; ); h; );
+function prs_same() local(h, r) ( h = prs_hash(); r = h == prs_h0; prs_h0 = h; r; );
+function prs_chk() local(k) (
+  prs_dirty > 0 ? (
+    k = prs_dirty; prs_dirty = 0; load_preset(k);
+    k <= 10 ? ( prs_sel = k; slider_automate(prs_sel); prs_cur_d = k; );
+    prs_last = prs_sel;
+  ) : prs_ok ? (
+    prs_sel = max(0, min(10, prs_sel | 0));
+    prs_hs = prs_same(); prs_sel != prs_last ? ( prs_last = prs_sel; prs_sel > 0 && prs_hs ? ( load_preset(prs_sel); prs_cur_d = prs_sel; ); );
+  ) : ( prs_last = prs_sel | 0; prs_ok = 1; );
+);
+prs_ok = 0; prs_dirty = 0;
+
+@slider
+(psw_view >= 0.5) != psw_last ? ( psw_last = psw_view >= 0.5; psw_all(psw_last); );
+prs_chk();
+pdc_delay = 0;
+
+@serialize
+file_var(0, ui_sz);
+file_var(0, pr_cur);
+pwr_ser();
+file_avail(0) != 0 ? file_var(0, prs_last) : prs_last = prs_sel | 0; prs_ok = 1;
+
+@block
+ext_gr_meter = min(xgr_a, 0); xgr_a = 0;
+prs_chk();
+srate != br_sr ? br_srinit();
+rs_now = time_precise();
+rs_last > 0 && rs_now - rs_last > max(0.15, 4 * samplesblock / srate) && !(play_position > rs_gpp && play_position - rs_gpp < 4 * rs_gpd + 0.05) ? rs_req = 1;
+rs_last = rs_now; rs_gpp = play_position; rs_gpd = samplesblock / srate;
+in_setup(0, 0);
+br_sat = min(max(slider16, 0), 100) / 100;
+ost_setup(br_sat, 0.3, 120, 6000, -0.3, 0);
+pdc_delay = 0; pdc_bot_ch = 0; pdc_top_ch = 2;
+pwr_block(slider18 < 0.5);
+drift_macro(slider17);
+br_n = samplesblock / srate;
+br_vt = dTh.drift_tick(0.05 * dm_s * br_n); br_vs = dS.drift_tick(0.07 * dm_s * br_n);
+br_tP = slider2 >= 0.5 ? -1 : 1;
+br_tM = slider4 >= 0.5 ? 0 : 1;
+br_tH = slider3 > 15.5; br_tL = slider10 < 21.95; br_tE = slider5 >= 0.5; br_tK = slider11 >= 0.5;
+br_tH ? br_hft = min(max(slider3, 16), 350);
+br_tL ? br_lft = min(max(slider10, 3), 22) * 1000;
+br_g0t = min(max(slider6, -12), 12); br_g1t = min(max(slider7, -12), 12); br_f1t = min(max(slider8, 1100), 5500); br_g2t = min(max(slider9, -12), 12);
+br_gnt = 10 ^ (min(max(slider1, -20), 20) / 20);
+br_outt = 10 ^ (min(max(slider15, -20), 20) / 20);
+cm_th = min(max(slider12, -40), -6) + 0.3 * dm_a * br_vt;
+cm_lim = max(min(max(slider13, -24), -1), cm_th + 2);
+cm_span = 1.5 * (cm_lim - cm_th);
+cm_pc = cm_lim + 3;
+br_sl = slider14 >= 0.5;
+cm_kr = br_tc(br_sl ? 320 : 110); cm_ksa = br_tc(br_sl ? 2500 : 2000); cm_ksr = br_tc(br_sl ? 6000 : 3000);
+br_snap ? (
+  !br_tH ? br_hft = 16; !br_tL ? br_lft = 22000;
+  br_hf_ = br_hft; br_lf_ = br_lft; br_g0_ = br_g0t; br_g1_ = br_g1t; br_f1_ = br_f1t; br_g2_ = br_g2t;
+  br_upd(1);
+  br_gH = br_tH; br_gL = br_tL; br_gE = br_tE; br_gC = br_tK; br_pol = br_tP; br_mu = br_tM;
+  br_gns = br_gnt; br_outs = br_outt;
+);
+br_snap = 0;
+chL.ch_tidy(); chR.ch_tidy(); cm.cm_tidy();
+o_disp = max(o_disp, max(br_ol, br_or));
+br_on > 0 ? orms_disp = max(orms_disp, sqrt(br_os / br_on));
+br_ip > 0 ? lvl_disp = max(lvl_disp, br_ip);
+lv_disp = br_lvb; gr_disp = min(gr_disp, br_grb);
+br_ol = br_or = 0; br_os = br_on = 0; br_ip = 0; br_grb = 0;
+
+@sample
+by_in();
+rs_req ? (
+  rs_req = 0; rs_g = 0;
+  chL.ch_reset(); chR.ch_reset(); cm.cm_reset();
+);
+spl0 != spl0 ? spl0 = 0; spl1 != spl1 ? spl1 = 0;
+br_dl = spl0; br_dr = spl1;
+in_process(spl0, spl1);
+br_a = in_l; br_b = in_r;
+abs(br_a) < 0.000000000000001 ? br_a = 0; abs(br_b) < 0.000000000000001 ? br_b = 0;
+br_gH != br_tH ? br_gH = br_tH ? min(br_gH + br_fst, 1) : max(br_gH - br_fst, 0);
+br_gL != br_tL ? br_gL = br_tL ? min(br_gL + br_fst, 1) : max(br_gL - br_fst, 0);
+br_gE != br_tE ? ( br_gE == 0 ? ( chL.e0.br_bqz(); chL.e1.br_bqz(); chL.e2.br_bqz(); chR.e0.br_bqz(); chR.e1.br_bqz(); chR.e2.br_bqz(); ); br_gE = br_tE ? min(br_gE + br_fst, 1) : max(br_gE - br_fst, 0); );
+br_gC != br_tK ? ( br_gC == 0 ? cm.cm_reset(); br_gC = br_tK ? min(br_gC + br_fst, 1) : max(br_gC - br_fst, 0); );
+br_pol != br_tP ? br_pol = br_tP > br_pol ? min(br_pol + 2 * br_fst, 1) : max(br_pol - 2 * br_fst, -1);
+br_mu != br_tM ? br_mu = br_tM > br_mu ? min(br_mu + br_fst, 1) : max(br_mu - br_fst, 0);
+br_eH = br_sm(br_gH); br_eL = br_sm(br_gL); br_eE = br_sm(br_gE); br_eC = br_sm(br_gC);
+(br_cnt += 1) >= 32 ? ( br_cnt = 0; br_upd(br_gk); );
+br_gns += (br_gnt - br_gns) * br_gsm;
+br_outs += (br_outt - br_outs) * br_gsm;
+br_a *= br_gns * br_pol; br_b *= br_gns * br_pol;
+pwr_in(br_a, br_b); br_a = pwr_l; br_b = pwr_r;
+br_a = chL.ch_run(br_a); br_b = chR.ch_run(br_b);
+br_ip = max(br_ip, max(abs(br_a), abs(br_b)));
+br_eC > 0 ? (
+  br_gr = cm.cm_run(br_a, br_b) * br_eC;
+  br_c = exp(0.115129255 * br_gr);
+  br_a *= br_c; br_b *= br_c;
+  br_lvb = cm.lv; br_grb = min(br_grb, br_gr);
+) : ( br_gr = 0; br_lvb = -120; );
+pwr_out(br_a, br_b); br_a = pwr_l; br_b = pwr_r;
+br_ms = br_sm(br_mu);
+br_a *= br_outs * br_ms; br_b *= br_outs * br_ms;
+xgr_a = min(xgr_a, br_gr);
+rs_g < 1 ? (
+  rs_g = min(rs_g + br_fst, 1); rs_e = rs_g * rs_g * (3 - 2 * rs_g);
+  br_a = br_dl + rs_e * (br_a - br_dl); br_b = br_dr + rs_e * (br_b - br_dr);
+);
+br_a = ostL.ost_band(br_a); br_b = ostR.ost_band(br_b);
+br_a != br_a ? br_a = 0; br_b != br_b ? br_b = 0;
+ost_out(br_a, br_b);
+spl0 = max(-4, min(4, ost_l));
+spl1 = max(-4, min(4, ost_r));
+by_out();
+br_ol = max(br_ol, abs(spl0)); br_or = max(br_or, abs(spl1));
+br_os += 0.5 * (spl0 * spl0 + spl1 * spl1); br_on += 1;
+
+@gfx 900 355
+ui_begin(900, 355);
+v5_begin();
+v5p_use(14);
+BF = v5p_bg; BK = v5p_pk; BI = v5p_ink;
+BB = ui_mix(v5p_bg, 0, 0.55); BKF = ui_mix(BB, 0, 0.30); BKH = ui_mix(BB, 0, 0.12); BKT = ui_mix(BKF, 0xFFFFFF, 0.08);
+BA = 0xF2D4A0; BH = 0x141618; BT = v5p_acc; BC2 = 0x8A4A3A; BG = 0x9CC46A;
+v5_led = 0xF0A030;
+sc != bu_fsc ? (
+  bu_fsc = sc;
+  bu_kt = ui_fitfont(8, 16 * sc) / (16 * sc);
+  bu_f6 = ui_fitfont(6, 26 * sc);
+);
+function bu_ft(px) ( gfx_setfont(8, "Trebuchet MS", px * bu_kt * sc, 'b'); );
+function bu_tl(x, cy, s) local(tw, th) ( gfx_measurestr(s, tw, th); gfx_x = x * sc; gfx_y = cy * sc - th * 0.5; gfx_drawstr(s); );
+function bu_tw(s) local(tw, th) ( gfx_measurestr(s, tw, th); tw / sc; );
+function bu_grad(x, y, w, h, c1, c2) local(r1, g1, b1, r2, g2, b2, x0, y0, x1, y1) (
+  r1 = ((c1 >> 16) & 255) / 255; g1 = ((c1 >> 8) & 255) / 255; b1 = (c1 & 255) / 255;
+  r2 = ((c2 >> 16) & 255) / 255; g2 = ((c2 >> 8) & 255) / 255; b2 = (c2 & 255) / 255;
+  x0 = floor(x * sc + 0.5); y0 = floor(y * sc + 0.5); x1 = floor((x + w) * sc + 0.5); y1 = floor((y + h) * sc + 0.5);
+  x1 > x0 && y1 > y0 ? gfx_gradrect(x0, y0, x1 - x0, y1 - y0, r1, g1, b1, 1, 0, 0, 0, 0, (r2 - r1) / (y1 - y0), (g2 - g1) / (y1 - y0), (b2 - b1) / (y1 - y0), 0);
+);
+function bu_rivet(x, y) ( ui_cola(0, 0.35); v5_d(x + 1, y + 1.5, 4); ui_col(0x8A9198); v5_d(x, y, 4); ui_col(0xB8BEC4); v5_d(x - 0.8, y - 0.8, 2.4); );
+function bu_cham(x, y, w, h, d, f, face) (
+  ui_cola(0xFFFFFF, 0.18); v5_r(x, y + h, w + 1, 1); v5_r(x + w, y, 1, h);
+  ui_col(ui_mix(f, 0, 0.30)); v5_q(x, y, x + w, y, x + w - d, y + d, x + d, y + d);
+  ui_col(ui_mix(f, 0, 0.20)); v5_q(x, y, x + d, y + d, x + d, y + h - d, x, y + h);
+  ui_col(ui_mix(f, 0xFFFFFF, 0.10)); v5_q(x + w, y, x + w, y + h, x + w - d, y + h - d, x + w - d, y + d);
+  ui_col(ui_mix(f, 0xFFFFFF, 0.22)); v5_q(x, y + h, x + d, y + h - d, x + w - d, y + h - d, x + w, y + h);
+  ui_col(face); v5_r(x + d, y + d, w - 2 * d, h - 2 * d);
+);
+function bu_plate(x, y, w, h, ttl, rc) (
+  bu_cham(x, y, w, h, 3, BF, BK);
+  bu_ft(18); ui_col(BI); bu_tl(x + 16, y + 21, ttl);
+  ui_col(rc); v5_r(x + 16, y + 33, bu_tw(ttl), 3);
+);
+function bu_dwell(x, y, w, h) local(j) (
+  ui_cola(0xFFFFFF, 0.2); v5_r(x, y + h, w + 1, 1.5); v5_r(x + w, y, 1.5, h + 1);
+  ui_col(v5p_well); v5_rr(x, y, w, h, 3);
+  j = 0; loop(4, ui_cola(0, 0.18 - j * 0.04); v5_r(x + 1, y + 1 + j, w - 2, 1); v5_r(x + 1 + j, y + 2 + j, 1, h - 3 - j); j += 1; );
+);
+function bu_marks(cx, cy, r, ink, ctr) local(i, t) (
+  ui_col(ink); i = 0;
+  loop(2, t = -0.75 * $pi + i * 1.5 * $pi; v5_sd(cx + sin(t) * (r + 5), cy - cos(t) * (r + 5), 1.7); i += 1; );
+  ctr ? v5_sd(cx, cy - r - 5, 1.7);
+);
+function bu_val(idx, fmt) (
+  idx == 3 ? ( slider3 <= 15.5 ? strcpy(#bu_vs, "OFF") : sprintf(#bu_vs, "%d Hz", floor(slider3 + 0.5)); ) :
+  idx == 10 ? ( slider10 >= 21.95 ? strcpy(#bu_vs, "OFF") : sprintf(#bu_vs, "%.1f kHz", slider10); ) :
+  idx == 8 ? sprintf(#bu_vs, "%.2f kHz", slider8 / 1000) :
+  sprintf(#bu_vs, fmt, slider(idx));
+  #bu_vs;
+);
+function bu_dial(cx, cy, r, idx, lo, hi, def, lg, cap, pc, ink, ctr, lbl, fmt) local(n, k, e, x0, y0, w0) (
+  n = v5_ctl(idx, lo, hi, def, lg, v5_hitc(cx, cy, r + 8), 0, 200);
+  k = n + (v5_act ? 2 : 0);
+  bu_ckr || k != BUCK[idx] ? (
+    BUCK[idx] = k;
+    e = r + 13; x0 = floor((cx - e) * sc); y0 = floor((cy - e) * sc); w0 = ceil((cx + e) * sc) - x0;
+    gfx_dest = 120; gfx_a = 1; gfx_mode = 2; gfx_blit(119, 1, 0, x0, y0, w0, w0, x0, y0, w0, w0); gfx_mode = 0;
+    bu_marks(cx, cy, r, ink, ctr);
+    v5_deskc(cx, cy, r, n, cap, pc, 0);
+    v5_act ? ( ui_cola(0xFFFFFF, 0.25); v5_arc(cx, cy, r + 1.5, -$pi, $pi, 1); );
+    gfx_dest = -1; gfx_a = 1; gfx_mode = 2; gfx_blit(120, 1, 0, x0, y0, w0, w0, x0, y0, w0, w0); gfx_mode = 0;
+  );
+  v5_act ? ( bu_hon = 1; bu_hx = cx; bu_hy = cy + r + 20; strcpy(#bu_hv, bu_val(idx, fmt)); strcpy(#bu_hl, lbl); );
+);
+function bu_lbl(cx, cy, r, lbl, ink) ( bu_ft(16); ui_col(ink); v5_t(cx, cy + r + 20, lbl); );
+function bu_rk(x, y, w, h, on, lg, led) local(gx, hv) (
+  hv = v5_hit(x, y, w, h);
+  ui_col(0x050606); v5_rr(x - 1, y - 1, w + 2, h + 2, 3);
+  ui_col(hv ? BKH : BKF); v5_rr(x, y, w, h, 3);
+  ui_cola(0, 0.45); v5_r(x + 1, y + 1, w - 2, 2); v5_r(x + 1, y + 1, 2, h - 2);
+  ui_cola(0xFFFFFF, 0.07); v5_r(x + 2, y + h - 1, w - 3, 1);
+  gx = x + 7;
+  ui_col(0x050606); v5_rr(gx, y + 5, 7, h - 10, 3.5);
+  on ? ( ui_cola(led, 0.25); v5_rr(gx - 3, y + 3, 13, h - 6, 5); ui_col(led); v5_rr(gx + 2, y + 6, 3, h - 12, 1.5); )
+     : ( ui_col(ui_mix(led, 0x0A0B0B, 0.75)); v5_rr(gx + 2, y + 6, 3, h - 12, 1.5); );
+  gfx_setfont(v5_fk); ui_col(on ? 0xF6F8F4 : 0xA8ACA6); v5_t((gx + 11 + x + w - 4) * 0.5, y + h * 0.5 + 0.5, lg);
+);
+function bu_tog(x, y, w, h, idx, lg, led) local(on) ( on = v5_toggle(idx, v5_hit(x, y, w, h)); bu_rk(x, y, w, h, on, lg, led); on; );
+function bu_hold(x, y, w, h, idx, lg, led) local(on) (
+  v5_pr && v5_drag == 0 && v5_hit(x, y, w, h) ? ( v5_drag = -2; bu_cgh = 1; slider(idx) = 1; ui_auto(idx); );
+  bu_cgh && !v5_dn ? ( bu_cgh = 0; slider(idx) = 0; ui_auto(idx); );
+  on = slider(idx) >= 0.5;
+  bu_rk(x, y, w, h, on, lg, led);
+);
+function bu_in(x, y, idx) local(on, dn) (
+  on = v5_toggle(idx, v5_hit(x, y, 40, 24));
+  dn = on ? 1.5 : 0;
+  v5_shr(x, y, 40, 24, 4);
+  ui_col(0x0A0B0B); v5_rr(x, y, 40, 24, 4);
+  ui_col(on ? BKF : BKH); v5_rr(x + 1, y + 1 + dn, 38, 22 - dn, 4);
+  ui_cola(0xFFFFFF, 0.08); v5_r(x + 4, y + 2 + dn, 32, 1);
+  gfx_setfont(v5_fk);
+  on ? v5_glowt(x + 20, y + 12 + dn * 0.5, "IN") : ( ui_col(0x5E5A50); v5_t(x + 20, y + 12 + dn * 0.5, "IN"); );
+  on;
+);
+function bu_lamp(cx, cy, col, lv) (
+  ui_col(0x050606); v5_sd(cx, cy, 5.2);
+  ui_col(ui_mix(ui_mix(col, 0x101010, 0.8), col, lv)); v5_sd(cx, cy, 4);
+  lv > 0.05 ? ( ui_cola(col, 0.3 * lv); v5_d(cx, cy, 8); ui_cola(0xFFFFFF, 0.5 * lv); v5_sd(cx - 1.2, cy - 1.2, 1.3); );
+);
+function bu_glass(x, y, w, h) local(c0, c1, c2) (
+  ui_col(0x050606); v5_rr(x - 6, y - 6, w + 12, h + 12, 5);
+  ui_col(0x1A1C1D); v5_rr(x - 3, y - 3, w + 6, h + 6, 3);
+  c0 = ui_mix(0xA8AC8C, 0xD8DCBC, 0.44); c1 = 0xD8DCBC; c2 = ui_mix(0xA8AC8C, 0xD8DCBC, 0.16);
+  bu_grad(x, y, w, h * 0.4, c0, c1); bu_grad(x, y + h * 0.4, w, h * 0.6, c1, c2);
+  ui_cola(0, 0.22); v5_r(x, y, w, 2); v5_r(x, y + 2, 2, h - 2);
+);
+function bu_arrkey(x, y, w, h, dir) local(cx, cy) (
+  v5_keycap(x, y, w, h, 0, BKF, BKT, v5_cr, "", -1);
+  cx = x + w / 2; cy = y + h * 0.40; ui_col(v5_cr);
+  dir < 0 ? gfx_triangle((cx - 5.5) * sc, cy * sc, (cx + 3.5) * sc, (cy - 5.5) * sc, (cx + 3.5) * sc, (cy + 5.5) * sc)
+          : gfx_triangle((cx + 5.5) * sc, cy * sc, (cx - 3.5) * sc, (cy - 5.5) * sc, (cx - 3.5) * sc, (cy + 5.5) * sc);
+);
+function bu_preset(x, y, w, cur) local(n, sel, open, gx, i) (
+  n = pk_pcount(#br_pm); sel = 0; open = 0;
+  v5_pr && v5_drag == 0 && v5_hit(x + 76, y, 42, 26) ? ( sel = cur <= 1 || cur > n ? n : cur - 1; v5_drag = -1; );
+  v5_pr && v5_drag == 0 && v5_hit(x + 122, y, 42, 26) ? ( sel = cur >= n || cur < 1 ? 1 : cur + 1; v5_drag = -1; );
+  v5_pr && v5_drag == 0 && v5_hit(x, y, 72, 26) ? ( open = 1; v5_drag = -1; );
+  v5_keycap(x, y, 72, 26, 0, BKF, BKT, v5_cr, "", -1);
+  bu_ft(13); bu_tw("PRESETS") > 62 ? bu_ft(13 * 62 / bu_tw("PRESETS")); ui_col(v5_cr); v5_t(x + 36, y + 11.5, "PRESETS");
+  bu_arrkey(x + 76, y, 42, 26, -1); bu_arrkey(x + 122, y, 42, 26, 1);
+  gx = x + 174; bu_glass(gx, y + 2, w - 174, 22);
+  cur >= 1 && cur <= n ? pk_pitem(#br_pm, cur, #bu_pl) : strcpy(#bu_pl, "--");
+  v5_lcdfit(#bu_pl, 16, w - 174 - 16, 12); ui_col(0x10181C); bu_tl(gx + 8, y + 13.5, #bu_pl);
+  v5_pr && v5_drag == 0 && v5_hit(gx, y + 2, w - 174, 22) ? ( open = 1; v5_drag = -1; );
+  open ? (
+    strcpy(#bu_pmm, ""); i = 1;
+    loop(n, i == cur ? strcat(#bu_pmm, "!"); strcat(#bu_pmm, pk_pitem(#br_pm, i, #bu_pt)); strcat(#bu_pmm, "|"); i += 1; );
+    gfx_x = gx * sc; gfx_y = (y + 30) * sc; i = gfx_showmenu(#bu_pmm); i > 0 && i <= n ? sel = i;
+  );
+  sel;
+);
+function bu_sml(x, y) local(i, cur, on) (
+  cur = ui_sz == 1 ? 0 : ui_sz == 2 ? 2 : 1;
+  ui_col(ui_mix(BB, 0, 0.7)); v5_rr(x - 2, y - 2, 84, 22, 3);
+  i = 0; loop(4, on = i < 3 ? i == cur : ui_help_open;
+    v5_pr && v5_drag == 0 && v5_hit(x + i * 20, y, 20, 18) ? (
+      i == 0 ? ui_sz = 1 : i == 1 ? ui_sz = 0 : i == 2 ? ui_sz = 2 : ( ui_help_open = 1; ui_help_new = 1; );
+      v5_drag = -1; on = 1;
+    );
+    ui_col(on ? 0xF0A030 : BKF); v5_r(x + i * 20 + (i > 0), y, 20 - (i > 0), 18);
+    on ? ( ui_cola(0xFFF0C8, 0.3); v5_r(x + i * 20 + 2, y + 2, 16, 14); );
+    bu_ft(11); ui_col(on ? 0x3A2408 : v5_cr); v5_t(x + i * 20 + 10, y + 9, i == 0 ? "S" : i == 1 ? "M" : i == 2 ? "L" : "?");
+    i += 1; );
+);
+function bu_vuface(x, y, w, h) (
+  ui_cola(0, 0.16); v5_r(x - 9, y - 9, w + 18, h + 18);
+  ui_cola(0, 0.22); v5_r(x - 9, y - 9, w + 18, 3); v5_r(x - 9, y - 6, 3, h + 15);
+  ui_cola(0xFFFFFF, 0.3); v5_r(x - 9, y + h + 7, w + 18, 2); v5_r(x + w + 7, y - 9, 2, h + 16);
+  ui_col(0x0C0C0C); v5_rr(x - 3, y - 3, w + 6, h + 6, 5);
+);
+function bu_vu(x, y, w, h, vdb, pkl, lbl) instance(vpos, vvel, vlt) local(fx, fy, fw, fh, rad, px, py, i, t, a, s, c, ang0, ang1, dt) (
+  ui_vu_dim = slider18 >= 0.5;
+  ui_spill((x - 3) * sc, (y - 3) * sc, (w + 6) * sc, (h + 6) * sc, 1);
+  ui_col(0x0C0C0C); v5_rr(x - 3, y - 3, w + 6, h + 6, 5);
+  fx = x + 3; fy = y + 3; fw = w - 6; fh = h - 6;
+  ui_glow(floor(fx * sc), floor(fy * sc), fw * sc, fh * sc, 1);
+  rad = min(w * 0.5, h * 0.95); px = fx + fw / 2; py = fy + fh + rad * 0.12;
+  ang0 = -0.72; ang1 = 1.44;
+  ui_col(0x1A1A1C); v5_arc(px, py, rad * 0.78, ang0, ang0 + ang1 * 0.72, 1.2);
+  ui_col(0xB8322A); v5_arc(px, py, rad * 0.8, ang0 + ang1 * 0.72, ang0 + ang1, 2.6);
+  bu_ft(11); i = 0;
+  loop(8, t = i == 0 ? 0 : i == 1 ? 0.2 : i == 2 ? 0.36 : i == 3 ? 0.5 : i == 4 ? 0.62 : i == 5 ? 0.72 : i == 6 ? 0.86 : 1;
+    a = ang0 + ang1 * t; c = t > 0.72 ? 0xB8322A : 0x1A1A1C;
+    ui_col(c); v5_sd(px + sin(a) * rad * 0.86, py - cos(a) * rad * 0.86, i == 5 ? 1.8 : 1.3);
+    (i == 0 || i == 1 || i == 3 || i == 5 || i == 7) ? (
+      s = i == 0 ? "20" : i == 1 ? "10" : i == 3 ? "5" : i == 5 ? "0" : "3";
+      v5_t(px + sin(a) * rad * 1.0, py - cos(a) * rad * 1.0, s); );
+    i += 1; );
+  bu_ft(13); ui_col(0x1A1A1C); v5_t(px, fy + fh - 21, lbl);
+  t = vdb <= -20 ? 0 : vdb <= -10 ? (vdb + 20) * 0.02 : vdb <= -7 ? 0.2 + (vdb + 10) * 0.16 / 3 : vdb <= -5 ? 0.36 + (vdb + 7) * 0.07 :
+      vdb <= -3 ? 0.5 + (vdb + 5) * 0.06 : vdb <= 0 ? 0.62 + (vdb + 3) * 0.1 / 3 : 0.72 + vdb * 0.28 / 3;
+  t = min(max(t, -0.05), 1.05);
+  dt = min(max(time_precise() - vlt, 0.001), 0.05); vlt = time_precise();
+  vvel += (160 * (t - vpos) - 18 * vvel) * dt; vpos = min(max(vpos + vvel * dt, -0.06), 1.06);
+  a = ang0 + ang1 * vpos;
+  ui_cola(0x5A3A10, 0.25); v5_ln(px + 1.5, py + 1.5, px + 1.5 + sin(a) * rad * 0.92, py + 1.5 - cos(a) * rad * 0.92, 1.2);
+  ui_col(0x151515); v5_ln(px, py, px + sin(a) * rad * 0.92, py - cos(a) * rad * 0.92, 1.3);
+  ui_col(0x1A1A1C); v5_rr(fx + fw / 2 - 18, fy + fh - 9, 36, 9, 2);
+  ui_col(0x050506); v5_sd(fx + fw - 8, fy + 8, 4.2);
+  ui_col(pkl ? 0xFF3A2A : 0x5A1410); v5_sd(fx + fw - 8, fy + 8, 3);
+  pkl ? ( ui_cola(0xFF3A2A, 0.25); v5_d(fx + fw - 8, fy + 8, 6); );
+);
+function bu_grrow(x, y, gr) local(i, d, c, on, sw) (
+  sw = 10.4; i = 0;
+  loop(12, d = i == 0 ? 1 : i == 1 ? 2 : i == 2 ? 3 : i == 3 ? 4 : i == 4 ? 6 : i == 5 ? 8 : i == 6 ? 10 : i == 7 ? 12 : i == 8 ? 14 : i == 9 ? 16 : i == 10 ? 18 : 20;
+    c = i < 6 ? 0x3CE05A : i < 9 ? 0xFFC81E : 0xFF3A2A; on = gr >= d - 0.5;
+    ui_col(on ? c : ui_mix(c, 0x0A0B0B, 0.82)); v5_rr(x + i * sw + 1, y, sw - 2.2, 9, 1.5);
+    on ? ( ui_cola(0xFFFFFF, 0.25); v5_r(x + i * sw + 2, y + 1, sw - 4.2, 1); );
+    i += 1; );
+);
+function bu_lvrow(x, y, vdb) local(i, c, on, d) (
+  i = 0;
+  loop(8, d = -20 + i * 5;
+    c = i < 2 ? 0x3A9CFF : i < 4 ? 0x3CE05A : i == 4 ? 0xFFC81E : i == 5 ? 0xFF8A1E : 0xFF3A2A; on = vdb >= d;
+    ui_col(0x050606); v5_sd(x + i * 18, y, 5.6);
+    ui_col(on ? c : ui_mix(c, 0x0A0B0B, 0.8)); v5_sd(x + i * 18, y, 4.3);
+    on ? ( ui_cola(c, 0.28); v5_d(x + i * 18, y, 8); ui_cola(0xFFFFFF, 0.45); v5_sd(x + i * 18 - 1.3, y - 1.3, 1.3); );
+    i += 1; );
+);
+function bu_wash(x, y, w, h) ( ui_cola(BK, 0.55); v5_r(x, y, w, h); );
+function bu_crv(o, span) ( o <= 0 ? 0 : o < span ? o * o * o / (3 * span * span) : span / 3 + (o - span); );
+function bu_cx(d) ( 556 + (d + 48) / 48 * 128; );
+function bu_cy(d) ( 238 - (d + 48) / 48 * 128; );
+function bu_curve(th, lim) local(sp, d, o, y0, x0, x1, y1, i) (
+  ui_col(0x0E1010); v5_rr(548, 102, 144, 144, 3);
+  ui_cola(0, 0.5); v5_r(549, 103, 142, 2); v5_r(549, 103, 2, 142);
+  ui_cola(0xFFFFFF, 0.08); v5_r(549, 244, 142, 1);
+  ui_cola(BI, 0.10); i = 1; loop(3, v5_r(bu_cx(-48 + i * 12), 110, 1, 128); v5_r(556, bu_cy(-48 + i * 12), 128, 1); i += 1; );
+  ui_cola(BI, 0.22); v5_ln(bu_cx(-48), bu_cy(-48), bu_cx(0), bu_cy(0), 1);
+  ui_cola(0xFF3A2A, 0.45); v5_r(556, bu_cy(lim), 128, 1);
+  sp = 1.5 * (lim - th);
+  x0 = bu_cx(-48); y0 = bu_cy(-48); d = -48;
+  ui_col(BT);
+  loop(96, d += 0.5; o = d - bu_crv(d - th, sp);
+    x1 = bu_cx(d); y1 = bu_cy(o); v5_ln(x0, y0, x1, y1, 2); x0 = x1; y0 = y1; );
+  bu_ft(11); ui_cola(BI, 0.55); bu_tl(556, 114, "OUT"); v5_t(668, 230, "IN");
+);
+
+BUCK = 7000000;
+bu_th = min(max(slider12, -40), -6); bu_lim = max(min(max(slider13, -24), -1), bu_th + 2);
+bu_bk = gfx_w != bu_bw || gfx_h != bu_bh || sc != bu_bs || bu_th != bu_bt || bu_lim != bu_bl;
+bu_bk ? (
+  bu_bw = gfx_w; bu_bh = gfx_h; bu_bs = sc; bu_bt = bu_th; bu_bl = bu_lim;
+  gfx_setimgdim(119, 0, 0); gfx_setimgdim(119, gfx_w, gfx_h); gfx_dest = 119; gfx_a = 1; gfx_mode = 0;
+  ui_col(ui_mix(BF, 0, 0.3)); gfx_rect(0, 0, gfx_w, gfx_h);
+  bu_grad(0, 0, 900, 355, ui_mix(BF, 0xFFFFFF, 0.22), ui_mix(BF, 0, 0.22));
+  ui_cola(0xFFFFFF, 0.2); v5_r(0, 0, 900, 1.5); v5_r(0, 0, 1.5, 355);
+  ui_cola(0, 0.3); v5_r(0, 352, 900, 3); v5_r(897, 0, 3, 355);
+  bu_rivet(8, 8); bu_rivet(892, 8); bu_rivet(8, 347); bu_rivet(892, 347);
+
+  ui_col(BB); v5_r(16, 16, 868, 38);
+  ui_col(0x050606); v5_d(44, 35, 17); ui_col(v5_cr); v5_d(44, 35, 15); ui_col(BB); v5_d(44, 35, 13);
+  bu_ft(10); ui_col(0xF4F6F8); ui_ctext(44 * sc, 35 * sc, "GFX");
+  gfx_setfont(6, "Trebuchet MS", bu_f6, 'b'); ui_col(v5_cr); bu_tl(70, 35, "BURE"); bu_sx = 70 + bu_tw("BURE");
+  bu_ft(12); ui_col(ui_mix(v5_cr, BB, 0.45)); bu_tl(bu_sx + 5, 40, "v5"); bu_sx += 5 + bu_tw("v5") + 14;
+  v5_stripes(min(bu_sx, 236), 16, 54, BG, BT, BC2);
+  ui_col(0x050606); v5_r(16, 54, 868, 2);
+
+  bu_plate(16, 64, 176, 275, "INPUT", BG);
+  bu_plate(200, 64, 244, 275, "EQ", BT);
+  bu_plate(452, 64, 248, 275, "COMP", BC2);
+  bu_lbl(62, 150, 24, "GAIN", BI); bu_lbl(150, 150, 16, "HPF", BI);
+  bu_ft(13); ui_col(BI); v5_t(104, 226, "LEVEL");
+  bu_lbl(258, 150, 18, "LOW", BI); bu_lbl(322, 150, 18, "PRES", BI); bu_lbl(386, 150, 18, "AIR", BI);
+  bu_lbl(290, 252, 15, "FREQ", BI); bu_lbl(354, 252, 15, "LPF", BI);
+  bu_lbl(500, 152, 24, "THRESH", BI); bu_lbl(500, 252, 16, "LIMIT", BI);
+  bu_curve(bu_th, bu_lim);
+  bu_cham(708, 64, 176, 275, 3, BF, BK);
+  bu_vuface(724, 84, 144, 72);
+  bu_ft(13); ui_col(BI); bu_tl(724, 179, "GR");
+  bu_dwell(716, 198, 160, 134);
+  bu_ft(15); ui_col(0xE2E2DF); v5_t(796, 259, "OUT"); v5_t(760, 323, "SAT"); v5_t(836, 323, "DRIFT");
+  gfx_dest = -1;
+);
+bu_ckr = bu_bk;
+bu_bk ? ( gfx_setimgdim(120, 0, 0); gfx_setimgdim(120, gfx_w, gfx_h); gfx_dest = 120; gfx_x = 0; gfx_y = 0; gfx_a = 1; gfx_mode = 2; gfx_blit(119, 1, 0); gfx_mode = 0; gfx_dest = -1; );
+gfx_x = 0; gfx_y = 0; gfx_a = 1; gfx_mode = 2; gfx_blit(120, 1, 0); gfx_mode = 0;
+
+bu_hon = 0;
+bu_gr = -gr_disp; gr_disp = 0; bu_grm = bu_gr > bu_grm ? bu_gr : bu_grm * 0.85;
+bu_iv = lvl_disp; lvl_disp = 0; bu_ivm = bu_iv > bu_ivm ? bu_iv : bu_ivm * 0.85;
+
+bu_dial(62, 150, 24, 1, -20, 20, 0, 0, 0x2A2C24, 0xF2EAD2, BI, 1, "GAIN", "%+.1f dB");
+bu_dial(150, 150, 16, 3, 15, 350, 88, 1, 0xF2C14E, 0x2A2008, BI, 0, "HPF", "");
+bu_lvrow(41, 250, 20 * log10(max(bu_ivm, 0.0000001)) + 18);
+bu_tog(28, 292, 70, 28, 2, "PHASE", v5_led);
+bu_hold(110, 292, 70, 28, 4, "COUGH", 0xFF3A2A);
+
+bu_dial(258, 150, 18, 6, -12, 12, 0, 0, 0xC08850, 0x23282A, BI, 1, "LOW", "%+.1f dB");
+bu_dial(322, 150, 18, 7, -12, 12, 0, 0, 0x6FB07A, 0x0E2014, BI, 1, "PRES", "%+.1f dB");
+bu_dial(386, 150, 18, 9, -12, 12, 0, 0, 0xEC7A6E, 0x2A0E0A, BI, 1, "AIR", "%+.1f dB");
+bu_dial(290, 252, 15, 8, 1100, 5500, 3300, 1, 0x6FB07A, 0x0E2014, BI, 0, "FREQ", "");
+bu_dial(354, 252, 15, 10, 3, 22, 22, 1, 0x2A2C2E, 0xF2EAD2, BI, 0, "LPF", "");
+slider5 < 0.5 ? bu_wash(226, 112, 192, 220);
+bu_in(396, 73, 5);
+
+bu_dial(500, 152, 24, 12, -40, -6, -24, 0, v5p_cap, v5p_c2, BI, 0, "THRESH", "%+.1f dBFS");
+bu_dial(500, 252, 16, 13, -24, -1, -10, 0, BC2, 0xF2EAD2, BI, 0, "LIMIT", "%+.1f dBFS");
+bu_tog(570, 292, 108, 28, 14, "SLOW", v5_led);
+slider11 < 0.5 ? (
+  bu_wash(468, 108, 226, 224);
+) : (
+  bu_ld = lv_disp;
+  bu_ld > -48 ? (
+    bu_lo = bu_ld + min(gr_last, 0);
+    ui_cola(BT, 0.3); v5_d(bu_cx(min(bu_ld, 0)), bu_cy(max(min(bu_lo, 0), -48)), 6);
+    ui_col(0xFFFFFF); v5_sd(bu_cx(min(bu_ld, 0)), bu_cy(max(min(bu_lo, 0), -48)), 3);
+  );
+);
+gr_last = -bu_gr;
+bu_in(648, 73, 11);
+
+bu_dial(796, 226, 13, 15, -20, 20, 0, 0, 0x2A2C24, 0xF2EAD2, 0xE2E2DF, 1, "OUT", "%+.1f dB");
+bu_dial(760, 290, 13, 16, 0, 100, 0, 0, 0xE07A4E, 0x2A1008, 0xE2E2DF, 0, "SAT", "%d %%");
+bu_dial(836, 290, 13, 17, 0, 100, 50, 0, 0x8A8E8C, 0x101214, 0xE2E2DF, 0, "DRIFT", "%d %%");
+
+bu_or = orms_disp; orms_disp = 0;
+bu_opk = o_disp; o_disp = 0;
+bu_opk > 0.891 ? bu_pkt = time_precise();
+v5_pr && v5_drag == 0 && v5_hit(724, 84, 144, 72) ? ( bu_pkt = 0; v5_drag = -1; );
+vuO.bu_vu(724, 84, 144, 72, 20 * log10(max(bu_or, 0.0000001)) + 18, time_precise() - bu_pkt < 1.2, "OUT");
+bu_grrow(748, 174, bu_grm);
+
+prs_cur_d > 0 ? ( pr_cur = prs_cur_d; prs_cur_d = 0; );
+bu_k = bu_preset(398, 22, 308, pr_cur);
+bu_k > 0 ? ( prs_dirty = bu_k; pr_cur = bu_k; );
+by_keywh(716, 22, 76, 28, 18, 7);
+bu_sml(802, 27);
+
+bu_hon ? (
+  bu_ft(16); bu_hw = max(bu_tw(#bu_hv), bu_tw(#bu_hl));
+  ui_col(BH); v5_rr(bu_hx - bu_hw / 2 - 6, bu_hy - 11, bu_hw + 12, 22, 3);
+  ui_col(BA); v5_t(bu_hx, bu_hy, #bu_hv);
+);
+mouse_wheel = 0;
+pk_end();
+ui_help_xh = 262;
+ui_name_keys(); ui_help();
+ui_help_open ? ( mouse_x = ui_mx; mouse_y = ui_my; pwr_panel(ui_help_cx + 30 * ui_help_s, ui_help_cy + 118 * ui_help_s, ui_help_s, 15, ui_help_clk, ui_mw); );
+ui_help_open ? ( psw_gt = psw_row(ui_help_cx + ui_help_cw * 0.5, ui_help_cy + 290 * ui_help_s, ui_help_s, 15, ui_help_clk, psw_view >= 0.5); psw_gt >= 0 ? ( psw_view = psw_gt; psw_allg(psw_gt); slider_automate(psw_view); ); );
+mouse_wheel = 0;
